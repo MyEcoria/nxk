@@ -53,19 +53,50 @@ console powers on to a black screen (AutoRCM) rather than the Nintendo logo
 - nxk DVFS/clock code is emulator-only and power-unsafe: never run
   experimental clock/voltage builds on hardware without review.
 
-## Why nxk.bin can't be injected (stage 2 work)
+## Stage 2 : demarrer nxk via l'entree L4T de hekate (pret, en attente de test)
 
-- RCM payloads execute on the BPMP in IRAM with a hard size cap (~196 KiB).
-  `build/nxk.bin` is ~1.7 MB (kernel + embedded bootfs) linked for DRAM at
-  `0x80000000` (`kernel/link.ld`), entry `_start` in EL3 with MMU off.
-- DRAM is uninitialized in RCM, so nxk needs a loader that does what
-  hekate's BDK does (SDRAM init, `MC_EMEM_CFG`, clocks) and then releases
-  the CCPLEX at `0x80000000`. Options: minimal BPMP loader reusing
-  `refs/hekate/bdk` sequences, or chain hekate→U-Boot→`go 0x80000000`.
-- Console visibility: nxk logs on UART-A (115200 8N1), which is **not**
-  routed to USB on retail hardware — reading it needs a UART mod
-  (Joy-Con-rail pads). The LCD panel init is also unimplemented
-  (see README "Limites"). First hardware boots will be blind; validate
-  with hekate's menu + SD activity, then bring up UART/display.
-- So for now: success = hekate menu on the Switch screen via `./inject.sh`.
-  Say the word and stage 2 (DRAM loader + blind-boot smoke test) is next.
+Ni l'injection RCM ni `payload=` ne peuvent demarrer nxk : c'est une image
+DRAM de ~1,7 Mo liee a `0x80000000` (`kernel/link.ld`), pas un payload
+BPMP/IRAM (plafond ~196 Kio, DRAM non initialisee en RCM).
+
+Chaine retenue (tout est construit et valide en emulateur, jamais sur
+hardware) : **hekate `[nxk]` (L4T) → `nxk/bl31.bin` (moniteur nxk-bl31)
+→ `nxk/bl33.bin` (= nxk.bin)**.
+
+- `bootloader/ini/nxk.ini` : `l4t=1`, `boot_prefixes=nxk/`, `uart_port=1`
+  (hekate active pinmux+horloge d'UART-A). Apparait dans More Configs.
+- `nxk/bl31.bin` : construit par `mkbl31.py` depuis `hwboot/nxk-bl31/`
+  (Rust `no_std`, ~6 Kio). Charge par hekate en TZDRAM a `0xFFF00000`, il
+  ouvre UART-A, bascule le GIC en Groupe 1, declare son Mo en carveout TZ
+  (nxk l'exclut via `detect_holes`), recopie bl33 de `0xAA000000` vers
+  `0x80000000`, refuse les `smc` (pas de PSCI -> nxk mono-coeur), et saute
+  en EL2 avec x0 = 0 (sans DTB : DRAM via `MC_EMEM_CFG` + sondage).
+- `nxk/bl33.bin` : copie byte-identique de `build/nxk.bin`.
+- `bootloader/sys/l4t/` + `libsys_*.bso` : firmware BPMP/SC7/Minerva du
+  pack Nyx (DRAM init par hekate) ; installes par `mksd-hw.sh` si absents.
+
+Validation emulateur (`./test-bl31.sh`, meme binaire bl31 que sur hardware) :
+banniere moniteur, recopie, `entree en EL2`, `sans PSCI : un seul coeur`,
+invite `nxk>`. Le chemin EL2+PSCI 4 coeurs est aussi couvert par
+`nxtest.py --monitor <l4tboot> --dtb build/moniteur.dtb`.
+
+## Test hardware (quand la carte SD est de retour sur le PC)
+
+1. `./mksd-hw.sh /mount/point` (reconstruit nxk + bl31, installe l'entree).
+2. Remettre la carte dans la Switch, injecter hekate, **More Configs → nxk**.
+3. **Adaptateur UART requis** (rail Joy-Con droit, ~5-10 €, sans soudure) :
+   sans lui le premier boot est aveugle — ni l'ecran (init panneau DSI non
+   implementee, voir README "Limites") ni l'USB ne montrent quoi que ce soit.
+   Avec lui (115200 8N1 sur UART-A) : logs du moniteur puis banniere nxk.
+4. Attendu : `entree en EL2`, `1/4 coeurs en ligne`, invite `nxk>`.
+   `ktest` passera sauf `affinite et migration` (exige les coeurs 1-3).
+5. Recuperation : un boot rate se resume a un hang. Maintenir Power 12 s
+   (extinction forcee), relancer en RCM, reessayer. Aucune ecriture NAND,
+   eMMC ou SD par nxk : rien de persistant ne peut etre corrompu.
+
+## Pourquoi nxk.bin ne peut pas etre injecte directement
+
+Rappel : payloads RCM = BPMP en IRAM, ~196 Kio max, DRAM eteinte.
+`build/nxk.bin` fait ~1,7 Mo (noyau + bootfs embarquee) et s'execute a
+`0x80000000` en EL3/EL2 avec MMU coupee. D'ou le moniteur intermediaire,
+qui fait ce que fait normalement ATF : GIC securise + saut EL2.

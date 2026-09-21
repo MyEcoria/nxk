@@ -52,6 +52,20 @@ for prog in hello-std stdtest; do
     [ -x "$appdir/$prog" ] && cp "$appdir/$prog" "$sd/bin/$prog"
 done
 printf 'Bienvenue sur nxk : ce fichier vient de la carte SD (FAT32).\n' > "$sd/motd-nxk.txt"
+
+echo "[mksd-hw] entree L4T nxk -> $sd"
+python3 "$here/mkbl31.py" -o "$here/dl/bl31.bin"
+mkdir -p "$sd/nxk"
+cp "$here/dl/bl31.bin" "$sd/nxk/bl31.bin"
+cp "$root/build/nxk.bin" "$sd/nxk/bl33.bin"
+mkdir -p "$sd/bootloader/ini"
+cp "$here/nxk.ini" "$sd/bootloader/ini/nxk.ini"
+if [ ! -d "$sd/bootloader/sys/l4t" ]; then
+    echo "[mksd-hw] firmware L4T hekate (BPMP/SC7/Minerva)"
+    unzip -oq "$nyx" -d "$sd" 'bootloader/sys/l4t/*' 'bootloader/sys/libsys_*.bso'
+else
+    echo "[mksd-hw] firmware L4T deja present"
+fi
 sync
 echo "[mksd-hw] SD ready:"
 ls "$sd" | head

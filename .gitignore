@@ -8,3 +8,4 @@ hwboot/venv/
 hwboot/fusee-nano/fusee-nano
 hwboot/fusee-nano/*.o
 hwboot/fusee-nano/src/intermezzo.h
+hwboot/nxk-bl31/target/
