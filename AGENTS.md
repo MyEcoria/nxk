@@ -157,8 +157,24 @@ Key details agents must respect:
 
 - After every task, `commit` **and** `push` the result (do not leave changes
   unpushed in the working tree).
+- Message format (Conventional Commits, all in English):
+
+  ```text
+  <type>(<scope>): <short imperative subject, max 72 chars>
+
+  [<body: what changed and why, 1-3 sentences.>]
+  [Tested: <commands run, e.g. ./tools/build.sh; ./tools/nxtest.py -c ktest -c stdtest --sd build/sd.img>]
+  Co-authored-by: <exact-model-id> <noreply@example.com>
+  ```
+
+- Allowed `type`: `feat` (new syscall, service, feature), `fix`, `docs`,
+  `refactor`, `test`, `bench`, `tools`, `chore`.
+- Allowed `scope`: `kernel`, `abi`, `std`, `apps`, `tools`, `bench`, or
+  `user/<service>` (e.g. `user/fs`, `user/net`, `user/shell`, `libnx`).
+- One logical change per commit; split unrelated changes.
+- Never commit `build/`, `*/target/`, `~/.cache/nxk/`, SD images, or
+  `screendump` PPMs.
 - Every commit message must include a `Co-authored-by` trailer naming the AI
-  model actually used, e.g.:
-  `Co-authored-by: <model-name> <noreply@example.com>`
-  Replace `<model-name>` with the exact model id (e.g. what `opencode models`
-  reports). Never omit it, never invent a human author.
+  model actually used. Replace `<exact-model-id>` with the exact model id
+  (e.g. what `opencode models` reports). Never omit it, never invent a human
+  author.
