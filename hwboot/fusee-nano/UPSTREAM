@@ -1,0 +1,18 @@
+fusee-nano — minimalist Fusée Gelée (Tegra X1 RCM) injector for Linux.
+
+Upstream: https://github.com/DavidBuchanan314/fusee-nano
+Pinned commit: f35caa7a1c7e5266d903004b3d884482849bcc6d
+License: MIT (see LICENSE.upstream-MIT), (c) 2018 David Buchanan.
+
+Vendored files (unmodified, only paths kept):
+  src/exploit.c, src/usb.c, src/usb.h  — exploit + raw usbdevice_fs backend
+  files/intermezzo.bin                  — 92-byte IRAM relocator (embedded at
+                                          build time into src/intermezzo.h)
+  Makefile                              — builds ./fusee-nano (zero deps,
+                                          only gcc + Linux headers)
+
+Why this tool: the classic fusee-launcher Python repos are gone, and
+TegraRcmSmash is Windows-only. fusee-nano speaks /dev/bus/usb directly, so
+no libusb dev headers or Python packages are needed on the host.
+
+Usage (from hwboot/): ./inject.sh [payload.bin]

@@ -1,0 +1,5 @@
+# udev rule: let regular users talk to a Switch in RCM (NVIDIA APX 0955:7321).
+# Install: sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+# Then unplug/replug USB. Permissions only — nothing auto-runs (inject.sh
+# stays an explicit manual step for safety).
+SUBSYSTEM=="usb", ATTR{idVendor}=="0955", ATTR{idProduct}=="7321", MODE="0666", GROUP="plugdev", SYMLINK+="switch-rcm"

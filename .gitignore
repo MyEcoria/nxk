@@ -3,3 +3,8 @@ kernel/target/
 user/target/
 abi/target/
 refs/
+hwboot/dl/
+hwboot/venv/
+hwboot/fusee-nano/fusee-nano
+hwboot/fusee-nano/*.o
+hwboot/fusee-nano/src/intermezzo.h
