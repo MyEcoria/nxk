@@ -1,0 +1,8 @@
+[package]
+name = "ktest"
+version = "0.1.0"
+edition = "2021"
+description = "Tests des mecanismes du noyau nxk"
+
+[dependencies]
+libnx = { path = "../libnx" }

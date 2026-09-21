@@ -1,0 +1,16 @@
+# Programmes Rust ordinaires (avec std) pour nxk.
+#
+# Construction : tools/build.sh (ou, ici : cargo build --release), avec la
+# chaine « nxk » preparee par tools/mkstd.py (bibliotheque standard portee).
+[workspace]
+resolver = "2"
+members = ["hello", "stdtest"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

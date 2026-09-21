@@ -1,0 +1,13 @@
+[package]
+name = "l4tboot"
+version = "0.1.0"
+edition = "2021"
+description = "Moniteur EL3 minimal pour demarrer le noyau L4T sur le Tegra X1 emule (PSCI)"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+debug = false
+
+[profile.dev]
+panic = "abort"

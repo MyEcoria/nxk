@@ -1,0 +1,32 @@
+[package]
+name    = "nxk"
+version = "0.1.0"
+edition = "2021"
+description = "Micro-noyau aarch64 pour Tegra X1 (Nintendo Switch), sans OS hote"
+
+[features]
+default = ["spectre-v2"]
+# Invalidation du predicteur de branchements a chaque changement de processus
+# (CVE-2017-5715, Cortex-A57).
+spectre-v2 = []
+# Coeurs au repos en attente active plutot qu'en WFI (comme idle=poll sous
+# Linux) : aucun IPI pour les reveiller. Utilise pour comparer a L4T, qui ne
+# fonctionne sous l'emulateur qu'avec idle=poll.
+idle-poll = []
+# Trace des decisions d'ordonnancement sur la console (diagnostic).
+trace-sched = []
+
+[dependencies]
+nxk-abi = { path = "../abi" }
+
+[profile.release]
+opt-level        = 3
+lto              = "fat"
+codegen-units    = 1
+panic            = "abort"
+debug            = true      # symboles gardes pour gdb, retires du binaire charge
+overflow-checks  = false
+strip            = false
+
+[profile.dev]
+panic = "abort"

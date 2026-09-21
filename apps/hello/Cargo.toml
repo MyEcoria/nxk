@@ -1,0 +1,9 @@
+[package]
+name = "hello-std"
+version = "0.1.0"
+edition = "2024"
+description = "Premier programme std sur nxk"
+
+[[bin]]
+name = "hello-std"
+path = "src/main.rs"

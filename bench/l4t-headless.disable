@@ -1,0 +1,78 @@
+# Noeuds du DTB officiel desactives pour un demarrage sans ecran sur
+# initramfs dans l'emulateur. Le noyau L4T est inchange : seuls des pilotes
+# de peripheriques absents ou incompletement emules sont ecartes.
+# Un chemin par ligne ; '#' = commentaire.
+
+# I2C : PMIC/regulateurs, chargeur, jauge, tactile, audio, camera
+/i2c@7000c000
+/i2c@7000c400
+/i2c@7000c500
+/i2c@7000c700
+/i2c@7000d000
+/i2c@7000d100
+/i2c@546c0000
+# DVFS, thermique et regulation (dependent des regulateurs I2C)
+/clock@70110000
+/dfll-cdev-cap
+/dfll-cdev-floor
+/cpufreq
+/dvfs
+/dvfs_rails
+/gpu-dvfs-rework
+/core_dvfs_cdev_floor
+/core_dvfs_cdev_cap
+/bthrot_cdev
+/thermal-fan-est
+/pwm-fan
+/nvpmodel
+/soctherm@0x700E2000
+/tegra-aotag
+/cpuidle
+/external-memory-controller@7001b000
+/actmon@6000c800
+/bwmgr
+# Affichage, GPU, multimedia
+/gpu
+/host1x
+/mipical
+/backlight
+/tegra_udrm
+/camera-pcl
+/tegra_cec
+/kfuse@7000fc00
+# USB, PCIe, stockage, liaisons Joy-Con
+/xusb@70090000
+/xusb_padctl@7009f000
+/mailbox@70098000
+/usb_cd
+/xudc@700d0000
+/extcon
+/psy_extcon
+/pcie@1003000
+/sdhci@700b0000
+/serial@70006040
+/serial@70006200
+/serial@70006300
+# Audio
+/sound
+/hda@70030000
+/aconnect@702c0000
+/agic-controller
+/adma@702e2000
+# Divers
+/pwm@7000a000
+/spi@7000da00
+/se@70012000
+/r2p
+/bluedroid_pm
+/tegra-supply-tests
+/smmu_test
+/dma_test
+# Chien de garde materiel du bloc timer Tegra : jamais rafraichi sous
+# emulation, il provoque une panique ~30 s apres son armement.
+/timer@60005000
+# Controleur de flux : programme par L4T pour suspendre un coeur sur wfi/wfe.
+# Sous emulation, un coeur suspendu sur wfe (attente de verrou) n'est pas
+# reveille par la liberation du verrou : blocages intermittents. Sans lui,
+# wfi/wfe restent de simples attentes, comme sur nxk.
+/flow-controller@60007000

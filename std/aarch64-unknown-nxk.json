@@ -1,0 +1,45 @@
+{
+  "arch": "aarch64",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "llvm-target": "aarch64-unknown-none",
+  "target-pointer-width": 64,
+  "max-atomic-width": 128,
+  "os": "nxk",
+  "cpu": "cortex-a57",
+  "features": "+v8a,+neon",
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "panic-strategy": "abort",
+  "relocation-model": "pie",
+  "position-independent-executables": true,
+  "static-position-independent-executables": true,
+  "crt-static-default": true,
+  "crt-static-respected": true,
+  "has-thread-local": true,
+  "tls-model": "local-exec",
+  "stack-probes": {
+    "kind": "inline"
+  },
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "pre-link-args": {
+    "gnu-lld": [
+      "--pack-dyn-relocs=none",
+      "-z",
+      "max-page-size=4096"
+    ]
+  },
+  "post-link-args": {
+    "gnu-lld": [
+      "-z",
+      "notext"
+    ]
+  },
+  "metadata": {
+    "description": "ARM64 nxk (micro-noyau Rust, Tegra X1)",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "link-script": "/* Programmes Rust (std) pour nxk : executables statiques independants de la\n   position (static-PIE), lies a partir de 0. Le chargeur du noyau choisit une\n   base aleatoire (ASLR) et applique les relocations R_AARCH64_RELATIVE.\n\n   Chaque groupe de sections commence sur une page pour recevoir ses propres\n   droits : code RX, constantes et donnees relogees R (RELRO complet : le noyau\n   les ecrit par adresse physique avant le demarrage), donnees RW. Le noyau\n   impose W^X et refuse deux segments dans une meme page.\n\n   Ce script est recopie dans la cible aarch64-unknown-nxk.json par\n   tools/mkstd.py (champ link-script). */\nENTRY(_start)\n\nPHDRS\n{\n    text    PT_LOAD FLAGS(5);   /* R X */\n    rodata  PT_LOAD FLAGS(4);   /* R   */\n    data    PT_LOAD FLAGS(6);   /* R W */\n    dynamic PT_DYNAMIC FLAGS(4);\n    tls     PT_TLS FLAGS(4);\n}\n\nSECTIONS\n{\n    . = 0;\n\n    .text : {\n        KEEP(*(.text._start))\n        *(.text .text.*)\n    } :text\n\n    . = ALIGN(4096);\n    .rodata : { *(.rodata .rodata.*) } :rodata\n    .init_array : {\n        PROVIDE_HIDDEN(__init_array_start = .);\n        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) .init_array))\n        PROVIDE_HIDDEN(__init_array_end = .);\n    } :rodata\n    .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) } :rodata\n    .got : { *(.got) *(.got.plt) } :rodata\n    .dynamic : { *(.dynamic) } :rodata :dynamic\n    .rela.dyn : { *(.rela.dyn) *(.rela.*) } :rodata\n    .dynsym : { *(.dynsym) } :rodata\n    .dynstr : { *(.dynstr) } :rodata\n    .hash : { *(.hash) } :rodata\n    .gnu.hash : { *(.gnu.hash) } :rodata\n\n    . = ALIGN(4096);\n    .tdata : { *(.tdata .tdata.*) } :data :tls\n    .tbss : { *(.tbss .tbss.*) } :data :tls\n    .data : { *(.data .data.*) } :data\n    .bss : ALIGN(16) {\n        *(.bss .bss.*)\n        *(COMMON)\n    } :data\n\n    /DISCARD/ : {\n        *(.comment) *(.note.*) *(.eh_frame) *(.eh_frame_hdr) *(.interp)\n        *(.fini_array .fini_array.*) *(.gcc_except_table .gcc_except_table.*)\n    }\n}\n"
+}

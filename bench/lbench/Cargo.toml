@@ -1,0 +1,15 @@
+[package]
+name = "lbench"
+version = "0.1.0"
+edition = "2021"
+description = "Mesures cote Linux (noyau L4T), /init statique sans libc"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+panic = "abort"

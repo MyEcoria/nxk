@@ -1,0 +1,9 @@
+[package]
+name = "stdtest"
+version = "0.1.0"
+edition = "2024"
+description = "Tests de la bibliotheque standard sur nxk"
+
+[[bin]]
+name = "stdtest"
+path = "src/main.rs"

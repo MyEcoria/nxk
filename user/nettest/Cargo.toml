@@ -1,0 +1,8 @@
+[package]
+name = "nettest"
+version = "0.1.0"
+edition = "2021"
+description = "Essais du reseau (application, hors du coeur)"
+
+[dependencies]
+libnx = { path = "../libnx" }

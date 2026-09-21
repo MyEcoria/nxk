@@ -1,0 +1,15 @@
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "target-cpu=cortex-a57",
+    # Code independant de la position, lie en static-PIE : ASLR.
+    "-C", "relocation-model=pie",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-znotext",
+    "-C", "link-arg=--pack-dyn-relocs=none",
+    "-C", "link-arg=-Tuser.ld",
+    "-C", "link-arg=-zmax-page-size=4096",
+]

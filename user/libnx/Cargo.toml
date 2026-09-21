@@ -1,0 +1,8 @@
+[package]
+name = "libnx"
+version = "0.1.0"
+edition = "2021"
+description = "Bibliotheque systeme de nxk : appels systeme, IPC, memoire, threads, console"
+
+[dependencies]
+nxk-abi = { path = "../../abi" }

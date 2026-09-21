@@ -1,0 +1,18 @@
+//! Arguments du programme, lus dans le bloc de demarrage que le noyau
+//! depose en haut de la pile principale (l'equivalent d'argv).
+
+pub use super::common::Args;
+use crate::ffi::OsString;
+use crate::sys::FromInner;
+use crate::sys::os_str::Buf;
+use crate::sys::pal::startup_strings;
+
+pub fn args() -> Args {
+    let (data, argc, _) = startup_strings();
+    let args = data
+        .split(|&c| c == 0)
+        .take(argc)
+        .map(|s| OsString::from_inner(Buf { inner: s.to_vec() }))
+        .collect();
+    Args::new(args)
+}

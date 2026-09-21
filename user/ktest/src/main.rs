@@ -1,0 +1,956 @@
+//! ktest : verifie les mecanismes du noyau depuis l'espace utilisateur.
+//!
+//! Chaque test affiche `[ok]` ou `[ECHEC]` avec la raison ; la derniere ligne
+//! `RESULT ktest_failed N` sert aux scripts de test.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use libnx::abi::err::{self, EACCES, EAGAIN, EBADF, ENOMEM, ESRCH, ETIMEDOUT};
+use libnx::abi::info::{self, CpuInfo, MemInfo};
+use libnx::abi::prot::{EXEC, READ, WRITE};
+use libnx::abi::rights;
+use libnx::abi::shm::{CONTIGUOUS, UNCACHED};
+use libnx::abi::timeout::POLL;
+use libnx::mem::{self, SharedMemory};
+use libnx::ipc::{self, Msg};
+use libnx::sync::{Condvar, Mutex};
+use libnx::process::{self, Strings};
+use libnx::{env, println, sys, thread, time};
+
+libnx::entry!(main);
+
+type R = Result<(), String>;
+
+const MS: u64 = 1_000_000;
+
+fn main() -> i32 {
+    let args: Vec<&str> = env::args().collect();
+    if args.get(1) == Some(&"--enfant") {
+        return child(&args[2..]);
+    }
+    let tests: &[(&str, fn() -> R)] = &[
+        ("getrandom", t_random),
+        ("sommeil precis", t_sleep),
+        ("notification bornee", t_notify_timeout),
+        ("IPC bornee et jetons", t_ipc_timeouts),
+        ("futex", t_futex),
+        ("mutex sous contention", t_mutex),
+        ("variable de condition", t_condvar),
+        ("heure murale", t_realtime),
+        ("tables de handles extensibles", t_many_handles),
+        ("threads nombreux", t_many_threads),
+        ("affinite et migration", t_affinity),
+        ("preemption par priorite", t_priority),
+        ("tourniquet sans tic", t_round_robin),
+        ("equilibrage de charge", t_balance),
+        ("coeurs au repos sans tic", t_tickless),
+        ("mem_protect", t_protect),
+        ("premier acces simultane, projection imposee", t_first_touch),
+        ("tube : fin de flux, ecriture sans lecteur", t_pipe),
+        ("memoire partagee", t_shm),
+        ("tampon DMA contigu et droits", t_shm_dma),
+        ("revocation", t_revoke),
+        ("arguments et environnement", t_args),
+        ("ASLR (static-PIE)", t_aslr),
+        ("code genere a la volee (JIT)", t_jit),
+        ("fautes : ecriture RO, sans acces, W^X", t_faults),
+        ("debogage : BRK, registres, pas a pas, memoire", t_debug),
+        ("debogage : arret a distance, KILL", t_debug_stop),
+    ];
+    let mut failed = 0;
+    for (name, f) in tests {
+        match f() {
+            Ok(()) => println!("[ok]     {}", name),
+            Err(e) => {
+                failed += 1;
+                println!("[ECHEC]  {} : {}", name, e);
+            }
+        }
+    }
+    println!("ktest : {}/{} tests reussis", tests.len() - failed, tests.len());
+    println!("RESULT ktest_failed {} tests", failed);
+    failed as i32
+}
+
+fn expect_err<T: core::fmt::Debug>(what: &str, r: Result<T, i64>, e: i64) -> R {
+    match r {
+        Err(x) if x == -e => Ok(()),
+        other => Err(format!("{} : attendu {}, obtenu {:?}", what, err::name(e), other.map_err(err::name))),
+    }
+}
+
+fn t_random() -> R {
+    let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+    sys::getrandom(&mut a);
+    sys::getrandom(&mut b);
+    if a == b {
+        return Err("deux tirages identiques".into());
+    }
+    if a.iter().all(|&x| x == 0) {
+        return Err("que des zeros".into());
+    }
+    // 64 KiB d'un coup : tous les octets doivent varier.
+    let mut big = alloc::vec![0u8; 65536];
+    sys::getrandom(&mut big);
+    let mut seen = [false; 256];
+    for &x in &big {
+        seen[x as usize] = true;
+    }
+    if seen.iter().any(|&s| !s) {
+        return Err("valeurs d'octets manquantes sur 64 KiB".into());
+    }
+    Ok(())
+}
+
+fn t_sleep() -> R {
+    for d in [1u64, 5, 12] {
+        let t0 = time::now_ns();
+        time::sleep_ms(d);
+        let dt = time::now_ns() - t0;
+        if dt < d * MS {
+            return Err(format!("sleep {} ms : reveil premature ({} us)", d, dt / 1000));
+        }
+        if dt > d * MS + 20 * MS {
+            return Err(format!("sleep {} ms : reveil tardif ({} us)", d, dt / 1000));
+        }
+    }
+    Ok(())
+}
+
+fn t_notify_timeout() -> R {
+    let n = sys::notify_create().map_err(|e| format!("notify_create {}", e))?;
+    let t0 = time::now_ns();
+    expect_err("attente 3 ms", sys::notify_wait_timeout(n, 3 * MS), ETIMEDOUT)?;
+    if time::now_ns() - t0 < 3 * MS {
+        return Err("delai non respecte".into());
+    }
+    expect_err("attente sans delai", sys::notify_wait_timeout(n, POLL), ETIMEDOUT)?;
+    sys::notify_signal(n, 5).map_err(|e| format!("signal {}", e))?;
+    match sys::notify_wait_timeout(n, MS) {
+        Ok(5) => {}
+        r => return Err(format!("bits attendus 5, obtenu {:?}", r)),
+    }
+    let _ = sys::handle_close(n);
+    Ok(())
+}
+
+fn t_ipc_timeouts() -> R {
+    let ep = sys::endpoint_create().map_err(|e| format!("endpoint {}", e))?;
+    expect_err("recv 2 ms", ipc::recv_timeout(ep, 2 * MS), ETIMEDOUT)?;
+    expect_err("recv sans attente", ipc::recv_timeout(ep, POLL), ETIMEDOUT)?;
+    expect_err("call sans serveur", ipc::call_timeout(ep, &Msg::new(1, 0, 0), POLL), ETIMEDOUT)?;
+    expect_err("call 2 ms sans serveur", ipc::call_timeout(ep, &Msg::new(1, 0, 0), 2 * MS), ETIMEDOUT)?;
+
+    // Serveur qui garde la requete sans repondre : le client abandonne, et
+    // ni la reponse implicite ni l'ancien jeton ne doivent l'atteindre ensuite.
+    let stage = Arc::new(AtomicU32::new(0));
+    let report = Arc::new(AtomicU64::new(0));
+    let (st, rp) = (stage.clone(), report.clone());
+    let server = thread::spawn(move || {
+        let rx = match ipc::recv(ep) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        st.store(1, Ordering::Release);
+        while st.load(Ordering::Acquire) != 2 {
+            time::sleep_ms(1);
+        }
+        let late = ipc::reply(&Msg::new(7, 0, 0));
+        let rx2 = match ipc::recv(ep) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let stale = ipc::reply_to(rx.token, &Msg::new(8, 0, 0));
+        let good = ipc::reply_to(rx2.token, &Msg::new(9, 0, 0));
+        let code = |r: Result<(), i64>| match r {
+            Ok(()) => 0u64,
+            Err(e) => (-e) as u64,
+        };
+        rp.store(code(late) | code(stale) << 16 | code(good) << 32 | 1 << 48, Ordering::Release);
+    })
+    .map_err(|e| format!("thread {}", e))?;
+
+    let t0 = time::now_ns();
+    let first = ipc::call_timeout(ep, &Msg::new(1, 0, 0), 5 * MS);
+    let dt = time::now_ns() - t0;
+    stage.store(2, Ordering::Release);
+    let second = ipc::call(ep, &Msg::new(2, 0, 0));
+    server.join();
+    let _ = sys::handle_close(ep);
+
+    expect_err("call 5 ms sans reponse", first.map(|m| m.label()), ETIMEDOUT)?;
+    if dt < 5 * MS {
+        return Err(format!("call abandonne trop tot ({} us)", dt / 1000));
+    }
+    match second {
+        Ok(m) if m.label() == 9 => {}
+        r => return Err(format!("second appel : attendu l'etiquette 9, obtenu {:?}", r.map(|m| m.label()))),
+    }
+    let r = report.load(Ordering::Acquire);
+    let (late, stale, good) = (r & 0xFFFF, (r >> 16) & 0xFFFF, (r >> 32) & 0xFFFF);
+    if late != ESRCH as u64 || stale != ESRCH as u64 || good != 0 {
+        return Err(format!(
+            "reponses : tardive {}, jeton perime {}, bonne {} (attendu ESRCH, ESRCH, 0)",
+            late, stale, good
+        ));
+    }
+    Ok(())
+}
+
+fn t_futex() -> R {
+    let w = AtomicU32::new(1);
+    expect_err("valeur differente", sys::futex_wait(&w, 0, 0), EAGAIN)?;
+    expect_err("attente 2 ms", sys::futex_wait(&w, 1, 2 * MS), ETIMEDOUT)?;
+    if sys::futex_wake(&w, 10) != 0 {
+        return Err("reveil sans attente : compte non nul".into());
+    }
+    // Un thread attend, on le reveille.
+    let flag = Arc::new(AtomicU32::new(0));
+    let f = flag.clone();
+    let h = thread::spawn(move || {
+        while f.load(Ordering::Acquire) == 0 {
+            let _ = sys::futex_wait(&f, 0, 0);
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    time::sleep_ms(3);
+    flag.store(1, Ordering::Release);
+    let woken = sys::futex_wake(&flag, 1);
+    h.join();
+    if woken != 1 {
+        return Err(format!("1 attente attendue, {} reveillee(s)", woken));
+    }
+    Ok(())
+}
+
+fn t_mutex() -> R {
+    let m = Arc::new(Mutex::new(0u64));
+    let mut hs = Vec::new();
+    for _ in 0..4 {
+        let m = m.clone();
+        hs.push(
+            thread::spawn(move || {
+                for _ in 0..20_000 {
+                    *m.lock() += 1;
+                }
+            })
+            .map_err(|e| format!("thread {}", e))?,
+        );
+    }
+    for h in hs {
+        h.join();
+    }
+    let v = *m.lock();
+    if v != 80_000 {
+        return Err(format!("compteur {} au lieu de 80000", v));
+    }
+    Ok(())
+}
+
+fn t_condvar() -> R {
+    let pair = Arc::new((Mutex::new(Vec::<u32>::new()), Condvar::new()));
+    let p2 = pair.clone();
+    let producer = thread::spawn(move || {
+        for i in 1..=100 {
+            p2.0.lock().push(i);
+            p2.1.notify_one();
+            if i % 10 == 0 {
+                time::sleep_us(200);
+            }
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    let mut sum = 0u32;
+    let mut got = 0;
+    let mut g = pair.0.lock();
+    while got < 100 {
+        while g.is_empty() {
+            g = pair.1.wait(g);
+        }
+        for v in g.drain(..) {
+            sum += v;
+            got += 1;
+        }
+    }
+    drop(g);
+    producer.join();
+    if sum != 5050 {
+        return Err(format!("somme {} au lieu de 5050", sum));
+    }
+    let (_g, timed_out) = pair.1.wait_timeout(pair.0.lock(), 2 * MS);
+    if !timed_out {
+        return Err("wait_timeout sans signal n'a pas expire".into());
+    }
+    Ok(())
+}
+
+fn t_realtime() -> R {
+    let mono = sys::clock_ns();
+    let real = sys::realtime_ns();
+    if real < mono.saturating_sub(MS) {
+        return Err(format!("REALTIME {} < MONOTONIC {}", real, mono));
+    }
+    expect_err("reglage sans capacite", sys::clock_set_realtime(0, 1), EBADF)
+}
+
+fn t_many_handles() -> R {
+    let mut hs = Vec::new();
+    for _ in 0..600 {
+        hs.push(sys::notify_create().map_err(|e| format!("notification {} : {}", hs.len(), err::name(e)))?);
+    }
+    for (k, &h) in hs.iter().enumerate() {
+        sys::notify_signal(h, k as u64 + 1).map_err(|e| format!("signal {}", err::name(e)))?;
+    }
+    for (k, &h) in hs.iter().enumerate() {
+        if sys::notify_wait_timeout(h, POLL) != Ok(k as u64 + 1) {
+            return Err(format!("handle {} : mauvais objet", k));
+        }
+    }
+    for h in hs {
+        sys::handle_close(h).map_err(|e| format!("close {}", err::name(e)))?;
+    }
+    Ok(())
+}
+
+fn t_many_threads() -> R {
+    let count = Arc::new(AtomicU32::new(0));
+    let mut hs = Vec::new();
+    for _ in 0..150 {
+        let c = count.clone();
+        hs.push(
+            thread::spawn(move || {
+                time::sleep_ms(2);
+                c.fetch_add(1, Ordering::Relaxed);
+            })
+            .map_err(|e| format!("thread {} : {}", hs.len(), err::name(e)))?,
+        );
+    }
+    for h in hs {
+        h.join();
+    }
+    let n = count.load(Ordering::Relaxed);
+    if n != 150 {
+        return Err(format!("{} threads termines sur 150", n));
+    }
+    Ok(())
+}
+
+fn t_affinity() -> R {
+    let out = Arc::new(AtomicU64::new(0));
+    let o = out.clone();
+    let h = thread::spawn_on(Some(1), 0, move || {
+        let a = sys::getcpu() as u64;
+        let _ = thread::set_current_affinity(Some(2));
+        let b = sys::getcpu() as u64;
+        let _ = thread::set_current_affinity(Some(3));
+        let c = sys::getcpu() as u64;
+        let _ = thread::set_current_affinity(None);
+        o.store(a | b << 8 | c << 16 | 1 << 24, Ordering::Release);
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    h.join();
+    let v = out.load(Ordering::Acquire);
+    let (a, b, c) = (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF);
+    if (a, b, c) != (1, 2, 3) {
+        return Err(format!("coeurs successifs {} {} {} au lieu de 1 2 3", a, b, c));
+    }
+
+    // Migration imposee de l'exterieur a un thread qui calcule.
+    let stop = Arc::new(AtomicBool::new(false));
+    let where_ = Arc::new(AtomicU32::new(99));
+    let (s, w) = (stop.clone(), where_.clone());
+    let h = thread::spawn_on(Some(1), 0, move || {
+        while !s.load(Ordering::Acquire) {
+            w.store(sys::getcpu(), Ordering::Release);
+            core::hint::spin_loop();
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    time::sleep_ms(5);
+    let before = where_.load(Ordering::Acquire);
+    h.set_affinity(Some(2)).map_err(|e| format!("set_affinity {}", err::name(e)))?;
+    let t0 = time::now_ns();
+    while where_.load(Ordering::Acquire) != 2 && time::now_ns() - t0 < 200 * MS {
+        time::sleep_ms(1);
+    }
+    let after = where_.load(Ordering::Acquire);
+    stop.store(true, Ordering::Release);
+    h.join();
+    if before != 1 || after != 2 {
+        return Err(format!("thread vu sur {} puis {} (attendu 1 puis 2)", before, after));
+    }
+    Ok(())
+}
+
+fn t_priority() -> R {
+    let stop = Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    let low = thread::spawn_on(Some(2), 25, move || {
+        while !s.load(Ordering::Relaxed) {
+            core::hint::spin_loop();
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    let worst = Arc::new(AtomicU64::new(0));
+    let wr = worst.clone();
+    let high = thread::spawn_on(Some(2), 5, move || {
+        for _ in 0..10 {
+            let t0 = time::now_ns();
+            time::sleep_ms(2);
+            let late = (time::now_ns() - t0).saturating_sub(2 * MS);
+            wr.fetch_max(late, Ordering::Relaxed);
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    high.join();
+    stop.store(true, Ordering::Relaxed);
+    low.join();
+    let w = worst.load(Ordering::Relaxed);
+    if w > 5 * MS {
+        return Err(format!("retard maximal du thread prioritaire : {} us", w / 1000));
+    }
+    Ok(())
+}
+
+fn t_round_robin() -> R {
+    let stop = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let mut hs = Vec::new();
+    for k in 0..2 {
+        let (s, c) = (stop.clone(), counts.clone());
+        hs.push(
+            thread::spawn_on(Some(3), 0, move || {
+                while !s.load(Ordering::Relaxed) {
+                    c[k].fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .map_err(|e| format!("thread {}", e))?,
+        );
+    }
+    time::sleep_ms(120);
+    stop.store(true, Ordering::Relaxed);
+    for h in hs {
+        h.join();
+    }
+    let (a, b) = (counts[0].load(Ordering::Relaxed), counts[1].load(Ordering::Relaxed));
+    let total = (a + b).max(1);
+    if a * 5 < total || b * 5 < total {
+        return Err(format!("partage inegal : {} contre {}", a, b));
+    }
+    Ok(())
+}
+
+fn t_balance() -> R {
+    // Huit threads nes sur le coeur 0, puis liberes : ils doivent se repartir.
+    let go = Arc::new(AtomicU32::new(0));
+    let mask = Arc::new(AtomicU32::new(0));
+    let mut hs = Vec::new();
+    for _ in 0..8 {
+        let (g, m) = (go.clone(), mask.clone());
+        hs.push(
+            thread::spawn_on(Some(0), 0, move || {
+                while g.load(Ordering::Acquire) == 0 {
+                    let _ = sys::futex_wait(&g, 0, 0);
+                }
+                let end = time::now_ns() + 60 * MS;
+                while time::now_ns() < end {
+                    m.fetch_or(1 << sys::getcpu(), Ordering::Relaxed);
+                    for _ in 0..1000 {
+                        core::hint::spin_loop();
+                    }
+                }
+            })
+            .map_err(|e| format!("thread {}", e))?,
+        );
+    }
+    time::sleep_ms(5);
+    for h in &hs {
+        h.set_affinity(None).map_err(|e| format!("set_affinity {}", err::name(e)))?;
+    }
+    go.store(1, Ordering::Release);
+    sys::futex_wake(&go, u64::MAX);
+    for h in hs {
+        h.join();
+    }
+    let m = mask.load(Ordering::Relaxed);
+    if m.count_ones() < 3 {
+        return Err(format!("coeurs utilises : masque {:#b}", m));
+    }
+    Ok(())
+}
+
+fn cpus() -> [CpuInfo; 4] {
+    let mut c = [CpuInfo::default(); 4];
+    let buf = unsafe { core::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut u8, core::mem::size_of_val(&c)) };
+    let _ = sys::sysinfo(info::CPUS, buf);
+    c
+}
+
+fn t_tickless() -> R {
+    let me = sys::getcpu() as usize;
+    let a = cpus();
+    time::sleep_ms(300);
+    let b = cpus();
+    let mut worst = 0;
+    for k in 0..4 {
+        if k == me || a[k].online == 0 {
+            continue;
+        }
+        worst = worst.max(b[k].irqs - a[k].irqs);
+    }
+    // Avec un tic a 100 Hz, un coeur au repos en recevrait 30.
+    if worst > 5 {
+        let detail: Vec<String> = (0..4)
+            .map(|k| format!("c{} irq+{} cs+{} occupe {} us", k, b[k].irqs - a[k].irqs, b[k].switches - a[k].switches, (b[k].busy_ns - a[k].busy_ns) / 1000))
+            .collect();
+        return Err(format!("{} interruptions sur un coeur au repos en 300 ms (moi : c{} ; {})", worst, me, detail.join(", ")));
+    }
+    Ok(())
+}
+
+const PAGE: usize = 4096;
+
+fn t_protect() -> R {
+    let p = mem::map(3 * PAGE, READ | WRITE).map_err(|e| format!("map {}", err::name(e)))?;
+    unsafe {
+        *p = 42;
+        *p.add(PAGE) = 43;
+    }
+    mem::protect(p, PAGE, READ).map_err(|e| format!("lecture seule {}", err::name(e)))?;
+    if unsafe { core::ptr::read_volatile(p) } != 42 {
+        return Err("contenu perdu en lecture seule".into());
+    }
+    mem::protect(p, PAGE, 0).map_err(|e| format!("aucun acces {}", err::name(e)))?;
+    mem::protect(p, PAGE, READ | WRITE).map_err(|e| format!("retour RW {}", err::name(e)))?;
+    unsafe {
+        if core::ptr::read_volatile(p) != 42 {
+            return Err("contenu perdu apres aucun acces".into());
+        }
+        core::ptr::write_volatile(p, 44);
+    }
+    expect_err("W+X", mem::protect(p, PAGE, READ | WRITE | EXEC), EACCES)?;
+    // Page de garde apres la projection : rien a proteger.
+    expect_err("hors projection", sys::mem_protect(p as u64 + 3 * PAGE as u64, PAGE as u64, READ), ENOMEM)?;
+    // Page reservee jamais touchee : peuplee en lecture seule au premier acces.
+    mem::protect(unsafe { p.add(2 * PAGE) }, PAGE, READ).map_err(|e| format!("reservee {}", err::name(e)))?;
+    if unsafe { core::ptr::read_volatile(p.add(2 * PAGE)) } != 0 {
+        return Err("page reservee non nulle".into());
+    }
+    mem::unmap(p, 3 * PAGE).map_err(|e| format!("unmap {}", err::name(e)))?;
+    Ok(())
+}
+
+/// Quatre threads, un par coeur, touchent ensemble les memes pages neuves :
+/// un coeur peuple la page pendant que l'autre attend le verrou du noyau
+/// pour la meme faute, qui doit alors etre consideree comme resolue.
+/// Puis une projection a adresse imposee sur une zone occupee echoue sans
+/// toucher aux pages deja la.
+fn t_first_touch() -> R {
+    const PAGES: usize = 512;
+    let p = mem::map(PAGES * PAGE, READ | WRITE).map_err(|e| format!("map {}", err::name(e)))? as usize;
+    let go = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicU32::new(0));
+    let mut hs = Vec::new();
+    for c in 0..4u8 {
+        let (go, ready) = (go.clone(), ready.clone());
+        hs.push(
+            thread::spawn_on(Some(c), 0, move || {
+                ready.fetch_add(1, Ordering::SeqCst);
+                while !go.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+                for k in 0..PAGES {
+                    unsafe { core::ptr::write_volatile((p + k * PAGE + c as usize) as *mut u8, 1) };
+                }
+            })
+            .map_err(|e| format!("thread {}", err::name(e)))?,
+        );
+    }
+    while ready.load(Ordering::SeqCst) < 4 {
+        sys::yield_now();
+    }
+    go.store(true, Ordering::Release);
+    for h in hs {
+        h.join();
+    }
+    for k in 0..PAGES {
+        for c in 0..4 {
+            if unsafe { core::ptr::read_volatile((p + k * PAGE + c) as *const u8) } != 1 {
+                return Err(format!("page {} octet {} perdu", k, c));
+            }
+        }
+    }
+    let ptr = p as *mut u8;
+    expect_err("projection sur une zone occupee", sys::mem_map(p as u64 + PAGE as u64, 2 * PAGE as u64, READ | WRITE), libnx::abi::err::EEXIST)?;
+    if unsafe { core::ptr::read_volatile(ptr.add(PAGE)) } != 1 {
+        return Err("page existante detruite par l'echec".into());
+    }
+    mem::unmap(ptr, PAGES * PAGE).map_err(|e| format!("unmap {}", err::name(e)))?;
+    Ok(())
+}
+
+/// Endpoint `PIPE` : la reception rend -EPIPE quand le dernier ecrivain
+/// (handle SEND seul) disparait, meme pour un lecteur deja en attente ;
+/// l'envoi rend -EPIPE quand le dernier lecteur disparait.
+fn t_pipe() -> R {
+    use libnx::abi::endpoint::PIPE;
+    use libnx::abi::err::EPIPE;
+    use libnx::abi::rights::{DUP, GRANT, RECV, SEND};
+    let ep = sys::check(unsafe { sys::syscall1(libnx::abi::sys::ENDPOINT_CREATE, PIPE) }).map_err(|e| format!("create {}", err::name(e)))? as u32;
+    let r = sys::handle_dup(ep, RECV | GRANT | DUP, 0).map_err(|e| format!("dup r {}", err::name(e)))?;
+    let w = sys::handle_dup(ep, SEND | GRANT | DUP, 0).map_err(|e| format!("dup w {}", err::name(e)))?;
+    sys::handle_close(ep).map_err(|e| format!("close {}", err::name(e)))?;
+    let sent = Arc::new(AtomicBool::new(false));
+    let sent2 = sent.clone();
+    let writer = thread::spawn(move || {
+        sent2.store(ipc::call(w, &ipc::pack(libnx::abi::proto::console::WRITE, b"abc")).is_ok(), Ordering::SeqCst);
+        time::sleep_ms(5);
+        let _ = sys::handle_close(w);
+    })
+    .map_err(|e| format!("thread {}", err::name(e)))?;
+    let m = ipc::recv(r).map_err(|e| format!("recv {}", err::name(e)))?;
+    let mut b = [0u8; 8];
+    let n = ipc::unpack(&m.msg, &mut b);
+    ipc::reply(&Msg::new(0, 0, 0)).map_err(|e| format!("reply {}", err::name(e)))?;
+    if &b[..n] != b"abc" {
+        return Err("contenu".into());
+    }
+    // Attente en cours quand l'ecrivain ferme : fin du flux.
+    expect_err("lecture apres le dernier ecrivain", ipc::recv(r).map(|_| ()), EPIPE)?;
+    writer.join();
+    if !sent.load(Ordering::SeqCst) {
+        return Err("ecriture refusee".into());
+    }
+    expect_err("lecture sans ecrivain", ipc::recv(r).map(|_| ()), EPIPE)?;
+    // Sans lecteur, l'ecriture echoue.
+    let w2 = sys::handle_dup(r, RECV, 0).map_err(|e| format!("dup {}", err::name(e)))?;
+    let _ = sys::handle_close(w2);
+    let ep2 = sys::check(unsafe { sys::syscall1(libnx::abi::sys::ENDPOINT_CREATE, PIPE) }).map_err(|e| format!("create {}", err::name(e)))? as u32;
+    let w3 = sys::handle_dup(ep2, SEND, 0).map_err(|e| format!("dup {}", err::name(e)))?;
+    sys::handle_close(ep2).map_err(|e| format!("close {}", err::name(e)))?;
+    expect_err("ecriture sans lecteur", ipc::call(w3, &Msg::new(1, 0, 0)).map(|_| ()), EPIPE)?;
+    let _ = sys::handle_close(w3);
+    let _ = sys::handle_close(r);
+    Ok(())
+}
+
+fn free_pages() -> u64 {
+    let mut m = [MemInfo::default()];
+    let buf = unsafe { core::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut u8, core::mem::size_of_val(&m)) };
+    let _ = sys::sysinfo(info::MEMORY, buf);
+    m[0].free_pages
+}
+
+fn t_shm() -> R {
+    const LEN: usize = 64 * 1024;
+    let before = free_pages();
+    let a = SharedMemory::new(LEN, 0).map_err(|e| format!("create {}", err::name(e)))?;
+    let b = sys::shm_map(a.handle(), 0, READ | WRITE).map_err(|e| format!("2e projection {}", err::name(e)))?;
+    let during = free_pages();
+    if b == a.as_ptr() as u64 {
+        return Err("meme adresse pour deux projections".into());
+    }
+    unsafe {
+        core::ptr::write_volatile(a.as_ptr().add(100), 0x5A);
+        if core::ptr::read_volatile((b + 100) as *const u8) != 0x5A {
+            return Err("ecriture invisible dans l'autre projection".into());
+        }
+        core::ptr::write_volatile((b + LEN as u64 - 1) as *mut u8, 0xA5);
+        if core::ptr::read_volatile(a.as_ptr().add(LEN - 1)) != 0xA5 {
+            return Err("ecriture invisible (sens inverse)".into());
+        }
+    }
+    // Futex a travers deux projections : meme page physique, meme cle.
+    let wa = unsafe { &*(a.as_ptr().add(512) as *const AtomicU32) };
+    let wb: &'static AtomicU32 = unsafe { &*((b + 512) as *const AtomicU32) };
+    wa.store(0, Ordering::Release);
+    let h = thread::spawn(move || {
+        while wb.load(Ordering::Acquire) == 0 {
+            let _ = sys::futex_wait(wb, 0, 0);
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    time::sleep_ms(3);
+    wa.store(1, Ordering::Release);
+    let woken = sys::futex_wake(wa, 1);
+    h.join();
+    if woken != 1 {
+        return Err(format!("futex entre projections : {} reveil(s)", woken));
+    }
+    // Plus de handle, une projection : les pages restent.
+    drop(a);
+    if unsafe { core::ptr::read_volatile((b + 100) as *const u8) } != 0x5A {
+        return Err("pages perdues apres fermeture du handle".into());
+    }
+    sys::mem_unmap(b, LEN as u64).map_err(|e| format!("unmap {}", err::name(e)))?;
+    let after = free_pages();
+    if after < during + (LEN / PAGE) as u64 || after + 8 < before {
+        return Err(format!("pages non rendues : avant {} pendant {} apres {}", before, during, after));
+    }
+    Ok(())
+}
+
+fn t_shm_dma() -> R {
+    const LEN: usize = 1 << 20;
+    let m = SharedMemory::new(LEN, CONTIGUOUS | UNCACHED).map_err(|e| format!("create {}", err::name(e)))?;
+    let p0 = m.paddr(0).map_err(|e| format!("paddr {}", err::name(e)))?;
+    let p1 = m.paddr(LEN / 2 + 3).map_err(|e| format!("paddr {}", err::name(e)))?;
+    if p1 != p0 + (LEN / 2 + 3) as u64 || p0 % LEN as u64 != 0 || p0 < 0x8000_0000 {
+        return Err(format!("adresses physiques {:#x} / {:#x}", p0, p1));
+    }
+    m.as_mut_slice()[LEN - 1] = 7;
+    if m.as_slice()[LEN - 1] != 7 {
+        return Err("projection non cachee illisible".into());
+    }
+    // Handle restreint : ni DMA, ni ecriture.
+    let h2 = sys::handle_dup(m.handle(), rights::MAP | rights::DUP, 0).map_err(|e| format!("dup {}", err::name(e)))?;
+    expect_err("paddr sans droit DMA", sys::shm_paddr(h2, 0), EACCES)?;
+    expect_err("projection RW sans droit", sys::shm_map(h2, 0, READ | WRITE), EACCES)?;
+    let ro = sys::shm_map(h2, 0, READ).map_err(|e| format!("projection RO {}", err::name(e)))?;
+    if unsafe { core::ptr::read_volatile((ro + LEN as u64 - 1) as *const u8) } != 7 {
+        return Err("projection RO : mauvais contenu".into());
+    }
+    expect_err("mem_protect au-dela des droits", sys::mem_protect(ro, PAGE as u64, READ | WRITE), EACCES)?;
+    sys::mem_unmap(ro, LEN as u64).map_err(|e| format!("unmap {}", err::name(e)))?;
+    let _ = sys::handle_close(h2);
+    Ok(())
+}
+
+fn t_revoke() -> R {
+    let ep = sys::endpoint_create().map_err(|e| format!("endpoint {}", err::name(e)))?;
+    let h2 = sys::handle_dup(ep, rights::SEND | rights::DUP, 0).map_err(|e| format!("dup {}", err::name(e)))?;
+    expect_err("appel avant revocation", ipc::call_timeout(h2, &Msg::new(1, 0, 0), POLL), ETIMEDOUT)?;
+    sys::handle_revoke(ep).map_err(|e| format!("revoke {}", err::name(e)))?;
+    expect_err("copie revoquee", ipc::call_timeout(h2, &Msg::new(1, 0, 0), POLL), EBADF)?;
+    expect_err("handle d'origine", ipc::recv_timeout(ep, POLL), ETIMEDOUT)?;
+    let h3 = sys::handle_dup(ep, rights::SEND | rights::DUP, 0).map_err(|e| format!("dup {}", err::name(e)))?;
+    expect_err("nouvelle copie", ipc::call_timeout(h3, &Msg::new(1, 0, 0), POLL), ETIMEDOUT)?;
+    expect_err("revocation sans CONTROL", sys::handle_revoke(h3), EACCES)?;
+    for h in [h2, h3, ep] {
+        let _ = sys::handle_close(h);
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------ processus ---
+
+/// Relance ktest dans un processus enfant (`--enfant MODE ...`) ; rend son code.
+fn run_child(args: &[&str], envs: &[String]) -> Result<i64, String> {
+    let mut argv = alloc::vec!["ktest", "--enfant"];
+    argv.extend_from_slice(args);
+    let h = process::spawn_with(&Strings::new(&argv, envs)).map_err(|e| format!("spawn {}", err::name(e)))?;
+    let code = process::wait(h);
+    let _ = sys::handle_close(h);
+    Ok(code)
+}
+
+fn child(a: &[&str]) -> i32 {
+    match a.first().copied() {
+        Some("args") => {
+            let all: Vec<&str> = env::args().collect();
+            let ok = all == ["ktest", "--enfant", "args", "x y", "z"] && env::var("NXK_TEST").as_deref() == Some("42");
+            i32::from(!ok)
+        }
+        Some("adresses") => {
+            let b = env::startup_block().map(|b| b.load_base).unwrap_or(0);
+            sys::process_exit(b as i64)
+        }
+        Some("pile") => {
+            let x = 0u64;
+            sys::process_exit(&x as *const u64 as i64)
+        }
+        Some("ecriture-ro") => {
+            let p = mem::map(PAGE, READ | WRITE).unwrap();
+            mem::protect(p, PAGE, READ).unwrap();
+            unsafe { core::ptr::write_volatile(p, 1) };
+            0
+        }
+        Some("sans-acces") => {
+            let p = mem::map(PAGE, READ | WRITE).unwrap();
+            mem::protect(p, PAGE, 0).unwrap();
+            unsafe { core::ptr::read_volatile(p) as i32 }
+        }
+        Some("cible") => {
+            let r: u64;
+            unsafe {
+                core::arch::asm!(
+                    "mov x9, #7",
+                    "brk #0x42",
+                    "add x9, x9, #1",
+                    "add x9, x9, #10",
+                    "mov {r}, x9",
+                    r = out(reg) r,
+                    out("x9") _,
+                )
+            };
+            sys::process_exit(r as i64)
+        }
+        Some("boucle") => loop {
+            core::hint::spin_loop();
+        },
+        Some("exec-donnees") => {
+            let p = mem::map(PAGE, READ | WRITE).unwrap() as *mut u32;
+            unsafe {
+                p.write(0xd280_00e0); // mov x0, #7
+                p.add(1).write(0xd65f_03c0); // ret
+                let f: extern "C" fn() -> i32 = core::mem::transmute(p);
+                f()
+            }
+        }
+        _ => 2,
+    }
+}
+
+fn t_args() -> R {
+    match run_child(&["args", "x y", "z"], &[String::from("NXK_TEST=42")])? {
+        0 => Ok(()),
+        c => Err(format!("l'enfant n'a pas recu ses arguments (code {})", c)),
+    }
+}
+
+fn t_aslr() -> R {
+    const TEXT_BASE: i64 = 0x10_0000_0000;
+    const HEAP_BASE: i64 = 0x20_0000_0000;
+    let (b1, b2) = (run_child(&["adresses"], &[])?, run_child(&["adresses"], &[])?);
+    for b in [b1, b2] {
+        if !(TEXT_BASE..HEAP_BASE).contains(&b) || b % 0x10000 != 0 {
+            return Err(format!("base de chargement {:#x} hors zone", b));
+        }
+    }
+    let (s1, s2) = (run_child(&["pile"], &[])?, run_child(&["pile"], &[])?);
+    if b1 == b2 || s1 == s2 {
+        return Err(format!("adresses identiques : base {:#x}/{:#x}, pile {:#x}/{:#x}", b1, b2, s1, s2));
+    }
+    Ok(())
+}
+
+fn t_jit() -> R {
+    let p = mem::map(PAGE, READ | WRITE).map_err(|e| format!("map {}", err::name(e)))? as *mut u32;
+    unsafe {
+        p.write(0xd280_0540); // mov x0, #42
+        p.add(1).write(0xd65f_03c0); // ret
+    }
+    mem::protect(p as *mut u8, PAGE, READ | EXEC).map_err(|e| format!("protect RX {}", err::name(e)))?;
+    let f: extern "C" fn() -> i64 = unsafe { core::mem::transmute(p) };
+    let v = f();
+    let _ = mem::unmap(p as *mut u8, PAGE);
+    if v != 42 {
+        return Err(format!("le code genere rend {}", v));
+    }
+    Ok(())
+}
+
+fn t_faults() -> R {
+    for mode in ["ecriture-ro", "sans-acces", "exec-donnees"] {
+        let c = run_child(&[mode], &[])?;
+        if c != 139 {
+            return Err(format!("{} : code {} au lieu de 139", mode, c));
+        }
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------- debogage ---
+
+use libnx::abi::debug::{self as dbg, Regs};
+
+/// Attend le prochain evenement de debogage : (genre, tid, pc).
+fn next_event(ep: u32) -> Result<(u64, u32, u64), String> {
+    let rx = ipc::recv_timeout(ep, 2000 * MS).map_err(|e| format!("pas d'evenement ({})", err::name(e)))?;
+    if rx.msg.label() != dbg::EVENT {
+        return Err(format!("message inattendu (etiquette {})", rx.msg.label()));
+    }
+    Ok((rx.msg.mr[0], rx.msg.mr[1] as u32, rx.msg.mr[4]))
+}
+
+fn resume(flags: u64) -> R {
+    let mut m = Msg::new(dbg::RESUME, 1, 0);
+    m.mr[0] = flags;
+    ipc::reply(&m).map_err(|e| format!("reprise {}", err::name(e)))
+}
+
+fn spawn_debuggee(mode: &str) -> Result<(u32, u32), String> {
+    let argv = ["ktest", "--enfant", mode];
+    let h = process::spawn_with(&Strings::new(&argv, &[]).suspended()).map_err(|e| format!("spawn {}", err::name(e)))?;
+    let ep = sys::endpoint_create().map_err(|e| format!("endpoint {}", err::name(e)))?;
+    sys::debug_attach(h, ep).map_err(|e| format!("attach {}", err::name(e)))?;
+    Ok((h, ep))
+}
+
+fn t_debug() -> R {
+    let (h, ep) = spawn_debuggee("cible")?;
+    // Lance suspendu : un arret avant la premiere instruction.
+    let (kind, tid, _) = next_event(ep)?;
+    if kind != dbg::KIND_STOP {
+        return Err(format!("premier evenement {} au lieu de STOP", kind));
+    }
+    resume(0)?;
+    let (kind, tid2, pc) = next_event(ep)?;
+    if kind != dbg::KIND_BREAK || tid2 != tid {
+        return Err(format!("attendu BRK du thread {}, obtenu genre {} thread {}", tid, kind, tid2));
+    }
+    let mut r: Regs = sys::debug_regs_read(h, tid).map_err(|e| format!("lecture registres {}", err::name(e)))?;
+    if r.x[9] != 7 || r.pc != pc {
+        return Err(format!("registres : x9 = {}, pc {:#x} (evenement {:#x})", r.x[9], r.pc, pc));
+    }
+    let mut code = [0u8; 4];
+    sys::debug_mem_read(h, pc, &mut code).map_err(|e| format!("lecture memoire {}", err::name(e)))?;
+    if u32::from_le_bytes(code) != 0xd420_0840 {
+        return Err(format!("instruction lue {:#x} au lieu de brk #0x42", u32::from_le_bytes(code)));
+    }
+    let mut tids = [0u32; 8];
+    let n = sys::debug_threads(h, &mut tids).map_err(|e| format!("threads {}", err::name(e)))?;
+    if n != 1 || tids[0] != tid {
+        return Err(format!("threads : {} ({:?})", n, &tids[..n.min(8)]));
+    }
+    // x9 := 100, on saute le BRK, et une seule instruction.
+    r.x[9] = 100;
+    r.pc += 4;
+    sys::debug_regs_write(h, tid, &r).map_err(|e| format!("ecriture registres {}", err::name(e)))?;
+    resume(dbg::FLAG_STEP)?;
+    let (kind, _, pc2) = next_event(ep)?;
+    let r2 = sys::debug_regs_read(h, tid).map_err(|e| format!("registres {}", err::name(e)))?;
+    if kind != dbg::KIND_STEP || pc2 != pc + 8 || r2.x[9] != 101 {
+        return Err(format!("pas a pas : genre {}, pc {:#x} (attendu {:#x}), x9 = {}", kind, pc2, pc + 8, r2.x[9]));
+    }
+    resume(0)?;
+    let code = process::wait(h);
+    let _ = sys::handle_close(h);
+    let _ = sys::handle_close(ep);
+    if code != 111 {
+        return Err(format!("code de sortie {} au lieu de 111", code));
+    }
+    Ok(())
+}
+
+fn t_debug_stop() -> R {
+    let (h, ep) = spawn_debuggee("boucle")?;
+    let (kind, _, _) = next_event(ep)?;
+    if kind != dbg::KIND_STOP {
+        return Err(format!("premier evenement {} au lieu de STOP", kind));
+    }
+    resume(0)?;
+    time::sleep_ms(5); // il tourne
+    sys::debug_stop(h, 0).map_err(|e| format!("stop {}", err::name(e)))?;
+    let (kind, _, _) = next_event(ep)?;
+    if kind != dbg::KIND_STOP {
+        return Err(format!("arret a distance : genre {}", kind));
+    }
+    ipc::reply(&Msg::new(dbg::KILL, 0, 0)).map_err(|e| format!("kill {}", err::name(e)))?;
+    let code = process::wait(h);
+    let _ = sys::handle_close(h);
+    let _ = sys::handle_close(ep);
+    if code != 137 {
+        return Err(format!("code de sortie {} au lieu de 137", code));
+    }
+    Ok(())
+}

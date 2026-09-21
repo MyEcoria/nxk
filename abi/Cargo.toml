@@ -1,0 +1,7 @@
+[package]
+name = "nxk-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Interface binaire du micro-noyau nxk (partagee noyau / espace utilisateur)"
+
+[dependencies]
