@@ -15,9 +15,25 @@ sd="${1:?usage: mksd-hw.sh /mount/point}"
 nyx="$here/dl/hekate_nyx.zip"
 [ -s "$nyx" ] || { echo "[mksd-hw] missing $nyx (run ./fetch.sh)" >&2; exit 1; }
 
-echo "[mksd-hw] hekate bootloader files -> $sd"
-unzip -oq "$nyx" -d "$sd" -x 'bootloader/ini/*'
-cp "$here/hekate_ipl.ini" "$sd/bootloader/hekate_ipl.ini"
+echo "[mksd-hw] bootloader files -> $sd"
+if [ -d "$sd/bootloader/sys" ]; then
+    echo "[mksd-hw] existing bootloader/ kept (Nyx pack already installed)"
+else
+    unzip -oq "$nyx" -d "$sd" -x 'bootloader/ini/*'
+fi
+if [ -f "$sd/bootloader/hekate_ipl.ini" ]; then
+    if ! grep -q "nxk (TODO)" "$sd/bootloader/hekate_ipl.ini"; then
+        [ -f "$sd/bootloader/hekate_ipl.ini.bak-nxk" ] || \
+            cp "$sd/bootloader/hekate_ipl.ini" "$sd/bootloader/hekate_ipl.ini.bak-nxk"
+        printf '\n' >> "$sd/bootloader/hekate_ipl.ini"
+        sed -n '/^# STAGE 2/,$p' "$here/hekate_ipl.ini" >> "$sd/bootloader/hekate_ipl.ini"
+        echo "[mksd-hw] appended nxk marker to hekate_ipl.ini (backup: .bak-nxk)"
+    else
+        echo "[mksd-hw] nxk marker already in hekate_ipl.ini"
+    fi
+else
+    cp "$here/hekate_ipl.ini" "$sd/bootloader/hekate_ipl.ini"
+fi
 
 "$root/tools/build.sh" >&2
 OBJCOPY="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy"
