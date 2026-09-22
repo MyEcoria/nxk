@@ -5,7 +5,7 @@ use libnx::abi::err::ENODEV;
 use libnx::abi::proto::power;
 use libnx::drv::Mmio;
 use libnx::ipc::{self, Msg};
-use libnx::{ns, time};
+use libnx::{ns, println, time};
 
 pub const APB_MISC: u64 = 0x7000_0000;
 pub const PINMUX: u64 = 0x7000_3000;
@@ -42,9 +42,9 @@ const PORT_E: usize = 4;
 const PORT_M: usize = 12;
 const PORT_Z: usize = 25;
 const PADS: u32 = 0x3F;
-const GPIO_CNF: usize = 0x80;
-const GPIO_OE: usize = 0x90;
-const GPIO_OUT: usize = 0xA0;
+const GPIO_CNF: usize = 0x00;
+const GPIO_OE: usize = 0x10;
+const GPIO_OUT: usize = 0x20;
 const GPIO_IN: usize = 0x30;
 
 pub struct Board {
@@ -71,18 +71,20 @@ impl Board {
         }
     }
 
-    /// Masked GPIO write (bits 15:8 select pins): no read-modify-write
-    /// race with other GPIO users.
+    /// Read-modify-write on the plain registers, as hekate: the masked
+    /// ones (0x80+) are not used here, nothing else drives these ports.
     fn gpio_set(&self, reg: usize, port: usize, pins: u32, value: u32) {
         let off = (port >> 2) * 0x100 + (port & 3) * 4;
-        self.gpio.w32(reg + off, pins << 8 | (value & pins));
+        self.gpio.modify(reg + off, pins & !value, value & pins);
+        let _ = self.gpio.r32(reg + off);
     }
 
-    fn gpio_in(&self, port: usize, pin: u32) -> bool {
-        let off = (port >> 2) * 0x100 + (port & 3) * 4;
-        self.gpio.r32(GPIO_IN + off) & (1 << pin) != 0
+    fn gpio_reg(&self, reg: usize, port: usize) -> u32 {
+        self.gpio.r32(reg + (port >> 2) * 0x100 + (port & 3) * 4)
     }
 
+    /// Card-detect switch on PZ1, low with a card in. Only a hint: a card
+    /// that answers wins over it, so print the registers behind a miss.
     pub fn card_present(&self) -> bool {
         self.pinmux
             .w32(PIN_GPIO_PZ1, INPUT_ENABLE | PULL_UP | FUNC_GPIO);
@@ -90,7 +92,17 @@ impl Board {
         self.gpio_set(GPIO_CNF, PORT_Z, 1 << 1, 1 << 1);
         self.gpio_set(GPIO_OE, PORT_Z, 1 << 1, 0);
         time::sleep_us(100);
-        !self.gpio_in(PORT_Z, 1)
+        if self.gpio_reg(GPIO_IN, PORT_Z) & 2 == 0 {
+            return true;
+        }
+        println!(
+            "[sd] card detect high: pinmux {:#x}, cnf {:#x}, oe {:#x}, in {:#x}",
+            self.pinmux.r32(PIN_GPIO_PZ1),
+            self.gpio_reg(GPIO_CNF, PORT_Z),
+            self.gpio_reg(GPIO_OE, PORT_Z),
+            self.gpio_reg(GPIO_IN, PORT_Z)
+        );
+        false
     }
 
     /// Pads, controller I/O power, card power, then I/O rail at 3.3 V.

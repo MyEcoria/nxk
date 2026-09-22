@@ -8,7 +8,7 @@ extern crate alloc;
 
 mod board;
 
-use libnx::abi::err::{EINVAL, EIO, ENODEV, ETIMEDOUT};
+use libnx::abi::err::{EINVAL, EIO, ETIMEDOUT};
 use libnx::abi::prot;
 use libnx::abi::proto::{blk, clk};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
@@ -341,10 +341,11 @@ fn map(slot: u32, phys: u64) -> Mmio {
     Mmio::map(drv::dev_slot(slot), phys, 0x1000).expect("sd: registers")
 }
 
-/// Card detect, slot power, controller clock. The slot stays off without a card.
+/// Slot power then controller clock. Card detect only reports: a card
+/// that answers beats a detect line read wrong.
 fn bring_up(board: &Board) -> Result<(), i64> {
     if !board.card_present() {
-        return Err(-ENODEV);
+        println!("[sd] no card detected, probing anyway");
     }
     board.power_on()?;
     let c = ns::wait_for_timeout("clk", 2_000_000_000)?;
@@ -381,10 +382,8 @@ fn main() -> i32 {
     };
     if let Err(e) = bring_up(&board).and_then(|()| card.init(&board)) {
         println!("[sd] no usable card ({})", libnx::abi::err::name(e));
-        if e != -ENODEV {
-            card.stop();
-            board.power_off();
-        }
+        card.stop();
+        board.power_off();
         loop {
             time::sleep_ms(3_600_000);
         }
