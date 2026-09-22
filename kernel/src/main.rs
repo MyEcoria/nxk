@@ -31,7 +31,9 @@ use mm::{pmm, vm};
 const KSTACK_SIZE: u64 = 0x4000;
 
 /// Device range handed to `init` (the kernel keeps the GIC for itself).
-const MMIO_ROOT: (u64, u64) = (0x5000_0000, 0x3000_0000);
+/// From the PCIe aperture (configuration space, downstream windows and
+/// the AFI, all below the APB blocks) up to where DRAM starts.
+const MMIO_ROOT: (u64, u64) = (0x0100_0000, 0x7F00_0000);
 
 extern "C" {
     static __stack_top: u8;
