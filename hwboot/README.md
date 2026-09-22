@@ -2,8 +2,9 @@
 
 Host-side setup to boot a first-generation Switch into **hekate** over USB
 (fusée-gelée RCM exploit), then nxk through hekate's L4T entry (Stage 2).
-Status: nxk boots to user space on hardware; the shell is not reachable
-yet (see "Hardware runs").
+Status: nxk boots to user space on hardware; the shell has not been
+reached there yet: the USB-C console ("Shell over USB-C") is the way in,
+tried in the emulator only (see "Hardware runs").
 
 ## What you need
 
@@ -22,6 +23,7 @@ cd hwboot
 ./fetch.sh        # hekate RCM payload + Nyx SD pack -> dl/ (pinned v6.5.3)
 make -C fusee-nano  # builds ./fusee-nano/fusee-nano (17 KiB, zero deps)
 sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 ./mksd-hw.sh /mount/point  # populate the FAT32 microSD (needs it mounted)
 ```
 
@@ -110,12 +112,48 @@ order:
    console normally): midnight-blue background, the nxk logo centered
    with `AArch64 microkernel for Tegra X1` under it, then one
    `nxk - screen 720x1280 turned landscape, terminal 160x45` line. User
-   space is alive. Nothing more appears on screen afterwards: service
-   logs and the shell go to UART-A only.
+   space is alive. Only `usbcon:` status lines follow (see "Shell over
+   USB-C"): service logs and the shell go to UART-A and the USB-C
+   console.
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
 monitor did not run or did not find the screen.
+
+## Shell over USB-C (usbcon)
+
+The injection cable doubles as the console. Once nxk runs, the `usbcon`
+driver turns the Switch into a USB serial device (CDC-ACM, ID
+`1209:0001`, pid.codes test ID) on Erista's OTG controller, the one the
+boot ROM uses for RCM, programmed as hekate's `bdk/usb/usbd.c` does. The
+PC sees a `/dev/ttyACM*` (`/dev/nxk-console` with the udev rule): keys
+typed there reach the shell, and all console output comes back,
+including the last 16 KiB printed before the PC attached. Kernel
+messages (`[nxk]` fault reports) stay on UART-A and the screen.
+
+1. Leave the USB-C cable in the PC after `./inject.sh`, then boot
+   **More Configs → nxk**.
+2. Under the nxk logo, the screen shows
+   `usbcon: USB-C console ready, waiting for a PC (tools/usbterm.py)`,
+   then `usbcon: host detected (bus reset)` and
+   `usbcon: configured by the host (high speed)` once the PC has
+   enumerated it (`dmesg`: `cdc_acm ... ttyACM0: USB ACM device`).
+3. On the PC: `../tools/usbterm.py` (Ctrl-] quits), or
+   `../tools/usbterm.py -c ps -c mem` to run commands and exit. Any
+   serial terminal works too (`picocom /dev/nxk-console`). The screen
+   then shows `usbcon: terminal open on the host`.
+
+The last `usbcon:` line locates a failure:
+
+- `ready` but no `host detected`: the PC saw nothing (`lsusb` has no
+  `1209:0001`): PHY setup or cable. Try another port, photograph the
+  screen.
+- `host detected` without `configured`: enumeration failed; `dmesg` on
+  the PC gives the reason (e.g. `device descriptor read/64, error -71`).
+- `configured` but `usbterm.py` cannot open the device: permissions
+  (udev rule above, or the `dialout`/`uucp` group).
+- `fuses unreadable: PHY left without its trims`: hekate did not leave
+  the fuses readable; high speed may then fail.
 
 ## Hardware runs
 
@@ -136,14 +174,15 @@ monitor did not run or did not find the screen.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
-3. Read the screen (see above). The shell is not reachable yet: the
-   monitor, the kernel and the `console` service use UART-A, whose pads
-   are internal. A right Joy-Con rail adapter (UART-B, 115200 8N1) will
-   only work once they switch to UART-B. A USB keyboard does not reach
-   the shell either: its keys go to the `input` service, and hekate's
-   L4T path leaves the xHCI unpowered (`usb` exits).
+3. Read the screen (see above). The shell: over the USB-C cable ("Shell
+   over USB-C"). The monitor, the kernel and the `console` service
+   otherwise use UART-A, whose pads are internal; a right Joy-Con rail
+   adapter (UART-B, 115200 8N1) would only work once they switch to
+   UART-B. A USB keyboard does not reach the shell: its keys go to the
+   `input` service, and hekate's L4T path leaves the xHCI unpowered
+   (`usb` exits).
 4. Expected: `entry in EL2`, `1/4 cores online`, `launching init`,
-   then the `display` service screen.
+   then the `display` service screen and the `usbcon:` lines.
 5. Recovery: a failed boot is just a hang. Hold Power 12 s (forced
    off), reboot into RCM, retry. No NAND, eMMC or SD writes by nxk:
    nothing persistent can be corrupted.

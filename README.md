@@ -27,7 +27,7 @@ like any other.
 ```
 EL0  Rust programs (std) · shell
      services: fs (FAT32) · net (TCP/IP) · display · input · power
-     drivers : console (UART) · sd · usb (xHCI) · i2c · clk
+     drivers : console (UART) · usbcon (USB-C) · sd · usb (xHCI) · i2c · clk
      init: process manager and name service
      ─────────── ported std · libnx (no_std) ───────────
      ─────────── svc #0: 51 system calls ───────────
@@ -37,7 +37,9 @@ EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 Everything has been verified in the `tegra_qemu` emulator. On a **real
 Switch** (Erista), nxk boots through hekate up to user space on one
 core: the `display` service takes over the screen; the shell has not
-been reached yet (see "Limits" and `hwboot/README.md`).
+been reached there yet. The USB-C console (`usbcon`: the Switch as a
+USB serial device, `tools/usbterm.py` on the PC) is the way in, tested
+in the emulator only (see "Limits" and `hwboot/README.md`).
 
 ## Build, run, test
 
@@ -56,7 +58,15 @@ Prerequisites: stable Rust with `rust-src`
 `nxtest.py` options: `--sd IMAGE` (SD card), `--net [REDIRECTIONS]`
 (USB network card, e.g. `tcp::8080-:80`), `--usb-kbd` and `--keys` (USB
 keyboard), `--machine tegrax1plus` (Mariko), `--monitor ELF --dtb DTB`
-(boot in EL2 under a PSCI monitor), `--screendump` (screen capture).
+(boot in EL2 under a PSCI monitor), `--screendump` (screen capture),
+`--usb-cmd CMD` (CMD typed on the USB-C console, the script acting as
+the PC).
+
+`--usb-cmd` needs the USB device mode of the OTG controller in
+`tegra_qemu`, which upstream lacks:
+`git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-usb-otg.patch`, then
+rebuild it. QEMU exposes the bus on chardev `usbotg`, where
+`tools/usbterm.py --emu SOCKET` plays the PC's USB host.
 
 Build directories live in `~/.cache/nxk/`: the project is synced and
 does not have to carry build artifacts.
@@ -124,7 +134,8 @@ user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
-tools/      build, SD card, std toolchain, launch, automated tests
+tools/      build, SD card, std toolchain, launch, automated tests,
+            usbterm.py (USB-C console terminal on the PC)
 hwboot/     physical Switch bring-up: RCM injector, hekate entry, nxk-bl31 EL3 monitor
 refs/       hekate, Atmosphere: hardware documentation (never compiled)
 docs/logo/  pixel-art logo (regenerate with tools/mklogo.py)
@@ -143,7 +154,7 @@ calls take a timeout (ns; 0 = unbounded).
 |---|---|
 | Base | `nop`, `yield`, `sleep`, `clock` (monotonic, real-time), `clock_set`, `getcpu`, `getpid`, `gettid`, `getrandom`, `debug_write`, `thread_exit`, `process_exit`, `system_power` |
 | Handles | `handle_close`, `handle_dup` (reduced rights, badge), `handle_revoke` |
-| Memory | `mem_map` (on demand or populated, free or fixed address, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguous, uncached, below 4 GiB for DMA), `mmio_map`, `mmio_derive` |
+| Memory | `mem_map` (on demand or populated, free or fixed address, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguous, uncached, below 4 GiB for DMA), `mmio_map` (read-only without the `WRITE` right), `mmio_derive` |
 | Threads | `thread_create`, `thread_set` (priority, core), `futex_wait`, `futex_wake` |
 | Processes | `process_spawn` (static-PIE ELF, arguments, environment), `process_wait`, `process_kill` |
 | IPC | `endpoint_create` (pipe option), `ipc_call`, `ipc_send`, `ipc_recv`, `ipc_reply`, `ipc_reply_recv`, `ipc_reply_to` |
@@ -211,8 +222,9 @@ All in EL0, started by `init` with only their capabilities.
 
 | Service | Role | State |
 |---|---|---|
-| `console` | UART-A, line editing | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
-| `clk` | clocks and resets (CAR), power-partition state (PMC, read-only) | emulator |
+| `console` | UART-A, line editing; mirrored to a terminal driver (input and all output) | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
+| `usbcon` | USB-C port as a USB serial device (CDC-ACM, 1209:0001) on the Erista OTG controller: the terminal of a PC (`tools/usbterm.py`) | emulator (virtual host); **Erista**: not tried yet; Mariko has no such controller (stops) |
+| `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
 | `sd` | SD card (SDHCI, ADMA2) | emulator; real reader power and pins not set up |
@@ -238,18 +250,22 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, TCP/IP, sockets | Wi-Fi, IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB host, USB device (serial console) | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
-| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18), debugger (gdb), L4T comparison | |
+| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18), debugger (gdb), L4T comparison, USB-C terminal | |
 
 ## Limits
 
 - **On a real Switch, only the boot up to the `display` service has
   been observed** (Erista, hekate L4T entry, single core). The shell
-  runs on UART-A, whose pads are internal: it stays unreachable until
-  the console moves to UART-B (right Joy-Con rail). A USB keyboard does
-  not help: its keys go to `input`, not to the shell, and hekate's L4T
-  path leaves the xHCI unpowered.
+  runs on UART-A, whose pads are internal; the USB-C console (`usbcon`)
+  mirrors it to a PC over the injection cable, but has only run against
+  the emulator's virtual host. A USB keyboard does not help: its keys go
+  to `input`, not to the shell, and hekate's L4T path leaves the xHCI
+  unpowered.
+- Kernel messages (`[nxk]` fault reports) go to UART-A and the loader's
+  screen only, not to the USB console. Mariko lacks the USB2 OTG device
+  controller (its OTG port belongs to XUSB): no USB console there.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.
@@ -283,7 +299,12 @@ program that vanished without closing them (crash) are reclaimed.
    The emulator answers anyway. A partition-gated block driver (XUSB)
    therefore asks `clk` for `ENABLE` then `STATUS`, which never powers a
    partition on by itself, and only touches its registers once
-   `ST_READY` is complete.
+   `ST_READY` is complete. Fuses too: `usbcon` reads its PHY trims only
+   when `clk` reports the fuse block clocked and visible.
+7. hekate turns the AHB memory prefetcher on for USB when it serves UMS
+   and flushes it before every transfer; left on, a device re-reading a
+   buffer the CPU rewrote can get stale data. The kernel turns it off at
+   boot, so uncached `shm` buffers stay coherent for DMA.
 
 ## L4T comparison
 
