@@ -1,4 +1,6 @@
 build/
+# Wi-Fi blobs extracted from a console: proprietary, never committed.
+firmware/
 kernel/target/
 user/target/
 abi/target/

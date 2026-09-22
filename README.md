@@ -276,13 +276,11 @@ program that vanished without closing them (crash) are reclaimed.
   complex up, trains the link and reads the BCM4356 chip identity, but
   the firmware upload and Broadcom's ring protocol are not written yet,
   so no frame moves. Its firmware and calibration data are proprietary
-  and never in the repository: put `brcmfmac4356-pcie.bin` and
-  `brcmfmac4356-pcie.txt` in a directory (`~/.cache/nxk/firmware` by
-  convention) and pass it to `tools/mksd.py --firmware DIR`, or to
-  `hwboot/mksd-hw.sh MOUNT DIR` for a real card; both put them in
-  `/firmware/brcm`. The calibration file is public (switch-linux-scripts,
-  CC0); the firmware image is not redistributable and is extracted from
-  a console's own system titles (`nx-fwextract`). The
+  and never in the repository: they are extracted from the console's own
+  system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
+  ignores it), then copied to the card by `tools/mksd.py --firmware DIR`
+  or `hwboot/mksd-hw.sh MOUNT DIR`, which put them in `/firmware/brcm`.
+  The whole procedure is in `hwboot/README.md` ("Wi-Fi firmware"). The
   station MAC is a locally administered one: the real address lives in
   CAL0 on the eMMC, which nxk cannot read. None of the PCIe path runs
   in the emulator, which has no root complex to model: there a

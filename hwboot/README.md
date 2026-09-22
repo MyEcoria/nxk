@@ -35,6 +35,42 @@ copies a directory of Wi-Fi blobs to `/firmware/brcm`, where `wlan` looks
 for `brcmfmac4356-pcie.bin` and `brcmfmac4356-pcie.txt`: proprietary files
 that are never part of the repository.
 
+## Wi-Fi firmware (extracted from the console)
+
+The `wlan` service needs Broadcom's firmware plus the calibration data
+of the board. Neither is redistributable: the image is absent from
+linux-firmware, and both live in the console's own system titles
+`0100000000000016` (wlan) and `010000000000000B` (bluetooth). They are
+extracted from the console that will run them, into `firmware/`, which
+git ignores.
+
+1. Keys: hekate, `Payloads` -> `Lockpick_RCM`; it writes
+   `sd:/switch/prod.keys`.
+2. ExeFS: hekate, `Launch` -> Atmosphere, then `nxdt_rw_poc.nro` (the
+   nxdumptool rewrite: the 1.1.x series does not read system titles) ->
+   `system titles menu` -> `wlan` -> `Program #0` -> its PartitionFS
+   section, with `write raw section` off. The result lands in
+   `sdmc:/nxdt_rw_poc/NCA FS/System/Extracted/.../Program #0/0/main`.
+3. Firmware: `./hwboot/nxfw-extract.py wlan <that main> -o firmware`,
+   and the same with `bluetooth` for `BCM4356A3.hcd`.
+4. Card: `./hwboot/mksd-hw.sh /mount/point firmware` copies them to
+   `/firmware/brcm`, where `wlan` looks for them.
+
+`main` is the title's NSO image and `nxfw-extract.py` reads it directly,
+so neither hactool nor nx2elf is needed; the markers it looks for come
+from nx-fwextract (perillamint, GPL-3.0). What comes out:
+
+| File | Content |
+|---|---|
+| `brcmfmac4356-pcie.bin` | firmware, ~570 KiB, version `4356a3-roml/pcie-ag-msgbuf-...` |
+| `brcmfmac4356-pcie.txt` | NVRAM of the board (`boardtype=0x074a` on an Erista) |
+| `BCM4356A3.hcd` | Bluetooth firmware, unused so far |
+
+That version string is also the answer to two design questions: the chip
+talks over PCIe, and its data path is Broadcom's msgbuf ring protocol.
+The sample NVRAM files that circulate for the BCM94356Z module describe
+another board (`boardtype=0x073e`): use the console's own.
+
 ## Inject (when the Switch is plugged in)
 
 ```bash
