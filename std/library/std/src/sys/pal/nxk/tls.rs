@@ -1,10 +1,5 @@
-//! Stockage local de thread, modele AArch64 « variante 1 ».
-//!
-//! `TPIDR_EL0` designe un bloc de controle de 16 octets suivi (a
-//! l'alignement du segment PT_TLS) de la copie propre au thread de `.tdata`
-//! puis de `.tbss` a zero. Le compilateur accede aux variables locales de
-//! thread par un simple decalage depuis `TPIDR_EL0` (modele local-exec) :
-//! ni noyau ni editeur de liens dynamique n'interviennent.
+//! TLS, AArch64 variant 1: 16-byte block at `TPIDR_EL0`, then `.tdata`/zeroed `.tbss`.
+//! Compiler uses plain `TPIDR_EL0` offsets (local-exec); no kernel or dynamic linker involved.
 
 use super::abi::layout::PAGE_SIZE;
 use super::abi::prot;
@@ -25,34 +20,29 @@ struct Phdr {
     align: u64,
 }
 
-// Modele du segment PT_TLS, lu une fois au demarrage.
+// PT_TLS template, read once at startup.
 static IMAGE: AtomicU64 = AtomicU64::new(0);
 static FILESZ: AtomicUsize = AtomicUsize::new(0);
 static MEMSZ: AtomicUsize = AtomicUsize::new(0);
 static ALIGN: AtomicUsize = AtomicUsize::new(16);
 
-/// Decalage des donnees depuis `TPIDR_EL0`.
+/// Data offset from `TPIDR_EL0`.
 fn data_offset() -> usize {
     16usize.next_multiple_of(ALIGN.load(Ordering::Relaxed))
 }
 
-/// Octets a reserver pour le bloc d'un thread (0 : programme sans TLS).
+/// Bytes to reserve per thread block (0: no TLS).
 pub fn block_size() -> usize {
     let m = MEMSZ.load(Ordering::Relaxed);
     if m == 0 { 0 } else { data_offset() + m }
 }
 
-/// Alignement exige par le bloc.
+/// Alignment required by the block.
 pub fn block_align() -> usize {
     ALIGN.load(Ordering::Relaxed)
 }
 
-/// Initialise un bloc a `base` (aligne, `block_size()` octets a zero) et
-/// rend la valeur de `TPIDR_EL0` correspondante.
-///
-/// # Safety
-/// `base` doit designer une zone inscriptible de `block_size()` octets,
-/// deja a zero.
+/// Init a block at `base` and return its `TPIDR_EL0`. # Safety: `base` is a zeroed writable `block_size()` zone.
 pub unsafe fn init_block(base: *mut u8) -> u64 {
     let n = FILESZ.load(Ordering::Relaxed);
     if n > 0 {
@@ -62,10 +52,7 @@ pub unsafe fn init_block(base: *mut u8) -> u64 {
     base as u64
 }
 
-/// Lit l'en-tete PT_TLS et installe le TLS du thread principal.
-///
-/// # Safety
-/// A appeler une seule fois, au demarrage, avant tout acces TLS.
+/// Install the main-thread TLS from the PT_TLS header. # Safety: call once at startup, before any TLS use.
 pub unsafe fn init_main() {
     let Some(b) = super::startup_block() else { return };
     for k in 0..b.phnum as usize {
@@ -81,7 +68,7 @@ pub unsafe fn init_main() {
     if size == 0 {
         return;
     }
-    // Pages fraiches (donc a zero), alignees sur la page.
+    // Fresh (hence zeroed) pages, page-aligned.
     let len = (size as u64).next_multiple_of(PAGE_SIZE);
     let r = syscall::mem_map(len, prot::READ | prot::WRITE);
     if r < 0 || block_align() as u64 > PAGE_SIZE {
@@ -91,7 +78,7 @@ pub unsafe fn init_main() {
 }
 
 /// # Safety
-/// `tp` doit designer un bloc initialise par `init_block`.
+/// `tp` must be a block initialized by `init_block`.
 pub unsafe fn set_tp(tp: u64) {
     unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nomem, nostack, preserves_flags)) };
 }

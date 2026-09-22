@@ -1,17 +1,5 @@
-//! Tubes : un endpoint IPC cree avec `endpoint::PIPE`.
-//!
-//! L'ecrivain (handle SEND seul) envoie ses octets par `ipc_call` avec
-//! l'etiquette WRITE du protocole console ; le lecteur (handle RECV seul) les
-//! recoit et repond aussitot. Aucune copie intermediaire ni tampon du noyau :
-//! les octets vont des registres et de l'UTCB de l'ecrivain a ceux du lecteur.
-//! Un ecrivain attend donc qu'un lecteur prenne ses donnees (un tube de
-//! capacite nulle). Quand le dernier ecrivain disparait, la lecture rend la
-//! fin du flux ; sans lecteur, l'ecriture rend `BrokenPipe`.
-//!
-//! La sortie d'un programme lance est le cote ecrivain d'un tube dont le
-//! parent garde le cote lecteur ; son entree, le cote lecteur. Brancher la
-//! sortie d'un enfant sur l'entree d'un autre (`a | b`) leur passe les deux
-//! cotes d'un meme tube, sans relais.
+//! Zero-capacity IPC pipes (`endpoint::PIPE`): writer blocks until a reader takes the bytes.
+//! Spawned programs get pipe ends for stdio; `a | b` passes both ends of one pipe, no relay.
 
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
@@ -26,7 +14,7 @@ use crate::sys::pal::{cvt, syscall};
 pub struct Pipe {
     handle: u32,
     reader: bool,
-    /// Lecteur : octets d'un message plus long que le tampon du lecteur.
+    /// Reader: bytes of a message longer than the read buffer.
     pending: Mutex<(Vec<u8>, usize)>,
 }
 
@@ -93,7 +81,7 @@ impl Pipe {
     }
 
     pub fn diverge(&self) -> ! {
-        panic!("tube : conversion non prise en charge")
+        panic!("pipe: unsupported conversion")
     }
 }
 
@@ -109,7 +97,7 @@ impl fmt::Debug for Pipe {
     }
 }
 
-/// Ecrit dans un tube (ou la console, meme protocole) : au plus un message.
+/// Write into a pipe (or the console, same protocol): at most one message.
 pub(crate) fn write_to(h: u32, buf: &[u8]) -> io::Result<usize> {
     if buf.is_empty() {
         return Ok(0);
@@ -121,8 +109,8 @@ pub(crate) fn write_to(h: u32, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
-/// Lit le cote lecteur d'un tube : reste du message precedent, sinon le
-/// prochain message d'un ecrivain. Fin du flux : plus aucun ecrivain.
+/// Read a pipe's read end: leftover of the previous message, else the next
+/// writer message. End of stream: no writer left.
 pub(crate) fn read_from(h: u32, reader: bool, pending: &Mutex<(Vec<u8>, usize)>, buf: &mut [u8]) -> io::Result<usize> {
     if !reader {
         return Err(io::Error::from_raw_os_error(EBADF as i32));
@@ -160,16 +148,16 @@ pub(crate) fn read_from(h: u32, reader: bool, pending: &Mutex<(Vec<u8>, usize)>,
             *p = (data, n);
             n
         };
-        // L'ecrivain repart des que ses octets sont copies.
+        // The writer resumes once its bytes are copied.
         let _ = ipc::reply(&Msg::new(0, 0, 0));
         if n > 0 {
             return Ok(n);
         }
-        // Message vide : on attend le suivant.
+        // Empty message: wait for the next one.
     }
 }
 
-/// Nouveau tube : (lecteur, ecrivain).
+/// New pipe: (reader, writer).
 pub fn pipe() -> io::Result<(Pipe, Pipe)> {
     let ep = cvt(syscall::endpoint_create(endpoint::PIPE))? as u32;
     let r = cvt(syscall::handle_dup(ep, RECV | GRANT | DUP, 0));
@@ -181,7 +169,7 @@ pub fn pipe() -> io::Result<(Pipe, Pipe)> {
             for h in [r, w].into_iter().flatten() {
                 syscall::handle_close(h as u32);
             }
-            Err(io::const_error!(io::ErrorKind::OutOfMemory, "tube : handles epuises"))
+            Err(io::const_error!(io::ErrorKind::OutOfMemory, "pipe: handles exhausted"))
         }
     }
 }

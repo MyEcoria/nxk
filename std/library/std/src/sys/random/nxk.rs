@@ -1,5 +1,4 @@
-//! Octets aleatoires : generateur ChaCha20 du noyau (graine materielle du
-//! moteur de securite du Tegra).
+//! Random bytes: kernel ChaCha20 generator (Tegra security-engine seed).
 
 pub fn fill_bytes(bytes: &mut [u8]) {
     crate::sys::pal::syscall::getrandom(bytes)

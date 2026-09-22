@@ -1,11 +1,5 @@
-//! Threads : un thread du noyau par thread Rust.
-//!
-//! Une seule projection par thread : la pile (sous laquelle le noyau laisse
-//! toujours une page libre, qui sert de garde) puis le bloc TLS. La fin d'un
-//! thread est signalee par une notification que le noyau pose une fois le
-//! thread sorti d'EL0 : alors seulement sa pile peut etre rendue. Un thread
-//! detache se range a sa sortie dans une liste que les creations suivantes
-//! vident.
+//! One kernel thread per Rust thread; one mapping each (stack with kernel guard page + TLS).
+//! Exit is signaled by a kernel notification (then the stack may be freed); detached threads park in a drain-on-create list.
 
 use crate::cell::UnsafeCell;
 use crate::ffi::CStr;
@@ -19,27 +13,27 @@ use crate::sys::sync::Mutex;
 use crate::thread::ThreadInit;
 use crate::time::Duration;
 
-/// Pages allouees au premier acces : une grande pile ne coute que ce qui sert.
+/// Demand-paged: a big stack only costs what is used.
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 const DETACHED: u32 = 1;
 const EXITED: u32 = 2;
 
-/// Etat partage entre le thread et son `Thread`.
+/// State shared between the thread and its `Thread`.
 struct Shared {
     state: AtomicU32,
-    /// Notification posee par le noyau a la sortie du thread.
+    /// Notification posted by the kernel at thread exit.
     notif: u32,
-    /// Handle noyau du thread (connu apres sa creation).
+    /// Kernel thread handle (known after creation).
     handle: AtomicU32,
     base: usize,
     len: usize,
 }
 
 impl Shared {
-    /// Rend la pile et les handles d'un thread sorti.
+    /// Free the stack and handles of an exited thread.
     fn free(&self) {
-        // SAFETY: le thread est sorti d'EL0, personne n'utilise plus sa pile.
+        // SAFETY: thread left EL0, nobody uses its stack.
         unsafe { stack_put(self.base as *mut u8, self.len) };
         syscall::handle_close(self.notif);
         let h = self.handle.load(Ordering::Relaxed);
@@ -49,16 +43,13 @@ impl Shared {
     }
 }
 
-/// Piles de threads termines, gardees pour les suivants (comme glibc) : ni
-/// projection ni fautes de page a la creation d'un thread. Leur contenu est
-/// celui du thread precedent du meme processus ; seul le bloc TLS est remis
-/// a neuf.
+/// Finished stacks kept for reuse (glibc-style); only the TLS block is refreshed.
 struct Stacks {
     lock: Mutex,
     free: UnsafeCell<[(usize, usize); STACK_CACHE]>,
 }
 
-// SAFETY: `free` n'est touche que sous `lock`.
+// SAFETY: `free` only touched under `lock`.
 unsafe impl Sync for Stacks {}
 
 const STACK_CACHE: usize = 8;
@@ -67,13 +58,13 @@ static STACKS: Stacks = Stacks { lock: Mutex::new(), free: UnsafeCell::new([(0, 
 
 fn stacks<R>(f: impl FnOnce(&mut [(usize, usize); STACK_CACHE]) -> R) -> R {
     STACKS.lock.lock();
-    // SAFETY: acces exclusif sous le verrou.
+    // SAFETY: exclusive access under the lock.
     let r = f(unsafe { &mut *STACKS.free.get() });
     unsafe { STACKS.lock.unlock() };
     r
 }
 
-/// Pile de `len` octets : une pile gardee de meme taille, ou une neuve.
+/// `len`-byte stack: a cached one of same size, or a fresh one.
 fn stack_get(len: usize) -> Option<(*mut u8, bool)> {
     let hit = stacks(|c| {
         let k = c.iter().position(|&(b, l)| b != 0 && l == len)?;
@@ -88,7 +79,7 @@ fn stack_get(len: usize) -> Option<(*mut u8, bool)> {
 }
 
 /// # Safety
-/// Plus aucun thread ne doit utiliser la pile.
+/// No thread may still use the stack.
 unsafe fn stack_put(base: *mut u8, len: usize) {
     let kept = stacks(|c| match c.iter().position(|&(b, _)| b == 0) {
         Some(k) => {
@@ -102,26 +93,26 @@ unsafe fn stack_put(base: *mut u8, len: usize) {
     }
 }
 
-/// Threads detaches sortis (ou sur le point de l'etre), a liberer.
+/// Exited (or exiting) detached threads, pending free.
 struct Zombies {
     lock: Mutex,
     list: UnsafeCell<Vec<Arc<Shared>>>,
 }
 
-// SAFETY: `list` n'est touche que sous `lock`.
+// SAFETY: `list` only touched under `lock`.
 unsafe impl Sync for Zombies {}
 
 static ZOMBIES: Zombies = Zombies { lock: Mutex::new(), list: UnsafeCell::new(Vec::new()) };
 
 fn zombies<R>(f: impl FnOnce(&mut Vec<Arc<Shared>>) -> R) -> R {
     ZOMBIES.lock.lock();
-    // SAFETY: acces exclusif sous le verrou.
+    // SAFETY: exclusive access under the lock.
     let r = f(unsafe { &mut *ZOMBIES.list.get() });
     unsafe { ZOMBIES.lock.unlock() };
     r
 }
 
-/// Libere les threads detaches dont le noyau a confirme la sortie.
+/// Free detached threads whose exit the kernel confirmed.
 fn reap() {
     let done: Vec<Arc<Shared>> = zombies(|z| {
         let mut done = Vec::new();
@@ -154,15 +145,15 @@ unsafe impl Send for Thread {}
 unsafe impl Sync for Thread {}
 
 extern "C" fn thread_start(arg: u64) -> ! {
-    // SAFETY: boite laissee par `Thread::new` pour ce thread seul.
+    // SAFETY: box left by `Thread::new` for this thread only.
     let p = unsafe { Box::from_raw(crate::ptr::with_exposed_provenance_mut::<Packet>(arg as usize)) };
     let Packet { init, shared, tp } = *p;
-    // SAFETY: bloc TLS initialise par `Thread::new`.
+    // SAFETY: TLS block initialized by `Thread::new`.
     unsafe { tls::set_tp(tp) };
     let rust_start = init.init();
     rust_start();
 
-    // SAFETY: fin du code Rust de ce thread.
+    // SAFETY: end of this thread's Rust code.
     unsafe { crate::sys::thread_local::destructors::run() };
     crate::rt::thread_cleanup();
 
@@ -182,10 +173,9 @@ impl Thread {
         let tls_len = tls::block_size().next_multiple_of(vm::PAGE);
         let len = stack + tls_len;
         let (base, fresh) =
-            stack_get(len).ok_or(io::const_error!(io::ErrorKind::OutOfMemory, "pas de memoire pour la pile"))?;
+            stack_get(len).ok_or(io::const_error!(io::ErrorKind::OutOfMemory, "no memory for stack"))?;
         let tp = if tls_len > 0 {
-            // SAFETY: zone de `tls_len` octets alignee sur la page, remise a
-            // zero si elle a deja servi.
+            // SAFETY: page-aligned `tls_len`-byte zone, re-zeroed on reuse.
             unsafe {
                 if !fresh {
                     crate::ptr::write_bytes(base.add(stack), 0, tls::block_size());
@@ -218,7 +208,7 @@ impl Thread {
                 Ok(Thread { shared: Some(shared) })
             }
             Err(e) => {
-                // Le thread n'a pas demarre : tout revient a l'appelant.
+                // Thread did not start: everything goes back to the caller.
                 drop(unsafe { Box::from_raw(packet) });
                 shared.free();
                 Err(e)
@@ -234,8 +224,8 @@ impl Thread {
 }
 
 impl Drop for Thread {
-    /// Thread detache : s'il est deja sorti, on le libere ici ; sinon il se
-    /// rangera lui-meme parmi les zombies.
+    /// Detached thread: if already exited, free it here; else it parks
+    /// itself among the zombies.
     fn drop(&mut self) {
         if let Some(s) = self.shared.take() {
             if s.state.fetch_or(DETACHED, Ordering::AcqRel) & EXITED != 0 {
@@ -258,7 +248,7 @@ pub fn available_parallelism() -> io::Result<NonZero<usize>> {
     let n = cvt(syscall::sysinfo(info::CPUS, &mut buf))? as usize;
     let online = (0..n.min(16))
         .filter(|&k| {
-            // SAFETY: le noyau a ecrit `n` fiches `CpuInfo` a la suite.
+            // SAFETY: the kernel wrote `n` trailing `CpuInfo` records.
             let c = unsafe { (buf.as_ptr().add(k * sz) as *const info::CpuInfo).read_unaligned() };
             c.online != 0
         })

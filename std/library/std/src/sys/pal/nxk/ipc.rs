@@ -1,8 +1,5 @@
-//! Messages IPC synchrones vers les services (cote client).
-//!
-//! Un message = une etiquette + des mots : les 6 premiers voyagent dans les
-//! registres x2-x7, les suivants dans l'UTCB du thread (page propre a chaque
-//! thread, adresse dans `TPIDRRO_EL0`), recopiee par le noyau.
+//! Sync IPC to services (client): label + words; first 6 in x2-x7, rest in thread UTCB.
+//! (UTCB: per-thread page at `TPIDRRO_EL0`, copied by the kernel).
 
 use core::arch::asm;
 
@@ -20,7 +17,7 @@ impl Msg {
         Self { tag: tag::make(label, words, handles), mr: [0; 6] }
     }
 
-    /// Message de mots seuls (au plus 6).
+    /// Words-only message (at most 6).
     pub fn words(label: u32, w: &[u64]) -> Self {
         let mut m = Self::new(label, w.len(), 0);
         m.mr[..w.len()].copy_from_slice(w);
@@ -43,8 +40,8 @@ fn utcb() -> *mut Utcb {
     p as *mut Utcb
 }
 
-/// Envoie `m` a l'endpoint `ep` et attend la reponse. Erreur : `-errno` du
-/// noyau (endpoint disparu, delai...).
+/// Send `m` to endpoint `ep` and wait for the reply. Error: kernel
+/// `-errno` (dead endpoint, timeout...).
 #[inline]
 pub fn call(ep: u32, m: &Msg) -> Result<Msg, i64> {
     let (r0, t, a, b, c, d, e, f): (i64, u64, u64, u64, u64, u64, u64, u64);
@@ -66,8 +63,8 @@ pub fn call(ep: u32, m: &Msg) -> Result<Msg, i64> {
     if r0 < 0 { Err(r0) } else { Ok(Msg { tag: t, mr: [a, b, c, d, e, f] }) }
 }
 
-/// Attend un message sur `ep` (droit RECV). Erreur : `-errno` du noyau
-/// (-EPIPE : tube sans ecrivain).
+/// Wait for a message on `ep` (RECV right). Error: kernel `-errno`
+/// (-EPIPE: pipe without writer).
 #[inline]
 pub fn recv(ep: u32) -> Result<Msg, i64> {
     let (r0, t, a, b, c, d, e, f): (i64, u64, u64, u64, u64, u64, u64, u64);
@@ -89,7 +86,7 @@ pub fn recv(ep: u32) -> Result<Msg, i64> {
     if r0 < 0 { Err(r0) } else { Ok(Msg { tag: t, mr: [a, b, c, d, e, f] }) }
 }
 
-/// Repond au dernier message recu par ce thread.
+/// Reply to the last message this thread received.
 #[inline]
 pub fn reply(m: &Msg) -> Result<(), i64> {
     let r0: i64;
@@ -111,7 +108,7 @@ pub fn reply(m: &Msg) -> Result<(), i64> {
     if r0 < 0 { Err(r0) } else { Ok(()) }
 }
 
-/// Octets transportables par message : un mot de longueur, puis les octets.
+/// Bytes per message: one length word, then the bytes.
 pub const MAX_BYTES: usize = (MR_WORDS - 1) * 8;
 
 #[inline]
@@ -128,14 +125,13 @@ fn set_word(m: &mut Msg, i: usize, v: u64) {
     }
 }
 
-/// Mot d'en-tete `i` d'une reponse (registre ou UTCB).
+/// Header word `i` of a reply (register or UTCB).
 pub fn header(m: &Msg, i: usize) -> u64 {
     word(m, i)
 }
 
-/// Message : mots d'en-tete `head`, puis un mot de longueur et les octets
-/// (tronques a ce que le message peut porter). Rend aussi le nombre
-/// d'octets emportes.
+/// Message: `head` header words, then a length word and the bytes
+/// (truncated to what fits). Also returns the carried byte count.
 pub fn pack_at(label: u32, head: &[u64], data: &[u8]) -> (Msg, usize) {
     let first = head.len();
     let n = data.len().min((MR_WORDS - 1 - first) * 8);
@@ -157,7 +153,7 @@ pub fn pack(label: u32, data: &[u8]) -> (Msg, usize) {
     pack_at(label, &[], data)
 }
 
-/// Octets d'une reponse construite avec `first` mots d'en-tete.
+/// Bytes of a reply built with `first` header words.
 pub fn unpack_at(m: &Msg, first: usize, out: &mut [u8]) -> usize {
     if m.len() <= first {
         return 0;
@@ -179,23 +175,23 @@ pub fn unpack(m: &Msg, out: &mut [u8]) -> usize {
     unpack_at(m, 0, out)
 }
 
-/// Longueur annoncee des octets d'une reponse (sans les copier).
+/// Advertised byte length of a reply (no copy).
 pub fn bytes_len(m: &Msg, first: usize) -> usize {
     if m.len() <= first { 0 } else { (word(m, first) as usize).min((m.len() - first - 1) * 8) }
 }
 
-/// Handle recu avec la derniere reponse.
+/// Handle received with the last reply.
 pub fn received_handle(k: usize) -> u32 {
     unsafe { (*utcb()).handles[k] }
 }
 
-/// Handle a transmettre avec le prochain message (droit GRANT requis).
+/// Handle to send with the next message (GRANT right needed).
 pub fn set_send_handle(k: usize, h: u32) {
     unsafe { (*utcb()).handles[k] = h };
 }
 
 impl Msg {
-    /// Meme message, accompagne de `n` handles (poses par `set_send_handle`).
+    /// Same message plus `n` handles (set via `set_send_handle`).
     pub const fn with_handles(self, n: usize) -> Self {
         Self { tag: tag::make(self.label(), self.len(), n), mr: self.mr }
     }

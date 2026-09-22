@@ -1,7 +1,4 @@
-//! nxk-specific extensions to the primitives in the `std::ffi` module.
-//!
-//! Comme sous Unix, un `OsStr` est une suite d'octets quelconque (en pratique
-//! de l'UTF-8 : noms FAT, arguments, environnement).
+//! nxk `std::ffi` extensions: `OsStr` is an arbitrary (in practice UTF-8) byte string.
 
 #![stable(feature = "rust1", since = "1.0.0")]
 

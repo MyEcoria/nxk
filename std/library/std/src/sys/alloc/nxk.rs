@@ -1,14 +1,5 @@
-//! Allocateur de nxk.
-//!
-//! Petits blocs (16 KiB au plus) : 36 classes de taille (pas de 16 octets
-//! jusqu'a 128, puis quatre classes par puissance de deux), decoupees a la
-//! demande dans des tranches de 64 KiB. Un bloc libere rejoint la liste de sa
-//! classe : allocation et liberation en O(1), sans en-tete (la taille est
-//! connue a la liberation). Les pages ne sont touchees qu'a l'usage : une
-//! tranche neuve ne coute rien tant qu'elle n'est pas remplie.
-//!
-//! Grands blocs : projection directe, rendue au noyau a la liberation
-//! (adresses reemployees par `pal::nxk::vm`).
+//! Size-class allocator (36 classes to 16 KiB, 64 KiB runs; O(1), headerless) plus direct-mapped large blocks.
+//! Fresh runs cost nothing until touched; freed addresses are reused via `pal::nxk::vm`.
 
 use crate::alloc::{GlobalAlloc, Layout, System};
 use crate::cell::UnsafeCell;
@@ -22,13 +13,13 @@ const MAX_SMALL: usize = 16 * 1024;
 const RUN: usize = 64 * 1024;
 const CHUNK: usize = 1024 * 1024;
 
-/// Classe d'une taille (1..=MAX_SMALL).
+/// Class of a size (1..=MAX_SMALL).
 #[inline]
 fn class_of(size: usize) -> usize {
     if size <= 128 {
         (size.max(1) + 15) / 16 - 1
     } else {
-        // size dans ]2^k, 2^(k+1)] : quatre classes de pas 2^(k-2).
+        // size in ]2^k, 2^(k+1)]: four classes of step 2^(k-2).
         let k = (usize::BITS - 1 - (size - 1).leading_zeros()) as usize;
         SMALL_CLASSES + (k - 7) * 4 + ((size - 1 - (1 << k)) >> (k - 2))
     }
@@ -44,9 +35,8 @@ fn class_size(c: usize) -> usize {
     }
 }
 
-/// Taille effective d'une demande : au-dela de 16 octets d'alignement, une
-/// puissance de deux (les blocs d'une telle classe y sont alignes, les
-/// tranches l'etant sur la page).
+/// Effective size of a request: past 16-byte alignment, a power of two
+/// (class blocks are aligned to it, runs to the page).
 #[inline]
 fn effective_size(l: &Layout) -> usize {
     if l.align() <= 16 { l.size() } else { l.size().max(l.align()).next_power_of_two() }
@@ -70,7 +60,7 @@ struct Global {
     heap: UnsafeCell<Heap>,
 }
 
-// SAFETY: `heap` n'est touche que sous `lock`.
+// SAFETY: `heap` only touched under `lock`.
 unsafe impl Sync for Global {}
 
 static GLOBAL: Global = Global {
@@ -84,15 +74,15 @@ static GLOBAL: Global = Global {
     }),
 };
 
-/// Bloc de la classe `c` ; le booleen dit s'il est neuf (donc a zero).
+/// Block of class `c`; the bool says if it is fresh (hence zeroed).
 fn small_alloc(c: usize) -> (*mut u8, bool) {
     let size = class_size(c);
     GLOBAL.lock.lock();
-    // SAFETY: acces exclusif sous le verrou.
+    // SAFETY: exclusive access under the lock.
     let h = unsafe { &mut *GLOBAL.heap.get() };
     let head = h.free[c];
     let r = if !head.is_null() {
-        // SAFETY: un bloc libre porte l'adresse du suivant.
+        // SAFETY: a free block links to the next.
         h.free[c] = unsafe { *(head as *mut *mut u8) };
         (head, false)
     } else {
@@ -123,7 +113,7 @@ fn small_alloc(c: usize) -> (*mut u8, bool) {
 
 fn small_free(p: *mut u8, c: usize) {
     GLOBAL.lock.lock();
-    // SAFETY: acces exclusif sous le verrou ; le bloc libre porte le lien.
+    // SAFETY: exclusive access under the lock; the free block holds the link.
     unsafe {
         let h = &mut *GLOBAL.heap.get();
         *(p as *mut *mut u8) = h.free[c];
@@ -136,24 +126,23 @@ fn large_len(l: &Layout) -> usize {
     l.size().next_multiple_of(PAGE)
 }
 
-/// Grand bloc : pages fraiches (a zero), suivies d'une page de garde.
+/// Large block: fresh (zeroed) pages plus a guard page.
 fn large_alloc(l: &Layout) -> *mut u8 {
     let len = large_len(l);
     if l.align() <= PAGE {
         return vm::map(len).unwrap_or(ptr::null_mut());
     }
-    // Alignement plus fort que la page : projection plus large, dont on rend
-    // le debut et la fin.
+    // Over-page alignment: wider mapping, head and tail returned.
     let Some(total) = len.checked_add(l.align()) else { return ptr::null_mut() };
     let Some(base) = vm::map(total) else { return ptr::null_mut() };
     let base = base as usize;
     let aligned = base.next_multiple_of(l.align());
     let tail = total - (aligned - base) - len;
-    // SAFETY: debut de la projection, que personne n'a vu.
+    // SAFETY: start of the mapping, unseen by anyone.
     unsafe { vm::release(base, aligned - base) };
     if tail > 0 {
-        // La page qui suit le bloc reste libre hors de la liste : c'est sa
-        // garde, rendue avec lui.
+        // The page past the block stays free off-list: its guard,
+        // freed with it.
         crate::sys::pal::syscall::mem_unmap((aligned + len) as u64, tail as u64);
         vm::record(aligned + len + PAGE, tail);
     }
@@ -173,7 +162,7 @@ unsafe impl GlobalAlloc for System {
             let c = class_of(effective_size(&l));
             let (p, fresh) = small_alloc(c);
             if !p.is_null() && !fresh {
-                // SAFETY: bloc de `class_size(c)` octets.
+                // SAFETY: `class_size(c)`-byte block.
                 unsafe { ptr::write_bytes(p, 0, l.size()) };
             }
             p
@@ -187,16 +176,16 @@ unsafe impl GlobalAlloc for System {
         if is_small(&l) {
             small_free(p, class_of(effective_size(&l)));
         } else {
-            // SAFETY: bloc rendu par `large_alloc`, plus utilise.
+            // SAFETY: `large_alloc` block, no longer used.
             unsafe { vm::unmap(p, large_len(&l)) };
         }
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: memes exigences que GlobalAlloc::realloc.
+        // SAFETY: same requirements as GlobalAlloc::realloc.
         let new = unsafe { Layout::from_size_align_unchecked(new_size, l.align()) };
         match (is_small(&l), is_small(&new)) {
-            // Meme classe : rien a faire.
+            // Same class: nothing to do.
             (true, true) if class_of(effective_size(&l)) == class_of(effective_size(&new)) => return p,
             (false, false) => {
                 let (old_len, new_len) = (large_len(&l), large_len(&new));
@@ -204,7 +193,7 @@ unsafe impl GlobalAlloc for System {
                     return p;
                 }
                 if new_len < old_len {
-                    // Reduction : la fin est rendue, une page de garde reste.
+                    // Shrink: tail returned, one guard page kept.
                     let end = p as usize + new_len;
                     crate::sys::pal::syscall::mem_unmap(end as u64, (old_len - new_len) as u64);
                     vm::record(end + PAGE, old_len - new_len);
@@ -213,7 +202,7 @@ unsafe impl GlobalAlloc for System {
             }
             _ => {}
         }
-        // SAFETY: memes exigences que GlobalAlloc::realloc.
+        // SAFETY: same requirements as GlobalAlloc::realloc.
         unsafe {
             let q = self.alloc(new);
             if !q.is_null() {

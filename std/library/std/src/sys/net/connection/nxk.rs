@@ -1,8 +1,5 @@
-//! Reseau : client du service « net » (pile smoltcp ; TCP, UDP et DNS en
-//! IPv4). Un socket est un identifiant du service ; lectures, ecritures et
-//! acceptations sont des appels bloquants que le service termine plus tard
-//! (reponse differee), avec un delai eventuel. Le mode non bloquant est un
-//! delai nul : le service repond tout de suite `EAGAIN`.
+//! Client of the `net` service (smoltcp; TCP/UDP/DNS over IPv4); sockets are service ids.
+//! Blocking calls complete later (deferred reply); nonblocking is a zero timeout (`EAGAIN`).
 
 use crate::fmt;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
@@ -16,7 +13,7 @@ use crate::sys::pal::ipc::{self, Msg};
 use crate::sys::pal::{svc, timeout_ns, unsupported};
 use crate::time::Duration;
 
-/// Octets par message (le service n'en prend ni n'en rend davantage).
+/// Bytes per message (the service takes/returns no more).
 const CHUNK: usize = 3 * 1024;
 
 fn call(m: &Msg) -> io::Result<Msg> {
@@ -26,7 +23,7 @@ fn call(m: &Msg) -> io::Result<Msg> {
 fn v4(a: &SocketAddr) -> io::Result<SocketAddrV4> {
     match a {
         SocketAddr::V4(a) => Ok(*a),
-        SocketAddr::V6(_) => Err(io::const_error!(io::ErrorKind::Unsupported, "IPv6 non gere")),
+        SocketAddr::V6(_) => Err(io::const_error!(io::ErrorKind::Unsupported, "no IPv6")),
     }
 }
 
@@ -34,7 +31,7 @@ fn addr(ip: u64, port: u64) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip as u32), port as u16))
 }
 
-/// Delai d'une operation : mode non bloquant, delai regle, ou aucun.
+/// Operation timeout: nonblocking, set timeout, or none.
 struct Timeouts {
     read: AtomicU64,
     write: AtomicU64,
@@ -66,15 +63,14 @@ impl Timeouts {
     }
 }
 
-/// Un delai echu devient `WouldBlock`, comme `EAGAIN` sous Unix.
+/// An expired timeout becomes `WouldBlock`, like `EAGAIN` on Unix.
 fn would_block(e: io::Error) -> io::Error {
     if e.raw_os_error() == Some(ETIMEDOUT as i32) { io::Error::from_raw_os_error(EAGAIN as i32) } else { e }
 }
 
 // ------------------------------------------------------------------- TCP ---
 
-/// Reglages d'un socket, partages par ses copies (`try_clone`) comme ceux
-/// d'un socket Unix.
+/// Socket settings, shared by clones (`try_clone`) like a Unix socket.
 struct StreamState {
     t: Timeouts,
     nodelay: AtomicBool,
@@ -179,7 +175,7 @@ impl TcpStream {
         self.addrs().map(|m| addr(m.mr[0], m.mr[1]))
     }
 
-    /// Seule la fin d'emission existe (FIN) ; fermer la lecture ne change rien.
+    /// Only send-side shutdown exists (FIN); read shutdown is a no-op.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match how {
             Shutdown::Read => Ok(()),
@@ -208,7 +204,7 @@ impl TcpStream {
         unsupported()
     }
 
-    /// Indication seulement : le service envoie des que possible.
+    /// Hint only: the service sends as soon as possible.
     pub fn set_nodelay(&self, v: bool) -> io::Result<()> {
         self.st.nodelay.store(v, Ordering::Relaxed);
         Ok(())
@@ -268,7 +264,7 @@ impl TcpListener {
         let (m, port) = if a.port() != 0 {
             (listen(a.port())?, a.port())
         } else {
-            // Port ephemere : le service n'en choisit pas pour l'ecoute.
+            // Ephemeral port: the service picks none for listening.
             let mut seed = [0u8; 2];
             crate::sys::random::fill_bytes(&mut seed);
             let mut p = 49152 + (u16::from_le_bytes(seed) % 16384);
@@ -347,7 +343,7 @@ impl fmt::Debug for TcpListener {
 // ------------------------------------------------------------------- UDP ---
 
 struct UdpState {
-    /// Correspondant de `connect` : 1 << 63 | adresse << 16 | port (0 : aucun).
+    /// `connect` peer: 1 << 63 | addr << 16 | port (0: none).
     peer: AtomicU64,
     t: Timeouts,
 }
@@ -492,7 +488,7 @@ impl UdpSocket {
         Ok(())
     }
 
-    /// Datagramme du correspondant (les autres sont ignores, comme sous Unix).
+    /// Datagram from the peer (others dropped, as on Unix).
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let (n, from) = self.recv_from(buf)?;
@@ -536,7 +532,7 @@ impl fmt::Debug for UdpSocket {
 
 // ------------------------------------------------------------------- DNS ---
 
-/// Le service rend une adresse par nom.
+/// The service resolves one address per name.
 pub struct LookupHost {
     addr: Option<SocketAddr>,
 }
@@ -551,7 +547,7 @@ impl Iterator for LookupHost {
 pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
     let (m, n) = ipc::pack(proto::RESOLVE, host.as_bytes());
     if n < host.len() {
-        return Err(io::const_error!(io::ErrorKind::InvalidInput, "nom d'hote trop long"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "hostname too long"));
     }
     let r = call(&m)?;
     Ok(LookupHost { addr: Some(addr(r.mr[0], port as u64)) })

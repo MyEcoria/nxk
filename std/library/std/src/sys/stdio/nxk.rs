@@ -1,12 +1,5 @@
-//! Entree et sorties standard.
-//!
-//! Par defaut, le serveur console (handles recus au demarrage) : ecriture par
-//! messages WRITE, lecture ligne a ligne (READ_LINE, edition et echo par le
-//! serveur). Un programme lance avec des tubes (`Command::stdout(piped())`...)
-//! recoit a la place le cote ecrivain d'un tube pour ses sorties, le cote
-//! lecteur pour son entree (voir `sys::pipe`), ou rien du tout (`null`).
-//! Sans console, ou si elle disparait, la sortie passe par le journal du
-//! noyau.
+//! Console server by default (WRITE messages out, READ_LINE lines in); pipes or null when spawned so.
+//! Falls back to the kernel log without a console.
 
 use crate::io;
 use crate::sync::Mutex;
@@ -40,7 +33,7 @@ impl Stderr {
     }
 }
 
-/// Reste de la derniere ligne (ou du dernier message du tube) pas encore lu.
+/// Leftover of the last line (or pipe message) not yet read.
 static PENDING: Mutex<(Vec<u8>, usize)> = Mutex::new((Vec::new(), 0));
 
 impl io::Read for Stdin {
@@ -58,7 +51,7 @@ impl io::Read for Stdin {
             if h == 0 {
                 return Ok(0);
             }
-            // Une ligne editee par le serveur (echo compris), sans son retour.
+            // One server-edited line (echo included), minus terminator.
             let r = match ipc::call(h, &Msg::new(proto::READ_LINE, 0, 0)) {
                 Ok(r) => r,
                 Err(_) => return Ok(0),
@@ -77,8 +70,8 @@ impl io::Read for Stdin {
     }
 }
 
-/// Ecrit tout `b` vers `h` : console (repli sur le journal du noyau si elle
-/// disparait) ou tube (erreur `BrokenPipe` sans lecteur).
+/// Write all of `b` to `h`: console (kernel-log fallback if gone)
+/// or pipe (`BrokenPipe` without reader).
 fn write_all(h: u32, pipe: bool, mut b: &[u8]) -> io::Result<usize> {
     let total = b.len();
     if h == 0 {
@@ -92,7 +85,7 @@ fn write_all(h: u32, pipe: bool, mut b: &[u8]) -> io::Result<usize> {
                 return if b.len() < total { Ok(total - b.len()) } else { Err(e) };
             }
             Err(_) => {
-                // Serveur console disparu : la suite part dans le journal.
+                // Console server gone: the rest goes to the log.
                 if h == svc::console() {
                     svc::set_console(0);
                 }

@@ -1,5 +1,5 @@
-//! Arguments du programme, lus dans le bloc de demarrage que le noyau
-//! depose en haut de la pile principale (l'equivalent d'argv).
+//! Program arguments, read from the startup block the kernel leaves atop
+//! the main stack (the argv equivalent).
 
 pub use super::common::Args;
 use crate::ffi::OsString;

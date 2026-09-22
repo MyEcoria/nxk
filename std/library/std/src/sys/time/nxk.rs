@@ -1,10 +1,5 @@
-//! Temps.
-//!
-//! `Instant` : compteur du temporisateur generique lu directement a EL0
-//! (`CNTVCT_EL0`, ouvert par le noyau comme le vDSO de Linux), converti en
-//! nanosecondes par multiplication et decalage : pas d'appel systeme.
-//! `SystemTime` : heure murale tenue par le noyau (chemin rapide de
-//! `clock`), reglee depuis l'horloge temps reel par le service power.
+//! `Instant`: EL0 generic-timer counter scaled to ns (no syscall, vDSO-style).
+//! `SystemTime`: kernel wall clock (`clock` fast path), set from the RTC by the power service.
 
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sys::pal::syscall;
@@ -18,7 +13,7 @@ pub struct SystemTime(Duration);
 
 pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 
-/// ns = ticks * MULT >> 32 (0 : pas encore calcule).
+/// ns = ticks * MULT >> 32 (0: not computed yet).
 static MULT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -37,7 +32,7 @@ fn init_mult() -> u64 {
     m
 }
 
-/// Temps monotone en ns depuis le demarrage.
+/// Monotonic time in ns since boot.
 #[inline]
 pub fn monotonic_ns() -> u64 {
     let mut m = MULT.load(Ordering::Relaxed);
@@ -64,7 +59,7 @@ impl Instant {
         Some(Instant(self.0.checked_sub(*other)?))
     }
 
-    /// Nanosecondes depuis le demarrage.
+    /// Nanoseconds since boot.
     pub fn as_nanos(&self) -> u128 {
         self.0.as_nanos()
     }
@@ -79,7 +74,7 @@ impl SystemTime {
         SystemTime(Duration::from_nanos(syscall::realtime_ns()))
     }
 
-    /// Date en secondes depuis 1970 (dates des fichiers).
+    /// Date in seconds since 1970 (file timestamps).
     pub fn from_secs(s: u64) -> SystemTime {
         SystemTime(Duration::from_secs(s))
     }

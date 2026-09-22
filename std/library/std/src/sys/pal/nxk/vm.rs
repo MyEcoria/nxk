@@ -1,14 +1,5 @@
-//! Projections anonymes, avec reemploi des adresses virtuelles.
-//!
-//! Le noyau place les projections `mem_map(0, ...)` par un simple pointeur
-//! croissant (une page de garde apres chacune) et ne reprend jamais une
-//! adresse. Un programme qui projette et libere sans cesse (grands blocs,
-//! piles de threads) finirait par epuiser sa zone : les plages rendues sont
-//! donc gardees ici et reprojetees a adresse fixe.
-//!
-//! Invariant : toute plage de la liste est libre (rien n'y est projete), et
-//! chaque projection vivante est suivie d'une page libre qui n'est pas dans la
-//! liste (sa page de garde) ; `unmap` la rend avec la projection.
+//! Anonymous mappings with address reuse: freed ranges are cached and remapped fixed.
+//! Invariant: listed ranges are free; each live mapping is followed by an off-list guard page.
 
 use super::abi::layout::PAGE_SIZE;
 use super::abi::prot;
@@ -21,7 +12,7 @@ const SLOTS: usize = 256;
 const RW: u64 = prot::READ | prot::WRITE;
 
 struct Ranges {
-    /// Plages libres triees par adresse, jamais adjacentes (fusionnees).
+    /// Free ranges sorted by address, never adjacent (merged).
     start: [usize; SLOTS],
     len: [usize; SLOTS],
     n: usize,
@@ -32,7 +23,7 @@ struct State {
     ranges: UnsafeCell<Ranges>,
 }
 
-// SAFETY: `ranges` n'est touche que sous `lock`.
+// SAFETY: `ranges` only touched under `lock`.
 unsafe impl Sync for State {}
 
 static STATE: State = State {
@@ -42,13 +33,13 @@ static STATE: State = State {
 
 fn with<R>(f: impl FnOnce(&mut Ranges) -> R) -> R {
     STATE.lock.lock();
-    // SAFETY: acces exclusif sous le verrou.
+    // SAFETY: exclusive access under the lock.
     let r = f(unsafe { &mut *STATE.ranges.get() });
     unsafe { STATE.lock.unlock() };
     r
 }
 
-/// Retire `need` octets en tete d'une plage libre (premiere qui convient).
+/// Pop `need` bytes off a free range (first fit).
 fn take(need: usize) -> Option<usize> {
     with(|r| {
         let i = (0..r.n).find(|&i| r.len[i] >= need)?;
@@ -65,7 +56,7 @@ fn take(need: usize) -> Option<usize> {
     })
 }
 
-/// Rend une plage libre (non projetee) a la liste.
+/// Return a free (unmapped) range to the list.
 pub fn record(start: usize, len: usize) {
     if len == 0 {
         return;
@@ -87,8 +78,8 @@ pub fn record(start: usize, len: usize) {
                 r.len[i] += len;
             }
             (false, false) => {
-                // Liste pleine : la plage est abandonnee (seule l'adresse est
-                // perdue, les pages sont deja rendues au noyau).
+                // List full: range dropped (only the address is lost;
+                // pages already went back to the kernel).
                 if r.n < SLOTS {
                     r.start.copy_within(i..r.n, i + 1);
                     r.len.copy_within(i..r.n, i + 1);
@@ -101,35 +92,27 @@ pub fn record(start: usize, len: usize) {
     })
 }
 
-/// Projette `len` octets en lecture/ecriture (pages a zero, allouees au
-/// premier acces), suivis d'une page de garde.
+/// Map `len` read/write bytes (zeroed demand pages) plus a guard page.
 pub fn map(len: usize) -> Option<*mut u8> {
     let len = len.checked_next_multiple_of(PAGE)?;
     if let Some(a) = take(len.checked_add(PAGE)?) {
         if syscall::mem_map_at(a as u64, len as u64, RW) >= 0 {
             return Some(a as *mut u8);
         }
-        // Ne devrait pas arriver : la plage est simplement oubliee.
+        // Should not happen: the range is just dropped.
     }
     let r = syscall::mem_map(len as u64, RW);
     if r < 0 { None } else { Some(r as *mut u8) }
 }
 
-/// Libere une projection obtenue par `map` (meme longueur), page de garde
-/// comprise.
-///
-/// # Safety
-/// Plus aucun acces a la zone ne doit suivre.
+/// Free a `map` mapping (same length) plus guard. # Safety: no further access.
 pub unsafe fn unmap(p: *mut u8, len: usize) {
     let len = len.next_multiple_of(PAGE);
     syscall::mem_unmap(p as u64, len as u64);
     record(p as usize, len + PAGE);
 }
 
-/// Retire `[start, start + len)` d'une projection et rend la plage.
-///
-/// # Safety
-/// Plus aucun acces a la zone ne doit suivre.
+/// Unmap `[start, start + len)` and recycle the range. # Safety: no further access.
 pub unsafe fn release(start: usize, len: usize) {
     if len > 0 {
         syscall::mem_unmap(start as u64, len as u64);

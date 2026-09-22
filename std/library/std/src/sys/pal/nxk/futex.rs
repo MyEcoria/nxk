@@ -1,5 +1,5 @@
-//! Futex du noyau (cles par adresse physique) : base de `Mutex`, `Condvar`,
-//! `RwLock`, `Once` et du parking des threads.
+//! Kernel futex (physical-address keys): backing for `Mutex`, `Condvar`,
+//! `RwLock`, `Once` and thread parking.
 
 use super::abi::err::ETIMEDOUT;
 use super::syscall;
@@ -16,20 +16,18 @@ pub type SmallFutex = Atomic<SmallPrimitive>;
 /// Must be the underlying type of SmallFutex
 pub type SmallPrimitive = u32;
 
-/// Attend un `futex_wake`, sauf si le futex ne vaut deja plus `expected`.
-///
-/// Rend false si le delai a expire, true dans tous les autres cas.
+/// Wait for `futex_wake` unless changed since `expected`; false on timeout.
 pub fn futex_wait(futex: &Atomic<u32>, expected: u32, timeout: Option<Duration>) -> bool {
     let r = syscall::futex_wait(futex, expected, super::timeout_ns(timeout));
     r != -ETIMEDOUT
 }
 
-/// Reveille un thread en attente ; rend true si un thread a ete reveille.
+/// Wake one waiter; true if one was woken.
 pub fn futex_wake(futex: &Atomic<u32>) -> bool {
     syscall::futex_wake(futex, 1) > 0
 }
 
-/// Reveille tous les threads en attente.
+/// Wake all waiters.
 pub fn futex_wake_all(futex: &Atomic<u32>) {
     syscall::futex_wake(futex, u32::MAX as u64);
 }

@@ -1,11 +1,5 @@
-//! Processus : lancement par le gestionnaire de processus (init), qui
-//! trouve le programme dans l'image de demarrage ou sur la carte SD
-//! (`/bin/NOM`, ou un chemin), puis attente et arret par le handle rendu.
-//!
-//! Entree et sorties : la console (heritee), rien (`null`), ou des tubes
-//! (`piped`, `io::pipe`, sortie d'un autre enfant) transmis au gestionnaire
-//! avec la requete. Un parent lui-meme redirige transmet ses propres tubes.
-//! Seule la redirection vers un fichier (`Stdio::from(File)`) manque.
+//! Spawned by the process manager (init) from boot image or SD; waited/killed via handle.
+//! Stdio: inherited console, null, or pipes forwarded to the manager (no `Stdio::from(File)`).
 
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
@@ -23,7 +17,6 @@ use crate::{fmt, io};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Command
-////////////////////////////////////////////////////////////////////////////////
 
 pub struct Command {
     program: OsString,
@@ -45,16 +38,16 @@ pub enum Stdio {
     ParentStderr,
     #[allow(dead_code)] // This variant exists only for the Debug impl
     InheritFile(File),
-    /// Tube existant : `io::pipe`, ou cote d'un tube d'un autre enfant.
+    /// Existing pipe: `io::pipe`, or one child's pipe end.
     Pipe(ChildPipe),
 }
 
-/// Flux standard du point de vue de l'enfant : 0 entree, 1 sortie, 2 erreurs.
+/// Child-side standard stream: 0 input, 1 output, 2 error.
 const PIPE_BITS: [u64; 3] = [spawn::STDIN_PIPE, spawn::STDOUT_PIPE, spawn::STDERR_PIPE];
 const NULL_BITS: [u64; 3] = [spawn::STDIN_NULL, spawn::STDOUT_NULL, spawn::STDERR_NULL];
 
-/// Ce que le processus courant a lui-meme recu pour le flux `k` : un tube
-/// (a transmettre tel quel), rien, ou la console (aucun drapeau).
+/// What this process itself got for stream `k`: a pipe (forward as-is),
+/// nothing, or the console (no flag).
 fn own_stream(k: usize) -> (u64, Option<u32>) {
     let f = startup_flags();
     let (pipe, null, h) = match k {
@@ -134,12 +127,12 @@ impl Command {
         self.cwd.as_ref().map(|cs| Path::new(cs))
     }
 
-    /// Chaines de lancement : arguments (le premier est le programme), puis
-    /// environnement « NOM=valeur » (dont `PWD`, le dossier courant).
+    /// Spawn strings: args (first is the program), then `NAME=value`
+    /// env (incl. `PWD`, the current dir).
     fn strings(&self) -> io::Result<(Vec<u8>, u32, u32)> {
         let mut data = Vec::new();
-        // Chemin relatif (« ./outil », « bin/x ») : absolu depuis le dossier
-        // courant, comme le fait le shell ; un nom seul est cherche par init.
+        // Relative path ("./tool", "bin/x"): made absolute from the current
+        // dir, like the shell does; a bare name is resolved by init.
         let prog = self.program.as_encoded_bytes();
         if prog.contains(&b'/') && !prog.starts_with(b"/") {
             data.extend_from_slice(crate::sys::fs::nxk_absolute(Path::new(&self.program))?.as_bytes());
@@ -171,13 +164,13 @@ impl Command {
         let envc = vars.len() as u32;
         for v in vars {
             if v.contains(&0) {
-                return Err(io::const_error!(io::ErrorKind::InvalidInput, "octet nul dans l'environnement"));
+                return Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte in env"));
             }
             data.extend_from_slice(&v);
             data.push(0);
         }
         if self.args.iter().any(|a| a.as_encoded_bytes().contains(&0)) {
-            return Err(io::const_error!(io::ErrorKind::InvalidInput, "octet nul dans un argument"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte in arg"));
         }
         Ok((data, self.args.len() as u32, envc))
     }
@@ -192,7 +185,7 @@ impl Command {
             return Err(io::Error::from_raw_os_error(ENOSYS as i32));
         }
         let (strings, argc, envc) = self.strings()?;
-        // Sans entree demandee (`output`), l'enfant lit un flux vide.
+        // With no input requested (`output`), the child reads empty input.
         let stdin_default = if needs_stdin { &default } else { &Stdio::Null };
         let cfgs = [
             self.stdin.as_ref().unwrap_or(stdin_default),
@@ -201,21 +194,20 @@ impl Command {
         ];
         let mut flags = 0u64;
         let mut grants: Vec<u32> = Vec::new();
-        // Cotes gardes par le parent, et cotes de l'enfant crees ici (fermes
-        // une fois transmis).
+        // Parent-kept ends, and child ends created here (closed once sent).
         let mut ours: [Option<ChildPipe>; 3] = [None, None, None];
         let mut theirs: Vec<ChildPipe> = Vec::new();
         for (k, cfg) in cfgs.into_iter().enumerate() {
             let (bits, handle) = match cfg {
                 Stdio::Inherit => own_stream(k),
-                // Sortie du parent : seulement pour les sorties de l'enfant.
+                // Parent output: only for child outputs.
                 Stdio::ParentStdout if k > 0 => own_stream(1),
                 Stdio::ParentStderr if k > 0 => own_stream(2),
                 Stdio::ParentStdout | Stdio::ParentStderr => (0, None),
                 Stdio::Null => (NULL_BITS[k], None),
                 Stdio::MakePipe => {
                     let (r, w) = crate::sys::pipe::pipe()?;
-                    // L'enfant lit son entree et ecrit ses sorties.
+                    // The child reads its input and writes its outputs.
                     let (child, parent) = if k == 0 { (r, w) } else { (w, r) };
                     let h = child.handle();
                     theirs.push(child);
@@ -224,14 +216,14 @@ impl Command {
                 }
                 Stdio::Pipe(p) => {
                     if p.is_reader() != (k == 0) {
-                        return Err(io::const_error!(io::ErrorKind::InvalidInput, "tube dans le mauvais sens"));
+                        return Err(io::const_error!(io::ErrorKind::InvalidInput, "pipe in wrong direction"));
                     }
                     (PIPE_BITS[k], Some(p.handle()))
                 }
                 Stdio::InheritFile(_) => return unsupported(),
             };
-            // Flux du parent d'une autre nature (sa sortie pour une entree) :
-            // on l'exprime avec les drapeaux du flux `k`.
+            // Parent stream of another kind (its output for an input):
+            // expressed with stream `k` flags.
             let bits = match bits {
                 0 => 0,
                 b if PIPE_BITS.contains(&b) => PIPE_BITS[k],
@@ -350,8 +342,8 @@ impl fmt::Debug for Command {
     }
 }
 
-/// Code de sortie rendu par le noyau (`process_exit`, ou 137 pour un
-/// processus tue, 134 pour un abandon).
+/// Exit code reported by the kernel (`process_exit`, or 137 for killed,
+/// 134 for abort).
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub struct ExitStatus(i64);
 
@@ -477,8 +469,8 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 
 pub type ChildPipe = crate::sys::pipe::Pipe;
 
-/// Lit les deux sorties d'un enfant en meme temps : un tube sans tampon
-/// bloquerait l'enfant sur l'une pendant qu'on attendrait l'autre.
+/// Read both child outputs at once: an unbuffered pipe would stall the
+/// child on one while waiting on the other.
 pub fn read_output(
     out: ChildPipe,
     stdout: &mut Vec<u8>,
@@ -490,7 +482,7 @@ pub fn read_output(
         err.read_to_end(&mut v).map(|_| v)
     })?;
     let r = out.read_to_end(stdout);
-    let e = h.join().map_err(|_| io::const_error!(io::ErrorKind::Other, "lecture des erreurs"))?;
+    let e = h.join().map_err(|_| io::const_error!(io::ErrorKind::Other, "stderr read"))?;
     stderr.extend_from_slice(&e?);
     r.map(|_| ())
 }

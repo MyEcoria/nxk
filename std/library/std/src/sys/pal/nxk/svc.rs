@@ -1,6 +1,4 @@
-//! Services du systeme : console et gestionnaire de processus (handles recus
-//! au demarrage), puis fichiers et reseau (trouves par le service de noms
-//! d'init au premier usage, et gardes).
+//! System services: console + process manager from startup; files/network via init lookup, cached.
 
 use super::abi::err::{ENOSYS, ETIMEDOUT};
 use super::abi::proto::pm;
@@ -17,13 +15,13 @@ pub fn set_console(h: u32) {
     CONSOLE.store(h, Ordering::Relaxed);
 }
 
-/// Endpoint du serveur console (0 : aucun, sortie par le noyau).
+/// Console server endpoint (0: none, kernel log fallback).
 pub fn console() -> u32 {
     CONSOLE.load(Ordering::Relaxed)
 }
 
-/// Entree standard et sortie d'erreurs (emplacements fournis par init aux
-/// programmes recents ; sinon la console, comme la sortie).
+/// Stdin and stderr (slots passed by init to recent
+/// programs; else the console, like stdout).
 pub fn stdin() -> u32 {
     if super::startup_flags() & super::abi::startup::HAS_STDIO != 0 { super::abi::slots::STDIN } else { console() }
 }
@@ -36,12 +34,12 @@ pub fn set_pm(h: u32) {
     PM.store(h, Ordering::Relaxed);
 }
 
-/// Endpoint du gestionnaire de processus (0 : aucun).
+/// Process manager endpoint (0: none).
 pub fn pm() -> u32 {
     PM.load(Ordering::Relaxed)
 }
 
-/// Appel a un service : un label de reponse non nul est un errno.
+/// Service call: a nonzero reply label is an errno.
 pub fn call(h: u32, m: &Msg) -> io::Result<Msg> {
     let r = ipc::call(h, m).map_err(|e| io::Error::from_raw_os_error((-e) as i32))?;
     if r.label() != 0 {
@@ -50,7 +48,7 @@ pub fn call(h: u32, m: &Msg) -> io::Result<Msg> {
     Ok(r)
 }
 
-/// Handle d'un service publie, en attendant sa publication au plus
+/// Published service handle, waiting for publication up to
 /// `timeout_ns`.
 fn lookup_wait(name: &str, timeout_ns: u64) -> io::Result<u32> {
     let h = pm();
@@ -92,12 +90,12 @@ fn cached(slot: &AtomicU32, name: &str, timeout_ns: u64) -> io::Result<u32> {
     }
     let h = lookup_wait(name, timeout_ns).map_err(|e| {
         if e.raw_os_error() == Some(ETIMEDOUT as i32) {
-            io::Error::new(io::ErrorKind::NotFound, "service absent")
+            io::Error::new(io::ErrorKind::NotFound, "service missing")
         } else {
             e
         }
     })?;
-    // Deux threads peuvent chercher en meme temps : un seul handle est garde.
+    // Two threads may race: only one handle is kept.
     match slot.compare_exchange(0, h, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Ok(h),
         Err(other) => {
@@ -107,12 +105,12 @@ fn cached(slot: &AtomicU32, name: &str, timeout_ns: u64) -> io::Result<u32> {
     }
 }
 
-/// Service de fichiers.
+/// File service.
 pub fn fs() -> io::Result<u32> {
     cached(&FS, "fs", 2_000_000_000)
 }
 
-/// Pile reseau.
+/// Network stack.
 pub fn net() -> io::Result<u32> {
     cached(&NET, "net", 3_000_000_000)
 }

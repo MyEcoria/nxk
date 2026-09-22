@@ -1,5 +1,5 @@
-//! Chemins du processus. Le dossier courant est la variable `PWD` (convention
-//! du shell nxk, transmise aux programmes lances) ; « / » par defaut.
+//! Process paths. The current dir is the `PWD` var (nxk shell convention,
+//! passed to spawned programs); `/` by default.
 
 use crate::ffi::{OsStr, OsString};
 use crate::path::{self, Path, PathBuf};
@@ -22,7 +22,7 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
     unsafe { crate::sys::env::setenv(OsStr::new("PWD"), OsStr::new(&abs)) }
 }
 
-/// Liste « a:b:c » (comme `PATH` sous Unix).
+/// `a:b:c` list (like Unix `PATH`).
 pub struct SplitPaths<'a> {
     rest: Option<&'a [u8]>,
 }
@@ -75,8 +75,8 @@ impl fmt::Display for JoinPathsError {
 impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
-    // Le noyau ne garde pas le chemin de l'executable ; le premier argument
-    // est ce que le lanceur a demande (nom de l'image de demarrage ou chemin).
+    // The kernel keeps no exe path; argv[0] is what the launcher asked
+    // (boot image name or path).
     match crate::env::args_os().next() {
         Some(a) if a.as_encoded_bytes().starts_with(b"/") => Ok(PathBuf::from(a)),
         Some(a) => Ok(PathBuf::from(format!("/bin/{}", a.to_string_lossy()))),

@@ -1,14 +1,4 @@
-/* Programmes Rust (std) pour nxk : executables statiques independants de la
-   position (static-PIE), lies a partir de 0. Le chargeur du noyau choisit une
-   base aleatoire (ASLR) et applique les relocations R_AARCH64_RELATIVE.
-
-   Chaque groupe de sections commence sur une page pour recevoir ses propres
-   droits : code RX, constantes et donnees relogees R (RELRO complet : le noyau
-   les ecrit par adresse physique avant le demarrage), donnees RW. Le noyau
-   impose W^X et refuse deux segments dans une meme page.
-
-   Ce script est recopie dans la cible aarch64-unknown-nxk.json par
-   tools/mkstd.py (champ link-script). */
+/* Rust (std) programs for nxk: static-PIE linked from 0; the kernel picks a random base (ASLR). Page-aligned groups: RX code, R rodata (kernel-relocated RELRO), RW data. Copied into the target JSON by tools/mkstd.py. */
 ENTRY(_start)
 
 PHDRS

@@ -1,8 +1,5 @@
-//! Fichiers : client du service « fs » (FAT32 sur la carte SD).
-//!
-//! Le service ne connait que des chemins absolus en UTF-8 et des lectures et
-//! ecritures positionnees : les chemins relatifs partent du dossier courant
-//! (`PWD`), et chaque `File` tient sa propre position.
+//! Client of the `fs` service (FAT32 on SD): absolute UTF-8 paths, positioned I/O.
+//! Relative paths resolve from `PWD`; each `File` holds its own position.
 
 use crate::ffi::OsString;
 use crate::fmt;
@@ -18,7 +15,7 @@ use crate::sys::pal::ipc::{self, Msg};
 use crate::sys::pal::{svc, unsupported};
 use crate::sys::time::SystemTime;
 
-/// Longueur maximale d'un chemin accepte par le service.
+/// Max path length accepted by the service.
 const MAX_PATH: usize = 2047;
 
 fn err(e: i64) -> io::Error {
@@ -29,12 +26,12 @@ fn call(m: &Msg) -> io::Result<Msg> {
     svc::call(svc::fs()?, m)
 }
 
-/// Chemin absolu normalise (« . » et « .. » resolus), en UTF-8.
+/// Normalized absolute path (`.` and `..` resolved), UTF-8.
 pub fn absolute(p: &Path) -> io::Result<String> {
     let s = p
         .as_os_str()
         .to_str()
-        .ok_or(io::const_error!(io::ErrorKind::InvalidFilename, "chemin non UTF-8"))?;
+        .ok_or(io::const_error!(io::ErrorKind::InvalidFilename, "non-UTF-8 path"))?;
     let cwd;
     let mut parts: Vec<&str> = Vec::new();
     if !s.starts_with('/') {
@@ -70,7 +67,7 @@ fn path_call(label: u32, p: &Path) -> io::Result<Msg> {
     call(&ipc::pack(label, a.as_bytes()).0)
 }
 
-// ------------------------------------------------------------ metadonnees ---
+// ---------------------------------------------------------------- metadata ---
 
 #[derive(Clone)]
 pub struct FileAttr {
@@ -124,8 +121,8 @@ impl FilePermissions {
     }
 }
 
-/// FAT n'a pas de droits : seule la lecture seule pourrait s'exprimer, et le
-/// service ne la gere pas.
+/// FAT has no permissions: only readonly could apply, and the service
+/// does not support it.
 fn apply_perm(perm: &FilePermissions) -> io::Result<()> {
     if perm.readonly { unsupported() } else { Ok(()) }
 }
@@ -157,10 +154,10 @@ impl FileType {
     }
 }
 
-// ---------------------------------------------------------------- dossiers ---
+// ------------------------------------------------------------------- dirs ---
 
-/// Contenu d'un dossier, lu en entier a l'ouverture : une suppression pendant
-/// le parcours ne decale pas les entrees restantes.
+/// Directory content, fully read at open: deleting during iteration does
+/// not shift remaining entries.
 pub struct ReadDir {
     dir: PathBuf,
     entries: crate::vec::IntoIter<(String, FileAttr)>,
@@ -218,7 +215,7 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
         let attr = FileAttr { size: r.mr[0], kind: r.mr[1], mtime: r.mr[2] };
         entries.push((String::from_utf8_lossy(&name[..n]).into_owned(), attr));
     }
-    // Chemin tel que l'appelant l'a donne (comme sous Unix).
+    // Path as the caller gave it (as on Unix).
     Ok(ReadDir { dir: p.to_path_buf(), entries: entries.into_iter() })
 }
 
@@ -235,7 +232,7 @@ impl DirBuilder {
     }
 }
 
-// ---------------------------------------------------------------- fichiers ---
+// ------------------------------------------------------------------ files ---
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -271,7 +268,7 @@ impl OpenOptions {
         self.create_new = create_new;
     }
 
-    /// Drapeaux du service, avec les memes refus que sous Unix.
+    /// Service flags, with the same rejections as Unix.
     fn flags(&self) -> io::Result<u64> {
         let writes = self.write || self.append;
         if !self.read && !writes {
@@ -301,7 +298,7 @@ impl OpenOptions {
 
 pub struct File {
     fd: u64,
-    /// Position partagee par les copies (`try_clone`), comme sous Unix.
+    /// Position shared by clones (`try_clone`), as on Unix.
     pos: Arc<AtomicU64>,
     append: bool,
     path: String,
@@ -355,7 +352,7 @@ impl File {
         call(&Msg::words(proto::TRUNCATE, &[self.fd, size])).map(|_| ())
     }
 
-    /// Lecture positionnee, par morceaux de `MAX_IO` octets.
+    /// Positioned read, in `MAX_IO`-byte chunks.
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
         let mut done = 0;
         while done < buf.len() {
@@ -400,7 +397,7 @@ impl File {
             let head = [self.fd, pos + done as u64];
             let w = match call(&ipc::pack_at(proto::WRITE, &head, &data[done..end]).0) {
                 Ok(r) => r.mr[0] as usize,
-                // Ecriture partielle deja faite : on la rend, comme POSIX.
+                // Partial write already done: report it, like POSIX.
                 Err(_) if done > 0 => break,
                 Err(e) => return Err(e),
             };
@@ -473,7 +470,7 @@ impl fmt::Debug for File {
     }
 }
 
-// --------------------------------------------------------------- chemins ---
+// ------------------------------------------------------------------ paths ---
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     path_call(proto::UNLINK, p).map(|_| ())

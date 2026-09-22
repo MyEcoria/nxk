@@ -1,6 +1,4 @@
-//! Environnement : les variables « NOM=valeur » du bloc de demarrage, copiees
-//! au premier usage puis modifiables. Le dossier courant est la variable
-//! `PWD`, comme pour le shell et les autres programmes nxk.
+//! `NAME=value` env from the startup block (copy-on-first-use); current dir is `PWD`.
 
 pub use super::common::Env;
 use crate::ffi::{OsStr, OsString};
@@ -62,7 +60,7 @@ pub unsafe fn unsetenv(key: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-/// Environnement sous forme « NOM=valeur » (pour lancer un programme).
+/// `NAME=value` environment (for spawning a program).
 pub fn pairs() -> Vec<Vec<u8>> {
     with(|v| {
         v.iter()
