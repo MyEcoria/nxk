@@ -687,6 +687,9 @@ pub mod proto {
         /// Fuse controller, STATUS only (`ST_POWERED`: fuses visible).
         /// Read fuses only at `ST_READY`.
         pub const FUSE: u64 = 23;
+        /// PCIe root complex: PCIe partition ungated, PLLE up, AFI,
+        /// PCIE and PCIEXCLK clocks out of reset.
+        pub const PCIE: u64 = 24;
     }
     /// I2C bus.
     pub mod i2c {
@@ -707,6 +710,9 @@ pub mod proto {
         pub const SYNC_TIME: u32 = 4;
         /// word 0 = 1: SD card I/O rail (PMIC LDO2) on at 3.3 V; 0: off.
         pub const SD_POWER: u32 = 5;
+        /// word 0 = 1: PCIe/XUSB rail (PMIC LDO1) on at 1.05 V; 0: off.
+        /// Powers the UPHY lanes the Wi-Fi chip sits on.
+        pub const PCIE_POWER: u32 = 6;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {
@@ -780,6 +786,43 @@ pub mod proto {
         pub const SEND: u32 = 2;
         /// Wait for a frame (word 0 = timeout ns, 0: no limit).
         pub const RECV: u32 = 3;
+    }
+    /// Wi-Fi station control (`wlan` driver). The link itself is the
+    /// `eth` protocol published as "wlan0".
+    pub mod wifi {
+        /// Look for networks. word 0 = timeout ns (0: default).
+        /// Reply: word 0 = network count, then bytes (see `pack_at`):
+        /// that many records, each `RECORD` bytes plus its SSID.
+        pub const SCAN: u32 = 1;
+        /// Join a network. word 0 = timeout ns (0: default); bytes =
+        /// SSID, a 0 byte, then the passphrase (empty: open network).
+        /// Replies once associated, or with the failure.
+        pub const CONNECT: u32 = 2;
+        /// Leave the current network.
+        pub const DISCONNECT: u32 = 3;
+        /// Reply: words = state (`ST_*`), channel, signal (-dBm, 0 =
+        /// unknown), MAC (low 6 bytes); bytes = current SSID.
+        pub const STATUS: u32 = 4;
+        /// No adapter: no PCIe device, or its firmware is missing.
+        pub const ST_DOWN: u64 = 0;
+        pub const ST_IDLE: u64 = 1;
+        pub const ST_SCANNING: u64 = 2;
+        pub const ST_CONNECTING: u64 = 3;
+        pub const ST_CONNECTED: u64 = 4;
+        /// Scan record head: SSID length, channel, security (`SEC_*`),
+        /// signal (-dBm), 6 BSSID bytes; the SSID follows.
+        pub const RECORD: usize = 10;
+        pub const SEC_OPEN: u8 = 0;
+        pub const SEC_WEP: u8 = 1;
+        pub const SEC_WPA: u8 = 2;
+        pub const SEC_WPA2: u8 = 3;
+        pub const SEC_WPA3: u8 = 4;
+        /// Longest SSID (802.11).
+        pub const MAX_SSID: usize = 32;
+        /// One endpoint, two names: the badge tells the link apart from
+        /// the control channel (the labels of both protocols overlap).
+        pub const BADGE_LINK: u64 = 1;
+        pub const BADGE_CTRL: u64 = 2;
     }
     /// TCP/IP stack (IPv4). 32-bit addresses, `a.b.c.d` = `a << 24 | ...`
     /// (like `u32::from(Ipv4Addr)`). Timeouts in ns (0: no limit).
