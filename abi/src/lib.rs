@@ -1,22 +1,10 @@
-//! Interface binaire du micro-noyau nxk.
-//!
-//! Partage par le noyau et par les programmes utilisateur : numeros d'appels
-//! systeme, codes d'erreur, droits, disposition memoire et formats d'echange.
-//! Une seule source de verite, pour que les deux cotes ne puissent pas diverger.
-//!
-//! Conventions d'appel, identiques a Linux arm64 : `svc #0`, numero dans `x8`,
-//! arguments dans `x0`-`x5`, resultat dans `x0`, erreur sous forme de `-errno`.
-//! Les appels IPC utilisent en plus `x1`-`x7` pour le message, et rendent
-//! l'insigne de l'emetteur dans `x8`, un jeton de reponse dans `x9` et le
-//! pid de l'emetteur dans `x10` (0 pour une notification).
+//! nxk ABI: syscalls, errors, rights, layout, formats.
+//! Linux arm64 convention (`svc #0`); IPC uses `x1`-`x7`, returns badge/token/pid.
 
 #![no_std]
 
-/// Numeros d'appels systeme.
-///
-/// Attentes bornees : les appels bloquants prennent un delai relatif en
-/// nanosecondes (`timeout::INFINITE` = 0 : sans limite). Un delai echu avant
-/// meme de bloquer fait echouer l'appel avec `-ETIMEDOUT` (`timeout::POLL`).
+/// Syscall numbers; blocking calls take a timeout in ns.
+/// (`timeout::INFINITE` = 0: no limit; `timeout::POLL` fails fast).
 pub mod sys {
     pub const NOP: u64 = 0;
     pub const DEBUG_WRITE: u64 = 1;
@@ -24,57 +12,57 @@ pub mod sys {
     pub const THREAD_EXIT: u64 = 3;
     pub const PROCESS_EXIT: u64 = 4;
     pub const SLEEP: u64 = 5;
-    /// clock(id) : `clock::MONOTONIC` ou `clock::REALTIME`, en ns.
+    /// clock(id): `clock::MONOTONIC` or `clock::REALTIME`, in ns.
     pub const CLOCK: u64 = 6;
     pub const GETCPU: u64 = 7;
-    /// getrandom(buf, len) : octets aleatoires (ChaCha20 du noyau) ; rend le
-    /// nombre d'octets ecrits (au plus 64 KiB par appel).
+    /// getrandom(buf, len): random bytes (kernel ChaCha20);
+    /// returns bytes written (at most 64 KiB per call).
     pub const GETRANDOM: u64 = 8;
-    /// clock_set(sysctl, id, ns) : regle l'heure murale (capacite SysControl).
+    /// clock_set(sysctl, id, ns): set wall clock (SysControl capability).
     pub const CLOCK_SET: u64 = 9;
 
     pub const HANDLE_CLOSE: u64 = 10;
     pub const HANDLE_DUP: u64 = 11;
-    /// handle_revoke(h) : invalide toutes les autres capacites designant le
-    /// meme objet (endpoint, notification) ; rend un handle neuf. Droit CONTROL.
+    /// handle_revoke(h): invalidate all other capabilities to the same
+    /// object; returns a fresh handle. Requires CONTROL.
     pub const HANDLE_REVOKE: u64 = 12;
-    /// getpid(process) : identifiant du processus designe par un handle, ou
-    /// du processus appelant (0).
+    /// getpid(process): id of the process named by a handle,
+    /// or of the caller (0).
     pub const GETPID: u64 = 13;
-    /// gettid() : identifiant du thread appelant (celui du debogage).
+    /// gettid(): id of the calling thread (used for debugging).
     pub const GETTID: u64 = 14;
 
     pub const MEM_MAP: u64 = 20;
     pub const MEM_UNMAP: u64 = 21;
     pub const MMIO_MAP: u64 = 22;
     pub const MMIO_DERIVE: u64 = 23;
-    /// mem_protect(addr, len, prot) : change les droits de pages projetees.
+    /// mem_protect(addr, len, prot): change rights of mapped pages.
     pub const MEM_PROTECT: u64 = 24;
-    /// shm_create(len, flags) : objet de memoire partagee (`shm::*`).
+    /// shm_create(len, flags): shared-memory object (`shm::*`).
     pub const SHM_CREATE: u64 = 25;
-    /// shm_map(h, addr, prot) : projette tout l'objet (addr 0 = choix du noyau).
+    /// shm_map(h, addr, prot): map the whole object (addr 0 = kernel picks).
     pub const SHM_MAP: u64 = 26;
-    /// shm_paddr(h, offset) : adresse physique d'une page (droit DMA).
+    /// shm_paddr(h, offset): physical address of a page (DMA right).
     pub const SHM_PADDR: u64 = 27;
 
     pub const THREAD_CREATE: u64 = 30;
-    /// thread_set(h, what, value) : `thread::SET_*` ; h = 0 : thread courant.
+    /// thread_set(h, what, value): `thread::SET_*`; h = 0: current thread.
     pub const THREAD_SET: u64 = 31;
 
-    /// futex_wait(addr, val, timeout) : bloque si `*addr == val` (32 bits).
-    /// Cle = adresse physique : fonctionne aussi en memoire partagee.
+    /// futex_wait(addr, val, timeout): block while `*addr == val` (32 bits).
+    /// Key is the physical address, so shared memory works.
     pub const FUTEX_WAIT: u64 = 35;
-    /// futex_wake(addr, n) : reveille jusqu'a n attentes ; rend leur nombre.
+    /// futex_wake(addr, n): wake up to n waiters; returns count.
     pub const FUTEX_WAKE: u64 = 36;
 
     pub const PROCESS_SPAWN: u64 = 40;
-    /// process_wait(h, timeout) : code de sortie.
+    /// process_wait(h, timeout): exit code.
     pub const PROCESS_WAIT: u64 = 41;
     pub const PROCESS_KILL: u64 = 42;
 
-    /// endpoint_create(flags) : `endpoint::PIPE` pour un tube.
+    /// endpoint_create(flags): `endpoint::PIPE` for a pipe.
     pub const ENDPOINT_CREATE: u64 = 50;
-    /// Les appels IPC bloquants lisent leur delai dans x9.
+    /// Blocking IPC calls read their timeout from x9.
     pub const IPC_CALL: u64 = 51;
     pub const IPC_SEND: u64 = 52;
     pub const IPC_RECV: u64 = 53;
@@ -93,69 +81,65 @@ pub mod sys {
     pub const IRQ_ACK: u64 = 72;
 
     pub const SYSINFO: u64 = 80;
-    /// system_power(sysctl, cmd) : `power::REBOOT` ou `power::OFF`. Sans
-    /// moniteur (PSCI), l'extinction passe par le PMIC : service utilisateur.
+    /// system_power(sysctl, cmd): `power::REBOOT` or `power::OFF`.
+    /// Without a PSCI monitor, power-off goes through the PMIC.
     pub const SYSTEM_POWER: u64 = 81;
 
-    /// debug_attach(process, endpoint) : les fautes et points d'arret du
-    /// processus deviennent des messages sur l'endpoint (droit CONTROL).
+    /// debug_attach(process, endpoint): faults and breakpoints of the
+    /// process become messages on the endpoint (CONTROL right).
     pub const DEBUG_ATTACH: u64 = 90;
-    /// debug_regs(process, tid, buf, write) : lit/ecrit `debug::Regs`.
+    /// debug_regs(process, tid, buf, write): read/write `debug::Regs`.
     pub const DEBUG_REGS: u64 = 91;
     /// debug_mem(process, addr, buf, len | write << 63).
     pub const DEBUG_MEM: u64 = 92;
-    /// debug_threads(process, buf, max) : identifiants des threads.
+    /// debug_threads(process, buf, max): thread ids.
     pub const DEBUG_THREADS: u64 = 93;
-    /// debug_stop(process, tid) : arrete un thread (0 : tous) ; chacun produit
-    /// un evenement STOP. Sans debogueur, les threads restent arretes jusqu'a
-    /// l'attachement.
+    /// debug_stop(process, tid): stop a thread (0: all); each one
+    /// produces a STOP event. Without a debugger they stay stopped.
     pub const DEBUG_STOP: u64 = 94;
 }
 
-/// Drapeaux de `endpoint_create`.
+/// Flags for `endpoint_create`.
 pub mod endpoint {
-    /// Tube : un ecrivain (handle SEND sans RECV) envoie ses donnees par
-    /// `ipc_call` (etiquette `proto::console::WRITE`), un lecteur (handle
-    /// RECV) les recoit. Quand il ne reste plus aucun ecrivain, la reception
-    /// rend -EPIPE : fin du flux. Sans lecteur, l'envoi rend -EPIPE.
+    /// Pipe: writer (SEND-only) sends via `ipc_call`, reader (RECV)
+    /// receives. No writers left: receive gives -EPIPE; no reader: send.
     pub const PIPE: u64 = 1 << 0;
 }
 
-/// Delais des appels bloquants (nanosecondes relatives).
+/// Timeouts for blocking calls (relative nanoseconds).
 pub mod timeout {
     pub const INFINITE: u64 = 0;
-    /// Ne pas attendre : echec immediat (-ETIMEDOUT) si l'appel devait bloquer.
+    /// Do not wait: fail immediately (-ETIMEDOUT) if it would block.
     pub const POLL: u64 = 1;
 }
 
-/// Commandes de `system_power`.
+/// Commands for `system_power`.
 pub mod power {
     pub const OFF: u64 = 0;
     pub const REBOOT: u64 = 1;
 }
 
-/// Horloges de `clock`.
+/// Clocks for `clock`.
 pub mod clock {
-    /// Temps depuis le demarrage, jamais ajuste.
+    /// Time since boot, never adjusted.
     pub const MONOTONIC: u64 = 0;
-    /// Heure murale (ns depuis 1970), reglee par le service d'horloge.
+    /// Wall time (ns since 1970), set by the clock service.
     pub const REALTIME: u64 = 1;
 }
 
-/// Drapeaux de `shm_create`.
+/// Flags for `shm_create`.
 pub mod shm {
-    /// Pages physiquement contigues (tampons DMA sans IOMMU), 4 MiB au plus.
+    /// Physically contiguous pages (DMA buffers without IOMMU), max 4 MiB.
     pub const CONTIGUOUS: u64 = 1 << 0;
-    /// Projection non cachee (Normal-NC) : coherente avec les peripheriques
-    /// qui ne sondent pas les caches du processeur.
+    /// Uncached mapping (Normal-NC): coherent with devices that
+    /// do not snoop CPU caches.
     pub const UNCACHED: u64 = 1 << 1;
-    /// Pages sous 4 GiB (peripheriques a adressage DMA sur 32 bits).
+    /// Pages below 4 GiB (32-bit DMA devices).
     pub const DMA32: u64 = 1 << 2;
 }
 
-/// Codes d'erreur : valeurs errno de Linux, renvoyees en negatif. Les
-/// services (fichiers, reseau) utilisent les memes, si bien que la
-/// bibliotheque standard retrouve ses `ErrorKind` habituels.
+/// Error codes: Linux errno values, returned negated. File and network
+/// services reuse them so std maps them to its usual `ErrorKind`s.
 pub mod err {
     pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
@@ -219,7 +203,7 @@ pub mod err {
     pub const EHOSTUNREACH: i64 = 113;
     pub const EALREADY: i64 = 114;
     pub const EINPROGRESS: i64 = 115;
-    /// Synonyme de EAGAIN, comme sous Linux.
+    /// Same as EAGAIN, as on Linux.
     pub const EWOULDBLOCK: i64 = EAGAIN;
 
     pub fn name(e: i64) -> &'static str {
@@ -291,65 +275,63 @@ pub mod err {
     }
 }
 
-/// Droits portes par un handle.
+/// Rights carried by a handle.
 pub mod rights {
     pub const SEND: u16 = 1 << 0;
     pub const RECV: u16 = 1 << 1;
-    /// Le handle peut etre transmis a un autre processus (IPC, spawn).
+    /// Handle may be transferred to another process (IPC, spawn).
     pub const GRANT: u16 = 1 << 2;
     pub const DUP: u16 = 1 << 3;
     pub const MAP: u16 = 1 << 4;
     pub const SIGNAL: u16 = 1 << 5;
     pub const WAIT: u16 = 1 << 6;
     pub const KILL: u16 = 1 << 7;
-    /// Adresses physiques d'une memoire partagee (programmation DMA).
+    /// Physical addresses of shared memory (DMA setup).
     pub const DMA: u16 = 1 << 8;
-    /// Controle : reglages d'un thread, debogage d'un processus, revocation.
+    /// Control: thread settings, process debugging, revocation.
     pub const CONTROL: u16 = 1 << 9;
-    /// Memoire partagee : projection en ecriture autorisee.
+    /// Shared memory: writable mapping allowed.
     pub const WRITE: u16 = 1 << 10;
     pub const ALL: u16 = 0x7FF;
 }
 
-/// Protections de `mem_map`.
+/// Protections for `mem_map`.
 pub mod prot {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const EXEC: u64 = 4;
-    /// Alloue les pages tout de suite (sinon : au premier acces, comme mmap).
+    /// Allocate pages immediately (otherwise: on first access, like mmap).
     pub const POPULATE: u64 = 1 << 8;
 }
 
-/// Disposition de l'espace d'adressage utilisateur (VA sur 39 bits).
-///
-/// Tout ce qui est sous `USER_MIN` appartient au noyau (vue identite de la
-/// memoire physique) et reste inaccessible depuis EL0.
+/// User layout (39-bit VA); below `USER_MIN` is the kernel view.
+/// That region is inaccessible from EL0.
 pub mod layout {
     pub const PAGE_SIZE: u64 = 4096;
-    /// Les 16 premiers GiB sont la vue identite du noyau (DRAM jusqu'a 14 GiB).
+    /// First 16 GiB are the kernel identity view (DRAM up to 14 GiB).
     pub const USER_MIN: u64 = 0x0000_0004_0000_0000; // 16 GiB
     pub const USER_MAX: u64 = 0x0000_0080_0000_0000; // 512 GiB
-    pub const TEXT_BASE: u64 = 0x0000_0010_0000_0000; // code des programmes
-    pub const HEAP_BASE: u64 = 0x0000_0020_0000_0000; // mem_map sans adresse
+    pub const TEXT_BASE: u64 = 0x0000_0010_0000_0000; // program code
+    pub const HEAP_BASE: u64 = 0x0000_0020_0000_0000; // address-less mem_map
     pub const HEAP_END: u64 = 0x0000_0040_0000_0000;
-    pub const MMIO_BASE: u64 = 0x0000_0040_0000_0000; // registres de peripheriques
+    pub const MMIO_BASE: u64 = 0x0000_0040_0000_0000; // device registers
     pub const MMIO_END: u64 = 0x0000_0060_0000_0000;
-    pub const BOOTFS_BASE: u64 = 0x0000_0060_0000_0000; // image de demarrage (init)
-    pub const UTCB_BASE: u64 = 0x0000_007E_0000_0000; // une page par thread
-    pub const STACK_TOP: u64 = 0x0000_007F_F000_0000; // pile du thread principal
+    pub const BOOTFS_BASE: u64 = 0x0000_0060_0000_0000; // boot image (init)
+    pub const UTCB_BASE: u64 = 0x0000_007E_0000_0000; // one page per thread
+    pub const STACK_TOP: u64 = 0x0000_007F_F000_0000; // main thread stack
     pub const STACK_SIZE: u64 = 256 * 1024;
     pub const MAX_THREADS_PER_PROCESS: usize = 4096;
 }
 
-/// Etiquette de message : `[0:31]` label, `[32:41]` longueur en mots,
-/// `[42:44]` nombre de handles, `[48:63]` drapeaux.
+/// Message tag: `[0:31]` label, `[32:41]` word length,
+/// `[42:44]` handle count, `[48:63]` flags.
 pub mod tag {
-    /// Mots transportes dans les registres x2-x7.
+    /// Words carried in registers x2-x7.
     pub const REG_WORDS: usize = 6;
-    /// Longueur maximale d'un message (registres + UTCB).
+    /// Longest message (registers + UTCB).
     pub const MAX_WORDS: usize = super::utcb::MR_WORDS;
     pub const MAX_HANDLES: usize = 4;
-    /// Message synthetique : une notification liee au thread a ete signalee.
+    /// Synthetic message: a notification bound to the thread fired.
     pub const FLAG_NOTIFY: u64 = 1 << 48;
 
     #[inline(always)]
@@ -374,18 +356,17 @@ pub mod tag {
     }
 }
 
-/// Page de controle propre a chaque thread (UTCB), projetee en lecture/ecriture
-/// dans son processus et lue par le noyau via la memoire physique. Son adresse
-/// est dans `TPIDRRO_EL0`, lisible depuis EL0 sans appel systeme.
+/// Per-thread control page (UTCB), mapped in its process and read by
+/// the kernel via physical memory. Address is in `TPIDRRO_EL0`.
 pub mod utcb {
-    /// Registres de message. Les 6 premiers voyagent dans x2-x7 ; le noyau ne
-    /// recopie depuis la page que les mots 6 et suivants.
+    /// Message registers. The first 6 travel in x2-x7; the kernel
+    /// only copies words 6 and up from the page.
     pub const MR_WORDS: usize = 504;
 
     #[repr(C, align(4096))]
     pub struct Utcb {
         pub mr: [u64; MR_WORDS],
-        /// Handles a transmettre (envoi) ou recus (reception).
+        /// Handles to send (send) or received (receive).
         pub handles: [u32; super::tag::MAX_HANDLES],
         pub _reserved: [u64; 6],
     }
@@ -393,7 +374,7 @@ pub mod utcb {
     const _: () = assert!(core::mem::size_of::<Utcb>() == 4096);
 }
 
-/// Arguments de `process_spawn`, passes par pointeur (comme `clone3`).
+/// Args for `process_spawn`, passed by pointer (like `clone3`).
 pub mod spawn {
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -402,35 +383,32 @@ pub mod spawn {
         pub elf_len: u64,
         pub name_ptr: u64,
         pub name_len: u64,
-        /// Tableau de `HandleGrant` : handles copies dans le nouveau processus.
+        /// Array of `HandleGrant`: handles copied into the new process.
         pub grants_ptr: u64,
         pub grants_len: u64,
-        /// Valeurs recues dans x0 / x1 par le point d'entree.
+        /// Values received in x0 / x1 by the entry point.
         pub arg0: u64,
         pub arg1: u64,
-        /// 0 = priorite par defaut.
+        /// 0 = default priority.
         pub prio: u32,
-        /// -1 = choix du noyau.
+        /// -1 = kernel picks.
         pub cpu: i32,
-        /// Arguments puis environnement : `argc + envc` chaines terminees par
-        /// NUL, a la suite (64 KiB au plus). Recopies dans le bloc de
-        /// demarrage du nouveau processus.
+        /// Args then environment: `argc + envc` NUL-terminated strings
+        /// back to back (64 KiB max).
         pub strings_ptr: u64,
         pub strings_len: u64,
         pub argc: u32,
         pub envc: u32,
-        /// `SUSPENDED` : le thread principal attend un debogueur.
+        /// `SUSPENDED`: main thread waits for a debugger.
         pub flags: u64,
     }
 
-    /// Demarrage suspendu : le premier thread s'arrete avant sa premiere
-    /// instruction, jusqu'a l'attachement d'un debogueur.
+    /// Suspended start: first thread stops before its first
+    /// instruction until a debugger attaches.
     pub const SUSPENDED: u64 = 1 << 0;
 
-    // Entrees et sorties d'un programme lance par le gestionnaire (drapeaux
-    // de `proto::pm::SPAWN`). Un tube est transmis avec la requete (dans
-    // l'ordre entree, sortie, erreurs) : lecteur (RECV) pour l'entree,
-    // ecrivain (SEND) pour les sorties. Sinon : la console, ou rien (NULL).
+    // stdio of a manager-spawned program (`proto::pm::SPAWN` flags):
+    // one pipe for stdin/stdout/stderr, else console or nothing.
     pub const STDIN_PIPE: u64 = 1 << 8;
     pub const STDOUT_PIPE: u64 = 1 << 9;
     pub const STDERR_PIPE: u64 = 1 << 10;
@@ -446,17 +424,17 @@ pub mod spawn {
     }
 }
 
-/// Drapeaux de `thread_create` et reglages de `thread_set`.
+/// Flags for `thread_create` and settings for `thread_set`.
 pub mod thread {
     pub const DEFAULT_PRIO: u8 = 16;
-    /// Plus basse priorite utilisable (0 = la plus haute, reservee au noyau).
+    /// Lowest usable priority (0 = highest, reserved for the kernel).
     pub const MAX_PRIO: u8 = 30;
-    /// thread_set : priorite (1..=30 ; 0 = defaut).
+    /// thread_set: priority (1..=30; 0 = default).
     pub const SET_PRIO: u64 = 0;
-    /// thread_set : coeur impose (0..=3), ou `ANY_CPU`.
+    /// thread_set: pinned core (0..=3), or `ANY_CPU`.
     pub const SET_AFFINITY: u64 = 1;
     pub const ANY_CPU: u64 = u64::MAX;
-    /// `prio` 0 = defaut ; `cpu` None = choix du noyau.
+    /// `prio` 0 = default; `cpu` None = kernel picks.
     pub const fn flags(prio: u8, cpu: Option<u8>) -> u64 {
         let c = match cpu {
             Some(c) => c as u64 + 1,
@@ -466,57 +444,56 @@ pub mod thread {
     }
 }
 
-/// Emplacements des handles transmis au demarrage (convention d'amorcage).
+/// Slots of handles handed out at startup (boot convention).
 pub mod slots {
     // init
     pub const INIT_IRQ_CONTROL: u32 = 1;
     pub const INIT_MMIO_ROOT: u32 = 2;
-    /// Controle du systeme : heure murale.
+    /// System control: wall clock.
     pub const INIT_SYSCTL: u32 = 3;
-    // applications lancees par init
-    /// Sortie standard (la console, ou un tube).
+    // init-spawned applications
+    /// Standard output (console, or a pipe).
     pub const CONSOLE: u32 = 2;
     pub const PM: u32 = 3;
-    /// Entree standard (`startup::HAS_STDIO`) : la console, ou un tube.
+    /// Standard input (`startup::HAS_STDIO`): console, or a pipe.
     pub const STDIN: u32 = 4;
-    /// Sortie d'erreurs (`startup::HAS_STDIO`) : la console, ou un tube.
+    /// Standard error (`startup::HAS_STDIO`): console, or a pipe.
     pub const STDERR: u32 = 5;
-    // pilote console (lance a part)
+    // console driver (spawned separately)
     pub const DRV_SERVICE: u32 = 2;
     pub const DRV_MMIO: u32 = 3;
     pub const DRV_IRQ: u32 = 4;
-    /// Autres pilotes : console et gestionnaire comme une application, puis
-    /// leurs ressources a partir d'ici : pages de registres, interruptions,
-    /// controle du systeme, dans l'ordre de la table des pilotes d'init.
+    /// Other drivers: resources from here (registers, IRQs, sysctl)
+    /// in init's driver-table order.
     pub const DEV_BASE: u32 = 8;
 }
 
-/// Demarrage d'un processus : x0 = drapeaux, x1 = argument libre du lanceur,
-/// x2 = adresse du bloc de demarrage (en haut de la pile principale).
+/// Process startup: x0 = flags, x1 = launcher-provided argument,
+/// x2 = address of the startup block (top of the main stack).
 pub mod startup {
     pub const HAS_CONSOLE: u64 = 1 << 0;
     pub const HAS_PM: u64 = 1 << 1;
-    /// Premier processus : x1 = taille de l'image de demarrage.
+    /// First process: x1 = boot-image size.
     pub const IS_INIT: u64 = 1 << 2;
     pub const IS_DRIVER: u64 = 1 << 3;
-    /// Emplacements `slots::STDIN` et `slots::STDERR` fournis.
+    /// Slots `slots::STDIN` and `slots::STDERR` provided.
     pub const HAS_STDIO: u64 = 1 << 4;
-    /// L'entree standard est un tube (lecture par `ipc_recv`), pas la console.
+    /// Standard input is a pipe (read via `ipc_recv`), not the console.
     pub const STDIN_PIPE: u64 = 1 << 5;
-    /// Entree vide, sorties jetees.
+    /// Empty input, discarded outputs.
     pub const STDIN_NULL: u64 = 1 << 6;
     pub const STDOUT_NULL: u64 = 1 << 7;
     pub const STDERR_NULL: u64 = 1 << 8;
-    /// Les sorties sont des tubes : une erreur d'ecriture est un tube casse
-    /// (pas de repli sur le journal du noyau, reserve a la console).
+    /// Outputs are pipes: a write error is a broken pipe (no
+    /// fallback to the kernel log, reserved for the console).
     pub const STDOUT_PIPE: u64 = 1 << 9;
     pub const STDERR_PIPE: u64 = 1 << 10;
 
     pub const BLOCK_MAGIC: u32 = u32::from_le_bytes(*b"NXSB");
-    /// Plus grande zone de chaines (arguments + environnement).
+    /// Largest string area (args + environment).
     pub const MAX_STRINGS: u64 = 64 * 1024;
 
-    /// Bloc de demarrage, l'equivalent de argv/envp/auxv sous Linux.
+    /// Startup block, the argv/envp/auxv equivalent on Linux.
     #[repr(C)]
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Block {
@@ -524,26 +501,25 @@ pub mod startup {
         pub version: u32,
         pub argc: u32,
         pub envc: u32,
-        /// `argc` arguments puis `envc` variables « NOM=valeur », chacun
-        /// termine par NUL.
+        /// `argc` args then `envc` `NAME=value` vars, each NUL-terminated.
         pub strings: u64,
         pub strings_len: u64,
-        /// Copie des en-tetes de programme de l'executable (TLS, relro...).
+        /// Copy of the executable's program headers (TLS, relro...).
         pub phdr: u64,
         pub phnum: u32,
         pub phent: u32,
-        /// Base de chargement (0 : executable a adresse fixe).
+        /// Load base (0: fixed-address executable).
         pub load_base: u64,
         pub entry: u64,
-        /// Pile du thread principal.
+        /// Main thread stack.
         pub stack_base: u64,
         pub stack_size: u64,
-        /// Graine aleatoire (comme AT_RANDOM).
+        /// Random seed (like AT_RANDOM).
         pub random: [u8; 16],
     }
 }
 
-/// Requetes de `sysinfo`.
+/// Requests for `sysinfo`.
 pub mod info {
     pub const PROCESSES: u64 = 0;
     pub const MEMORY: u64 = 1;
@@ -561,7 +537,7 @@ pub mod info {
         pub name: [u8; 16],
         pub state: u32,
         pub parent: u32,
-        /// Temps processeur consomme (ns).
+        /// CPU time consumed (ns).
         pub cpu_ns: u64,
     }
 
@@ -585,14 +561,8 @@ pub mod info {
     }
 }
 
-/// Debogage : evenements envoyes au debogueur et reponses attendues.
-///
-/// Un thread d'un processus debogue qui fait une faute, execute `BRK`, finit
-/// un pas a pas ou recoit un arret s'immobilise et « appelle » l'endpoint du
-/// debogueur : etiquette `EVENT`, mots `[kind, tid, esr, far, pc, pid]`. La
-/// reponse le relance : etiquette `RESUME` (mot 0 : `FLAG_STEP` pour une
-/// seule instruction) ou `KILL`. Ses registres ne sont touches que par
-/// `debug_regs`.
+/// Debugger events: a stopped thread "calls" the endpoint (`EVENT`).
+/// Reply `RESUME` (or `KILL`); registers change via `debug_regs`.
 pub mod debug {
     pub const EVENT: u32 = 0x4442;
     pub const KIND_FAULT: u64 = 1;
@@ -604,8 +574,8 @@ pub mod debug {
     pub const KILL: u32 = 1;
     pub const FLAG_STEP: u64 = 1;
 
-    /// Registres d'un thread (lecture/ecriture par `debug_regs`). Seuls les
-    /// drapeaux NZCV de `pstate` sont modifiables.
+    /// Thread registers (read/written via `debug_regs`). Only the
+    /// NZCV flags of `pstate` are writable.
     #[repr(C)]
     #[derive(Clone, Copy, Default, Debug)]
     pub struct Regs {
@@ -617,7 +587,7 @@ pub mod debug {
     }
 }
 
-/// Format de l'image de demarrage (bootfs) embarquee dans le noyau.
+/// Boot-image (bootfs) format embedded in the kernel.
 pub mod bootfs {
     pub const MAGIC: [u8; 8] = *b"NXKBOOT1";
     pub const NAME_LEN: usize = 24;
@@ -639,59 +609,49 @@ pub mod bootfs {
     }
 }
 
-/// Protocoles des services systeme (labels de message).
-///
-/// Sauf mention contraire, une reponse porte le code d'erreur (errno
-/// positif, 0 = succes) dans son etiquette.
+/// Service protocols; replies carry the error code in the label.
+/// 0 = success, positive errno otherwise.
 pub mod proto {
     pub mod console {
-        /// Ecriture : mot 0 = nombre d'octets, octets a partir du mot 1.
+        /// Write: word 0 = byte count, bytes from word 1 on.
         pub const WRITE: u32 = 1;
-        /// Lecture d'une ligne : reponse au meme format que WRITE.
+        /// Read a line: reply has the same shape as WRITE.
         pub const READ_LINE: u32 = 2;
     }
     pub mod pm {
-        /// Lancement : octets = argc (u32), envc (u32), drapeaux (u32,
-        /// `spawn::SUSPENDED`...), 0 (u32), puis `argc + envc` chaines
-        /// terminees par NUL (le premier argument est le programme).
-        /// Reponse : handle du processus transmis.
+        /// Spawn: bytes = argc, envc, flags, 0 (u32 each) then the
+        /// strings (first arg is the program). Reply: process handle.
         pub const SPAWN: u32 = 1;
-        /// Liste des programmes disponibles, noms separes par des espaces.
+        /// Available programs, space-separated names.
         pub const LIST: u32 = 2;
-        /// Publication d'un service : octets = nom, handle 0 = endpoint
-        /// (droit SEND) a remettre aux clients. Reserve aux services lances
-        /// par init.
+        /// Service publication: bytes = name, handle 0 = endpoint (SEND).
+        /// Only for init-spawned services.
         pub const REGISTER: u32 = 3;
-        /// Recherche d'un service : octets = nom. Reponse : handle transmis
-        /// (ENOENT si le service n'est pas publie).
+        /// Service lookup: bytes = name. Reply: transmitted handle
+        /// (ENOENT if not published).
         pub const LOOKUP: u32 = 4;
-        /// Comme LOOKUP, mais attend que le service soit publie.
+        /// Like LOOKUP, but waits until the service is published.
         pub const LOOKUP_WAIT: u32 = 5;
-        /// Services publies, noms separes par des espaces.
+        /// Published services, space-separated names.
         pub const SERVICES: u32 = 6;
-        /// Insignes de l'endpoint du gestionnaire : applications, services.
+        /// Badges of the manager endpoint: applications, services.
         pub const BADGE_APP: u64 = 1;
         pub const BADGE_SERVICE: u64 = 2;
     }
-    /// Horloges et resets des peripheriques (CAR).
+    /// Device clocks and resets (CAR).
     pub mod clk {
-        /// mot 0 = peripherique : active son horloge et le sort du reset.
-        /// Un bloc dont une partition d'alimentation (PMC) est coupee n'est
-        /// pas touche : ENODEV (clk n'allume pas les partitions). Un bloc de
-        /// partition deja pret est laisse tel quel. EIO si l'etat lu ensuite
-        /// n'est pas `ST_READY`.
+        /// word 0 = device: enable clock, take out of reset. Blocks in
+        /// powered-off PMC partitions are untouched (ENODEV, EIO if not ready).
         pub const ENABLE: u32 = 1;
         pub const DISABLE: u32 = 2;
-        /// mot 0 = peripherique. Reponse : mot 0 = etat (bits `ST_*`). Sur
-        /// Tegra, acceder a un bloc sans horloge, en reset ou hors tension
-        /// bloque le bus : un pilote ne touche a ses registres qu'avec
-        /// `ST_READY` complet.
+        /// word 0 = device. Reply: word 0 = state (`ST_*` bits). Only
+        /// touch registers at full `ST_READY` (bus hangs otherwise).
         pub const STATUS: u32 = 3;
-        /// Toutes ses horloges actives.
+        /// All its clocks running.
         pub const ST_CLOCK: u64 = 1;
-        /// Sorti du reset.
+        /// Out of reset.
         pub const ST_OUT_OF_RESET: u64 = 2;
-        /// Partitions d'alimentation allumees et sans verrou (clamp).
+        /// Power partitions on and unclamped.
         pub const ST_POWERED: u64 = 4;
         pub const ST_READY: u64 = ST_CLOCK | ST_OUT_OF_RESET | ST_POWERED;
         pub const I2C1: u64 = 1;
@@ -702,70 +662,70 @@ pub mod proto {
         pub const I2C6: u64 = 6;
         pub const SDMMC1: u64 = 10;
         pub const SDMMC4: u64 = 13;
-        /// Hote xHCI : horloges de l'hote et de la logique SuperSpeed,
-        /// partitions XUSBA et XUSBC.
+        /// xHCI host: host plus SuperSpeed logic clocks, XUSBA
+        /// and XUSBC partitions.
         pub const XUSB_HOST: u64 = 20;
     }
-    /// Bus I2C.
+    /// I2C bus.
     pub mod i2c {
-        /// mot 0 = bus (1..6) | adresse << 8 | octets a lire << 16 ; octets
-        /// a ecrire ensuite (format `pack`). Reponse : octets lus.
+        /// word 0 = bus (1..6) | address << 8 | read bytes << 16;
+        /// write bytes follow (see `pack`). Reply: bytes read.
         pub const TRANSFER: u32 = 1;
         pub const fn header(bus: u64, addr: u64, read: u64) -> u64 {
             bus | addr << 8 | read << 16
         }
     }
-    /// Alimentation, heure, capteurs.
+    /// Power, time, sensors.
     pub mod power {
         pub const OFF: u32 = 1;
         pub const REBOOT: u32 = 2;
-        /// Reponse : mot 0 = temperature locale, mot 1 = distante (m degC).
+        /// Reply: word 0 = local temp, word 1 = remote (millidegrees C).
         pub const TEMPERATURE: u32 = 3;
-        /// Relit la RTC et remet l'heure murale du noyau a jour.
+        /// Re-read the RTC and update the kernel wall clock.
         pub const SYNC_TIME: u32 = 4;
     }
-    /// Peripherique bloc (carte SD, eMMC).
+    /// Block device (SD card, eMMC).
     pub mod blk {
-        /// Reponse : mot 0 = taille de bloc, mot 1 = nombre de blocs.
+        /// Reply: word 0 = block size, word 1 = block count.
         pub const INFO: u32 = 1;
-        /// handle 0 = memoire partagee servant de tampon d'echange.
+        /// handle 0 = shared memory used as transfer buffer.
         pub const ATTACH: u32 = 2;
-        /// mots : bloc de depart, nombre de blocs, decalage dans le tampon.
+        /// words: start block, block count, buffer offset.
         pub const READ: u32 = 3;
         pub const WRITE: u32 = 4;
     }
-    /// Systeme de fichiers.
+    /// Filesystem.
     pub mod fs {
-        /// octets = chemin ; mot place avant : drapeaux (`O_*`). Reponse :
-        /// mot 0 = descripteur, mot 1 = taille.
+        /// bytes = path; word before: flags (`O_*`). Reply:
+        /// word 0 = descriptor, word 1 = size.
         pub const OPEN: u32 = 1;
-        /// mots : descripteur, position, longueur (<= MAX_IO). Reponse :
-        /// octets lus.
+        /// words: descriptor, position, length (<= MAX_IO).
+        /// Reply: bytes read.
         pub const READ: u32 = 2;
-        /// mots : descripteur, position ; octets a ecrire.
+        /// words: descriptor, position; bytes to write.
         pub const WRITE: u32 = 3;
         pub const CLOSE: u32 = 4;
-        /// octets = chemin. Reponse : mot 0 = taille, mot 1 = genre, mot 2 =
-        /// date de modification (s depuis 1970).
+        /// bytes = path. Reply: word 0 = size, word 1 = kind,
+        /// word 2 = mtime (s since 1970).
         pub const STAT: u32 = 5;
-        /// mots : index ; octets = chemin du dossier. Reponse : mot 0 =
-        /// taille, mot 1 = genre, octets = nom (vide : fin du dossier).
+        /// words: index; bytes = dir path. Reply: word 0 = size,
+        /// word 1 = kind, bytes = name (empty: end of dir).
         pub const READDIR: u32 = 6;
         pub const MKDIR: u32 = 7;
         pub const UNLINK: u32 = 8;
         pub const RMDIR: u32 = 9;
-        /// octets = « ancien\0nouveau ».
+        /// bytes = "old\0new".
         pub const RENAME: u32 = 10;
-        /// mots : descripteur, nouvelle taille.
+        /// words: descriptor, new size.
         pub const TRUNCATE: u32 = 11;
-        /// Ecrit sur le support tout ce qui est en cache.
+        /// Flush everything cached to the medium.
         pub const SYNC: u32 = 12;
-        /// Reponse : mot 0 = octets libres, mot 1 = octets totaux.
+        /// Reply: word 0 = free bytes, word 1 = total bytes.
         pub const STATFS: u32 = 13;
-        /// mots : descripteur. Reponse comme STAT (fichier ouvert).
+        /// words: descriptor. Reply like STAT (open file).
         pub const FSTAT: u32 = 14;
-        /// mots : descripteur. Reference supplementaire au meme fichier
-        /// ouvert ; CLOSE ne le ferme qu'a la derniere.
+        /// words: descriptor. Extra reference to the same open file;
+        /// CLOSE only closes it at the last one.
         pub const DUP: u32 = 15;
 
         pub const O_READ: u64 = 1;
@@ -776,80 +736,78 @@ pub mod proto {
 
         pub const KIND_FILE: u64 = 1;
         pub const KIND_DIR: u64 = 2;
-        /// Octets par lecture ou ecriture en un message.
+        /// Bytes per single-message read or write.
         pub const MAX_IO: usize = 3 * 1024;
     }
-    /// Affichage.
+    /// Display.
     pub mod display {
-        /// Reponse : mots = largeur, hauteur, pas (octets par ligne), format
-        /// (1 = A8B8G8R8) ; handle 0 = memoire de l'image.
+        /// Reply: words = width, height, stride (bytes per row), format
+        /// (1 = A8B8G8R8); handle 0 = framebuffer memory.
         pub const OPEN: u32 = 1;
-        /// Texte a afficher dans le terminal de l'ecran (format `pack`).
+        /// Text for the on-screen terminal (see `pack`).
         pub const WRITE: u32 = 2;
         pub const FORMAT_RGBA8888: u64 = 1;
     }
-    /// Interface Ethernet (couche liaison).
+    /// Ethernet interface (link layer).
     pub mod eth {
-        /// Reponse : mot 0 = adresse MAC (6 octets de poids faible, octet 0
-        /// en premier), mot 1 = MTU.
+        /// Reply: word 0 = MAC (low 6 bytes, byte 0 first), word 1 = MTU.
         pub const INFO: u32 = 1;
-        /// Trame a emettre (format `pack`).
+        /// Frame to send (see `pack`).
         pub const SEND: u32 = 2;
-        /// Attend une trame (mot 0 = delai en ns, 0 : sans limite).
+        /// Wait for a frame (word 0 = timeout ns, 0: no limit).
         pub const RECV: u32 = 3;
     }
-    /// Pile TCP/IP (IPv4). Adresses sur 32 bits, `a.b.c.d` = `a << 24 | ...`
-    /// (comme `u32::from(Ipv4Addr)`). Les delais sont en ns (0 : sans limite).
+    /// TCP/IP stack (IPv4). 32-bit addresses, `a.b.c.d` = `a << 24 | ...`
+    /// (like `u32::from(Ipv4Addr)`). Timeouts in ns (0: no limit).
     pub mod net {
-        /// mots : adresse, port, delai. Reponse : mot 0 = socket.
+        /// words: address, port, timeout. Reply: word 0 = socket.
         pub const TCP_CONNECT: u32 = 1;
-        /// mots : port, file d'attente. Reponse : mot 0 = socket d'ecoute.
+        /// words: port, backlog. Reply: word 0 = listen socket.
         pub const TCP_LISTEN: u32 = 2;
-        /// mots : socket d'ecoute, delai. Reponse : socket, adresse, port.
+        /// words: listen socket, timeout. Reply: socket, address, port.
         pub const TCP_ACCEPT: u32 = 3;
-        /// mots : socket, delai ; octets. Reponse : mot 0 = octets acceptes.
+        /// words: socket, timeout; bytes. Reply: word 0 = bytes accepted.
         pub const SEND: u32 = 4;
-        /// mots : socket, longueur maximale, delai. Reponse : octets (aucun :
-        /// fin de flux).
+        /// words: socket, max length, timeout. Reply: bytes (none:
+        /// end of stream).
         pub const RECV: u32 = 5;
-        /// mots : socket.
+        /// words: socket.
         pub const CLOSE: u32 = 6;
-        /// mots : socket. Fin d'emission (FIN), la reception continue.
+        /// words: socket. End sending (FIN), receiving continues.
         pub const SHUTDOWN: u32 = 7;
-        /// mots : port (0 : ephemere). Reponse : mot 0 = socket UDP.
+        /// words: port (0: ephemeral). Reply: word 0 = UDP socket.
         pub const UDP_BIND: u32 = 8;
-        /// mots : socket, adresse, port ; octets.
+        /// words: socket, address, port; bytes.
         pub const SEND_TO: u32 = 9;
-        /// mots : socket, delai. Reponse : mots adresse, port ; octets.
+        /// words: socket, timeout. Reply: words address, port; bytes.
         pub const RECV_FROM: u32 = 10;
-        /// octets = nom d'hote. Reponse : mot 0 = adresse.
+        /// bytes = hostname. Reply: word 0 = address.
         pub const RESOLVE: u32 = 11;
-        /// Reponse : adresse, longueur de prefixe, passerelle, serveur DNS.
+        /// Reply: address, prefix length, gateway, DNS server.
         pub const INFO: u32 = 12;
-        /// mots : socket. Reponse : adresse et port locaux, puis distants.
+        /// words: socket. Reply: local address and port, then remote.
         pub const ADDRS: u32 = 13;
-        /// mots : socket. Reference supplementaire au meme socket (meme
-        /// identifiant) ; CLOSE ne le ferme qu'a la derniere.
+        /// words: socket. Extra reference to the same socket (same
+        /// id); CLOSE only closes it at the last one.
         pub const DUP: u32 = 14;
     }
-    /// Evenements d'entree.
+    /// Input events.
     pub mod input {
-        /// Attend le prochain evenement. Reponse : mot 0 = genre, mot 1 =
-        /// code, mot 2 = valeur, mots 3-4 = x, y. Mot 0 de la requete : delai
-        /// d'attente en ns (0 : sans limite).
+        /// Wait for the next event. Reply: kind, code, value, x, y.
+        /// Request word 0: timeout ns (0: no limit).
         pub const READ: u32 = 1;
-        /// Evenement fourni par un autre pilote (clavier USB...) : memes mots.
+        /// Event from another driver (USB keyboard...): same words.
         pub const INJECT: u32 = 2;
         pub const KIND_KEY: u64 = 1;
         pub const KIND_TOUCH: u64 = 2;
         pub const KIND_BUTTON: u64 = 3;
-        /// Toucher : code = appui (1), mouvement (2), relachement (3) ;
-        /// valeur = numero du doigt.
+        /// Touch: code = press (1), move (2), release (3);
+        /// value = finger index.
         pub const TOUCH_DOWN: u64 = 1;
         pub const TOUCH_MOVE: u64 = 2;
         pub const TOUCH_UP: u64 = 3;
-        /// Touche : code = code HID (page clavier), valeur = 1 appui, 0
-        /// relachement ; x = caractere Unicode produit (0 : aucun).
+        /// Key: code = HID code (keyboard page), value = 1 press,
+        /// 0 release; x = Unicode char produced (0: none).
         pub const KEY_PRESSED: u64 = 1;
     }
 }
