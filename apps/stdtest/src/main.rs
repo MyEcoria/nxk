@@ -1,10 +1,5 @@
-//! Tests de la bibliotheque standard sur nxk : un programme Rust ordinaire,
-//! sans rien de propre au systeme, qui exerce threads, synchronisation,
-//! canaux, temps, memoire, environnement, fichiers, processus et reseau.
-//!
-//!     stdtest            tous les tests (fichiers : carte SD requise)
-//!     stdtest net        plus le reseau (acces a Internet requis)
-//!     stdtest bench      mesures de quelques operations courantes
+//! std tests on nxk: plain Rust over threads, sync, time, memory, env, files, processes, net.
+//! `stdtest` (all; files need SD), `stdtest net` (+network), `stdtest bench` (timings).
 
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::Cell;
@@ -26,11 +21,11 @@ fn ensure(c: bool, msg: impl Into<String>) -> Result<(), String> {
 fn threads() -> R {
     let handles: Vec<_> = (0..16u64).map(|k| thread::spawn(move || (k * 1000..(k + 1) * 1000).sum::<u64>())).collect();
     let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-    ensure(total == (0..16000u64).sum(), format!("somme {total}"))?;
-    let named = thread::Builder::new().name("ouvrier".into()).spawn(|| thread::current().name().map(String::from)).unwrap();
-    ensure(named.join().unwrap().as_deref() == Some("ouvrier"), "nom du thread")?;
+    ensure(total == (0..16000u64).sum(), format!("sum {total}"))?;
+    let named = thread::Builder::new().name("worker".into()).spawn(|| thread::current().name().map(String::from)).unwrap();
+    ensure(named.join().unwrap().as_deref() == Some("worker"), "thread name")?;
     let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    Ok(format!("16 threads, {cpus} coeurs"))
+    Ok(format!("16 threads, {cpus} cores"))
 }
 
 fn scope() -> R {
@@ -41,8 +36,8 @@ fn scope() -> R {
         let hb = s.spawn(|| b.iter().sum::<u32>());
         (ha.join().unwrap(), hb.join().unwrap())
     });
-    ensure(sa + sb == 500500, "somme")?;
-    Ok("emprunts entre threads".into())
+    ensure(sa + sb == 500500, "sum")?;
+    Ok("scoped borrows".into())
 }
 
 fn mutex() -> R {
@@ -61,8 +56,8 @@ fn mutex() -> R {
         h.join().unwrap();
     }
     let v = *m.lock().unwrap();
-    ensure(v == 80_000, format!("compteur {v}"))?;
-    Ok("8 x 10000 sous contention".into())
+    ensure(v == 80_000, format!("counter {v}"))?;
+    Ok("8 x 10000 contended".into())
 }
 
 fn condvar() -> R {
@@ -89,12 +84,12 @@ fn condvar() -> R {
         }
     }
     prod.join().unwrap();
-    ensure(got == 499_500, "somme")?;
+    ensure(got == 499_500, "sum")?;
     let (m, c) = (Mutex::new(()), Condvar::new());
     let t0 = Instant::now();
     let (_g, r) = c.wait_timeout(m.lock().unwrap(), Duration::from_millis(20)).unwrap();
-    ensure(r.timed_out() && t0.elapsed() >= Duration::from_millis(20), "attente bornee")?;
-    Ok("producteur/consommateur, delai".into())
+    ensure(r.timed_out() && t0.elapsed() >= Duration::from_millis(20), "bounded wait")?;
+    Ok("producer/consumer, timeout".into())
 }
 
 fn rwlock() -> R {
@@ -116,7 +111,7 @@ fn rwlock() -> R {
             thread::spawn(move || {
                 for _ in 0..500 {
                     let g = l.read().unwrap();
-                    // Un ecrivain ne doit jamais etre vu a moitie.
+                    // A writer must never be seen half-way.
                     if g.iter().any(|&x| x != g[0]) {
                         return false;
                     }
@@ -127,9 +122,9 @@ fn rwlock() -> R {
         .collect();
     w.join().unwrap();
     for r in readers {
-        ensure(r.join().unwrap(), "lecture incoherente")?;
+        ensure(r.join().unwrap(), "inconsistent read")?;
     }
-    Ok("1 ecrivain, 4 lecteurs".into())
+    Ok("1 writer, 4 readers".into())
 }
 
 fn channels() -> R {
@@ -144,17 +139,17 @@ fn channels() -> R {
     }
     drop(tx);
     let sum: u64 = rx.iter().map(|v| v as u64).sum();
-    ensure(sum == (0..4000u64).sum(), "somme")?;
-    // Rendez-vous : canal synchrone sans tampon.
+    ensure(sum == (0..4000u64).sum(), "sum")?;
+    // Rendezvous: unbuffered sync channel.
     let (tx, rx) = mpsc::sync_channel::<u32>(0);
     let h = thread::spawn(move || (0..100).map(|_| rx.recv().unwrap()).sum::<u32>());
     for i in 0..100 {
         tx.send(i).unwrap();
     }
-    ensure(h.join().unwrap() == 4950, "rendez-vous")?;
+    ensure(h.join().unwrap() == 4950, "rendezvous")?;
     let (_tx, rx) = mpsc::channel::<u32>();
     ensure(rx.recv_timeout(Duration::from_millis(10)).is_err(), "recv_timeout")?;
-    Ok("4 producteurs, rendez-vous, delai".into())
+    Ok("4 producers, rendezvous, timeout".into())
 }
 
 fn barrier_once() -> R {
@@ -174,8 +169,8 @@ fn barrier_once() -> R {
         })
         .collect();
     let vals: Vec<u32> = hs.into_iter().map(|h| h.join().unwrap()).collect();
-    ensure(inits.load(Ordering::SeqCst) == 1, "initialisations multiples")?;
-    ensure(vals.iter().all(|&v| v == vals[0]), "valeurs differentes")?;
+    ensure(inits.load(Ordering::SeqCst) == 1, "multiple inits")?;
+    ensure(vals.iter().all(|&v| v == vals[0]), "mismatched values")?;
     Ok("Barrier(8), OnceLock".into())
 }
 
@@ -209,17 +204,17 @@ fn thread_locals() -> R {
         .collect();
     for (k, h) in hs.into_iter().enumerate() {
         let (v, c) = h.join().unwrap();
-        ensure(v == k as u32 && c == 100, format!("thread {k} : {v} {c}"))?;
+        ensure(v == k as u32 && c == 100, format!("thread {k}: {v} {c}"))?;
     }
     let d = DROPS.load(Ordering::SeqCst) - before;
-    ensure(d == 6, format!("{d} destructeurs sur 6"))?;
-    Ok("valeurs propres, 6 destructeurs".into())
+    ensure(d == 6, format!("{d} destructors out of 6"))?;
+    Ok("own values, 6 destructors".into())
 }
 
 fn park() -> R {
     let t0 = Instant::now();
     thread::park_timeout(Duration::from_millis(15));
-    ensure(t0.elapsed() >= Duration::from_millis(15), "park_timeout trop court")?;
+    ensure(t0.elapsed() >= Duration::from_millis(15), "park_timeout too short")?;
     let main = thread::current();
     let flag = Arc::new(AtomicUsize::new(0));
     let f = flag.clone();
@@ -242,76 +237,76 @@ fn sleep_time() -> R {
     ensure(dt >= Duration::from_millis(50) && dt < Duration::from_millis(150), format!("{dt:?}"))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?;
     let year = 1970 + now.as_secs() / 31_556_952;
-    Ok(format!("sleep(50 ms) = {:.1} ms, annee ~{year}", dt.as_secs_f64() * 1000.0))
+    Ok(format!("sleep(50 ms) = {:.1} ms, year ~{year}", dt.as_secs_f64() * 1000.0))
 }
 
 fn environment() -> R {
     let args: Vec<String> = env::args().collect();
     ensure(args.first().map(|a| a.ends_with("stdtest")).unwrap_or(false), format!("args {args:?}"))?;
-    unsafe { env::set_var("NXK_ESSAI", "valeur=1") };
-    ensure(env::var("NXK_ESSAI").as_deref() == Ok("valeur=1"), "set_var")?;
-    ensure(env::vars().any(|(k, _)| k == "NXK_ESSAI"), "vars")?;
-    unsafe { env::remove_var("NXK_ESSAI") };
-    ensure(env::var("NXK_ESSAI").is_err(), "remove_var")?;
+    unsafe { env::set_var("NXK_TEST", "value=1") };
+    ensure(env::var("NXK_TEST").as_deref() == Ok("value=1"), "set_var")?;
+    ensure(env::vars().any(|(k, _)| k == "NXK_TEST"), "vars")?;
+    unsafe { env::remove_var("NXK_TEST") };
+    ensure(env::var("NXK_TEST").is_err(), "remove_var")?;
     ensure(env::consts::OS == "nxk", env::consts::OS)?;
     {
         use std::io::IsTerminal;
-        ensure(std::io::stdout().is_terminal(), "stdout devrait etre la console")?;
+        ensure(std::io::stdout().is_terminal(), "stdout should be the console")?;
     }
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
-    Ok(format!("{} arguments, dossier {}", args.len(), cwd.display()))
+    Ok(format!("{} arguments, dir {}", args.len(), cwd.display()))
 }
 
 fn memory() -> R {
-    // Gros tableau (pages a zero a la demande), puis croissance par ajouts.
+    // Big array (demand-zero pages), then push growth.
     let big = vec![0u64; 2 << 20];
-    ensure(big.iter().all(|&x| x == 0), "vec![0; N] non nul")?;
+    ensure(big.iter().all(|&x| x == 0), "vec![0; N] not zero")?;
     drop(big);
     let mut v = Vec::new();
     for i in 0..1_000_000u32 {
         v.push(i);
     }
-    ensure(v.iter().map(|&x| x as u64).sum::<u64>() == 499_999_500_000, "somme")?;
+    ensure(v.iter().map(|&x| x as u64).sum::<u64>() == 499_999_500_000, "sum")?;
     drop(v);
-    // Beaucoup de petits blocs, liberes dans le desordre.
+    // Many small blocks, freed out of order.
     let mut boxes: Vec<Box<[u8]>> = (0..20_000).map(|i| vec![i as u8; 1 + i % 300].into_boxed_slice()).collect();
     for i in (0..boxes.len()).step_by(3) {
         boxes[i] = Box::new([]);
     }
-    ensure(boxes.iter().enumerate().all(|(i, b)| b.is_empty() || b[0] == i as u8), "contenu")?;
+    ensure(boxes.iter().enumerate().all(|(i, b)| b.is_empty() || b[0] == i as u8), "content")?;
     drop(boxes);
-    // Alignements forts.
+    // Strong alignments.
     for align in [16usize, 64, 4096, 65536] {
         let l = Layout::from_size_align(100, align).unwrap();
         let p = unsafe { alloc(l) };
-        ensure(!p.is_null() && p as usize % align == 0, format!("alignement {align}"))?;
+        ensure(!p.is_null() && p as usize % align == 0, format!("alignment {align}"))?;
         unsafe {
             p.write_bytes(0xAB, 100);
             dealloc(p, l);
         }
     }
-    // Grands blocs alloues et rendus en boucle : les adresses sont reemployees.
+    // Large blocks cycled: addresses get reused.
     for _ in 0..64 {
         let b = vec![1u8; 2 << 20];
         hint::black_box(&b);
     }
     let s: String = (0..1000).map(|i| format!("{i},")).collect();
     ensure(s.len() == 3890, "format")?;
-    Ok("16 Mio, 1M ajouts, 20k blocs, alignements, 64 x 2 Mio".into())
+    Ok("16 MiB, 1M pushes, 20k blocks, alignments, 64 x 2 MiB".into())
 }
 
 fn collections() -> R {
     let mut h = HashMap::new();
     for i in 0..10_000u32 {
-        h.insert(format!("cle{i}"), i);
+        h.insert(format!("key{i}"), i);
     }
-    ensure(h.len() == 10_000 && h["cle1234"] == 1234, "HashMap")?;
+    ensure(h.len() == 10_000 && h["key1234"] == 1234, "HashMap")?;
     let b: BTreeMap<u32, u32> = (0..1000).rev().map(|i| (i, i * i)).collect();
     ensure(b.keys().next() == Some(&0) && b[&999] == 998_001, "BTreeMap")?;
     let mut v: Vec<i64> = (0..50_000).map(|i| (i * 7919) % 50_021).collect();
     v.sort_unstable();
-    ensure(v.windows(2).all(|w| w[0] <= w[1]), "tri")?;
-    Ok("HashMap 10k, BTreeMap, tri 50k".into())
+    ensure(v.windows(2).all(|w| w[0] <= w[1]), "sort")?;
+    Ok("HashMap 10k, BTreeMap, sort 50k".into())
 }
 
 fn math() -> R {
@@ -326,84 +321,84 @@ fn math() -> R {
 fn files() -> R {
     let root = "/tmp/stdtest";
     let _ = fs::remove_dir_all(root);
-    fs::create_dir_all(format!("{root}/a/b")).map_err(|e| format!("create_dir_all : {e}"))?;
+    fs::create_dir_all(format!("{root}/a/b")).map_err(|e| format!("create_dir_all: {e}"))?;
     let p = format!("{root}/a/b/notes.txt");
-    fs::write(&p, "premiere ligne\n").map_err(|e| format!("write : {e}"))?;
+    fs::write(&p, "first line\n").map_err(|e| format!("write: {e}"))?;
     {
         let mut f = fs::OpenOptions::new().append(true).open(&p).map_err(|e| format!("append : {e}"))?;
-        writeln!(f, "deuxieme ligne, accentuee : ete").map_err(|e| e.to_string())?;
+        writeln!(f, "second line, accented: summer").map_err(|e| e.to_string())?;
     }
-    let text = fs::read_to_string(&p).map_err(|e| format!("read : {e}"))?;
-    ensure(text == "premiere ligne\ndeuxieme ligne, accentuee : ete\n", format!("contenu {text:?}"))?;
+    let text = fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+    ensure(text == "first line\nsecond line, accented: summer\n", format!("content {text:?}"))?;
     let lines: Vec<String> = BufReader::new(fs::File::open(&p).unwrap()).lines().map(|l| l.unwrap()).collect();
-    ensure(lines.len() == 2, "lignes")?;
+    ensure(lines.len() == 2, "lines")?;
     let meta = fs::metadata(&p).map_err(|e| e.to_string())?;
     ensure(meta.is_file() && meta.len() == text.len() as u64, "metadata")?;
-    // Position : seek puis lecture.
+    // Position: seek then read.
     let mut f = fs::File::open(&p).unwrap();
-    f.seek(SeekFrom::Start(9)).unwrap();
-    let mut w = [0u8; 5];
+    f.seek(SeekFrom::Start(6)).unwrap();
+    let mut w = [0u8; 4];
     f.read_exact(&mut w).unwrap();
-    ensure(&w == b"ligne", "seek")?;
-    ensure(f.seek(SeekFrom::End(-4)).unwrap() == text.len() as u64 - 4, "seek fin")?;
-    // Le service FAT refuse de supprimer un fichier ouvert (EBUSY) : on ferme.
+    ensure(&w == b"line", "seek")?;
+    ensure(f.seek(SeekFrom::End(-4)).unwrap() == text.len() as u64 - 4, "seek end")?;
+    // FAT refuses to delete an open file (EBUSY): close first.
     drop(f);
-    // Gros fichier : plusieurs messages par lecture et par ecriture.
+    // Big file: several messages per read and write.
     let data: Vec<u8> = (0..200_000u32).map(|i| (i * 31 % 251) as u8).collect();
-    fs::write(format!("{root}/gros.bin"), &data).map_err(|e| e.to_string())?;
-    ensure(fs::read(format!("{root}/gros.bin")).map_err(|e| e.to_string())? == data, "gros fichier")?;
-    // Copie d'un fichier ouvert : position partagee, comme sous Unix.
+    fs::write(format!("{root}/big.bin"), &data).map_err(|e| e.to_string())?;
+    ensure(fs::read(format!("{root}/big.bin")).map_err(|e| e.to_string())? == data, "big file")?;
+    // Open-file clone: shared position, as on Unix.
     {
         let mut a = fs::File::open(&p).unwrap();
-        let mut b = a.try_clone().map_err(|e| format!("try_clone : {e}"))?;
-        let mut w = [0u8; 9];
-        a.read_exact(&mut w).unwrap();
-        b.read_exact(&mut w[..5]).unwrap();
-        ensure(&w[..5] == b"ligne", "position partagee")?;
+        let mut b = a.try_clone().map_err(|e| format!("try_clone: {e}"))?;
+        let mut w = [0u8; 10];
+        a.read_exact(&mut w[..6]).unwrap();
+        b.read_exact(&mut w[6..10]).unwrap();
+        ensure(&w[6..10] == b"line", "shared position")?;
     }
-    fs::copy(&p, format!("{root}/copie.txt")).map_err(|e| format!("copy : {e}"))?;
-    fs::rename(format!("{root}/copie.txt"), format!("{root}/a/renomme.txt")).map_err(|e| format!("rename : {e}"))?;
+    fs::copy(&p, format!("{root}/copy.txt")).map_err(|e| format!("copy: {e}"))?;
+    fs::rename(format!("{root}/copy.txt"), format!("{root}/a/renamed.txt")).map_err(|e| format!("rename: {e}"))?;
     let mut names: Vec<String> =
         fs::read_dir(format!("{root}/a")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
-    ensure(names == ["b", "renomme.txt"], format!("read_dir {names:?}"))?;
-    // Chemins relatifs depuis le dossier courant.
+    ensure(names == ["b", "renamed.txt"], format!("read_dir {names:?}"))?;
+    // Relative paths from the current dir.
     let old = env::current_dir().unwrap();
     env::set_current_dir(format!("{root}/a")).map_err(|e| e.to_string())?;
-    ensure(fs::read_to_string("b/../renomme.txt").map_err(|e| e.to_string())? == text, "chemin relatif")?;
+    ensure(fs::read_to_string("b/../renamed.txt").map_err(|e| e.to_string())? == text, "relative path")?;
     env::set_current_dir(old).unwrap();
-    ensure(fs::metadata(format!("{root}/absent")).map(|_| ()).unwrap_err().kind() == std::io::ErrorKind::NotFound, "NotFound")?;
-    // Fichier garde ouvert par un programme qui s'arrete brutalement : le
-    // service le ferme d'office et la suppression aboutit.
+    ensure(fs::metadata(format!("{root}/missing")).map(|_| ()).unwrap_err().kind() == std::io::ErrorKind::NotFound, "NotFound")?;
+    // File held open by a crashing program: the
+    // service closes it so deletion succeeds.
     let st = Command::new("stdtest").args(["holdfile", &p]).status().map_err(|e| e.to_string())?;
-    ensure(st.code() == Some(134), format!("holdfile : {st}"))?;
-    fs::remove_file(&p).map_err(|e| format!("fichier d'un programme disparu : {e}"))?;
-    fs::remove_dir_all(root).map_err(|e| format!("remove_dir_all : {e}"))?;
-    ensure(!fs::exists(root).unwrap(), "suppression")?;
-    Ok("dossiers, ajout, seek, 200 ko, copie, renommage, relatifs".into())
+    ensure(st.code() == Some(134), format!("holdfile: {st}"))?;
+    fs::remove_file(&p).map_err(|e| format!("dead program file: {e}"))?;
+    fs::remove_dir_all(root).map_err(|e| format!("remove_dir_all: {e}"))?;
+    ensure(!fs::exists(root).unwrap(), "deletion")?;
+    Ok("dirs, append, seek, 200 KiB, copy, rename, relative".into())
 }
 
 fn processes() -> R {
-    let st = Command::new("true").status().map_err(|e| format!("true : {e}"))?;
-    ensure(st.success(), format!("true : {st}"))?;
-    let mut child = Command::new("hello-std").arg("depuis-stdtest").spawn().map_err(|e| e.to_string())?;
+    let st = Command::new("true").status().map_err(|e| format!("true: {e}"))?;
+    ensure(st.success(), format!("true: {st}"))?;
+    let mut child = Command::new("hello-std").arg("from-stdtest").spawn().map_err(|e| e.to_string())?;
     let pid = child.id();
     let st = child.wait().map_err(|e| e.to_string())?;
-    ensure(st.code() == Some(0), format!("hello-std : {st}"))?;
-    ensure(Command::new("absent-xyz").status().is_err(), "programme absent")?;
-    Ok(format!("true, hello-std (pid {pid}), moi : pid {}", std::process::id()))
+    ensure(st.code() == Some(0), format!("hello-std: {st}"))?;
+    ensure(Command::new("missing-xyz").status().is_err(), "missing program")?;
+    Ok(format!("true, hello-std (pid {pid}), self: pid {}", std::process::id()))
 }
 
 fn pipes() -> R {
     use std::process::Stdio;
-    // output() : sortie capturee.
-    let out = Command::new("hello-std").arg("tube").output().map_err(|e| format!("output : {e}"))?;
+    // output(): captured output.
+    let out = Command::new("hello-std").arg("pipe").output().map_err(|e| format!("output: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    ensure(out.status.success() && text.starts_with("Bonjour depuis std"), format!("output : {:?}", text))?;
-    // Sortie et erreurs separees.
+    ensure(out.status.success() && text.starts_with("Hello from std"), format!("output: {:?}", text))?;
+    // Separate stdout and stderr.
     let out = Command::new("stdtest").arg("errtest").output().map_err(|e| e.to_string())?;
-    ensure(out.stdout == b"vers stdout\n" && out.stderr == b"vers stderr\n", format!("stderr : {:?} / {:?}", out.stdout, out.stderr))?;
-    // Entree et sortie redirigees.
+    ensure(out.stdout == b"to stdout\n" && out.stderr == b"to stderr\n", format!("stderr: {:?} / {:?}", out.stdout, out.stderr))?;
+    // Redirected input and output.
     let mut child = Command::new("stdtest")
         .arg("upper")
         .stdin(Stdio::piped())
@@ -418,37 +413,37 @@ fn pipes() -> R {
     let mut up = String::new();
     child.stdout.take().unwrap().read_to_string(&mut up).map_err(|e| e.to_string())?;
     writer.join().unwrap();
-    ensure(child.wait().map_err(|e| e.to_string())?.success(), "upper : statut")?;
-    ensure(up.len() == 10_004 && up.starts_with("ABC\nXXX"), format!("upper : {} octets", up.len()))?;
-    // Chaine a | b : la sortie de l'un est l'entree de l'autre, sans relais.
+    ensure(child.wait().map_err(|e| e.to_string())?.success(), "upper: status")?;
+    ensure(up.len() == 10_004 && up.starts_with("ABC\nXXX"), format!("upper: {} bytes", up.len()))?;
+    // a | b chain: one's output is the other's input, no relay.
     let mut a = Command::new("hello-std").stdout(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
     let b = Command::new("stdtest").arg("upper").stdin(a.stdout.take().unwrap()).output().map_err(|e| e.to_string())?;
     a.wait().map_err(|e| e.to_string())?;
-    ensure(String::from_utf8_lossy(&b.stdout).starts_with("BONJOUR DEPUIS STD"), "a | b")?;
-    // Rien : sortie jetee.
+    ensure(String::from_utf8_lossy(&b.stdout).starts_with("HELLO FROM STD"), "a | b")?;
+    // Null: output discarded.
     ensure(Command::new("hello-std").stdout(Stdio::null()).status().map_err(|e| e.to_string())?.success(), "null")?;
-    // io::pipe() vers un enfant.
+    // io::pipe() into a child.
     let (mut r, w) = std::io::pipe().map_err(|e| e.to_string())?;
     let mut c = Command::new("hello-std").stdout(w).spawn().map_err(|e| e.to_string())?;
     let mut got = String::new();
     r.read_to_string(&mut got).map_err(|e| e.to_string())?;
     c.wait().map_err(|e| e.to_string())?;
     ensure(got.contains("arguments"), "io::pipe")?;
-    Ok("output, stderr, entree+sortie 10 ko, a | b, null, io::pipe".into())
+    Ok("output, stderr, in+out 10 KiB, a | b, null, io::pipe".into())
 }
 
 fn network() -> R {
-    let addr = ("example.com", 80).to_socket_addrs().map_err(|e| format!("DNS : {e}"))?.next().unwrap();
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("connect : {e}"))?;
+    let addr = ("example.com", 80).to_socket_addrs().map_err(|e| format!("DNS: {e}"))?.next().unwrap();
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("connect: {e}"))?;
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     s.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n").map_err(|e| e.to_string())?;
     let mut resp = Vec::new();
-    s.read_to_end(&mut resp).map_err(|e| format!("lecture : {e}"))?;
+    s.read_to_end(&mut resp).map_err(|e| format!("read: {e}"))?;
     let head = String::from_utf8_lossy(&resp[..resp.len().min(12)]).into_owned();
-    ensure(head.starts_with("HTTP/1."), format!("reponse {head:?}"))?;
-    // Copie d'un flux (try_clone) : lecture et ecriture depuis deux threads.
-    let s2 = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("connect 2 : {e}"))?;
-    let mut w = s2.try_clone().map_err(|e| format!("try_clone : {e}"))?;
+    ensure(head.starts_with("HTTP/1."), format!("response {head:?}"))?;
+    // Cloned stream (try_clone): read and write from two threads.
+    let s2 = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(|e| format!("connect 2: {e}"))?;
+    let mut w = s2.try_clone().map_err(|e| format!("try_clone: {e}"))?;
     let reader = thread::spawn(move || {
         let mut s2 = s2;
         let mut v = Vec::new();
@@ -456,15 +451,15 @@ fn network() -> R {
     });
     w.write_all(b"HEAD / HTTP/1.0\r\nHost: example.com\r\n\r\n").map_err(|e| e.to_string())?;
     drop(w);
-    let n2 = reader.join().unwrap().map_err(|e| format!("lecture clone : {e}"))?;
-    ensure(n2 > 0, "clone : reponse vide")?;
-    // Port garde par un programme disparu : repris.
+    let n2 = reader.join().unwrap().map_err(|e| format!("clone read: {e}"))?;
+    ensure(n2 > 0, "clone: empty response")?;
+    // Port held by a dead program: reclaimed.
     let st = Command::new("stdtest").args(["holdport", "8765"]).status().map_err(|e| e.to_string())?;
-    ensure(st.code() == Some(134), format!("holdport : {st}"))?;
-    drop(std::net::TcpListener::bind("0.0.0.0:8765").map_err(|e| format!("port d'un programme disparu : {e}"))?);
+    ensure(st.code() == Some(134), format!("holdport: {st}"))?;
+    drop(std::net::TcpListener::bind("0.0.0.0:8765").map_err(|e| format!("dead program port: {e}"))?);
     let u = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let local = u.local_addr().unwrap();
-    Ok(format!("{addr} : {} octets ({}), UDP {local}", resp.len(), head.trim()))
+    Ok(format!("{addr}: {} bytes ({}), UDP {local}", resp.len(), head.trim()))
 }
 
 fn bench() {
@@ -503,16 +498,16 @@ fn bench() {
         tx.send(i).unwrap();
         rx2.recv().unwrap();
     }
-    println!("  canal aller-retour    {:>8.1} us", t.elapsed().as_nanos() as f64 / 10_000.0 / 1000.0);
+    println!("  channel round-trip    {:>8.1} us", t.elapsed().as_nanos() as f64 / 10_000.0 / 1000.0);
     drop(tx);
     h.join().unwrap();
 }
 
-/// `stdtest serve PORT N` : petit serveur HTTP (un thread par connexion)
-/// pour verifier `TcpListener` depuis l'hote ; s'arrete apres N reponses.
+/// `stdtest serve PORT N`: tiny HTTP server (one thread per connection)
+/// to check `TcpListener` from the host; stops after N replies.
 fn serve(port: u16, count: usize) {
     let l = std::net::TcpListener::bind(("0.0.0.0", port)).expect("bind");
-    println!("stdtest : ecoute sur {}", l.local_addr().unwrap());
+    println!("stdtest: listening on {}", l.local_addr().unwrap());
     let served = Arc::new(AtomicUsize::new(0));
     let mut hs = Vec::new();
     for _ in 0..count {
@@ -523,7 +518,7 @@ fn serve(port: u16, count: usize) {
             let n = s.read(&mut req).unwrap_or(0);
             let first = String::from_utf8_lossy(&req[..n]).lines().next().unwrap_or("").to_string();
             let k = served.fetch_add(1, Ordering::SeqCst) + 1;
-            let body = format!("bonjour de std sur nxk, reponse {k} a {peer} ({first})\n");
+            let body = format!("hello from std on nxk, reply {k} to {peer} ({first})\n");
             let resp = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
             s.write_all(resp.as_bytes()).unwrap();
         }));
@@ -531,21 +526,21 @@ fn serve(port: u16, count: usize) {
     for h in hs {
         h.join().unwrap();
     }
-    println!("RESULT stdtest_serve {} reponses", served.load(Ordering::SeqCst));
+    println!("RESULT stdtest_serve {} replies", served.load(Ordering::SeqCst));
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
-        // Outils des tests de tubes.
+        // Pipe-test helpers.
         Some("upper") => {
             let mut v = Vec::new();
             std::io::stdin().read_to_end(&mut v).unwrap();
             std::io::stdout().write_all(&v.to_ascii_uppercase()).unwrap();
             return;
         }
-        // Garde une ressource puis s'arrete brutalement (abort) : le service
-        // doit la liberer d'office.
+        // Hold a resource then abort: the service
+        // must release it.
         Some("holdfile") => {
             let _f = fs::File::open(&args[2]).unwrap();
             std::process::abort();
@@ -556,10 +551,10 @@ fn main() {
         }
         Some("errtest") => {
             use std::io::IsTerminal;
-            // Redirigees, les sorties ne sont pas des terminaux.
+            // Redirected outputs are not terminals.
             let tty = std::io::stdout().is_terminal() || std::io::stderr().is_terminal();
-            println!("{}", if tty { "terminal ?" } else { "vers stdout" });
-            eprintln!("vers stderr");
+            println!("{}", if tty { "terminal?" } else { "to stdout" });
+            eprintln!("to stderr");
             return;
         }
         _ => {}
@@ -572,7 +567,7 @@ fn main() {
     }
     let with_net = args.iter().any(|a| a == "net");
     if args.iter().any(|a| a == "bench") {
-        println!("stdtest : mesures");
+        println!("stdtest: bench");
         bench();
         return;
     }
@@ -582,23 +577,23 @@ fn main() {
         ("mutex", mutex),
         ("condvar", condvar),
         ("rwlock", rwlock),
-        ("canaux", channels),
-        ("barriere", barrier_once),
+        ("channels", channels),
+        ("barrier", barrier_once),
         ("thread_local", thread_locals),
         ("park", park),
-        ("temps", sleep_time),
-        ("environnement", environment),
-        ("memoire", memory),
+        ("time", sleep_time),
+        ("env", environment),
+        ("memory", memory),
         ("collections", collections),
-        ("maths", math),
-        ("fichiers", files),
-        ("processus", processes),
-        ("tubes", pipes),
+        ("math", math),
+        ("files", files),
+        ("processes", processes),
+        ("pipes", pipes),
     ];
     if with_net {
-        tests.push(("reseau", network));
+        tests.push(("network", network));
     }
-    println!("stdtest : {} tests", tests.len());
+    println!("stdtest: {} tests", tests.len());
     let t0 = Instant::now();
     let mut ok = 0;
     for (name, f) in &tests {
@@ -608,9 +603,9 @@ fn main() {
                 ok += 1;
                 println!("  ok     {name:<14} {detail} [{} ms]", t.elapsed().as_millis());
             }
-            Err(e) => println!("  ECHEC  {name:<14} {e}"),
+            Err(e) => println!("  FAIL   {name:<14} {e}"),
         }
     }
-    println!("RESULT stdtest {ok}/{} reussis en {} ms", tests.len(), t0.elapsed().as_millis());
+    println!("RESULT stdtest {ok}/{} passed in {} ms", tests.len(), t0.elapsed().as_millis());
     std::process::exit(if ok == tests.len() { 0 } else { 1 });
 }

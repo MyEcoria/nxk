@@ -1,7 +1,7 @@
-# Programmes Rust ordinaires (avec std) pour nxk.
+# Ordinary Rust programs (with std) for nxk.
 #
-# Construction : tools/build.sh (ou, ici : cargo build --release), avec la
-# chaine « nxk » preparee par tools/mkstd.py (bibliotheque standard portee).
+# Build: tools/build.sh (or here: cargo build --release), with the
+# "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
 [workspace]
 resolver = "2"
 members = ["hello", "stdtest"]
