@@ -227,7 +227,7 @@ All in EL0, started by `init` with only their capabilities.
 | `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
-| `sd` | SD card (SDHCI, ADMA2) | emulator; real reader power and pins not set up |
+| `sd` | SD card (SDHCI, ADMA2), slot power-up (pads, GPIOs, PMC I/O power, PMIC LDO2) | 3.3 V default speed only (no UHS / 1.8 V) |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
 | `display` | screen (window A), boot logo and landscape text terminal (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
@@ -261,7 +261,9 @@ program that vanished without closing them (crash) are reclaimed.
   pads are internal. Last hardware run: single core (before PSCI in
   nxk-bl31) and no SD card (see `hwboot/README.md`, "Hardware runs").
   A USB keyboard does not help: its keys go to `input`, not to the
-  shell, and hekate's L4T path leaves the xHCI unpowered.
+  shell, and hekate's L4T path leaves the xHCI unpowered. That run
+  predates PSCI `CPU_ON` in nxk-bl31 and the `sd` slot power-up: both
+  work in the emulator, neither has been seen on silicon yet.
 - Kernel messages (`[nxk]` fault reports) go to UART-A and the loader's
   screen only, not to the USB console. Mariko lacks the USB2 OTG device
   controller (its OTG port belongs to XUSB): no USB console there.

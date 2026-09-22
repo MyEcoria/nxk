@@ -705,6 +705,8 @@ pub mod proto {
         pub const TEMPERATURE: u32 = 3;
         /// Re-read the RTC and update the kernel wall clock.
         pub const SYNC_TIME: u32 = 4;
+        /// word 0 = 1: SD card I/O rail (PMIC LDO2) on at 3.3 V; 0: off.
+        pub const SD_POWER: u32 = 5;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {

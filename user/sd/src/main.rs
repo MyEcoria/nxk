@@ -1,10 +1,12 @@
 //! sd: SDMMC1 card (SDHCI); 512-byte ADMA2 blocks via `blk` protocol.
-//! Card power and pads are left to the bootloader.
+//! Powers the slot itself (`board`), then Tegra pad trims and calibration as hekate.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
+
+mod board;
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV, ETIMEDOUT};
 use libnx::abi::prot;
@@ -15,7 +17,12 @@ use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
 use libnx::{ns, println, sys, time};
 
+use board::Board;
+
 const SDMMC1: u64 = 0x700B_0000;
+/// Controller clock set by `clk` (PLLP / 8.5); CAPABILITIES' base clock
+/// field is not reliable on Tegra.
+const BASE_KHZ: u32 = 48_000;
 
 // SDHCI registers.
 const BLOCK_SIZE: usize = 0x04;
@@ -33,9 +40,24 @@ const SOFTWARE_RESET: usize = 0x2F;
 const INT_STATUS: usize = 0x30;
 const INT_ENABLE: usize = 0x34;
 const INT_SIGNAL: usize = 0x38;
-const CAPABILITIES: usize = 0x40;
+const HOST_CONTROL2: usize = 0x3E;
 const ADMA_ADDRESS: usize = 0x58;
+
+// Tegra vendor registers (hekate bdk/storage/sdmmc_t210.h).
 const VENDOR_CLOCK_CNTRL: usize = 0x100;
+const VENDOR_TUNING_CNTRL0: usize = 0x1C0;
+const VENDOR_IO_TRIM_CNTRL: usize = 0x1AC;
+const SDMEMCOMPPADCTRL: usize = 0x1E0;
+const AUTO_CAL_CONFIG: usize = 0x1E4;
+const AUTO_CAL_STATUS: usize = 0x1EC;
+const IO_SPARE: usize = 0x1F0;
+const PADCTRL_E_INPUT_PWRD: u32 = 1 << 31;
+const AUTOCAL_ENABLE: u32 = 1 << 29;
+const AUTOCAL_START: u32 = 1 << 31;
+const AUTOCAL_ACTIVE: u32 = 1 << 31;
+const TUNING_TAP_HW_UPDATED: u32 = 1 << 17;
+const PRESET_VAL_EN: u16 = 1 << 15;
+const CLOCK_CARD_EN: u16 = 1 << 2;
 
 const INT_CMD_DONE: u32 = 1 << 0;
 const INT_XFER_DONE: u32 = 1 << 1;
@@ -73,19 +95,51 @@ impl Card {
         while self.regs.r8(SOFTWARE_RESET) & what != 0 && time::now_ns() < end {}
     }
 
-    fn set_clock(&self, khz: u32) {
+    fn set_clock(&self, khz: u32) -> Result<(), i64> {
         self.regs.w16(CLOCK_CONTROL, 0);
-        let base = ((self.regs.r32(CAPABILITIES) >> 8) & 0xFF).max(1) * 1000;
-        let div = if khz >= base {
+        let div = if khz >= BASE_KHZ {
             0
         } else {
-            base.div_ceil(2 * khz)
+            BASE_KHZ.div_ceil(2 * khz)
         };
         let v = ((div & 0xFF) << 8 | ((div >> 8) & 3) << 6 | 1) as u16;
         self.regs.w16(CLOCK_CONTROL, v);
         let end = time::now_ns() + 20_000_000;
-        while self.regs.r16(CLOCK_CONTROL) & 2 == 0 && time::now_ns() < end {}
-        self.regs.w16(CLOCK_CONTROL, v | 4);
+        while self.regs.r16(CLOCK_CONTROL) & 2 == 0 {
+            if time::now_ns() > end {
+                return Err(-ETIMEDOUT); // internal clock never stable
+            }
+        }
+        self.regs.w16(CLOCK_CONTROL, v | CLOCK_CARD_EN);
+        Ok(())
+    }
+
+    /// Pad trims (T210: trim 2, tap 4, vref 7; T210B01: 14, 11, 0) and
+    /// 3.3 V drive auto-calibration, hekate values; SD clock off meanwhile.
+    fn tegra_pads(&self, board: &Board) {
+        let (trim, tap, vref) = if board.mariko { (14, 11, 0) } else { (2, 4, 7) };
+        self.regs.modify(IO_SPARE, 0, 1 << 19); // 1-cycle delayed cmd_oen
+        self.regs.modify(VENDOR_IO_TRIM_CNTRL, 1 << 2, 0); // band gap supplies the DLL
+        self.regs
+            .modify(VENDOR_CLOCK_CNTRL, 0x1FFF_0004, trim << 24 | tap << 16 | 1);
+        self.regs
+            .modify(VENDOR_TUNING_CNTRL0, TUNING_TAP_HW_UPDATED, 0);
+        self.regs.modify(SDMEMCOMPPADCTRL, 0xF, vref);
+        // Offsets: T210 pull-down -3 (7-bit two's complement), pull-up 0.
+        let (pd, pu) = if board.mariko { (0, 0) } else { (0x7D, 0) };
+        self.regs.modify(AUTO_CAL_CONFIG, 0x7F7F, pd << 8 | pu);
+
+        self.regs.modify(SDMEMCOMPPADCTRL, 0, PADCTRL_E_INPUT_PWRD);
+        time::sleep_us(1);
+        self.regs
+            .modify(AUTO_CAL_CONFIG, 0, AUTOCAL_ENABLE | AUTOCAL_START);
+        time::sleep_us(2);
+        if !self.regs.wait(AUTO_CAL_STATUS, AUTOCAL_ACTIVE, 0, 10_000) {
+            self.regs.modify(AUTO_CAL_CONFIG, AUTOCAL_ENABLE, 0);
+            board.pad_fallback();
+            println!("[sd] pad calibration timed out: standard drive strengths");
+        }
+        self.regs.modify(SDMEMCOMPPADCTRL, PADCTRL_E_INPUT_PWRD, 0);
     }
 
     /// Wait for one of the `mask` status bits; the IRQ wakes the thread
@@ -197,14 +251,15 @@ impl Card {
         self.command(idx, arg, rsp, None)
     }
 
-    fn init(&mut self) -> Result<(), i64> {
-        if self.regs.r32(PRESENT_STATE) & (1 << 16) == 0 {
-            return Err(-ENODEV); // no card
-        }
-        self.regs.modify(VENDOR_CLOCK_CNTRL, 0, 1);
+    /// Controller already clocked and out of reset, slot powered.
+    fn init(&mut self, board: &Board) -> Result<(), i64> {
         self.reset(0x1);
-        self.regs.w8(POWER_CONTROL, 0x0F); // 3.3 V
-        self.set_clock(400);
+        self.tegra_pads(board);
+        self.regs
+            .w16(HOST_CONTROL2, self.regs.r16(HOST_CONTROL2) & !PRESET_VAL_EN);
+        self.regs.w8(HOST_CONTROL, 0); // 1-bit bus, default speed
+        self.regs.w8(POWER_CONTROL, 0x0F); // 3.3 V, bus power on
+        self.set_clock(400)?;
         self.regs.w8(TIMEOUT_CONTROL, 0x0E);
         self.regs.w16(INT_ENABLE, 0xFFFF);
         self.regs.w16(INT_ENABLE + 2, 0xFFFF);
@@ -248,8 +303,13 @@ impl Card {
         if !self.block_addressed {
             self.command(16, BLOCK as u32, Rsp::R1, None)?;
         }
-        self.set_clock(25_000);
-        Ok(())
+        self.set_clock(25_000)
+    }
+
+    /// SD clock and bus power off before the slot loses power.
+    fn stop(&self) {
+        self.regs.w16(CLOCK_CONTROL, 0);
+        self.regs.w8(POWER_CONTROL, 0);
     }
 
     fn transfer(&self, lba: u64, n: usize, read: bool) -> Result<(), i64> {
@@ -277,15 +337,33 @@ impl Card {
 
 libnx::entry!(main);
 
-fn main() -> i32 {
-    let regs = Mmio::map(drv::dev_slot(0), SDMMC1, 0x1000).expect("sd: registers");
-    let irq = Irq::new(drv::dev_slot(1)).expect("sd: interrupt");
-    if let Ok(c) = ns::wait_for_timeout("clk", 2_000_000_000) {
-        let mut m = Msg::new(clk::ENABLE, 1, 0);
-        m.mr[0] = clk::SDMMC1;
-        let _ = ipc::call(c, &m);
-        let _ = sys::handle_close(c);
+fn map(slot: u32, phys: u64) -> Mmio {
+    Mmio::map(drv::dev_slot(slot), phys, 0x1000).expect("sd: registers")
+}
+
+/// Card detect, slot power, controller clock. The slot stays off without a card.
+fn bring_up(board: &Board) -> Result<(), i64> {
+    if !board.card_present() {
+        return Err(-ENODEV);
     }
+    board.power_on()?;
+    let c = ns::wait_for_timeout("clk", 2_000_000_000)?;
+    let mut m = Msg::new(clk::ENABLE, 1, 0);
+    m.mr[0] = clk::SDMMC1;
+    let r = ipc::call(c, &m).and_then(ipc::checked);
+    let _ = sys::handle_close(c);
+    r.map(|_| ())
+}
+
+fn main() -> i32 {
+    let regs = map(0, SDMMC1);
+    let board = Board::new(
+        map(1, board::APB_MISC),
+        map(2, board::PINMUX),
+        map(3, board::GPIO),
+        map(4, board::PMC_PAGE),
+    );
+    let irq = Irq::new(drv::dev_slot(5)).expect("sd: interrupt");
     let dma = SharedMemory::new(
         DESC_BYTES + MAX_BLOCKS * BLOCK,
         CONTIGUOUS | UNCACHED | DMA32,
@@ -301,8 +379,12 @@ fn main() -> i32 {
         block_addressed: false,
         blocks: 0,
     };
-    if let Err(e) = card.init() {
+    if let Err(e) = bring_up(&board).and_then(|()| card.init(&board)) {
         println!("[sd] no usable card ({})", libnx::abi::err::name(e));
+        if e != -ENODEV {
+            card.stop();
+            board.power_off();
+        }
         loop {
             time::sleep_ms(3_600_000);
         }

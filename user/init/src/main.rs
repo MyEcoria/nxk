@@ -68,9 +68,17 @@ const DRIVERS: &[Driver] = &[
         terminal: false,
         prio: 8,
     },
+    // SDMMC1, plus what powers the slot: APB_MISC (pad control, chip
+    // revision), pinmux, GPIO (card detect/power) and PMC (I/O power).
     Driver {
         name: "sd",
-        mmio: &[(0x700B_0000, 0x1000)],
+        mmio: &[
+            (0x700B_0000, 0x1000),
+            (0x7000_0000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+            (0x7000_E000, 0x1000),
+        ],
         ro_mmio: &[],
         irqs: &[46],
         sysctl: false,

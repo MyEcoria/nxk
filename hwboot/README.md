@@ -190,6 +190,8 @@ The last `usbcon:` line locates a failure:
    balancing: no PSCI then), and no SD card (`ls /`: ENOSYS, stdtest
    `files`): hekate's `sd_end()` powers the card off before the L4T
    jump, and `sd` expected it on. `usb` and `net` exit (xHCI off).
+   Both failures are fixed since (PSCI `CPU_ON` in the monitor, slot
+   power-up in `sd`), emulator-tested, awaiting a hardware run.
 
 ## Hardware test (once the SD card is back in the PC)
 
@@ -203,7 +205,8 @@ The last `usbcon:` line locates a failure:
    `input` service, and hekate's L4T path leaves the xHCI unpowered
    (`usb` exits).
 4. Expected: `entry in EL2`, `PSCI 1.0`, `4/4 cores online`, `launching init`,
-   then the `display` service screen and the `usbcon:` lines.
+   then the `display` service screen and the `usbcon:` lines. In the
+   shell: `cpu` shows the four cores, `ls /` the SD card.
 5. Recovery: a failed boot is just a hang. Hold Power 12 s (forced
    off), reboot into RCM, retry. No NAND, eMMC or SD writes by nxk:
    nothing persistent can be corrupted.
