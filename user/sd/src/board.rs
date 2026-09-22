@@ -95,6 +95,8 @@ impl Board {
 
     /// Pads, controller I/O power, card power, then I/O rail at 3.3 V.
     pub fn power_on(&self) -> Result<(), i64> {
+        // A power-off leaves the pads driven high to discharge them.
+        self.pads_gpio(false);
         // Deep loopback on the CLK pad: without it reads fail.
         self.misc.w32(GP_SDMMC1_CLK_LPBK_CONTROL, 1);
         let clk = self.pinmux.r32(PIN_SDMMC1_CLK) & !SCHMT;
