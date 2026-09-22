@@ -1,13 +1,5 @@
-//! fs : systeme de fichiers FAT32 de la carte SD.
-//!
-//! Le service attend le peripherique bloc (« blk:sd »), monte la premiere
-//! partition FAT32 (ou le volume entier s'il n'y a pas de table), puis sert
-//! le protocole `fs` : ouverture, lecture et ecriture positionnees (le
-//! client tient sa position, comme `pread`/`pwrite`), dossiers, suppression,
-//! renommage, troncature, synchronisation.
-//!
-//! Les donnees passent par un cache de secteurs en ecriture differee : tout
-//! est ecrit a la fermeture d'un fichier ou sur `sync`.
+//! fs: SD card FAT32 filesystem over "blk:sd" (`fs` protocol).
+//! Write-back sector cache; flushed on file close or `sync`.
 
 #![no_std]
 #![no_main]
@@ -35,11 +27,10 @@ struct Open {
     entry: Entry,
     cur: Cursor,
     flags: u64,
-    /// References (DUP) : CLOSE ne ferme qu'a la derniere.
+    /// References (DUP): CLOSE only closes on the last one.
     refs: u32,
-    /// Processus proprietaire (pid pose par le noyau sur chaque message) :
-    /// seul lui peut se servir du descripteur, et ses fichiers sont fermes
-    /// s'il disparait sans l'avoir fait (plantage).
+    /// Owner process (pid stamped by the kernel on each message): only it
+    /// may use the descriptor, and its files are closed if it dies first.
     owner: u32,
 }
 
@@ -58,7 +49,10 @@ fn kind(e: &Entry) -> u64 {
 
 impl Server {
     fn is_open(files: &[Option<Open>], e: &Entry) -> bool {
-        files.iter().flatten().any(|o| o.entry.dir == e.dir && o.entry.index == e.index)
+        files
+            .iter()
+            .flatten()
+            .any(|o| o.entry.dir == e.dir && o.entry.index == e.index)
     }
 
     fn fd(&mut self, fd: u64, pid: u32) -> Result<&mut Open, i64> {
@@ -69,7 +63,7 @@ impl Server {
             .ok_or(-EBADF)
     }
 
-    /// Ferme les fichiers des processus disparus ; rend vrai s'il y en avait.
+    /// Close files of dead processes; true if there were any.
     fn reap(&mut self) -> bool {
         let live = libnx::process::live_pids();
         let mut closed = false;
@@ -85,8 +79,8 @@ impl Server {
         closed
     }
 
-    /// Operation refusee sur un fichier ouvert (EBUSY) : peut-etre ouvert par
-    /// un processus disparu ; on ramasse et on reessaie une fois.
+    /// Operation refused on an open file (EBUSY): maybe held by a dead
+    /// process; reap and retry once.
     fn retry_busy<T>(&mut self, mut op: impl FnMut(&mut Self) -> Result<T, i64>) -> Result<T, i64> {
         match op(self) {
             Err(e) if e == -libnx::abi::err::EBUSY && self.reap() => op(self),
@@ -110,11 +104,18 @@ impl Server {
             }
             Err(err) if err == -ENOENT && flags & proto::O_CREATE != 0 => {
                 let (parent, name) = self.vol.parent(path)?;
-                self.vol.create(&parent, name, Volume::default_attr(), 0, 0)?
+                self.vol
+                    .create(&parent, name, Volume::default_attr(), 0, 0)?
             }
             Err(err) => return Err(err),
         };
-        let mut o = Open { entry: e, cur: Cursor::default(), flags, refs: 1, owner };
+        let mut o = Open {
+            entry: e,
+            cur: Cursor::default(),
+            flags,
+            refs: 1,
+            owner,
+        };
         if flags & proto::O_TRUNC != 0 && flags & proto::O_WRITE != 0 && o.entry.size != 0 {
             self.vol.truncate(&mut o.entry, &mut o.cur, 0)?;
         }
@@ -211,7 +212,9 @@ impl Server {
                     true
                 })?;
                 Ok(match found {
-                    Some(e) => ipc::pack_at(0, &[e.size as u64, kind(&e), e.mtime], e.name.as_bytes()),
+                    Some(e) => {
+                        ipc::pack_at(0, &[e.size as u64, kind(&e), e.mtime], e.name.as_bytes())
+                    }
                     None => ipc::pack_at(0, &[0, 0, 0], &[]),
                 })
             }
@@ -288,30 +291,40 @@ fn main() -> i32 {
     let blk = match ns::wait_for_timeout("blk:sd", 5_000_000_000) {
         Ok(h) => h,
         Err(_) => {
-            println!("[fs] pas de carte SD : pas de systeme de fichiers");
+            println!("[fs] no SD card: no filesystem");
             return 0;
         }
     };
-    let io = SharedMemory::new(IO_SECTORS * SECTOR, 0).expect("fs : tampon");
+    let io = SharedMemory::new(IO_SECTORS * SECTOR, 0).expect("fs: buffer");
     ipc::set_send_handle(0, io.handle());
-    let r = ipc::call(blk, &Msg::new(blk::ATTACH, 0, 1)).expect("fs : attache du tampon");
+    let r = ipc::call(blk, &Msg::new(blk::ATTACH, 0, 1)).expect("fs: buffer attach");
     if r.label() != 0 {
-        println!("[fs] le peripherique bloc refuse le tampon");
+        println!("[fs] block device refused the buffer");
         return 1;
     }
-    let info = ipc::call(blk, &Msg::new(blk::INFO, 0, 0)).expect("fs : info");
+    let info = ipc::call(blk, &Msg::new(blk::INFO, 0, 0)).expect("fs: info");
     let cache = Cache::new(blk, io, info.mr[1], 2048);
     let mut vol = match Volume::mount(cache) {
         Ok(v) => v,
         Err(e) => {
-            println!("[fs] pas de volume FAT32 sur la carte ({})", libnx::abi::err::name(e));
+            println!(
+                "[fs] no FAT32 volume on card ({})",
+                libnx::abi::err::name(e)
+            );
             return 1;
         }
     };
     let (free, total) = vol.statfs().unwrap_or((0, 0));
-    println!("[fs] FAT32 monte : {} Mio, {} Mio libres", total >> 20, free >> 20);
-    let ep = drv::publish("fs").expect("fs : publication");
-    let mut srv = Server { vol, files: Vec::new() };
+    println!(
+        "[fs] FAT32 mounted: {} MiB, {} MiB free",
+        total >> 20,
+        free >> 20
+    );
+    let ep = drv::publish("fs").expect("fs: publish");
+    let mut srv = Server {
+        vol,
+        files: Vec::new(),
+    };
     drv::serve(ep, |rx| {
         Some(match srv.handle(&rx.msg, rx.pid) {
             Ok(m) => m,

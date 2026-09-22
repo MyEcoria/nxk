@@ -1,10 +1,5 @@
-//! Cache de secteurs du volume, en ecriture differee.
-//!
-//! Tout acces au support passe par ici. Un defaut de cache lit d'un coup
-//! plusieurs secteurs consecutifs (lecture anticipee : les fichiers et les
-//! dossiers FAT sont le plus souvent contigus). Les secteurs modifies ne sont
-//! ecrits qu'au `flush` (fermeture d'un fichier, `sync`) ou a leur eviction,
-//! regroupes en ecritures multi-blocs.
+//! Volume sector cache, write-back, with readahead on misses.
+//! Dirty sectors flush on `flush`/eviction in contiguous runs.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -15,9 +10,9 @@ use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
 
 pub const SECTOR: usize = 512;
-/// Secteurs lus d'avance sur un defaut de cache.
+/// Sectors read ahead on a cache miss.
 const READAHEAD: usize = 64;
-/// Taille du tampon partage avec le pilote (256 KiB = 512 blocs).
+/// Size of the buffer shared with the driver (256 KiB = 512 blocks).
 pub const IO_SECTORS: usize = 512;
 
 pub struct Cache {
@@ -61,7 +56,7 @@ impl Cache {
         Ok(())
     }
 
-    /// Emplacement libre (algorithme de l'horloge), apres ecriture eventuelle.
+    /// Free slot (clock algorithm), flushing if needed.
     fn victim(&mut self) -> Result<usize, i64> {
         loop {
             let s = self.hand;
@@ -89,9 +84,12 @@ impl Cache {
         if lba >= self.total {
             return Err(-libnx::abi::err::EIO);
         }
-        // Lecture anticipee jusqu'au prochain secteur deja en cache.
+        // Readahead up to the next already-cached sector.
         let mut n = 1;
-        while n < READAHEAD && lba + (n as u64) < self.total && !self.map.contains_key(&(lba + n as u64)) {
+        while n < READAHEAD
+            && lba + (n as u64) < self.total
+            && !self.map.contains_key(&(lba + n as u64))
+        {
             n += 1;
         }
         self.io(blk::READ, lba, n)?;
@@ -121,7 +119,7 @@ impl Cache {
         Ok(&mut self.data[s * SECTOR..(s + 1) * SECTOR])
     }
 
-    /// Secteur entierement reecrit : inutile de le lire d'abord.
+    /// Fully overwritten sector: no need to read it first.
     pub fn overwrite(&mut self, lba: u64) -> Result<&mut [u8], i64> {
         let s = match self.map.get(&lba) {
             Some(&s) => s,
@@ -137,17 +135,22 @@ impl Cache {
         Ok(&mut self.data[s * SECTOR..(s + 1) * SECTOR])
     }
 
-    /// Ecrit tous les secteurs modifies, par suites contigues.
+    /// Write all dirty sectors, in contiguous runs.
     pub fn flush(&mut self) -> Result<(), i64> {
-        let dirty: Vec<(u64, usize)> =
-            self.map.iter().filter(|(_, &s)| self.dirty[s]).map(|(&l, &s)| (l, s)).collect();
+        let dirty: Vec<(u64, usize)> = self
+            .map
+            .iter()
+            .filter(|(_, &s)| self.dirty[s])
+            .map(|(&l, &s)| (l, s))
+            .collect();
         let mut i = 0;
         while i < dirty.len() {
             let start = dirty[i].0;
             let mut n = 0;
             while i + n < dirty.len() && dirty[i + n].0 == start + n as u64 && n < IO_SECTORS {
                 let s = dirty[i + n].1;
-                self.io.as_mut_slice()[n * SECTOR..(n + 1) * SECTOR].copy_from_slice(&self.data[s * SECTOR..(s + 1) * SECTOR]);
+                self.io.as_mut_slice()[n * SECTOR..(n + 1) * SECTOR]
+                    .copy_from_slice(&self.data[s * SECTOR..(s + 1) * SECTOR]);
                 n += 1;
             }
             self.io(blk::WRITE, start, n)?;

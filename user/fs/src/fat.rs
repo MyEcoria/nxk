@@ -1,9 +1,11 @@
-//! FAT32 : volume, table d'allocation, dossiers (noms longs), fichiers.
+//! FAT32: volume, allocation table, directories (long names), files.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EBUSY, EEXIST, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY};
+use libnx::abi::err::{
+    EBUSY, EEXIST, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY,
+};
 
 use crate::cache::{Cache, SECTOR};
 
@@ -17,21 +19,21 @@ const ENTRY: usize = 32;
 
 pub type Res<T> = Result<T, i64>;
 
-/// Une entree de dossier, et l'endroit ou elle est rangee.
+/// A directory entry, and where it is stored.
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
     pub attr: u8,
     pub cluster: u32,
     pub size: u32,
-    /// Date de modification (secondes depuis 1970).
+    /// Modification time (seconds since 1970).
     pub mtime: u64,
-    /// Dossier parent (premier cluster ; 0 pour la racine elle-meme).
+    /// Parent directory (first cluster; 0 for the root itself).
     pub dir: u32,
-    /// Index de l'entree courte dans le parent, et entrees LFN avant elle.
+    /// Index of the short entry in the parent, and LFN entries before it.
     pub index: u32,
     pub lfn: u32,
-    /// Nom 8.3 enregistre.
+    /// Stored 8.3 name.
     pub short: [u8; 11],
 }
 
@@ -41,8 +43,8 @@ impl Entry {
     }
 }
 
-/// Position dans la chaine d'un fichier : evite de reparcourir la FAT
-/// depuis le debut a chaque lecture sequentielle.
+/// Position in a file chain: avoids rewalking FAT from the start on
+/// each sequential read.
 #[derive(Clone, Copy, Default)]
 pub struct Cursor {
     pub index: u32,
@@ -95,7 +97,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// (heure, date) FAT de l'instant present.
+/// (time, date) FAT pair for the current instant.
 fn fat_now() -> (u16, u16) {
     let s = (libnx::sys::realtime_ns() / 1_000_000_000) as i64;
     let (y, m, d) = civil_from_days(s.div_euclid(86_400));
@@ -110,15 +112,21 @@ fn unix_time(time: u16, date: u16) -> u64 {
         return 0;
     }
     let y = 1980 + (date >> 9) as i64;
-    let (m, d) = (((date >> 5) & 0xF).clamp(1, 12) as u32, (date & 0x1F).max(1) as u32);
-    let s = (time >> 11) as i64 * 3600 + ((time >> 5) & 0x3F) as i64 * 60 + (time & 0x1F) as i64 * 2;
+    let (m, d) = (
+        ((date >> 5) & 0xF).clamp(1, 12) as u32,
+        (date & 0x1F).max(1) as u32,
+    );
+    let s =
+        (time >> 11) as i64 * 3600 + ((time >> 5) & 0x3F) as i64 * 60 + (time & 0x1F) as i64 * 2;
     (days_from_civil(y, m, d) * 86_400 + s).max(0) as u64
 }
 
 // ------------------------------------------------------------- noms ---
 
 fn eq_name(a: &str, b: &str) -> bool {
-    a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .eq(b.chars().flat_map(char::to_lowercase))
 }
 
 fn lfn_checksum(short: &[u8; 11]) -> u8 {
@@ -133,7 +141,7 @@ fn short_valid(c: u8) -> bool {
     c.is_ascii_uppercase() || c.is_ascii_digit() || b"$%'-_@~`!(){}^#&".contains(&c) || c >= 0x80
 }
 
-/// Nom 8.3 exact si `name` s'y ecrit tel quel (majuscules, sans LFN).
+/// Exact 8.3 name if `name` fits as-is (uppercase, no LFN).
 fn exact_short(name: &str) -> Option<[u8; 11]> {
     let (base, ext) = match name.rfind('.') {
         Some(p) if p > 0 => (&name[..p], &name[p + 1..]),
@@ -151,7 +159,7 @@ fn exact_short(name: &str) -> Option<[u8; 11]> {
     Some(s)
 }
 
-/// Nom 8.3 de substitution « BASE~N.EXT » pour un nom long.
+/// Substitute "BASE~N.EXT" 8.3 name for a long name.
 fn alias(name: &str, n: u32) -> [u8; 11] {
     let clean = |s: &str, max: usize| -> Vec<u8> {
         s.chars()
@@ -184,7 +192,7 @@ fn alias(name: &str, n: u32) -> [u8; 11] {
     s
 }
 
-/// Nom lisible d'une entree courte (minuscules selon les drapeaux NT).
+/// Readable name of a short entry (lowercase per NT flags).
 fn short_to_string(e: &[u8]) -> String {
     let lower_base = e[12] & 0x08 != 0;
     let lower_ext = e[12] & 0x10 != 0;
@@ -194,7 +202,11 @@ fn short_to_string(e: &[u8]) -> String {
             break;
         }
         let c = if k == 0 && c == 0x05 { 0xE5 } else { c };
-        s.push(if lower_base { (c as char).to_ascii_lowercase() } else { c as char });
+        s.push(if lower_base {
+            (c as char).to_ascii_lowercase()
+        } else {
+            c as char
+        });
     }
     if e[8] != b' ' {
         s.push('.');
@@ -202,7 +214,11 @@ fn short_to_string(e: &[u8]) -> String {
             if c == b' ' {
                 break;
             }
-            s.push(if lower_ext { (c as char).to_ascii_lowercase() } else { c as char });
+            s.push(if lower_ext {
+                (c as char).to_ascii_lowercase()
+            } else {
+                c as char
+            });
         }
     }
     s
@@ -215,7 +231,10 @@ fn valid_name(name: &str) -> Res<()> {
     if name.encode_utf16().count() > 255 {
         return Err(-ENAMETOOLONG);
     }
-    if name.chars().any(|c| (c as u32) < 0x20 || "\"*/:<>?\\|".contains(c)) {
+    if name
+        .chars()
+        .any(|c| (c as u32) < 0x20 || "\"*/:<>?\\|".contains(c))
+    {
         return Err(-EINVAL);
     }
     Ok(())
@@ -224,27 +243,35 @@ fn valid_name(name: &str) -> Res<()> {
 // ------------------------------------------------------------- volume ---
 
 impl Volume {
-    /// Monte le volume FAT32 (table MBR ou volume sans partition).
+    /// Mount the FAT32 volume (MBR table or partition-less volume).
     pub fn mount(mut cache: Cache) -> Res<Self> {
         let s0 = cache.read(0)?.to_vec();
         let mut part = 0u64;
-        let is_vbr = |b: &[u8]| (b[0] == 0xEB || b[0] == 0xE9) && le16(b, 11) == 512 && b[510] == 0x55 && b[511] == 0xAA;
+        let is_vbr = |b: &[u8]| {
+            (b[0] == 0xEB || b[0] == 0xE9) && le16(b, 11) == 512 && b[510] == 0x55 && b[511] == 0xAA
+        };
         if !is_vbr(&s0) {
             if s0[510] != 0x55 || s0[511] != 0xAA {
                 return Err(-EINVAL);
             }
-            // Premiere partition FAT de la table MBR.
-            let found = (0..4).map(|k| &s0[446 + 16 * k..462 + 16 * k]).find(|p| matches!(p[4], 0x0B | 0x0C | 0x0E | 0x06));
+            // First FAT partition of the MBR table.
+            let found = (0..4)
+                .map(|k| &s0[446 + 16 * k..462 + 16 * k])
+                .find(|p| matches!(p[4], 0x0B | 0x0C | 0x0E | 0x06));
             part = le32(found.ok_or(-EINVAL)?, 8) as u64;
         }
         let b = cache.read(part)?.to_vec();
         if !is_vbr(&b) || le16(&b, 17) != 0 || le32(&b, 36) == 0 {
-            return Err(-EINVAL); // pas du FAT32
+            return Err(-EINVAL); // not FAT32
         }
         let spc = b[13] as u32;
         let reserved = le16(&b, 14) as u64;
         let nfats = b[16] as u32;
-        let total = if le16(&b, 19) != 0 { le16(&b, 19) as u64 } else { le32(&b, 32) as u64 };
+        let total = if le16(&b, 19) != 0 {
+            le16(&b, 19) as u64
+        } else {
+            le32(&b, 32) as u64
+        };
         let fat_size = le32(&b, 36);
         let root = le32(&b, 44);
         let fsinfo = le16(&b, 48) as u64;
@@ -262,7 +289,11 @@ impl Volume {
             data_start,
             root,
             clusters,
-            fsinfo: if fsinfo != 0 && fsinfo != 0xFFFF { part + fsinfo } else { 0 },
+            fsinfo: if fsinfo != 0 && fsinfo != 0xFFFF {
+                part + fsinfo
+            } else {
+                0
+            },
             next_free: 2,
             free: None,
         };
@@ -307,7 +338,9 @@ impl Volume {
         self.check(c)?;
         let off = c as u64 * 4;
         for k in 0..self.nfats as u64 {
-            let s = self.cache.write(self.fat_start + k * self.fat_size as u64 + off / SECTOR as u64)?;
+            let s = self
+                .cache
+                .write(self.fat_start + k * self.fat_size as u64 + off / SECTOR as u64)?;
             let o = (off % SECTOR as u64) as usize;
             let old = le32(s, o);
             s[o..o + 4].copy_from_slice(&((old & 0xF000_0000) | (v & 0x0FFF_FFFF)).to_le_bytes());
@@ -319,7 +352,7 @@ impl Volume {
         v >= 0x0FFF_FFF8 || v < 2
     }
 
-    /// Nouveau cluster, chaine apres `prev` (0 : premier d'une chaine).
+    /// New cluster, chained after `prev` (0: first of a chain).
     pub fn alloc_cluster(&mut self, prev: u32, zero: bool) -> Res<u32> {
         let n = self.clusters;
         for k in 0..n {
@@ -359,9 +392,13 @@ impl Volume {
         Ok(())
     }
 
-    /// Cluster numero `n` de la chaine commencant a `start`.
+    /// Cluster number `n` of the chain starting at `start`.
     fn nth(&mut self, start: u32, n: u32, cur: &mut Cursor) -> Res<Option<u32>> {
-        let (mut idx, mut c) = if cur.cluster != 0 && cur.index <= n { (cur.index, cur.cluster) } else { (0, start) };
+        let (mut idx, mut c) = if cur.cluster != 0 && cur.index <= n {
+            (cur.index, cur.cluster)
+        } else {
+            (0, start)
+        };
         while idx < n {
             if Self::is_end(c) {
                 return Ok(None);
@@ -372,11 +409,14 @@ impl Volume {
         if Self::is_end(c) {
             return Ok(None);
         }
-        *cur = Cursor { index: n, cluster: c };
+        *cur = Cursor {
+            index: n,
+            cluster: c,
+        };
         Ok(Some(c))
     }
 
-    /// Octets libres et totaux (compte la FAT une fois si FSInfo l'ignore).
+    /// Free and total bytes (counts FAT once if FSInfo ignores it).
     pub fn statfs(&mut self) -> Res<(u64, u64)> {
         if self.free.is_none() {
             let mut n = 0;
@@ -403,7 +443,7 @@ impl Volume {
         self.cache.flush()
     }
 
-    // ------------------------------------------------------- dossiers ---
+    // ------------------------------------------------------- directories ---
 
     fn root_entry(&self) -> Entry {
         Entry {
@@ -419,8 +459,8 @@ impl Volume {
         }
     }
 
-    /// Secteur et decalage de l'entree `index` du dossier ; `extend`
-    /// ajoute des clusters (a zero) si le dossier est trop court.
+    /// Sector and offset of entry `index` in a directory; `extend`
+    /// appends (zeroed) clusters if the directory is too short.
     fn slot(&mut self, dir: u32, index: u32, extend: bool) -> Res<Option<(u64, usize)>> {
         let per = (self.cluster_bytes() / ENTRY as u64) as u32;
         let (n, within) = (index / per, index % per);
@@ -437,10 +477,13 @@ impl Volume {
             };
         }
         let byte = within as u64 * ENTRY as u64;
-        Ok(Some((self.lba(c) + byte / SECTOR as u64, (byte % SECTOR as u64) as usize)))
+        Ok(Some((
+            self.lba(c) + byte / SECTOR as u64,
+            (byte % SECTOR as u64) as usize,
+        )))
     }
 
-    /// Parcourt un dossier ; `f` rend faux pour arreter.
+    /// Walk a directory; `f` returns false to stop.
     pub fn list(&mut self, dir: u32, mut f: impl FnMut(&Entry) -> bool) -> Res<()> {
         let mut lfn: Vec<u16> = Vec::new();
         let (mut lfn_sum, mut lfn_count, mut lfn_expect) = (0u8, 0u32, 0u32);
@@ -485,13 +528,21 @@ impl Volume {
                 continue;
             }
             let short: [u8; 11] = e[..11].try_into().unwrap();
-            let name = if lfn_count > 0 && lfn_count == lfn_expect && lfn_checksum(&short) == lfn_sum {
-                let end = lfn.iter().position(|&c| c == 0 || c == 0xFFFF).unwrap_or(lfn.len());
-                String::from_utf16_lossy(&lfn[..end])
+            let name =
+                if lfn_count > 0 && lfn_count == lfn_expect && lfn_checksum(&short) == lfn_sum {
+                    let end = lfn
+                        .iter()
+                        .position(|&c| c == 0 || c == 0xFFFF)
+                        .unwrap_or(lfn.len());
+                    String::from_utf16_lossy(&lfn[..end])
+                } else {
+                    short_to_string(&e)
+                };
+            let used_lfn = if lfn_count > 0 && lfn_count == lfn_expect {
+                lfn_count
             } else {
-                short_to_string(&e)
+                0
             };
-            let used_lfn = if lfn_count > 0 && lfn_count == lfn_expect { lfn_count } else { 0 };
             lfn_count = 0;
             let entry = Entry {
                 name,
@@ -524,7 +575,7 @@ impl Volume {
         Ok(found)
     }
 
-    /// Resout un chemin absolu.
+    /// Resolve an absolute path.
     pub fn lookup(&mut self, path: &str) -> Res<Entry> {
         let mut cur = self.root_entry();
         for comp in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
@@ -533,14 +584,14 @@ impl Volume {
             }
             let mut e = self.find(cur.cluster, comp)?.ok_or(-ENOENT)?;
             if comp == ".." && e.cluster == 0 {
-                e = self.root_entry(); // « .. » d'un sous-dossier de la racine
+                e = self.root_entry(); // ".." of a root subdir
             }
             cur = e;
         }
         Ok(cur)
     }
 
-    /// Dossier parent d'un chemin et dernier composant.
+    /// Parent directory of a path and last component.
     pub fn parent<'a>(&mut self, path: &'a str) -> Res<(Entry, &'a str)> {
         let path = path.trim_end_matches('/');
         let (dir, name) = match path.rfind('/') {
@@ -554,8 +605,15 @@ impl Volume {
         Ok((d, name))
     }
 
-    /// Cree une entree `name` dans `parent` (fichier vide ou dossier).
-    pub fn create(&mut self, parent: &Entry, name: &str, attr: u8, cluster: u32, size: u32) -> Res<Entry> {
+    /// Create entry `name` in `parent` (empty file or directory).
+    pub fn create(
+        &mut self,
+        parent: &Entry,
+        name: &str,
+        attr: u8,
+        cluster: u32,
+        size: u32,
+    ) -> Res<Entry> {
         valid_name(name)?;
         if self.find(parent.cluster, name)?.is_some() {
             return Err(-EEXIST);
@@ -585,10 +643,14 @@ impl Volume {
             }
         };
         let units: Vec<u16> = name.encode_utf16().collect();
-        let nlfn = if lfn_needed { units.len().div_ceil(13) as u32 } else { 0 };
+        let nlfn = if lfn_needed {
+            units.len().div_ceil(13) as u32
+        } else {
+            0
+        };
         let need = nlfn + 1;
 
-        // Premiere suite de `need` entrees libres (ou au-dela de la fin).
+        // First run of `need` free entries (or past the end).
         let (mut start, mut run, mut index) = (0u32, 0u32, 0u32);
         loop {
             let (lba, off) = self.slot(parent.cluster, index, true)?.ok_or(-EIO)?;
@@ -611,7 +673,7 @@ impl Volume {
         }
         let sum = lfn_checksum(&short);
         for k in 0..nlfn {
-            let ord = nlfn - k; // les morceaux sont ranges du dernier au premier
+            let ord = nlfn - k; // pieces stored last-to-first
             let mut e = [0u8; ENTRY];
             e[0] = ord as u8 | if k == 0 { 0x40 } else { 0 };
             e[11] = ATTR_LFN;
@@ -656,10 +718,10 @@ impl Volume {
         })
     }
 
-    /// Reecrit taille, premier cluster et date de modification.
+    /// Rewrite size, first cluster and modification date.
     pub fn update(&mut self, e: &Entry) -> Res<()> {
         if e.dir == 0 {
-            return Ok(()); // racine : pas d'entree
+            return Ok(()); // root: no entry
         }
         let (time, date) = fat_now();
         let (lba, off) = self.slot(e.dir, e.index, false)?.ok_or(-EIO)?;
@@ -673,7 +735,7 @@ impl Volume {
         Ok(())
     }
 
-    /// Efface l'entree (et ses morceaux LFN) sans toucher a ses clusters.
+    /// Clear the entry (and its LFN pieces) without freeing clusters.
     fn remove_entry(&mut self, e: &Entry) -> Res<()> {
         for k in e.index - e.lfn..=e.index {
             let (lba, off) = self.slot(e.dir, k, false)?.ok_or(-EIO)?;
@@ -695,9 +757,15 @@ impl Volume {
         let (time, date) = fat_now();
         let lba = self.lba(c);
         let s = self.cache.write(lba)?;
-        for (k, (nm, cl)) in [(*b".          ", c), (*b"..         ", if parent.dir == 0 { 0 } else { parent.cluster })]
-            .iter()
-            .enumerate()
+        for (k, (nm, cl)) in [
+            (*b".          ", c),
+            (
+                *b"..         ",
+                if parent.dir == 0 { 0 } else { parent.cluster },
+            ),
+        ]
+        .iter()
+        .enumerate()
         {
             let o = k * ENTRY;
             s[o..o + 11].copy_from_slice(nm);
@@ -731,7 +799,7 @@ impl Volume {
             return Err(-ENOTDIR);
         }
         if e.dir == 0 {
-            return Err(-EBUSY); // la racine
+            return Err(-EBUSY); // the root
         }
         let mut empty = true;
         self.list(e.cluster, |x| {
@@ -753,7 +821,7 @@ impl Volume {
         let (parent, name) = self.parent(to)?;
         if let Some(old) = self.find(parent.cluster, name)? {
             if old.dir == e.dir && old.index == e.index {
-                return Ok(()); // meme entree
+                return Ok(()); // same entry
             }
             if old.is_dir() || e.is_dir() {
                 return Err(-EEXIST);
@@ -765,8 +833,8 @@ impl Volume {
             self.free_chain(old.cluster)?;
         }
         let moved = self.create(&parent, name, e.attr, e.cluster, e.size)?;
-        // L'ancienne entree a pu changer de place si elle etait dans le meme
-        // dossier : on la retrouve par son emplacement exact.
+        // The old entry may have moved within the same directory:
+        // look it up by exact position.
         self.remove_entry(&e)?;
         if e.is_dir() && e.dir != parent.cluster {
             let lba = self.lba(e.cluster);
@@ -779,7 +847,7 @@ impl Volume {
         Ok(())
     }
 
-    // -------------------------------------------------------- fichiers ---
+    // -------------------------------------------------------- files ---
 
     pub fn read(&mut self, e: &Entry, cur: &mut Cursor, pos: u64, out: &mut [u8]) -> Res<usize> {
         if pos >= e.size as u64 {
@@ -801,13 +869,16 @@ impl Volume {
         Ok(n)
     }
 
-    /// Ecrit a `pos`, en allongeant le fichier (zeros entre l'ancienne fin et
-    /// `pos`). Met a jour l'entree du dossier.
+    /// Write at `pos`, extending the file (zeros between old end and
+    /// `pos`). Updates the directory entry.
     pub fn write(&mut self, e: &mut Entry, cur: &mut Cursor, pos: u64, data: &[u8]) -> Res<usize> {
         if e.is_dir() {
             return Err(-EISDIR);
         }
-        let end = pos.checked_add(data.len() as u64).filter(|&x| x <= u32::MAX as u64).ok_or(-EINVAL)?;
+        let end = pos
+            .checked_add(data.len() as u64)
+            .filter(|&x| x <= u32::MAX as u64)
+            .ok_or(-EINVAL)?;
         if pos > e.size as u64 {
             let gap = alloc::vec![0u8; (pos - e.size as u64).min(1 << 20) as usize];
             let mut p = e.size as u64;
@@ -827,7 +898,11 @@ impl Volume {
             let lba = self.lba(c) + in_c / SECTOR as u64;
             let o = (in_c % SECTOR as u64) as usize;
             let k = (SECTOR - o).min(data.len() - done);
-            let s = if k == SECTOR { self.cache.overwrite(lba)? } else { self.cache.write(lba)? };
+            let s = if k == SECTOR {
+                self.cache.overwrite(lba)?
+            } else {
+                self.cache.write(lba)?
+            };
             s[o..o + k].copy_from_slice(&data[done..done + k]);
             done += k;
         }
@@ -838,7 +913,7 @@ impl Volume {
         Ok(data.len())
     }
 
-    /// Au moins `n` clusters dans la chaine du fichier.
+    /// At least `n` clusters in the file chain.
     fn ensure_clusters(&mut self, e: &mut Entry, cur: &mut Cursor, n: u32) -> Res<()> {
         if n == 0 {
             return Ok(());
@@ -871,7 +946,7 @@ impl Volume {
 
     pub fn truncate(&mut self, e: &mut Entry, cur: &mut Cursor, size: u64) -> Res<()> {
         if size > e.size as u64 {
-            // Allonger = ecrire des zeros jusqu'a la nouvelle taille.
+            // Extend = write zeros up to the new size.
             let zeros = alloc::vec![0u8; 4096];
             let mut p = e.size as u64;
             while p < size {

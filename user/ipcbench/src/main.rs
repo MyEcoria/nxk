@@ -1,5 +1,5 @@
-//! Mesures : appel systeme nul, aller-retour IPC (meme coeur / coeurs
-//! differents), debit IPC par messages de 4 KiB.
+//! Benchmarks: null syscall, IPC round trip (same core / other cores),
+//! IPC throughput with 4 KiB messages.
 
 #![no_std]
 #![no_main]
@@ -15,24 +15,27 @@ const N: u64 = 20_000;
 
 fn main() -> i32 {
     let me = sys::getcpu() as u8;
-    println!("ipcbench : thread principal sur le coeur {}", me);
+    println!("ipcbench: main thread on core {}", me);
 
     let t0 = time::ticks();
     for _ in 0..N * 5 {
         sys::nop();
     }
-    println!("  appel systeme nul            : {:>6} ns", time::ticks_to_ns(time::ticks() - t0) / (N * 5));
+    println!(
+        "  null syscall               : {:>6} ns",
+        time::ticks_to_ns(time::ticks() - t0) / (N * 5)
+    );
 
     let same = round_trip(me);
-    println!("  IPC aller-retour, meme coeur : {:>6} ns", same);
+    println!("  IPC round trip, same core  : {:>6} ns", same);
     let other = round_trip((me + 1) % 4);
-    println!("  IPC aller-retour, 2 coeurs   : {:>6} ns", other);
+    println!("  IPC round trip, 2 cores    : {:>6} ns", other);
     let mbs = bulk(me);
-    println!("  debit IPC (messages 4 KiB)   : {:>6} Mo/s", mbs);
+    println!("  IPC throughput (4 KiB msgs)  : {:>6} MB/s", mbs);
     0
 }
 
-/// Serveur d'echo sur le coeur `cpu`, client sur le thread principal.
+/// Echo server on core `cpu`, client on the main thread.
 fn round_trip(cpu: u8) -> u64 {
     let ep = sys::endpoint_create().expect("endpoint");
     let server = thread::spawn_on(Some(cpu), 0, move || {
@@ -49,7 +52,7 @@ fn round_trip(cpu: u8) -> u64 {
             };
         }
     })
-    .expect("thread serveur");
+    .expect("server thread");
 
     let mut m = Msg::new(1, 1, 0);
     for i in 0..1000 {
@@ -61,16 +64,16 @@ fn round_trip(cpu: u8) -> u64 {
         m.mr[0] = i;
         let r = ipc::call(ep, &m).expect("call");
         if r.mr[0] != i + 1 {
-            println!("  reponse incorrecte !");
+            println!("  bad reply!");
         }
     }
     let ns = time::ticks_to_ns(time::ticks() - t0) / N;
-    let _ = sys::handle_close(ep); // le serveur recoit EPIPE et se termine
+    let _ = sys::handle_close(ep); // the server gets EPIPE and exits
     server.join();
     ns
 }
 
-/// Messages de 4 KiB (UTCB) vers un serveur qui repond a vide.
+/// 4 KiB messages (UTCB) to a server replying empty.
 fn bulk(cpu: u8) -> u64 {
     let ep = sys::endpoint_create().expect("endpoint");
     let server = thread::spawn_on(Some(cpu), 0, move || {
@@ -87,7 +90,7 @@ fn bulk(cpu: u8) -> u64 {
             };
         }
     })
-    .expect("thread serveur");
+    .expect("server thread");
 
     let data = [0x5Au8; 4000];
     let iters = N / 4;

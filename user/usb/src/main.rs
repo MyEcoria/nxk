@@ -1,17 +1,5 @@
-//! usb : controleur hote USB (xHCI) et deux classes de peripheriques.
-//!
-//! - Clavier HID (protocole « boot ») : chaque rapport de 8 octets devient
-//!   des evenements de touche (code HID, caractere en disposition US)
-//!   remis au service « input ».
-//! - Carte reseau CDC-ECM : trames Ethernet par transferts en masse,
-//!   publiee comme « eth0 » (protocole `eth`) pour la pile reseau.
-//!
-//! Sur la console, le xHCI du Tegra X1 est anime par un microcode NVIDIA
-//! (non fourni) : ce pilote vise le xHCI standard (emulateur, autres cartes).
-//! Il ne touche au controleur qu'une fois le service clk assure qu'il est
-//! cadence, sorti du reset et alimente (partitions XUSBA et XUSBC) : hekate
-//! laisse l'hote sans horloge et en reset, ses partitions peut-etre coupees,
-//! et le premier acces bloquerait le bus, donc tout le systeme.
+//! usb: xHCI host; HID keyboard to "input", CDC-ECM net as "eth0".
+//! Standard xHCI only; controller touched once clk reports it ready.
 
 #![no_std]
 #![no_main]
@@ -56,12 +44,16 @@ struct Net {
     frames: VecDeque<Vec<u8>>,
 }
 
-/// Caractere produit par une touche (disposition US).
+/// Character produced by a key (US layout).
 fn hid_char(code: u8, shift: bool) -> u32 {
     let c = match code {
         0x04..=0x1D => {
             let c = (b'a' + code - 0x04) as char;
-            if shift { c.to_ascii_uppercase() } else { c }
+            if shift {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
         }
         0x1E..=0x27 => {
             let (n, s) = (b"1234567890", b"!@#$%^&*()");
@@ -80,11 +72,18 @@ fn hid_char(code: u8, shift: bool) -> u32 {
     c as u32
 }
 
-fn desc(hc: &mut Xhci, dev: &mut Device, kind: u16, index: u16, lang: u16, out: &mut [u8]) -> Result<usize, i64> {
+fn desc(
+    hc: &mut Xhci,
+    dev: &mut Device,
+    kind: u16,
+    index: u16,
+    lang: u16,
+    out: &mut [u8],
+) -> Result<usize, i64> {
     hc.control(dev, 0x80, 6, kind << 8 | index, lang, out)
 }
 
-/// Point d'acces lu dans un descripteur de configuration.
+/// Endpoint parsed from a configuration descriptor.
 #[derive(Clone, Copy)]
 struct Ep {
     iface: u8,
@@ -109,7 +108,12 @@ struct Config {
 }
 
 fn parse_config(d: &[u8]) -> Config {
-    let mut c = Config { value: d[5], ifaces: Vec::new(), eps: Vec::new(), mac_string: 0 };
+    let mut c = Config {
+        value: d[5],
+        ifaces: Vec::new(),
+        eps: Vec::new(),
+        mac_string: 0,
+    };
     let (mut cur, mut alt) = (0u8, 0u8);
     let mut p = 0;
     while p + 2 <= d.len() {
@@ -122,7 +126,11 @@ fn parse_config(d: &[u8]) -> Config {
             4 if len >= 9 => {
                 cur = x[2];
                 alt = x[3];
-                c.ifaces.push(Iface { number: x[2], alt: x[3], class: (x[5], x[6], x[7]) });
+                c.ifaces.push(Iface {
+                    number: x[2],
+                    alt: x[3],
+                    class: (x[5], x[6], x[7]),
+                });
             }
             5 if len >= 7 => c.eps.push(Ep {
                 iface: cur,
@@ -141,44 +149,97 @@ fn parse_config(d: &[u8]) -> Config {
 }
 
 fn set_config(hc: &mut Xhci, dev: &mut Device, value: u8) -> Result<(), i64> {
-    hc.control(dev, 0x00, 9, value as u16, 0, &mut []).map(|_| ())
+    hc.control(dev, 0x00, 9, value as u16, 0, &mut [])
+        .map(|_| ())
 }
 
 fn setup_keyboard(hc: &mut Xhci, mut dev: Device, c: &Config, iface: u8) -> Result<Keyboard, i64> {
-    let ep = *c.eps.iter().find(|e| e.iface == iface && e.attr == 3 && e.address & 0x80 != 0).ok_or(-ENODEV)?;
+    let ep = *c
+        .eps
+        .iter()
+        .find(|e| e.iface == iface && e.attr == 3 && e.address & 0x80 != 0)
+        .ok_or(-ENODEV)?;
     set_config(hc, &mut dev, c.value)?;
-    hc.configure(&mut dev, &[EpSpec { address: ep.address, kind: 7, max_packet: ep.max_packet, interval: ep.interval }])?;
+    hc.configure(
+        &mut dev,
+        &[EpSpec {
+            address: ep.address,
+            kind: 7,
+            max_packet: ep.max_packet,
+            interval: ep.interval,
+        }],
+    )?;
     let _ = hc.control(&mut dev, 0x21, 0x0B, 0, iface as u16, &mut []); // SET_PROTOCOL(boot)
     let _ = hc.control(&mut dev, 0x21, 0x0A, 0, iface as u16, &mut []); // SET_IDLE(0)
     let buf = hc.dma.alloc(64, 64)?;
     let d = dci(ep.address);
     hc.queue(&mut dev, d, buf.1, 8)?;
-    Ok(Keyboard { dev, dci: d, buf, last: [0; 8] })
+    Ok(Keyboard {
+        dev,
+        dci: d,
+        buf,
+        last: [0; 8],
+    })
 }
 
 fn setup_net(hc: &mut Xhci, mut dev: Device, c: &Config) -> Result<Net, i64> {
-    let data = c.ifaces.iter().find(|i| i.class.0 == 0x0A && c.eps.iter().filter(|e| e.iface == i.number && e.alt == i.alt && e.attr == 2).count() == 2).ok_or(-ENODEV)?;
+    let data = c
+        .ifaces
+        .iter()
+        .find(|i| {
+            i.class.0 == 0x0A
+                && c.eps
+                    .iter()
+                    .filter(|e| e.iface == i.number && e.alt == i.alt && e.attr == 2)
+                    .count()
+                    == 2
+        })
+        .ok_or(-ENODEV)?;
     let (num, alt) = (data.number, data.alt);
-    let bulk_in = *c.eps.iter().find(|e| e.iface == num && e.alt == alt && e.attr == 2 && e.address & 0x80 != 0).ok_or(-ENODEV)?;
-    let bulk_out = *c.eps.iter().find(|e| e.iface == num && e.alt == alt && e.attr == 2 && e.address & 0x80 == 0).ok_or(-ENODEV)?;
+    let bulk_in = *c
+        .eps
+        .iter()
+        .find(|e| e.iface == num && e.alt == alt && e.attr == 2 && e.address & 0x80 != 0)
+        .ok_or(-ENODEV)?;
+    let bulk_out = *c
+        .eps
+        .iter()
+        .find(|e| e.iface == num && e.alt == alt && e.attr == 2 && e.address & 0x80 == 0)
+        .ok_or(-ENODEV)?;
     set_config(hc, &mut dev, c.value)?;
     hc.configure(
         &mut dev,
         &[
-            EpSpec { address: bulk_in.address, kind: 6, max_packet: bulk_in.max_packet, interval: 0 },
-            EpSpec { address: bulk_out.address, kind: 2, max_packet: bulk_out.max_packet, interval: 0 },
+            EpSpec {
+                address: bulk_in.address,
+                kind: 6,
+                max_packet: bulk_in.max_packet,
+                interval: 0,
+            },
+            EpSpec {
+                address: bulk_out.address,
+                kind: 2,
+                max_packet: bulk_out.max_packet,
+                interval: 0,
+            },
         ],
     )?;
     hc.control(&mut dev, 0x01, 11, alt as u16, num as u16, &mut [])?; // SET_INTERFACE
-    // Adresse MAC : chaine de 12 chiffres hexadecimaux (UTF-16).
+                                                                      // MAC address: 12-hex-digit string (UTF-16).
     let mut mac = [0x02, 0, 0, 0, 0, 1];
     if c.mac_string != 0 {
         let mut s = [0u8; 64];
         if desc(hc, &mut dev, 3, c.mac_string as u16, 0x0409, &mut s).is_ok() {
-            let hex: Vec<u8> = s[2..(s[0] as usize).min(64)].iter().step_by(2).copied().collect();
+            let hex: Vec<u8> = s[2..(s[0] as usize).min(64)]
+                .iter()
+                .step_by(2)
+                .copied()
+                .collect();
             if hex.len() >= 12 {
                 for k in 0..6 {
-                    let h = core::str::from_utf8(&hex[k * 2..k * 2 + 2]).ok().and_then(|v| u8::from_str_radix(v, 16).ok());
+                    let h = core::str::from_utf8(&hex[k * 2..k * 2 + 2])
+                        .ok()
+                        .and_then(|v| u8::from_str_radix(v, 16).ok());
                     if let Some(b) = h {
                         mac[k] = b;
                     }
@@ -186,7 +247,7 @@ fn setup_net(hc: &mut Xhci, mut dev: Device, c: &Config) -> Result<Net, i64> {
             }
         }
     }
-    // L'hote est l'autre extremite du lien : notre adresse doit differer.
+    // The host is the other link end: our address must differ.
     mac[5] ^= 1;
     let (rx_dci, tx_dci) = (dci(bulk_in.address), dci(bulk_out.address));
     let mut rx = Vec::new();
@@ -199,10 +260,20 @@ fn setup_net(hc: &mut Xhci, mut dev: Device, c: &Config) -> Result<Net, i64> {
     for _ in 0..TX_BUFS {
         tx.push(hc.dma.alloc(FRAME, 64)?);
     }
-    Ok(Net { dev, rx_dci, tx_dci, mac, rx, tx, tx_next: 0, tx_busy: 0, frames: VecDeque::new() })
+    Ok(Net {
+        dev,
+        rx_dci,
+        tx_dci,
+        mac,
+        rx,
+        tx,
+        tx_next: 0,
+        tx_busy: 0,
+        frames: VecDeque::new(),
+    })
 }
 
-/// Traite les evenements du controleur.
+/// Handle controller events.
 fn events(hc: &mut Xhci, kbd: &mut Option<Keyboard>, net: &mut Option<Net>, input: u32) {
     hc.collect();
     while let Some(t) = hc.pending.pop_front() {
@@ -220,14 +291,26 @@ fn events(hc: &mut Xhci, kbd: &mut Option<Keyboard>, net: &mut Option<Net>, inpu
                 let send = |code: u8, down: bool| {
                     if input != 0 {
                         let mut m = Msg::new(input::INJECT, 5, 0);
-                        m.mr[..5].copy_from_slice(&[input::KIND_KEY, code as u64, down as u64, hid_char(code, shift) as u64, 0]);
+                        m.mr[..5].copy_from_slice(&[
+                            input::KIND_KEY,
+                            code as u64,
+                            down as u64,
+                            hid_char(code, shift) as u64,
+                            0,
+                        ]);
                         let _ = ipc::call(input, &m);
                     }
                 };
-                for &c in r[2..].iter().filter(|&&c| c > 3 && !k.last[2..].contains(&c)) {
+                for &c in r[2..]
+                    .iter()
+                    .filter(|&&c| c > 3 && !k.last[2..].contains(&c))
+                {
                     send(c, true);
                 }
-                for &c in k.last[2..].iter().filter(|&&c| c > 3 && !r[2..].contains(&c)) {
+                for &c in k.last[2..]
+                    .iter()
+                    .filter(|&&c| c > 3 && !r[2..].contains(&c))
+                {
                     send(c, false);
                 }
                 k.last = r;
@@ -257,10 +340,11 @@ fn events(hc: &mut Xhci, kbd: &mut Option<Keyboard>, net: &mut Option<Net>, inpu
     }
 }
 
-/// Demande au service clk d'activer le controleur, puis s'assure qu'il est
-/// pret (`clk::ST_READY`). Erreur : ce qui manque.
+/// Ask clk to enable the controller, then check it is ready
+/// (`clk::ST_READY`). Error: what is missing.
 fn controller_ready() -> Result<(), String> {
-    let c = ns::wait_for_timeout("clk", 2_000_000_000).map_err(|_| String::from("service clk injoignable"))?;
+    let c = ns::wait_for_timeout("clk", 2_000_000_000)
+        .map_err(|_| String::from("clk service unreachable"))?;
     let ask = |label| {
         let mut m = Msg::new(label, 1, 0);
         m.mr[0] = clk::XUSB_HOST;
@@ -271,15 +355,18 @@ fn controller_ready() -> Result<(), String> {
     let _ = sys::handle_close(c);
     let st = match r {
         Ok(m) if m.label() == 0 => m.mr[0],
-        Ok(m) => return Err(alloc::format!("clk : {}", err::name(m.label() as i64))),
-        Err(e) => return Err(alloc::format!("clk : {}", err::name(e))),
+        Ok(m) => return Err(alloc::format!("clk: {}", err::name(m.label() as i64))),
+        Err(e) => return Err(alloc::format!("clk: {}", err::name(e))),
     };
-    let missing: Vec<&str> =
-        [(clk::ST_POWERED, "partition coupee"), (clk::ST_CLOCK, "horloge coupee"), (clk::ST_OUT_OF_RESET, "en reset")]
-            .iter()
-            .filter(|b| st & b.0 == 0)
-            .map(|b| b.1)
-            .collect();
+    let missing: Vec<&str> = [
+        (clk::ST_POWERED, "partition off"),
+        (clk::ST_CLOCK, "clock off"),
+        (clk::ST_OUT_OF_RESET, "in reset"),
+    ]
+    .iter()
+    .filter(|b| st & b.0 == 0)
+    .map(|b| b.1)
+    .collect();
     if missing.is_empty() {
         Ok(())
     } else {
@@ -291,33 +378,38 @@ libnx::entry!(main);
 
 fn main() -> i32 {
     if let Err(why) = controller_ready() {
-        println!("[usb] controleur xHCI non alimente ({})", why);
+        println!("[usb] xHCI controller unpowered ({})", why);
         return 0;
     }
-    let regs = Mmio::map(drv::dev_slot(0), XHCI_BASE, 0x4000).expect("usb : registres");
-    let irq = Irq::new(drv::dev_slot(1)).expect("usb : interruption");
+    let regs = Mmio::map(drv::dev_slot(0), XHCI_BASE, 0x4000).expect("usb: registers");
+    let irq = Irq::new(drv::dev_slot(1)).expect("usb: interrupt");
     let mut hc = match Xhci::new(regs, irq) {
         Ok(h) => h,
         Err(e) => {
-            println!("[usb] controleur xHCI absent ({})", err::name(e));
+            println!("[usb] xHCI controller missing ({})", err::name(e));
             return 0;
         }
     };
     let (mut kbd, mut net): (Option<Keyboard>, Option<Net>) = (None, None);
     for port in 1..=hc.ports {
-        let Some(speed) = hc.reset_port(port) else { continue };
-        let mut step = "adresse";
+        let Some(speed) = hc.reset_port(port) else {
+            continue;
+        };
+        let mut step = "address";
         let r = (|| -> Result<(), i64> {
             let mut dev = hc.address(port, speed)?;
             let mut d = [0u8; 18];
-            step = "descripteur (8 octets)";
+            step = "descriptor (8 bytes)";
             desc(&mut hc, &mut dev, 1, 0, 0, &mut d[..8])?;
             let mps0 = if d[7] == 9 { 512 } else { d[7] as u16 };
-            step = "taille de paquet EP0";
+            step = "EP0 packet size";
             hc.set_ep0_packet(&mut dev, mps0)?;
-            step = "descripteur de peripherique";
+            step = "device descriptor";
             desc(&mut hc, &mut dev, 1, 0, 0, &mut d)?;
-            let vid_pid = (u16::from_le_bytes([d[8], d[9]]), u16::from_le_bytes([d[10], d[11]]));
+            let vid_pid = (
+                u16::from_le_bytes([d[8], d[9]]),
+                u16::from_le_bytes([d[10], d[11]]),
+            );
             step = "configuration";
             for ci in 0..d[17] {
                 let mut hdr = [0u8; 9];
@@ -330,41 +422,60 @@ fn main() -> i32 {
                     if kbd.is_none() {
                         let n = i.number;
                         kbd = Some(setup_keyboard(&mut hc, dev, &c, n)?);
-                        println!("[usb] port {} : clavier HID {:04x}:{:04x}", port, vid_pid.0, vid_pid.1);
+                        println!(
+                            "[usb] port {}: HID keyboard {:04x}:{:04x}",
+                            port, vid_pid.0, vid_pid.1
+                        );
                         return Ok(());
                     }
                 }
                 if c.ifaces.iter().any(|i| i.class.0 == 2 && i.class.1 == 6) && net.is_none() {
-                    step = "mise en service CDC-ECM";
+                    step = "CDC-ECM setup";
                     let n = setup_net(&mut hc, dev, &c)?;
                     let m = n.mac;
                     println!(
-                        "[usb] port {} : carte reseau CDC-ECM {:04x}:{:04x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        "[usb] port {}: CDC-ECM network {:04x}:{:04x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                         port, vid_pid.0, vid_pid.1, m[0], m[1], m[2], m[3], m[4], m[5]
                     );
                     net = Some(n);
                     return Ok(());
                 }
             }
-            println!("[usb] port {} : peripherique {:04x}:{:04x} non pris en charge", port, vid_pid.0, vid_pid.1);
+            println!(
+                "[usb] port {}: unsupported device {:04x}:{:04x}",
+                port, vid_pid.0, vid_pid.1
+            );
             Ok(())
         })();
         if let Err(e) = r {
-            println!("[usb] port {} : echec a l'etape {} ({})", port, step, err::name(e));
+            println!(
+                "[usb] port {}: failed at step {} ({})",
+                port,
+                step,
+                err::name(e)
+            );
         }
     }
-    let input = if kbd.is_some() { ns::wait_for_timeout("input", 3_000_000_000).unwrap_or(0) } else { 0 };
+    let input = if kbd.is_some() {
+        ns::wait_for_timeout("input", 3_000_000_000).unwrap_or(0)
+    } else {
+        0
+    };
     if kbd.is_none() && net.is_none() {
-        println!("[usb] aucun peripherique utilisable");
+        println!("[usb] no usable device");
     }
-    let ep = if net.is_some() { drv::publish("eth0").expect("usb : publication") } else { sys::endpoint_create().expect("usb : endpoint") };
+    let ep = if net.is_some() {
+        drv::publish("eth0").expect("usb: publish")
+    } else {
+        sys::endpoint_create().expect("usb: endpoint")
+    };
     let _ = sys::notify_bind(hc.irq.notification());
 
-    // Lecteurs de trames en attente : (jeton, echeance).
+    // Waiting frame readers: (token, deadline).
     let mut readers: VecDeque<(u64, u64)> = VecDeque::new();
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     let mut rx = ipc::recv_timeout(ep, 50_000_000);
-    // (Premier tour borne : evenements arrives pendant l'enumeration.)
+    // (First round bounded: events arrived during enumeration.)
     loop {
         match &rx {
             Ok(r) if r.msg.is_notify() => {
@@ -429,9 +540,7 @@ fn main() -> i32 {
                 true
             }
         });
-        // Tout arrive par interruption (evenements du controleur) ou par
-        // message : on ne se reveille de soi-meme que pour l'echeance du
-        // lecteur le plus presse. Sans peripherique, le coeur reste au repos.
+        // IRQ- or message-driven: only wake for the earliest deadline.
         let wait = match readers.iter().filter(|r| r.1 != 0).map(|r| r.1).min() {
             Some(d) => d.saturating_sub(time::now_ns()).max(1),
             None => 0,

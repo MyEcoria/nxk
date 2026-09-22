@@ -1,4 +1,4 @@
-//! Premier programme : verifie EL0, la console, le tas et le temps.
+//! First program: checks EL0, console, heap and time.
 
 #![no_std]
 #![no_main]
@@ -13,14 +13,21 @@ use libnx::{println, sys, time};
 libnx::entry!(main);
 
 fn main() -> i32 {
-    println!("Bonjour depuis EL0 ! (coeur {})", sys::getcpu());
+    println!("Hello from EL0! (core {})", sys::getcpu());
     let v: Vec<u64> = (1..=100).collect();
     let mut s = String::new();
-    for w in ["tas", "vecteurs", "chaines"] {
+    for w in ["heap", "vectors", "strings"] {
         s.push_str(w);
         s.push(' ');
     }
-    println!("  allocations : {}-> somme 1..100 = {}", s, v.iter().sum::<u64>());
-    println!("  horloge sans appel systeme : {} ms depuis le demarrage", time::now_ns() / 1_000_000);
+    println!(
+        "  allocations: {}-> sum 1..100 = {}",
+        s,
+        v.iter().sum::<u64>()
+    );
+    println!(
+        "  syscall-free clock: {} ms since boot",
+        time::now_ns() / 1_000_000
+    );
     0
 }

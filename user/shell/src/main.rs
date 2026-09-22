@@ -1,4 +1,4 @@
-//! Shell interactif de nxk, sur la console serie.
+//! nxk interactive shell, over the serial console.
 
 #![no_std]
 #![no_main]
@@ -11,21 +11,21 @@ use alloc::vec::Vec;
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
 use libnx::abi::proto::power;
-use libnx::ipc::{self, Msg};
 use libnx::fs::{self, Kind};
+use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
 
 libnx::entry!(main);
 
 fn main() -> i32 {
     println!();
-    println!("nxk - shell. Tapez 'help' pour la liste des commandes.");
+    println!("nxk - shell. Type 'help' for the command list.");
     let mut buf = [0u8; 256];
     loop {
         print!("nxk> ");
         let n = console::read_line(&mut buf);
         if n == 0 && console::handle() == 0 {
-            time::sleep_ms(1000); // plus de console : inutile de tourner a vide
+            time::sleep_ms(1000); // no console left: avoid spinning idle
             continue;
         }
         let line = core::str::from_utf8(&buf[..n]).unwrap_or("").trim();
@@ -35,8 +35,8 @@ fn main() -> i32 {
     }
 }
 
-/// Decoupe une ligne en arguments ; les guillemets (simples ou doubles)
-/// regroupent des mots separes par des espaces.
+/// Split a line into arguments; single or double quotes group
+/// whitespace-separated words.
 fn split_args(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -78,7 +78,7 @@ fn command(line: &str) {
         "ps" => ps(),
         "mem" => mem(),
         "cpu" => cpu(),
-        "uptime" => println!("{} ms depuis le demarrage", time::now_ns() / 1_000_000),
+        "uptime" => println!("{} ms since boot", time::now_ns() / 1_000_000),
         "progs" => progs(),
         "ls" => ls(argv.get(1).copied().unwrap_or(".")),
         "cd" => cd(argv.get(1).copied().unwrap_or("/")),
@@ -88,7 +88,10 @@ fn command(line: &str) {
         "mkdir" => argv[1..].iter().for_each(|p| report(p, fs::mkdir(p))),
         "rmdir" => argv[1..].iter().for_each(|p| report(p, fs::remove_dir(p))),
         "mv" if argv.len() == 3 => report(argv[1], fs::rename(argv[1], argv[2])),
-        "cp" if argv.len() == 3 => report(argv[1], fs::read(argv[1]).and_then(|d| fs::write(argv[2], &d))),
+        "cp" if argv.len() == 3 => report(
+            argv[1],
+            fs::read(argv[1]).and_then(|d| fs::write(argv[2], &d)),
+        ),
         "stat" => argv[1..].iter().for_each(|p| stat(p)),
         "df" => df(),
         "sync" => report("sync", fs::sync()),
@@ -103,7 +106,7 @@ fn command(line: &str) {
             for a in &argv[1..] {
                 match a.split_once('=') {
                     Some((k, v)) if !k.is_empty() => env::set_var(k, v),
-                    _ => println!("export : NOM=valeur attendu ({})", a),
+                    _ => println!("export: expected NAME=value ({})", a),
                 }
             }
         }
@@ -119,35 +122,35 @@ fn command(line: &str) {
         "poweroff" => power_cmd(power::OFF),
         "reboot" => power_cmd(power::REBOOT),
         "run" => run(&argv[1..]),
-        _ => run(&argv), // un nom de programme se lance directement
+        _ => run(&argv), // a program name runs directly
     }
 }
 
 fn help() {
-    println!("  help            cette aide");
-    println!("  progs           programmes de l'image de demarrage");
-    println!("  ls [DOSSIER]    contenu d'un dossier (carte SD)");
-    println!("  cd, pwd         dossier courant");
-    println!("  cat FICHIER     affiche un fichier");
-    println!("  echo T > F      ecrit T dans F (>> : ajoute a la fin)");
+    println!("  help            this help");
+    println!("  progs           boot image programs");
+    println!("  ls [DIR]        list directory contents (SD card)");
+    println!("  cd, pwd         current directory");
+    println!("  cat FILE        print a file");
+    println!("  echo T > F      write T into F (>>: append)");
     println!("  rm, mkdir, rmdir, mv A B, cp A B, stat, df, sync");
-    println!("  fbecho TEXTE    affiche TEXTE sur l'ecran");
-    println!("  events [N]      affiche N evenements d'entree (ecran tactile, clavier)");
-    println!("  run PROG ARGS.. lance PROG (& final : en arriere-plan) ; 'PROG' seul suffit");
-    println!("  env             variables d'environnement");
-    println!("  export NOM=VAL  definit une variable (transmise aux programmes lances)");
-    println!("  unset NOM       retire une variable");
-    println!("  ps              processus");
-    println!("  mem             memoire physique");
-    println!("  cpu             statistiques par coeur");
-    println!("  uptime          temps depuis le demarrage");
-    println!("  echo TEXTE      affiche TEXTE");
-    println!("  date            heure murale (RTC)");
-    println!("  sleep MS        attend MS millisecondes");
-    println!("  temp            temperatures de la puce et du boitier");
-    println!("  services        services publies");
-    println!("  poweroff        eteint la machine");
-    println!("  reboot          redemarre la machine");
+    println!("  fbecho TEXT     print TEXT on the screen");
+    println!("  events [N]      show N input events (touchscreen, keyboard)");
+    println!("  run PROG ARGS.. run PROG (trailing &: background); bare PROG works");
+    println!("  env             environment variables");
+    println!("  export NAME=VAL set a variable (passed to spawned programs)");
+    println!("  unset NAME      remove a variable");
+    println!("  ps              processes");
+    println!("  mem             physical memory");
+    println!("  cpu             per-core statistics");
+    println!("  uptime          time since boot");
+    println!("  echo TEXT       print TEXT");
+    println!("  date            wall-clock time (RTC)");
+    println!("  sleep MS        wait MS milliseconds");
+    println!("  temp            chip and package temperatures");
+    println!("  services        published services");
+    println!("  poweroff        power off the machine");
+    println!("  reboot          reboot the machine");
 }
 
 fn progs() {
@@ -172,7 +175,7 @@ fn ls(path: &str) {
                 }
             }
         }
-        Err(e) => println!("ls {} : {}", path, err::name(e)),
+        Err(e) => println!("ls {}: {}", path, err::name(e)),
     }
 }
 
@@ -180,15 +183,15 @@ fn cd(path: &str) {
     let abs = fs::absolute(path);
     match fs::stat(&abs) {
         Ok(s) if s.kind == Kind::Dir => env::set_var("PWD", &abs),
-        Ok(_) => println!("cd {} : pas un dossier", path),
-        Err(e) => println!("cd {} : {}", path, err::name(e)),
+        Ok(_) => println!("cd {}: not a directory", path),
+        Err(e) => println!("cd {}: {}", path, err::name(e)),
     }
 }
 
 fn cat(path: &str) {
     match fs::read(path) {
         Ok(d) => console::write(&d),
-        Err(e) => println!("cat {} : {}", path, err::name(e)),
+        Err(e) => println!("cat {}: {}", path, err::name(e)),
     }
 }
 
@@ -199,7 +202,7 @@ fn echo(args: &[&str]) {
         return;
     };
     let Some(&target) = args.get(k + 1) else {
-        println!("echo : fichier manquant apres {}", args[k]);
+        println!("echo: missing file after {}", args[k]);
         return;
     };
     let mut text = args[..k].join(" ");
@@ -222,9 +225,9 @@ fn stat(path: &str) {
             let (y, m, d) = civil_from_days(t.div_euclid(86_400));
             let h = t.rem_euclid(86_400);
             println!(
-                "{} : {}, {} octets, modifie le {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                "{}: {}, {} bytes, modified {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                 path,
-                if s.kind == Kind::Dir { "dossier" } else { "fichier" },
+                if s.kind == Kind::Dir { "dir" } else { "file" },
                 s.size,
                 y,
                 m,
@@ -234,14 +237,14 @@ fn stat(path: &str) {
                 h % 60
             );
         }
-        Err(e) => println!("stat {} : {}", path, err::name(e)),
+        Err(e) => println!("stat {}: {}", path, err::name(e)),
     }
 }
 
 fn df() {
     match fs::statfs() {
-        Ok((free, total)) => println!("  carte SD : {} Mio libres sur {} Mio", free >> 20, total >> 20),
-        Err(e) => println!("df : {}", err::name(e)),
+        Ok((free, total)) => println!("  SD card: {} MiB free of {} MiB", free >> 20, total >> 20),
+        Err(e) => println!("df: {}", err::name(e)),
     }
 }
 
@@ -258,7 +261,7 @@ fn run(argv: &[&str]) {
         }
     }
     let Some(&name) = argv.first() else {
-        println!("run : nom de programme manquant");
+        println!("run: missing program name");
         return;
     };
     let abs;
@@ -270,23 +273,23 @@ fn run(argv: &[&str]) {
     let h = match process::spawn_args(&argv) {
         Ok(h) => h,
         Err(e) if e == -err::ENOENT => {
-            println!("{} : commande ou programme inconnu (voir 'help' et 'ls')", name);
+            println!("{}: unknown command or program (see 'help' and 'ls')", name);
             return;
         }
         Err(e) => {
-            println!("{} : echec du lancement ({})", name, err::name(e));
+            println!("{}: failed to start ({})", name, err::name(e));
             return;
         }
     };
     if bg {
-        println!("[{} lance en arriere-plan]", name);
+        println!("[{} started in background]", name);
     } else {
         let code = process::wait(h);
         let ms = (time::now_ns() - t0) / 1_000_000;
         match code {
             0 => {}
-            139 => println!("[{} tue par une faute memoire, {} ms]", name, ms),
-            c => println!("[{} termine avec le code {}, {} ms]", name, c, ms),
+            139 => println!("[{} killed by a memory fault, {} ms]", name, ms),
+            c => println!("[{} exited with code {}, {} ms]", name, c, ms),
         }
     }
     let _ = sys::handle_close(h);
@@ -299,11 +302,15 @@ fn as_bytes_mut<T>(v: &mut [T]) -> &mut [u8] {
 fn ps() {
     let mut procs = [ProcInfo::default(); 64];
     let n = sys::sysinfo(info::PROCESSES, as_bytes_mut(&mut procs)).unwrap_or(0) as usize;
-    println!("  PID  PPID  THR  PAGES  CPU(ms)  ETAT    NOM");
+    println!("  PID  PPID  THR  PAGES  CPU(ms)  STATE   NAME");
     for p in &procs[..n.min(64)] {
         let len = p.name.iter().position(|&b| b == 0).unwrap_or(16);
         let name = core::str::from_utf8(&p.name[..len]).unwrap_or("?");
-        let state = if p.state == info::PSTATE_ALIVE { "actif" } else { "zombie" };
+        let state = if p.state == info::PSTATE_ALIVE {
+            "alive"
+        } else {
+            "zombie"
+        };
         println!(
             "  {:>3}  {:>4}  {:>3}  {:>5}  {:>7}  {:<6}  {}",
             p.pid,
@@ -325,7 +332,7 @@ fn mem() {
     let m = m[0];
     let used = m.total_pages - m.free_pages;
     println!(
-        "  total {} MiB, libre {} MiB, utilise {} KiB (dont noyau {} KiB)",
+        "  total {} MiB, free {} MiB, used {} KiB (of which kernel {} KiB)",
         m.total_pages * 4 / 1024,
         m.free_pages * 4 / 1024,
         used * 4,
@@ -336,7 +343,7 @@ fn mem() {
 fn cpu() {
     let mut cpus = [CpuInfo::default(); 4];
     let n = sys::sysinfo(info::CPUS, as_bytes_mut(&mut cpus)).unwrap_or(0) as usize;
-    println!("  COEUR  COMMUTATIONS  APPELS SYS  IRQ      REPOS");
+    println!("  CORE   SWITCHES     SYSCALLS    IRQ      IDLE");
     for (i, c) in cpus[..n.min(4)].iter().enumerate() {
         let total = (c.idle_ns + c.busy_ns).max(1);
         println!(
@@ -350,7 +357,7 @@ fn cpu() {
     }
 }
 
-/// Date civile d'un nombre de jours depuis 1970 (H. Hinnant).
+/// Civil date from a day count since 1970 (H. Hinnant).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -367,15 +374,23 @@ fn date() {
     let s = (sys::realtime_ns() / 1_000_000_000) as i64;
     let (y, m, d) = civil_from_days(s.div_euclid(86_400));
     let t = s.rem_euclid(86_400);
-    println!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, t / 3600, t % 3600 / 60, t % 60);
+    println!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y,
+        m,
+        d,
+        t / 3600,
+        t % 3600 / 60,
+        t % 60
+    );
 }
 
-/// Service `name`, en l'attendant un peu s'il demarre encore.
+/// Service `name`, waiting briefly if it is still starting.
 fn service(name: &str) -> Option<u32> {
     match ns::wait_for_timeout(name, 3_000_000_000) {
         Ok(h) => Some(h),
         Err(_) => {
-            println!("service {} absent", name);
+            println!("service {} missing", name);
             None
         }
     }
@@ -394,10 +409,10 @@ fn temp() {
                 (v / 1000, (v % 1000).abs() / 100)
             };
             let (a, b) = (f(m.mr[0]), f(m.mr[1]));
-            println!("puce {}.{} C, boitier {}.{} C", a.0, a.1, b.0, b.1);
+            println!("chip {}.{} C, package {}.{} C", a.0, a.1, b.0, b.1);
         }
-        Ok(m) => println!("temp : erreur {}", err::name(-(m.label() as i64))),
-        Err(e) => println!("temp : {}", err::name(e)),
+        Ok(m) => println!("temp: error {}", err::name(-(m.label() as i64))),
+        Err(e) => println!("temp: {}", err::name(e)),
     }
     let _ = sys::handle_close(h);
 }
@@ -405,8 +420,8 @@ fn temp() {
 fn power_cmd(label: u32) {
     let Some(h) = power_service() else { return };
     match ipc::call(h, &Msg::new(label, 0, 0)) {
-        Ok(m) if m.label() != 0 => println!("echec : {}", err::name(-(m.label() as i64))),
-        Err(e) => println!("echec : {}", err::name(e)),
+        Ok(m) if m.label() != 0 => println!("failed: {}", err::name(-(m.label() as i64))),
+        Err(e) => println!("failed: {}", err::name(e)),
         _ => {}
     }
     let _ = sys::handle_close(h);
@@ -416,7 +431,10 @@ fn fbecho(text: &str) {
     let Some(h) = service("display") else { return };
     let mut t = alloc::string::String::from(text);
     t.push('\n');
-    let _ = ipc::call(h, &ipc::pack(libnx::abi::proto::display::WRITE, t.as_bytes()));
+    let _ = ipc::call(
+        h,
+        &ipc::pack(libnx::abi::proto::display::WRITE, t.as_bytes()),
+    );
     let _ = sys::handle_close(h);
 }
 
@@ -430,25 +448,33 @@ fn events(n: u32) {
             Ok(r) if r.label() == 0 => {
                 let kind = match r.mr[0] {
                     input::KIND_TOUCH => match r.mr[1] {
-                        input::TOUCH_DOWN => "toucher : appui",
-                        input::TOUCH_MOVE => "toucher : mouvement",
-                        _ => "toucher : relachement",
+                        input::TOUCH_DOWN => "touch: down",
+                        input::TOUCH_MOVE => "touch: move",
+                        _ => "touch: up",
                     },
                     input::KIND_KEY => {
                         let c = char::from_u32(r.mr[3] as u32).unwrap_or('?');
-                        println!("  touche HID {:#04x} {} '{}'", r.mr[1], if r.mr[2] != 0 { "appuyee" } else { "relachee" }, c);
+                        println!(
+                            "  HID key {:#04x} {} '{}'",
+                            r.mr[1],
+                            if r.mr[2] != 0 { "pressed" } else { "released" },
+                            c
+                        );
                         continue;
                     }
-                    _ => "evenement",
+                    _ => "event",
                 };
-                println!("  {} (doigt {}) x={} y={}", kind, r.mr[2], r.mr[3], r.mr[4]);
+                println!(
+                    "  {} (finger {}) x={} y={}",
+                    kind, r.mr[2], r.mr[3], r.mr[4]
+                );
             }
             Ok(_) => {
-                println!("  (aucun evenement en 10 s)");
+                println!("  (no event in 10 s)");
                 break;
             }
             Err(e) => {
-                println!("events : {}", err::name(e));
+                println!("events: {}", err::name(e));
                 break;
             }
         }

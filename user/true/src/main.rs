@@ -1,4 +1,4 @@
-//! Programme vide : sert a mesurer le cout d'un lancement de processus.
+//! Empty program: measures process spawn cost.
 #![no_std]
 #![no_main]
 

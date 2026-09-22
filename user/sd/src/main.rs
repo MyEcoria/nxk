@@ -1,13 +1,5 @@
-//! sd : carte SD du lecteur (controleur SDMMC1, compatible SDHCI).
-//!
-//! Initialisation SD standard (CMD0, CMD8, ACMD41, CMD2/3/9/7, bus 4 bits),
-//! puis lecture et ecriture par blocs de 512 octets en DMA ADMA2. Le tampon
-//! DMA appartient au pilote (contigu, non cache, sous 4 GiB) : un client ne
-//! donne jamais d'adresse physique, il echange les donnees par une memoire
-//! partagee attachee au service (protocole `blk`).
-//!
-//! Sur la console, SDMMC1 demande aussi l'alimentation de la carte par le
-//! PMIC et le reglage des pads : laisses au chargeur d'amorcage ici.
+//! sd: SDMMC1 card (SDHCI); 512-byte ADMA2 blocks via `blk` protocol.
+//! Card power and pads are left to the bootloader.
 
 #![no_std]
 #![no_main]
@@ -15,9 +7,9 @@
 extern crate alloc;
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV, ETIMEDOUT};
+use libnx::abi::prot;
 use libnx::abi::proto::{blk, clk};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
-use libnx::abi::prot;
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
@@ -25,7 +17,7 @@ use libnx::{ns, println, sys, time};
 
 const SDMMC1: u64 = 0x700B_0000;
 
-// Registres SDHCI.
+// SDHCI registers.
 const BLOCK_SIZE: usize = 0x04;
 const BLOCK_COUNT: usize = 0x06;
 const ARGUMENT: usize = 0x08;
@@ -50,7 +42,7 @@ const INT_XFER_DONE: u32 = 1 << 1;
 const INT_ERROR: u32 = 1 << 15;
 
 const BLOCK: usize = 512;
-/// Tampon DMA : une page de descripteurs puis 256 KiB de donnees.
+/// DMA buffer: one descriptor page then 256 KiB of data.
 const DESC_BYTES: usize = 4096;
 const MAX_BLOCKS: usize = 512;
 
@@ -69,7 +61,7 @@ struct Card {
     dma: SharedMemory,
     dma_pa: u64,
     rca: u32,
-    /// Adressage par blocs (SDHC/SDXC) ou par octets (SDSC).
+    /// Block addressing (SDHC/SDXC) vs byte addressing (SDSC).
     block_addressed: bool,
     blocks: u64,
 }
@@ -84,7 +76,11 @@ impl Card {
     fn set_clock(&self, khz: u32) {
         self.regs.w16(CLOCK_CONTROL, 0);
         let base = ((self.regs.r32(CAPABILITIES) >> 8) & 0xFF).max(1) * 1000;
-        let div = if khz >= base { 0 } else { base.div_ceil(2 * khz) };
+        let div = if khz >= base {
+            0
+        } else {
+            base.div_ceil(2 * khz)
+        };
         let v = ((div & 0xFF) << 8 | ((div >> 8) & 3) << 6 | 1) as u16;
         self.regs.w16(CLOCK_CONTROL, v);
         let end = time::now_ns() + 20_000_000;
@@ -92,15 +88,15 @@ impl Card {
         self.regs.w16(CLOCK_CONTROL, v | 4);
     }
 
-    /// Attend l'un des bits `mask` du registre d'etat ; l'interruption
-    /// reveille le thread pour les transferts, sinon courte attente active.
+    /// Wait for one of the `mask` status bits; the IRQ wakes the thread
+    /// for transfers, else short busy wait.
     fn wait_int(&self, mask: u32, timeout_ms: u64) -> Result<u32, i64> {
         let end = time::now_ns() + timeout_ms * 1_000_000;
         loop {
             let st = self.regs.r32(INT_STATUS);
             if st & INT_ERROR != 0 {
                 self.regs.w32(INT_STATUS, st);
-                self.reset(0x6); // lignes CMD et DAT
+                self.reset(0x6); // CMD and DAT lines
                 return Err(-EIO);
             }
             if st & mask != 0 {
@@ -121,7 +117,13 @@ impl Card {
         }
     }
 
-    fn command(&self, idx: u8, arg: u32, rsp: Rsp, data: Option<(usize, bool)>) -> Result<[u32; 4], i64> {
+    fn command(
+        &self,
+        idx: u8,
+        arg: u32,
+        rsp: Rsp,
+        data: Option<(usize, bool)>,
+    ) -> Result<[u32; 4], i64> {
         let busy = rsp == Rsp::R1b || data.is_some();
         let inhibit = if busy { 3 } else { 1 };
         let end = time::now_ns() + 100_000_000;
@@ -135,12 +137,13 @@ impl Card {
         if let Some((n, read)) = data {
             self.write_descriptors(n * BLOCK);
             self.regs.w32(ADMA_ADDRESS, self.dma_pa as u32);
-            self.regs.w8(HOST_CONTROL, (self.regs.r8(HOST_CONTROL) & !0x18) | 0x10); // ADMA2 32 bits
+            self.regs
+                .w8(HOST_CONTROL, (self.regs.r8(HOST_CONTROL) & !0x18) | 0x10); // 32-bit ADMA2
             self.regs.w16(BLOCK_SIZE, BLOCK as u16 | 7 << 12);
             self.regs.w16(BLOCK_COUNT, n as u16);
-            mode = 1 | 2; // DMA, compteur de blocs
+            mode = 1 | 2; // DMA, block count
             if n > 1 {
-                mode |= 1 << 5 | 1 << 2; // plusieurs blocs, CMD12 automatique
+                mode |= 1 << 5 | 1 << 2; // multi-block, auto CMD12
             }
             if read {
                 mode |= 1 << 4;
@@ -169,7 +172,7 @@ impl Card {
         Ok(r)
     }
 
-    /// Descripteurs ADMA2 (32 bits) couvrant `len` octets du tampon.
+    /// ADMA2 (32-bit) descriptors covering `len` buffer bytes.
     fn write_descriptors(&self, len: usize) {
         let d = self.dma.as_ptr() as *mut u32;
         let mut off = 0;
@@ -177,10 +180,12 @@ impl Card {
         while off < len {
             let n = (len - off).min(65536);
             let last = off + n >= len;
-            let attr = 1 | 0x20 | if last { 2 } else { 0 }; // valide, transfert, fin
+            let attr = 1 | 0x20 | if last { 2 } else { 0 }; // valid, transfer, end
             unsafe {
-                d.add(2 * k).write_volatile(((n as u32 & 0xFFFF) << 16) | attr);
-                d.add(2 * k + 1).write_volatile((self.dma_pa + (DESC_BYTES + off) as u64) as u32);
+                d.add(2 * k)
+                    .write_volatile(((n as u32 & 0xFFFF) << 16) | attr);
+                d.add(2 * k + 1)
+                    .write_volatile((self.dma_pa + (DESC_BYTES + off) as u64) as u32);
             }
             off += n;
             k += 1;
@@ -194,21 +199,25 @@ impl Card {
 
     fn init(&mut self) -> Result<(), i64> {
         if self.regs.r32(PRESENT_STATE) & (1 << 16) == 0 {
-            return Err(-ENODEV); // pas de carte
+            return Err(-ENODEV); // no card
         }
         self.regs.modify(VENDOR_CLOCK_CNTRL, 0, 1);
         self.reset(0x1);
-        self.regs.w8(POWER_CONTROL, 0x0F); // 3,3 V
+        self.regs.w8(POWER_CONTROL, 0x0F); // 3.3 V
         self.set_clock(400);
         self.regs.w8(TIMEOUT_CONTROL, 0x0E);
         self.regs.w16(INT_ENABLE, 0xFFFF);
         self.regs.w16(INT_ENABLE + 2, 0xFFFF);
-        self.regs.w16(INT_SIGNAL, (INT_XFER_DONE | INT_ERROR) as u16);
+        self.regs
+            .w16(INT_SIGNAL, (INT_XFER_DONE | INT_ERROR) as u16);
         self.regs.w16(INT_SIGNAL + 2, 0xFFFF);
         time::sleep_ms(2);
 
         self.command(0, 0, Rsp::None, None)?;
-        let v2 = self.command(8, 0x1AA, Rsp::R1, None).map(|r| r[0] & 0xFFF == 0x1AA).unwrap_or(false);
+        let v2 = self
+            .command(8, 0x1AA, Rsp::R1, None)
+            .map(|r| r[0] & 0xFFF == 0x1AA)
+            .unwrap_or(false);
         let end = time::now_ns() + 1_000_000_000;
         let ocr = loop {
             let r = self.app_command(41, if v2 { 0x40FF_8000 } else { 0x00FF_8000 }, Rsp::R3)?;
@@ -234,7 +243,7 @@ impl Card {
             ((c_size + 1) << (mult + 2)) << bl_len >> 9
         };
         self.command(7, self.rca << 16, Rsp::R1b, None)?;
-        self.app_command(6, 2, Rsp::R1)?; // bus 4 bits
+        self.app_command(6, 2, Rsp::R1)?; // 4-bit bus
         self.regs.w8(HOST_CONTROL, self.regs.r8(HOST_CONTROL) | 2);
         if !self.block_addressed {
             self.command(16, BLOCK as u32, Rsp::R1, None)?;
@@ -247,7 +256,11 @@ impl Card {
         if n == 0 || n > MAX_BLOCKS || lba + n as u64 > self.blocks {
             return Err(-EINVAL);
         }
-        let arg = if self.block_addressed { lba } else { lba * BLOCK as u64 } as u32;
+        let arg = if self.block_addressed {
+            lba
+        } else {
+            lba * BLOCK as u64
+        } as u32;
         let idx = match (read, n > 1) {
             (true, false) => 17,
             (true, true) => 18,
@@ -265,30 +278,46 @@ impl Card {
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let regs = Mmio::map(drv::dev_slot(0), SDMMC1, 0x1000).expect("sd : registres");
-    let irq = Irq::new(drv::dev_slot(1)).expect("sd : interruption");
+    let regs = Mmio::map(drv::dev_slot(0), SDMMC1, 0x1000).expect("sd: registers");
+    let irq = Irq::new(drv::dev_slot(1)).expect("sd: interrupt");
     if let Ok(c) = ns::wait_for_timeout("clk", 2_000_000_000) {
         let mut m = Msg::new(clk::ENABLE, 1, 0);
         m.mr[0] = clk::SDMMC1;
         let _ = ipc::call(c, &m);
         let _ = sys::handle_close(c);
     }
-    let dma = SharedMemory::new(DESC_BYTES + MAX_BLOCKS * BLOCK, CONTIGUOUS | UNCACHED | DMA32).expect("sd : tampon DMA");
-    let dma_pa = dma.paddr(0).expect("sd : adresse DMA");
-    let mut card = Card { regs, irq, dma, dma_pa, rca: 0, block_addressed: false, blocks: 0 };
+    let dma = SharedMemory::new(
+        DESC_BYTES + MAX_BLOCKS * BLOCK,
+        CONTIGUOUS | UNCACHED | DMA32,
+    )
+    .expect("sd: DMA buffer");
+    let dma_pa = dma.paddr(0).expect("sd: DMA address");
+    let mut card = Card {
+        regs,
+        irq,
+        dma,
+        dma_pa,
+        rca: 0,
+        block_addressed: false,
+        blocks: 0,
+    };
     if let Err(e) = card.init() {
-        println!("[sd] pas de carte utilisable ({})", libnx::abi::err::name(e));
+        println!("[sd] no usable card ({})", libnx::abi::err::name(e));
         loop {
             time::sleep_ms(3_600_000);
         }
     }
     println!(
-        "[sd] carte {} de {} Mio ({} blocs)",
-        if card.block_addressed { "SDHC/SDXC" } else { "SDSC" },
+        "[sd] {} card of {} MiB ({} blocks)",
+        if card.block_addressed {
+            "SDHC/SDXC"
+        } else {
+            "SDSC"
+        },
         card.blocks / 2048,
         card.blocks
     );
-    let ep = drv::publish("blk:sd").expect("sd : publication");
+    let ep = drv::publish("blk:sd").expect("sd: publish");
     let mut client: Option<SharedMemory> = None;
     drv::serve(ep, |rx| {
         let m = &rx.msg;
@@ -315,13 +344,17 @@ fn main() -> i32 {
             }
             op @ (blk::READ | blk::WRITE) => {
                 let (lba, n, off) = (m.mr[0], m.mr[1] as usize, m.mr[2] as usize);
-                let Some(buf) = client.as_ref() else { return Some(Msg::error(-EINVAL)) };
+                let Some(buf) = client.as_ref() else {
+                    return Some(Msg::error(-EINVAL));
+                };
                 let len = n * BLOCK;
                 if off.checked_add(len).is_none_or(|e| e > buf.len()) || n > MAX_BLOCKS {
                     return Some(Msg::error(-EINVAL));
                 }
                 let r = if op == blk::READ {
-                    card.transfer(lba, n, true).map(|_| buf.as_mut_slice()[off..off + len].copy_from_slice(&card.data()[..len]))
+                    card.transfer(lba, n, true).map(|_| {
+                        buf.as_mut_slice()[off..off + len].copy_from_slice(&card.data()[..len])
+                    })
                 } else {
                     card.data()[..len].copy_from_slice(&buf.as_slice()[off..off + len]);
                     card.transfer(lba, n, false)

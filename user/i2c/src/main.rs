@@ -1,10 +1,5 @@
-//! i2c : les six controleurs I2C du Tegra X1.
-//!
-//! Chaque requete est un transfert court (8 octets au plus dans chaque sens,
-//! le « mode normal » du controleur) : ecriture puis lecture, typiquement un
-//! numero de registre puis sa valeur. C'est ce qu'utilisent les capteurs, le
-//! PMIC, la RTC et l'ecran tactile. Sequence reprise de hekate
-//! (bdk/soc/i2c.c) ; les bus ne sont initialises qu'a leur premier usage.
+//! i2c: six Tegra X1 controllers; short transfers, init on first use.
+//! Sequence from hekate (bdk/soc/i2c.c).
 
 #![no_std]
 #![no_main]
@@ -33,8 +28,15 @@ const DEBOUNCE_CNT_4T: u32 = 2 << 12;
 const STATUS_NOACK: u32 = 0xF;
 const STATUS_BUSY: u32 = 1 << 8;
 
-/// Controleurs 1 a 6 : (page projetee, decalage dans la page).
-const BUSES: [(usize, usize); 6] = [(0, 0x000), (0, 0x400), (0, 0x500), (0, 0x700), (1, 0x000), (1, 0x100)];
+/// Controllers 1-6: (mapped page, offset within the page).
+const BUSES: [(usize, usize); 6] = [
+    (0, 0x000),
+    (0, 0x400),
+    (0, 0x500),
+    (0, 0x700),
+    (1, 0x000),
+    (1, 0x100),
+];
 
 struct Bus {
     regs: Mmio,
@@ -59,7 +61,7 @@ fn run(b: &Mmio, cnfg: u32) -> Result<(), i64> {
     b.w32(CNFG, cnfg);
     load_cfg(b);
     b.w32(CNFG, (b.r32(CNFG) & !NORMAL_MODE_GO) | NORMAL_MODE_GO);
-    // 8 octets a 100 kHz : moins d'une milliseconde.
+    // 8 bytes at 100 kHz: under a millisecond.
     let end = time::now_ns() + 100_000_000;
     while b.r32(STATUS) & STATUS_BUSY != 0 {
         if time::now_ns() > end {
@@ -79,12 +81,18 @@ fn write(b: &Mmio, addr: u32, data: &[u8]) -> Result<(), i64> {
     b.w32(CMD_ADDR0, addr << 1);
     b.w32(CMD_DATA1, u32::from_le_bytes(w[..4].try_into().unwrap()));
     b.w32(CMD_DATA2, u32::from_le_bytes(w[4..].try_into().unwrap()));
-    run(b, ((data.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM)
+    run(
+        b,
+        ((data.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM,
+    )
 }
 
 fn read(b: &Mmio, addr: u32, out: &mut [u8]) -> Result<(), i64> {
     b.w32(CMD_ADDR0, (addr << 1) | 1);
-    run(b, ((out.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM | CMD1_READ)?;
+    run(
+        b,
+        ((out.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM | CMD1_READ,
+    )?;
     let mut w = [0u8; 8];
     w[..4].copy_from_slice(&b.r32(CMD_DATA1).to_le_bytes());
     w[4..].copy_from_slice(&b.r32(CMD_DATA2).to_le_bytes());
@@ -96,13 +104,16 @@ libnx::entry!(main);
 
 fn main() -> i32 {
     let pages = [
-        Mmio::map(drv::dev_slot(0), 0x7000_C000, 0x1000).expect("i2c : registres"),
-        Mmio::map(drv::dev_slot(1), 0x7000_D000, 0x1000).expect("i2c : registres"),
+        Mmio::map(drv::dev_slot(0), 0x7000_C000, 0x1000).expect("i2c: registers"),
+        Mmio::map(drv::dev_slot(1), 0x7000_D000, 0x1000).expect("i2c: registers"),
     ];
-    let mut buses: [Bus; 6] = core::array::from_fn(|k| Bus { regs: pages[BUSES[k].0].offset(BUSES[k].1), ready: false });
+    let mut buses: [Bus; 6] = core::array::from_fn(|k| Bus {
+        regs: pages[BUSES[k].0].offset(BUSES[k].1),
+        ready: false,
+    });
     let clk = ns::wait_for("clk").ok();
-    let ep = drv::publish("i2c").expect("i2c : publication");
-    println!("[i2c] six bus I2C prets");
+    let ep = drv::publish("i2c").expect("i2c: publish");
+    println!("[i2c] six I2C buses ready");
 
     let mut data = [0u8; 16];
     drv::serve(ep, |rx| {
@@ -110,7 +121,11 @@ fn main() -> i32 {
             return Some(Msg::error(-EINVAL));
         }
         let h = ipc::header(&rx.msg, 0);
-        let (bus, addr, rlen) = ((h & 0xFF) as usize, ((h >> 8) & 0x7F) as u32, ((h >> 16) & 0xFF) as usize);
+        let (bus, addr, rlen) = (
+            (h & 0xFF) as usize,
+            ((h >> 8) & 0x7F) as u32,
+            ((h >> 16) & 0xFF) as usize,
+        );
         let wlen = ipc::unpack_at(&rx.msg, 1, &mut data);
         if !(1..=6).contains(&bus) || wlen > 8 || rlen > 8 || (wlen == 0 && rlen == 0) {
             return Some(Msg::error(-EINVAL));

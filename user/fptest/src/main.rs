@@ -1,6 +1,5 @@
-//! Test du FP paresseux : 8 threads flottants, 2 par coeur, preemptes en
-//! plein calcul. Chaque resultat doit etre identique au bit pres a celui
-//! calcule seul, sans concurrence.
+//! Lazy-FP test: 8 floating threads, 2 per core, preempted mid-compute.
+//! Each result must match bit-for-bit the one computed alone.
 
 #![no_std]
 #![no_main]
@@ -41,14 +40,17 @@ fn main() -> i32 {
                     }
                 }
             })
-            .expect("thread"),
+            .expect("thread spawn"),
         );
     }
     for h in hs {
         h.join();
     }
     let n = fails.load(Ordering::Relaxed);
-    println!("fptest : 8 threads x 4 passes, 2 threads par coeur : {}", if n == 0 { "OK" } else { "ECHEC" });
+    println!(
+        "fptest: 8 threads x 4 passes, 2 threads per core: {}",
+        if n == 0 { "OK" } else { "FAILED" }
+    );
     if n == 0 {
         0
     } else {

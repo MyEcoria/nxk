@@ -1,12 +1,5 @@
-//! Pilote console : UART-A du Tegra X1, en espace utilisateur.
-//!
-//! Il n'a acces qu'a une page de registres (projetee par le noyau) et a une
-//! seule ligne d'interruption. Sa boucle attend a la fois les requetes des
-//! clients et l'interruption de reception, grace a une notification liee :
-//! un seul thread, un seul appel bloquant.
-//!
-//! Il assure aussi l'edition de ligne (echo, effacement) : les programmes ne
-//! recoivent que des lignes completes.
+//! Console driver: Tegra X1 UART-A in user space (one page, one IRQ).
+//! Line editing included: programs only get full lines.
 
 #![no_std]
 #![no_main]
@@ -23,7 +16,7 @@ use libnx::sys;
 
 const UART_A: u64 = 0x7000_6000;
 
-// Registres 16550, espacement de 4 octets.
+// 16550 registers, 4-byte spacing.
 const THR_RBR: usize = 0x00;
 const IER: usize = 0x04;
 const LSR: usize = 0x14;
@@ -65,23 +58,25 @@ libnx::entry!(main);
 
 fn main() -> i32 {
     let ep = slots::DRV_SERVICE;
-    let base = sys::mmio_map(slots::DRV_MMIO, UART_A, 0x1000).expect("mmio");
-    let uart = Uart { base: base as usize };
+    let base = sys::mmio_map(slots::DRV_MMIO, UART_A, 0x1000).expect("mmio map");
+    let uart = Uart {
+        base: base as usize,
+    };
 
-    let notif = sys::notify_create().expect("notification");
-    sys::irq_bind(slots::DRV_IRQ, notif, 1).expect("irq_bind");
-    sys::notify_bind(notif).expect("notify_bind");
+    let notif = sys::notify_create().expect("notify create");
+    sys::irq_bind(slots::DRV_IRQ, notif, 1).expect("irq bind");
+    sys::notify_bind(notif).expect("notify bind");
     uart.wr(IER, IER_RX);
 
     let mut line: Vec<u8> = Vec::with_capacity(256);
     let mut lines: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut reader: Option<u64> = None; // client en attente d'une ligne
+    let mut reader: Option<u64> = None; // client waiting for a line
     let mut buf = [0u8; ipc::MAX_BYTES];
 
     let mut rx = ipc::recv(ep).expect("recv");
     loop {
         if rx.msg.is_notify() {
-            // Interruption de reception : vidage de la FIFO et edition.
+            // Receive interrupt: drain the FIFO and edit.
             while let Some(b) = uart.get() {
                 match b {
                     b'\r' | b'\n' => {
@@ -89,7 +84,7 @@ fn main() -> i32 {
                         lines.push_back(core::mem::take(&mut line));
                     }
                     0x08 | 0x7F => {
-                        // Un caractere UTF-8 entier (octets de continuation compris).
+                        // One whole UTF-8 char (continuation bytes included).
                         let mut erased = false;
                         while let Some(c) = line.pop() {
                             erased = true;
@@ -130,7 +125,7 @@ fn main() -> i32 {
             proto::READ_LINE => match lines.pop_front() {
                 Some(l) => ipc::pack(0, &l),
                 None => {
-                    // Reponse differee : on la portera a la prochaine ligne.
+                    // Deferred reply: sent with the next line.
                     reader = Some(rx.token);
                     rx = ipc::recv(ep).expect("recv");
                     continue;

@@ -1,5 +1,5 @@
-//! Mesures nxk, alignees sur `lbench` (cote Linux) : memes charges, meme
-//! horloge (CNTVCT_EL0), memes cles `RESULT <cle> <valeur> <unite>`.
+//! nxk benchmarks, aligned with `lbench` (Linux side): same loads, same
+//! clock (CNTVCT_EL0), same `RESULT <key> <value> <unit>` keys.
 
 #![no_std]
 #![no_main]
@@ -76,8 +76,7 @@ fn round_trip(client: u8, server: u8, _bytes: usize) -> u64 {
     ns
 }
 
-/// 4000 octets aller (UTCB), 8 octets retour : meme schema que les tubes
-/// de `lbench`.
+/// 4000 bytes out (UTCB), 8 bytes back: same shape as `lbench` pipes.
 fn bulk(server: u8, iters: u64) -> u64 {
     let ep = sys::endpoint_create().expect("endpoint");
     let s = thread::spawn_on(Some(server), 0, move || {
@@ -118,7 +117,7 @@ fn thread_create() -> u64 {
     time::ticks_to_ns(time::ticks() - t0) / n
 }
 
-/// Lancement d'un programme (chargement ELF compris) et attente de sa fin.
+/// Spawn a program (including ELF load) and wait for it.
 fn spawn() -> u64 {
     let n = 200;
     let t0 = time::ticks();
@@ -130,7 +129,7 @@ fn spawn() -> u64 {
     time::ticks_to_ns(time::ticks() - t0) / n
 }
 
-/// Calcul entier pur, identique a `lbench` : temoin independant du noyau.
+/// Pure integer compute, identical to `lbench`: kernel-independent witness.
 fn compute() -> u64 {
     let t0 = time::ticks();
     let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;

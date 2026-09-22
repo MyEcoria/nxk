@@ -1,12 +1,5 @@
-//! net : pile TCP/IP (smoltcp) au-dessus de l'interface Ethernet « eth0 ».
-//!
-//! Configuration automatique par DHCP, resolution DNS, sockets TCP (client
-//! et serveur) et UDP offertes aux programmes par IPC (protocole `net`).
-//!
-//! Un thread attend les trames du pilote et reveille le thread principal
-//! par une notification ; celui-ci fait avancer la pile, sert les requetes
-//! et repond plus tard (jeton de reponse) aux operations qui doivent
-//! attendre : connexion, acceptation, reception, resolution.
+//! net: TCP/IP stack (smoltcp) over "eth0" (`net` protocol).
+//! DHCP/DNS plus deferred replies for connect/accept/receive/resolve.
 
 #![no_std]
 #![no_main]
@@ -20,7 +13,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{
-    EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETUNREACH, ENOENT, ENOTCONN, EPIPE, ETIMEDOUT,
+    EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETUNREACH, ENOENT, ENOTCONN,
+    EPIPE, ETIMEDOUT,
 };
 use libnx::abi::proto::{eth, net as proto};
 use libnx::drv;
@@ -32,11 +26,13 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, dns, tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{
+    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+};
 
 const TCP_BUF: usize = 64 * 1024;
 const UDP_BUF: usize = 64 * 1024;
-/// Octets de donnees par message de reponse.
+/// Data bytes per reply message.
 const MAX_IO: usize = 3 * 1024;
 
 // ------------------------------------------------------------ interface ---
@@ -59,7 +55,7 @@ impl TxToken for Tx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut b = vec![0u8; len];
         let r = f(&mut b);
-        // Anneau d'emission du pilote plein : on laisse passer ce qui s'y trouve.
+        // Driver TX ring full: let what is there drain.
         for _ in 0..100 {
             match ipc::call(self.0, &ipc::pack(eth::SEND, &b)) {
                 Ok(m) if m.label() == EAGAIN as u32 => time::sleep_us(100),
@@ -71,8 +67,14 @@ impl TxToken for Tx {
 }
 
 impl Device for Dev {
-    type RxToken<'a> = Rx where Self: 'a;
-    type TxToken<'a> = Tx where Self: 'a;
+    type RxToken<'a>
+        = Rx
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = Tx
+    where
+        Self: 'a;
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx)> {
         let f = self.rx.lock().pop_front()?;
@@ -108,7 +110,7 @@ enum Op {
     Resolve { query: dns::QueryHandle },
 }
 
-/// Operation en attente : ce qu'on attend, a qui repondre, jusqu'a quand.
+/// Pending operation: what is awaited, who to reply to, until when.
 struct Wait {
     op: Op,
     token: u64,
@@ -146,25 +148,28 @@ struct Net {
     dhcp: SocketHandle,
     dns: SocketHandle,
     table: Vec<Option<Sock>>,
-    /// References de chaque entree de `table` (DUP).
+    /// Reference count of each `table` entry (DUP).
     refs: Vec<u32>,
-    /// Processus proprietaire de chaque entree (pid pose par le noyau) : seul
-    /// lui s'en sert, et ses sockets sont fermes s'il disparait.
+    /// Owner process of each entry (pid stamped by the kernel): only it
+    /// uses it, and its sockets close if it dies.
     owners: Vec<u32>,
-    /// Requetes depuis le dernier ramassage des sockets orphelins.
+    /// Requests since the last orphan-socket reap.
     since_reap: u32,
     waits: Vec<Wait>,
     next_port: u16,
     addr: Option<(Ipv4Address, u8)>,
     gateway: Option<Ipv4Address>,
     dns_server: Option<Ipv4Address>,
-    /// Sockets TCP fermes par leur client, en fin de connexion.
+    /// TCP sockets closed by their client, at end of connection.
     closing: Vec<SocketHandle>,
 }
 
 impl Net {
     fn new_tcp(&mut self) -> SocketHandle {
-        let s = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; TCP_BUF]), tcp::SocketBuffer::new(vec![0; TCP_BUF]));
+        let s = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_BUF]),
+            tcp::SocketBuffer::new(vec![0; TCP_BUF]),
+        );
         self.sockets.add(s)
     }
 
@@ -186,13 +191,17 @@ impl Net {
         k as u64 + 1
     }
 
-    /// Le socket `id` existe et appartient a `pid`.
+    /// Socket `id` exists and belongs to `pid`.
     fn owned(&self, id: u64, pid: u32) -> Result<(), i64> {
         self.sock(id)?;
-        if self.owners[id as usize - 1] == pid { Ok(()) } else { Err(-EBADF) }
+        if self.owners[id as usize - 1] == pid {
+            Ok(())
+        } else {
+            Err(-EBADF)
+        }
     }
 
-    /// Ferme les sockets des processus disparus ; rend vrai s'il y en avait.
+    /// Close sockets of dead processes; true if there were any.
     fn reap(&mut self) -> bool {
         self.since_reap = 0;
         let live = libnx::process::live_pids();
@@ -208,7 +217,10 @@ impl Net {
     }
 
     fn sock(&self, id: u64) -> Result<&Sock, i64> {
-        self.table.get((id as usize).wrapping_sub(1)).and_then(|s| s.as_ref()).ok_or(-EBADF)
+        self.table
+            .get((id as usize).wrapping_sub(1))
+            .and_then(|s| s.as_ref())
+            .ok_or(-EBADF)
     }
 
     fn tcp_handle(&self, id: u64) -> Result<SocketHandle, i64> {
@@ -235,7 +247,7 @@ impl Net {
         let s = self.table.get_mut(k).and_then(|s| s.take()).ok_or(-EBADF)?;
         match s {
             Sock::Tcp(h) => {
-                // Fermeture propre ; le socket sera recycle une fois ferme.
+                // Clean close; the socket is recycled once closed.
                 self.sockets.get_mut::<tcp::Socket>(h).close();
                 self.closing.push(h);
             }
@@ -251,8 +263,14 @@ impl Net {
         Ok(())
     }
 
-    /// Requete d'un client : `Some` = reponse immediate, `None` = en attente.
-    fn request(&mut self, m: &Msg, token: u64, pid: u32, buf: &mut [u8]) -> Option<Result<Msg, i64>> {
+    /// Client request: `Some` = immediate reply, `None` = pending.
+    fn request(
+        &mut self,
+        m: &Msg,
+        token: u64,
+        pid: u32,
+        buf: &mut [u8],
+    ) -> Option<Result<Msg, i64>> {
         self.since_reap += 1;
         if self.since_reap >= 256 {
             self.reap();
@@ -273,8 +291,7 @@ impl Net {
                 return Some(Err(e));
             }
         }
-        // Port occupe, peut-etre par un processus disparu : on ramasse et on
-        // reessaie une fois.
+        // Port busy, maybe by a dead process: reap and retry once.
         let r = self.request_inner(m, token, pid, buf);
         if matches!(r, Some(Err(e)) if e == -EADDRINUSE) && self.reap() {
             return self.request_inner(m, token, pid, buf);
@@ -282,7 +299,13 @@ impl Net {
         r
     }
 
-    fn request_inner(&mut self, m: &Msg, token: u64, pid: u32, buf: &mut [u8]) -> Option<Result<Msg, i64>> {
+    fn request_inner(
+        &mut self,
+        m: &Msg,
+        token: u64,
+        pid: u32,
+        buf: &mut [u8],
+    ) -> Option<Result<Msg, i64>> {
         Some(match m.label() {
             proto::TCP_CONNECT => {
                 let (addr, port, t) = (ip(m.mr[0]), m.mr[1] as u16, m.mr[2]);
@@ -292,12 +315,21 @@ impl Net {
                 let h = self.new_tcp();
                 let local = self.ephemeral();
                 let cx = self.iface.context();
-                if self.sockets.get_mut::<tcp::Socket>(h).connect(cx, (IpAddress::Ipv4(addr), port), local).is_err() {
+                if self
+                    .sockets
+                    .get_mut::<tcp::Socket>(h)
+                    .connect(cx, (IpAddress::Ipv4(addr), port), local)
+                    .is_err()
+                {
                     self.sockets.remove(h);
                     return Some(Err(-EINVAL));
                 }
                 let id = self.insert(Sock::Tcp(h), pid);
-                self.waits.push(Wait { op: Op::Connect { sock: id as usize }, token, deadline: deadline(t) });
+                self.waits.push(Wait {
+                    op: Op::Connect { sock: id as usize },
+                    token,
+                    deadline: deadline(t),
+                });
                 return None;
             }
             proto::TCP_LISTEN => {
@@ -305,7 +337,12 @@ impl Net {
                 if port == 0 {
                     return Some(Err(-EINVAL));
                 }
-                if self.table.iter().flatten().any(|s| matches!(s, Sock::Listener { port: p, .. } if *p == port)) {
+                if self
+                    .table
+                    .iter()
+                    .flatten()
+                    .any(|s| matches!(s, Sock::Listener { port: p, .. } if *p == port))
+                {
                     return Some(Err(-EADDRINUSE));
                 }
                 let mut pool = Vec::new();
@@ -320,7 +357,13 @@ impl Net {
                 if !matches!(self.sock(m.mr[0]), Ok(Sock::Listener { .. })) {
                     return Some(Err(-EINVAL));
                 }
-                self.waits.push(Wait { op: Op::Accept { listener: m.mr[0] as usize }, token, deadline: deadline(m.mr[1]) });
+                self.waits.push(Wait {
+                    op: Op::Accept {
+                        listener: m.mr[0] as usize,
+                    },
+                    token,
+                    deadline: deadline(m.mr[1]),
+                });
                 return None;
             }
             proto::SEND => {
@@ -329,7 +372,14 @@ impl Net {
                 if let Err(e) = self.tcp_handle(id) {
                     return Some(Err(e));
                 }
-                self.waits.push(Wait { op: Op::Send { sock: id as usize, data: buf[..n].to_vec() }, token, deadline: deadline(t) });
+                self.waits.push(Wait {
+                    op: Op::Send {
+                        sock: id as usize,
+                        data: buf[..n].to_vec(),
+                    },
+                    token,
+                    deadline: deadline(t),
+                });
                 return None;
             }
             proto::RECV => {
@@ -337,7 +387,14 @@ impl Net {
                     return Some(Err(e));
                 }
                 let max = (m.mr[1] as usize).clamp(1, MAX_IO);
-                self.waits.push(Wait { op: Op::Recv { sock: m.mr[0] as usize, max }, token, deadline: deadline(m.mr[2]) });
+                self.waits.push(Wait {
+                    op: Op::Recv {
+                        sock: m.mr[0] as usize,
+                        max,
+                    },
+                    token,
+                    deadline: deadline(m.mr[2]),
+                });
                 return None;
             }
             proto::CLOSE => self.close(m.mr[0]).map(|_| Msg::new(0, 0, 0)),
@@ -356,7 +413,11 @@ impl Net {
                 Err(e) => Err(e),
             },
             proto::UDP_BIND => {
-                let port = if m.mr[0] == 0 { self.ephemeral() } else { m.mr[0] as u16 };
+                let port = if m.mr[0] == 0 {
+                    self.ephemeral()
+                } else {
+                    m.mr[0] as u16
+                };
                 let meta = || vec![udp::PacketMetadata::EMPTY; 32];
                 let s = udp::Socket::new(
                     udp::PacketBuffer::new(meta(), vec![0; UDP_BUF]),
@@ -370,13 +431,21 @@ impl Net {
                 Ok(words(&[self.insert(Sock::Udp(h), pid), port as u64]))
             }
             proto::SEND_TO => {
-                let (id, addr, port) = (ipc::header(m, 0), ip(ipc::header(m, 1)), ipc::header(m, 2) as u16);
+                let (id, addr, port) = (
+                    ipc::header(m, 0),
+                    ip(ipc::header(m, 1)),
+                    ipc::header(m, 2) as u16,
+                );
                 let n = ipc::unpack_at(m, 3, buf);
                 match self.sock(id) {
                     Ok(Sock::Udp(h)) => {
                         let h = *h;
                         let ep = IpEndpoint::new(IpAddress::Ipv4(addr), port);
-                        match self.sockets.get_mut::<udp::Socket>(h).send_slice(&buf[..n], ep) {
+                        match self
+                            .sockets
+                            .get_mut::<udp::Socket>(h)
+                            .send_slice(&buf[..n], ep)
+                        {
                             Ok(()) => Ok(words(&[n as u64])),
                             Err(_) => Err(-EAGAIN),
                         }
@@ -389,13 +458,19 @@ impl Net {
                 if !matches!(self.sock(m.mr[0]), Ok(Sock::Udp(_))) {
                     return Some(Err(-EINVAL));
                 }
-                self.waits.push(Wait { op: Op::RecvFrom { sock: m.mr[0] as usize }, token, deadline: deadline(m.mr[1]) });
+                self.waits.push(Wait {
+                    op: Op::RecvFrom {
+                        sock: m.mr[0] as usize,
+                    },
+                    token,
+                    deadline: deadline(m.mr[1]),
+                });
                 return None;
             }
             proto::RESOLVE => {
                 let n = ipc::unpack(m, buf);
                 let name = String::from(core::str::from_utf8(&buf[..n]).unwrap_or(""));
-                // Adresse litterale : pas de requete.
+                // Literal address: no query.
                 if let Some(a) = parse_ipv4(&name) {
                     return Some(Ok(words(&[u32::from(a) as u64])));
                 }
@@ -403,16 +478,27 @@ impl Net {
                     return Some(Err(-ENETUNREACH));
                 }
                 let cx = self.iface.context();
-                match self.sockets.get_mut::<dns::Socket>(self.dns).start_query(cx, &name, DnsQueryType::A) {
+                match self.sockets.get_mut::<dns::Socket>(self.dns).start_query(
+                    cx,
+                    &name,
+                    DnsQueryType::A,
+                ) {
                     Ok(q) => {
-                        self.waits.push(Wait { op: Op::Resolve { query: q }, token, deadline: deadline(5_000_000_000) });
+                        self.waits.push(Wait {
+                            op: Op::Resolve { query: q },
+                            token,
+                            deadline: deadline(5_000_000_000),
+                        });
                         return None;
                     }
                     Err(_) => Err(-EINVAL),
                 }
             }
             proto::INFO => {
-                let (a, p) = self.addr.map(|(a, p)| (u32::from(a) as u64, p as u64)).unwrap_or((0, 0));
+                let (a, p) = self
+                    .addr
+                    .map(|(a, p)| (u32::from(a) as u64, p as u64))
+                    .unwrap_or((0, 0));
                 let g = self.gateway.map(|g| u32::from(g) as u64).unwrap_or(0);
                 let d = self.dns_server.map(|d| u32::from(d) as u64).unwrap_or(0);
                 Ok(words(&[a, p, g, d]))
@@ -435,7 +521,7 @@ impl Net {
         })
     }
 
-    /// Fait avancer une operation en attente : `Some` = reponse a porter.
+    /// Drive a pending operation forward: `Some` = reply to deliver.
     fn progress(&mut self, op: &mut Op, now: u64, deadline: u64) -> Option<Result<Msg, i64>> {
         let expired = now >= deadline;
         match op {
@@ -462,7 +548,10 @@ impl Net {
                     Sock::Listener { port, pool } => (
                         *port,
                         pool.iter().position(|&h| {
-                            matches!(self.sockets.get::<tcp::Socket>(h).state(), tcp::State::Established | tcp::State::CloseWait)
+                            matches!(
+                                self.sockets.get::<tcp::Socket>(h).state(),
+                                tcp::State::Established | tcp::State::CloseWait
+                            )
                         }),
                     ),
                     _ => return Some(Err(-EINVAL)),
@@ -472,7 +561,9 @@ impl Net {
                         let fresh = self.new_tcp();
                         let _ = self.sockets.get_mut::<tcp::Socket>(fresh).listen(port);
                         let h = match self.table[*listener - 1].as_mut() {
-                            Some(Sock::Listener { pool, .. }) => core::mem::replace(&mut pool[k], fresh),
+                            Some(Sock::Listener { pool, .. }) => {
+                                core::mem::replace(&mut pool[k], fresh)
+                            }
                             _ => return Some(Err(-EBADF)),
                         };
                         let r = self.sockets.get::<tcp::Socket>(h).remote_endpoint();
@@ -502,7 +593,7 @@ impl Net {
                     });
                 }
                 if !s.may_recv() {
-                    // Fin de flux (FIN recu) ou connexion terminee.
+                    // End of stream (FIN received) or done connection.
                     return Some(Ok(ipc::pack(0, &[])));
                 }
                 if expired {
@@ -517,7 +608,11 @@ impl Net {
                 };
                 let s = self.sockets.get_mut::<tcp::Socket>(h);
                 if !s.may_send() {
-                    return Some(Err(if s.state() == tcp::State::Closed { -ENOTCONN } else { -EPIPE }));
+                    return Some(Err(if s.state() == tcp::State::Closed {
+                        -ENOTCONN
+                    } else {
+                        -EPIPE
+                    }));
                 }
                 if s.can_send() {
                     return Some(match s.send_slice(data) {
@@ -539,7 +634,11 @@ impl Net {
                 if s.can_recv() {
                     let mut b = vec![0u8; MAX_IO];
                     return Some(match s.recv_slice(&mut b) {
-                        Ok((n, meta)) => Ok(ipc::pack_at(0, &[word(meta.endpoint.addr), meta.endpoint.port as u64], &b[..n])),
+                        Ok((n, meta)) => Ok(ipc::pack_at(
+                            0,
+                            &[word(meta.endpoint.addr), meta.endpoint.port as u64],
+                            &b[..n],
+                        )),
                         Err(_) => Err(-EAGAIN),
                     });
                 }
@@ -549,13 +648,19 @@ impl Net {
                 None
             }
             Op::Resolve { query } => {
-                match self.sockets.get_mut::<dns::Socket>(self.dns).get_query_result(*query) {
+                match self
+                    .sockets
+                    .get_mut::<dns::Socket>(self.dns)
+                    .get_query_result(*query)
+                {
                     Ok(addrs) => Some(match addrs.first() {
                         Some(&a) => Ok(words(&[word(a)])),
                         None => Err(-ENOENT),
                     }),
                     Err(dns::GetQueryResultError::Pending) if expired => {
-                        self.sockets.get_mut::<dns::Socket>(self.dns).cancel_query(*query);
+                        self.sockets
+                            .get_mut::<dns::Socket>(self.dns)
+                            .cancel_query(*query);
                         Some(Err(-ETIMEDOUT))
                     }
                     Err(dns::GetQueryResultError::Pending) => None,
@@ -567,7 +672,9 @@ impl Net {
 
     fn dhcp_events(&mut self) {
         let ev = match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
-            Some(dhcpv4::Event::Configured(c)) => Some((c.address, c.router, c.dns_servers.first().copied())),
+            Some(dhcpv4::Event::Configured(c)) => {
+                Some((c.address, c.router, c.dns_servers.first().copied()))
+            }
             Some(dhcpv4::Event::Deconfigured) => None,
             None => return,
         };
@@ -586,24 +693,30 @@ impl Net {
                     }
                 }
                 if let Some(d) = dns_server {
-                    self.sockets.get_mut::<dns::Socket>(self.dns).update_servers(&[IpAddress::Ipv4(d)]);
+                    self.sockets
+                        .get_mut::<dns::Socket>(self.dns)
+                        .update_servers(&[IpAddress::Ipv4(d)]);
                 }
                 self.addr = Some((cidr.address(), cidr.prefix_len()));
                 self.gateway = router;
                 self.dns_server = dns_server;
                 println!(
-                    "[net] DHCP : adresse {}/{}, passerelle {}, DNS {}",
+                    "[net] DHCP: address {}/{}, gateway {}, DNS {}",
                     cidr.address(),
                     cidr.prefix_len(),
-                    router.map(|r| alloc::format!("{}", r)).unwrap_or_else(|| String::from("aucune")),
-                    dns_server.map(|r| alloc::format!("{}", r)).unwrap_or_else(|| String::from("aucun"))
+                    router
+                        .map(|r| alloc::format!("{}", r))
+                        .unwrap_or_else(|| String::from("none")),
+                    dns_server
+                        .map(|r| alloc::format!("{}", r))
+                        .unwrap_or_else(|| String::from("none"))
                 );
             }
             None => {
                 self.iface.update_ip_addrs(|a| a.clear());
                 self.iface.routes_mut().remove_default_ipv4_route();
                 if self.addr.take().is_some() {
-                    println!("[net] DHCP : bail perdu");
+                    println!("[net] DHCP: lease lost");
                 }
             }
         }
@@ -633,20 +746,23 @@ fn main() -> i32 {
     let eth = match ns::wait_for_timeout("eth0", 5_000_000_000) {
         Ok(h) => h,
         Err(_) => {
-            println!("[net] pas d'interface reseau");
+            println!("[net] no network interface");
             return 0;
         }
     };
-    let info = ipc::call(eth, &Msg::new(eth::INFO, 0, 0)).expect("net : interface");
+    let info = ipc::call(eth, &Msg::new(eth::INFO, 0, 0)).expect("net: interface");
     let mut mac = [0u8; 6];
     mac.copy_from_slice(&info.mr[0].to_le_bytes()[..6]);
 
-    // Reception : un thread bloque sur le pilote, le principal est prevenu.
+    // Receive: one thread blocks on the driver, the main one is signaled.
     let rxq: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let notif = sys::notify_create().expect("net : notification");
+    let notif = sys::notify_create().expect("net: notification");
     let _ = sys::notify_bind(notif);
     {
-        let (q, eth2) = (rxq.clone(), sys::handle_dup(eth, libnx::abi::rights::SEND, 0).unwrap_or(eth));
+        let (q, eth2) = (
+            rxq.clone(),
+            sys::handle_dup(eth, libnx::abi::rights::SEND, 0).unwrap_or(eth),
+        );
         thread::spawn(move || {
             let mut frame = vec![0u8; ipc::MAX_BYTES];
             loop {
@@ -666,7 +782,7 @@ fn main() -> i32 {
                 }
             }
         })
-        .expect("net : thread de reception");
+        .expect("net: receive thread");
     }
 
     let mut dev = Dev { eth, rx: rxq };
@@ -677,7 +793,10 @@ fn main() -> i32 {
     let iface = Interface::new(cfg, &mut dev, now());
     let mut sockets = SocketSet::new(Vec::new());
     let dhcp = sockets.add(dhcpv4::Socket::new());
-    let dns = sockets.add(dns::Socket::new(&[], vec![None, None, None, None, None, None, None, None]));
+    let dns = sockets.add(dns::Socket::new(
+        &[],
+        vec![None, None, None, None, None, None, None, None],
+    ));
     let mut net = Net {
         iface,
         dev,
@@ -695,14 +814,14 @@ fn main() -> i32 {
         dns_server: None,
         closing: Vec::new(),
     };
-    let ep = drv::publish("net").expect("net : publication");
+    let ep = drv::publish("net").expect("net: publish");
     let mut buf = vec![0u8; ipc::MAX_BYTES];
     loop {
         let t = now();
         net.iface.poll(t, &mut net.dev, &mut net.sockets);
         net.dhcp_events();
 
-        // Operations en attente.
+        // Pending operations.
         let now_ns = time::now_ns();
         let mut k = 0;
         while k < net.waits.len() {
@@ -710,7 +829,7 @@ fn main() -> i32 {
             match net.progress(&mut w.op, now_ns, w.deadline) {
                 Some(r) => {
                     let _ = ipc::reply_to(w.token, &r.unwrap_or_else(Msg::error));
-                    // Des donnees ont pu etre mises en file : a emettre.
+                    // Data may have been queued: push it out.
                     net.iface.poll(now(), &mut net.dev, &mut net.sockets);
                 }
                 None => {
@@ -721,7 +840,7 @@ fn main() -> i32 {
                 }
             }
         }
-        // Sockets fermes par leur client : recycles une fois termines.
+        // Sockets closed by their client: recycled once done.
         net.closing.retain(|&h| {
             let done = net.sockets.get::<tcp::Socket>(h).state() == tcp::State::Closed;
             if done {
@@ -730,11 +849,18 @@ fn main() -> i32 {
             !done
         });
 
-        // Prochaine echeance : minuteries de la pile (retransmissions, DHCP)
-        // et delais des clients. Sans echeance, attente sans limite : une
-        // trame recue ou un message nous reveille (aucun reveil periodique).
-        let mut delay = net.iface.poll_delay(now(), &net.sockets).map(|d| d.total_micros() * 1000);
-        if let Some(d) = net.waits.iter().map(|w| w.deadline).filter(|&d| d != u64::MAX).min() {
+        // Next deadline from stack timers and client timeouts (else wait).
+        let mut delay = net
+            .iface
+            .poll_delay(now(), &net.sockets)
+            .map(|d| d.total_micros() * 1000);
+        if let Some(d) = net
+            .waits
+            .iter()
+            .map(|w| w.deadline)
+            .filter(|&d| d != u64::MAX)
+            .min()
+        {
             let left = d.saturating_sub(time::now_ns());
             delay = Some(delay.map_or(left, |x| x.min(left)));
         }
