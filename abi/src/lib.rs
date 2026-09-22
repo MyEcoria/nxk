@@ -666,6 +666,14 @@ pub mod proto {
         /// xHCI host: host plus SuperSpeed logic clocks, XUSBA
         /// and XUSBC partitions.
         pub const XUSB_HOST: u64 = 20;
+        /// USB2 OTG device controller (USB-C port, Erista): PLLU and
+        /// UTMIPLL up, controller clock with a reset pulse.
+        pub const USBD: u64 = 21;
+        /// USB2 pad tracking clock, on during PHY bias calibration.
+        pub const USB2_TRK: u64 = 22;
+        /// Fuse controller, STATUS only (`ST_POWERED`: fuses visible).
+        /// Read fuses only at `ST_READY`.
+        pub const FUSE: u64 = 23;
     }
     /// I2C bus.
     pub mod i2c {
