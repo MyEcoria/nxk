@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/nxk-logo-dark.svg">
+    <img alt="nxk" src="docs/logo/nxk-logo-light.svg" width="384">
+  </picture>
+</p>
+
 # nxk — AArch64 microkernel for Tegra X1
 
 Microkernel written **entirely in Rust**, with no host OS, for the
@@ -120,6 +127,7 @@ bench/      comparison against L4T: EL3 monitor, Linux measurement program, scri
 tools/      build, SD card, std toolchain, launch, automated tests
 hwboot/     physical Switch bring-up: RCM injector, hekate entry, nxk-bl31 EL3 monitor
 refs/       hekate, Atmosphere: hardware documentation (never compiled)
+docs/logo/  pixel-art logo (regenerate with tools/mklogo.py)
 ```
 
 About 8,000 lines of Rust for the kernel, 7,000 for drivers, services
