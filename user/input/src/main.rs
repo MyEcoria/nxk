@@ -1,9 +1,5 @@
-//! input : evenements d'entree (ecran tactile, clavier).
-//!
-//! L'ecran tactile (FTM3BD56 de STMicro, I2C3 adresse 0x49) est interroge a
-//! 100 Hz : sa pile d'evenements se lit par la commande 0x85. Les autres
-//! pilotes (clavier USB) deposent leurs evenements par INJECT. Les clients
-//! attendent le suivant par READ (reponse differee, jeton de reponse).
+//! input: touchscreen (polled at 100 Hz) and keyboard events.
+//! Clients wait via READ; drivers inject via INJECT.
 
 #![no_std]
 #![no_main]
@@ -23,7 +19,7 @@ use libnx::{println, time};
 const TOUCH_ADDR: u8 = 0x49;
 const READ_ONE_EVENT: u8 = 0x85;
 const MS_MT_SENSE_ON: u8 = 0x93;
-/// Lecture de registre : 0x0023 = nombre d'evenements en attente (x2).
+/// Register read: 0x0023 = pending event count (x2).
 const READ_REG: u8 = 0xB6;
 const POLL_NS: u64 = 10_000_000;
 
@@ -36,23 +32,29 @@ fn reply(e: Event) -> Msg {
     m
 }
 
-/// Evenements en attente dans le controleur tactile ; rend vrai si un doigt
-/// reste pose apres eux.
+/// Pending events in the touch controller; true if a finger is still
+/// down afterwards.
 fn poll_touch(i2c: &I2c, out: &mut VecDeque<Event>, mut down: bool) -> bool {
     let mut count = [0u8; 2];
-    if i2c.transfer(3, TOUCH_ADDR, &[READ_REG, 0x00, 0x23], &mut count).is_err() {
+    if i2c
+        .transfer(3, TOUCH_ADDR, &[READ_REG, 0x00, 0x23], &mut count)
+        .is_err()
+    {
         return down;
     }
     for _ in 0..(count[1] >> 1).min(32) {
         let mut ev = [0u8; 8];
-        if i2c.transfer(3, TOUCH_ADDR, &[READ_ONE_EVENT], &mut ev).is_err() {
+        if i2c
+            .transfer(3, TOUCH_ADDR, &[READ_ONE_EVENT], &mut ev)
+            .is_err()
+        {
             return down;
         }
         let code = match ev[0] & 0x0F {
             0x03 => proto::TOUCH_DOWN,
             0x05 => proto::TOUCH_MOVE,
             0x04 => proto::TOUCH_UP,
-            _ => continue, // autres evenements (controleur pret, etat...)
+            _ => continue, // other events (controller ready, state...)
         };
         let finger = (ev[0] >> 4) as u64;
         let x = (ev[1] as u64) << 4 | (ev[3] >> 4) as u64;
@@ -66,19 +68,22 @@ fn poll_touch(i2c: &I2c, out: &mut VecDeque<Event>, mut down: bool) -> bool {
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let i2c = I2c::connect().expect("input : service i2c");
-    let touch = i2c.transfer(3, TOUCH_ADDR, &[MS_MT_SENSE_ON], &mut []).is_ok();
-    let ep = drv::publish("input").expect("input : publication");
-    println!("[input] ecran tactile {}", if touch { "pret" } else { "absent" });
+    let i2c = I2c::connect().expect("input: i2c service");
+    let touch = i2c
+        .transfer(3, TOUCH_ADDR, &[MS_MT_SENSE_ON], &mut [])
+        .is_ok();
+    let ep = drv::publish("input").expect("input: publish");
+    println!(
+        "[input] touchscreen {}",
+        if touch { "ready" } else { "missing" }
+    );
 
     let mut queue: VecDeque<Event> = VecDeque::new();
-    // Lecteurs en attente : jeton de reponse et echeance (0 : aucune).
+    // Waiting readers: reply token and deadline (0: none).
     let mut readers: Vec<(u64, u64)> = Vec::new();
     let mut down = false;
     loop {
-        // Le controleur n'est interroge que si quelqu'un attend un evenement
-        // ou qu'un doigt est pose : sans lecteur, aucun reveil periodique (le
-        // coeur reste au repos, rien ne tourne pour un serveur sans ecran).
+        // Poll only while a reader waits or a finger is down (else idle).
         let polling = touch && (!readers.is_empty() || down);
         let rx: Option<Received> = match ipc::recv_timeout(ep, if polling { POLL_NS } else { 0 }) {
             Ok(r) => Some(r),
@@ -111,7 +116,7 @@ fn main() -> i32 {
                 }
             }
         }
-        // Distribution aux lecteurs en attente, puis delais echus.
+        // Deliver to waiting readers, then expired deadlines.
         while !readers.is_empty() {
             let Some(e) = queue.pop_front() else { break };
             let (tok, _) = readers.remove(0);
@@ -126,7 +131,7 @@ fn main() -> i32 {
                 true
             }
         });
-        // Evenements sans lecteur : on n'en garde qu'un nombre raisonnable.
+        // Events with no reader: keep only a bounded number.
         while queue.len() > 256 {
             queue.pop_front();
         }
