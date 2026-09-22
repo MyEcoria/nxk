@@ -1,4 +1,5 @@
-//! Console noyau : un UART unique partage, protege par un verrou.
+//! Console noyau : un UART unique partage, protege par un verrou, et recopie
+//! sur l'ecran laisse allume par le chargeur (`drivers::fbcon`).
 //!
 //! Les macros `kprint!`/`kprintln!` prennent le verrou le temps d'un message,
 //! ce qui garde les lignes entieres meme quand plusieurs coeurs ecrivent.
@@ -12,6 +13,7 @@
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::drivers::fbcon;
 use crate::drivers::uart::{Uart, UART_A};
 use crate::sync::SpinLock;
 
@@ -32,6 +34,7 @@ impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self.ready {
             self.uart.write_str(s);
+            fbcon::write_str(s);
         }
         Ok(())
     }
@@ -52,6 +55,7 @@ pub fn init() {
         c.uart.init(115_200);
         c.ready = true;
     });
+    fbcon::init();
 }
 
 /// La MMU est active : les messages suivants passent par le verrou.
@@ -69,6 +73,9 @@ pub fn write_bytes(b: &[u8]) {
                 }
                 c.uart.put(x);
             }
+            if let Ok(s) = core::str::from_utf8(b) {
+                fbcon::write_str(s);
+            }
         }
     });
 }
@@ -81,8 +88,15 @@ pub fn _print(args: fmt::Arguments) {
 /// Ecriture d'urgence : ignore le verrou (panique, exception fatale).
 #[doc(hidden)]
 pub fn _print_emergency(args: fmt::Arguments) {
-    let mut uart = Uart::new(UART_A);
-    let _ = uart.write_fmt(args);
+    struct Emergency(Uart);
+    impl Write for Emergency {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            self.0.write_str(s);
+            fbcon::write_str(s);
+            Ok(())
+        }
+    }
+    let _ = Emergency(Uart::new(UART_A)).write_fmt(args);
 }
 
 #[macro_export]

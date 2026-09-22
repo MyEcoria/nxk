@@ -187,7 +187,9 @@ pas d'un processus, lit et écrit registres et mémoire, arrête des threads.
 
 **Démarrage** : directement depuis le reset (EL3), ou en EL2 sous un moniteur
 PSCI (comme sur une Switch avec son firmware sécurisé) ; taille de la DRAM
-détectée ; arbre de périphériques lu s'il est fourni.
+détectée ; arbre de périphériques lu s'il est fourni. Si le chargeur a laissé
+l'écran allumé (hekate), le journal du noyau y est recopié jusqu'à ce que le
+service `display` le reprenne : seule sortie visible sans adaptateur UART.
 
 ## Services et pilotes
 

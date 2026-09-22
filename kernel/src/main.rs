@@ -31,6 +31,7 @@ use nxk_abi::layout::{BOOTFS_BASE, PAGE_SIZE};
 use nxk_abi::{prot, rights, slots, startup};
 
 use arch::{gic, mmu, smp, timer};
+use drivers::fbcon;
 use kern::cap::{self, Cap, Kind};
 use kern::{bkl, bootfs, elf, exec, ipc, notify, percpu, process, random, sched, thread};
 use mm::{pmm, vm};
@@ -93,6 +94,14 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
         mmu::enable();
     }
     console::enable_lock();
+    // Image de l'ecran de secours : reste projetee (le noyau y ecrit) mais
+    // n'est pas distribuee. Hors DRAM projetee ou dans un trou : abandon.
+    let fb = fbcon::region().filter(|&(b, e)| {
+        b >= dram.0 && e <= mmu::dram_end() && !holes.iter().any(|&(hb, he)| hb < e && he > b)
+    });
+    if fbcon::region().is_some() && fb.is_none() {
+        fbcon::disable();
+    }
     bkl::acquire();
     percpu::init(0, kstack_top(0), mmu::kernel_ttbr());
     arch::cpu_init();
@@ -107,7 +116,10 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     );
 
     let kend = sym(unsafe { &__kernel_end });
-    pmm::init(kend, mmu::dram_end(), &holes);
+    let mut reserved = [(0u64, 0u64); mmu::MAX_HOLES + fdt::MAX_RESERVED + 1];
+    reserved[..holes.len()].copy_from_slice(&holes);
+    reserved[holes.len()] = fb.unwrap_or((0, 0));
+    pmm::init(kend, mmu::dram_end(), &reserved);
     let (total, free, kpages) = pmm::stats();
     kprintln!(
         "[mem] {} MiB de DRAM, {} MiB libres (noyau et metadonnees : {} KiB)",
@@ -131,6 +143,9 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     }
     for &(b, e) in holes.iter().filter(|h| h.1 > h.0) {
         kprintln!("[mem] zone reservee par le moniteur : {:#x}..{:#x} ({} MiB)", b, e, (e - b) >> 20);
+    }
+    if let Some((b, e)) = fb {
+        kprintln!("[ecran] messages recopies sur l'image du chargeur : {:#x}..{:#x}", b, e);
     }
 
     thread::init();
@@ -223,27 +238,36 @@ fn banner(core: usize) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Ecriture brute : aucune machinerie `core::fmt`, pour que le message
-    // sorte meme si la panique vient du formatage lui-meme.
+    // Ecriture brute : aucune machinerie `core::fmt` hors du message, pour
+    // que la panique sorte meme si elle vient du formatage lui-meme. UART et
+    // ecran de secours, sans verrou.
     use drivers::uart::{Uart, UART_A};
-    let uart = Uart::new(UART_A);
+    struct Out(Uart);
+    impl core::fmt::Write for Out {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.write_str(s);
+            fbcon::write_str(s);
+            Ok(())
+        }
+    }
+    let mut out = Out(Uart::new(UART_A));
 
-    let put_str = |s: &str| uart.write_str(s);
+    let put_str = |s: &str| {
+        Uart::new(UART_A).write_str(s);
+        fbcon::write_str(s);
+    };
     let put_num = |mut n: u64| {
         let mut buf = [0u8; 20];
         let mut i = buf.len();
-        if n == 0 {
-            uart.put(b'0');
-            return;
-        }
-        while n > 0 {
+        loop {
             i -= 1;
             buf[i] = b'0' + (n % 10) as u8;
             n /= 10;
+            if n == 0 {
+                break;
+            }
         }
-        for &b in &buf[i..] {
-            uart.put(b);
-        }
+        put_str(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
     };
 
     put_str("\n*** PANIQUE NOYAU cpu");
@@ -257,7 +281,7 @@ fn panic(info: &PanicInfo) -> ! {
         put_str("\n");
     }
     put_str("  quoi : ");
-    let _ = core::fmt::write(&mut Uart::new(UART_A), format_args!("{}", info.message()));
+    let _ = core::fmt::write(&mut out, format_args!("{}", info.message()));
     put_str("\n");
     arch::park()
 }
