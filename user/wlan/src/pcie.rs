@@ -173,6 +173,34 @@ const GPIO_CNF: usize = 0x00;
 const GPIO_OE: usize = 0x10;
 const GPIO_OUT: usize = 0x20;
 
+/// Where bring-up stopped, with the value that said so: the only way
+/// to tell a dead rail from an untrained link without a UART.
+pub struct Fail {
+    pub step: &'static str,
+    pub err: i64,
+    /// Register that decided it, when one did: 0 and 0xFFFFFFFF are both
+    /// meaningful (nothing there vs a bus error), hence the option.
+    pub value: Option<u32>,
+}
+
+impl Fail {
+    fn new(step: &'static str, err: i64) -> Self {
+        Self {
+            step,
+            err,
+            value: None,
+        }
+    }
+
+    fn read(step: &'static str, err: i64, value: u32) -> Self {
+        Self {
+            step,
+            err,
+            value: Some(value),
+        }
+    }
+}
+
 /// An endpoint found behind a root port.
 pub struct Endpoint {
     pub port: usize,
@@ -527,18 +555,19 @@ impl Pcie {
 
     /// Whole bring-up: rail, module, clocks, UPHY, AFI, link, then the
     /// endpoint behind whichever port trained.
-    pub fn bring_up(&self) -> Result<Endpoint, i64> {
-        rail(true)?;
-        clock_on()?;
+    pub fn bring_up(&self) -> Result<Endpoint, Fail> {
+        rail(true).map_err(|e| Fail::new("PCIe rail (PMIC LDO1)", e))?;
+        clock_on().map_err(|e| Fail::new("PCIe clocks and PLLE", e))?;
         // The root ports identify themselves once their clock runs. No
         // NVIDIA bridge there means no root complex (emulator): stop
         // before seconds of calibration and link-training timeouts.
-        let id = self.port(0).r32(CFG_VENDOR) as u16;
-        if id != VENDOR_NVIDIA {
-            return Err(-ENODEV);
+        let id = self.port(0).r32(CFG_VENDOR);
+        if id as u16 != VENDOR_NVIDIA {
+            return Err(Fail::read("no NVIDIA root port", -ENODEV, id));
         }
         self.module_on();
-        self.uphy_pll()?;
+        self.uphy_pll()
+            .map_err(|e| Fail::new("UPHY PLL of the PCIe lanes", e))?;
         self.uphy_lanes();
         self.controller();
 
@@ -549,11 +578,22 @@ impl Pcie {
                 found = Some(i);
                 break;
             }
-            println!("[wlan] PCIe port {}: no link", i);
+            println!(
+                "[wlan] PCIe port {}: no link (RP_VEND_XP {:#010x})",
+                i,
+                self.port(i).r32(RP_VEND_XP)
+            );
         }
-        let port = found.ok_or(-ENODEV)?;
+        let port = found.ok_or_else(|| {
+            Fail::read(
+                "no link on either port",
+                -ENODEV,
+                self.port(0).r32(RP_VEND_XP),
+            )
+        })?;
         println!("[wlan] PCIe port {}: link up", port);
         self.enumerate(port)
+            .map_err(|e| Fail::new("endpoint behind the port", e))
     }
 
     /// One endpoint behind the port: bus numbers, BARs placed in our

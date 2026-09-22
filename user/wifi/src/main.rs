@@ -99,6 +99,17 @@ fn connect(ssid: &str, psk: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// One line on what the adapter is, or why there is none.
+fn diag() -> Result<(), i64> {
+    let r = call(&Msg::new(proto::DIAG, 0, 0))?;
+    let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
+    let n = ipc::unpack(&r, &mut buf);
+    if n > 0 {
+        println!("adapter {}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
+    }
+    Ok(())
+}
+
 fn status() -> Result<(), i64> {
     let r = call(&Msg::new(proto::STATUS, 0, 0))?;
     let state = ipc::header(&r, 0);
@@ -119,6 +130,7 @@ fn status() -> Result<(), i64> {
         mac[4],
         mac[5]
     );
+    let _ = diag();
     if state == proto::ST_CONNECTED {
         println!(
             "network {}, channel {}, signal -{} dBm",

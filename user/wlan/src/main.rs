@@ -14,6 +14,8 @@ mod pcie;
 mod sim;
 
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{self, EINVAL, ENOSYS, ETIMEDOUT};
@@ -89,21 +91,32 @@ fn publish(ep: u32, name: &str, badge: u64) -> Result<(), i64> {
 /// Bring the PCIe root complex up and identify what sits behind it.
 /// A failure means no adapter, never a hang: `clk` reports the clocks
 /// and the power partition ready before a register is touched.
-fn hardware() -> Option<(Hw, Irq)> {
-    let regs = Mmio::map(drv::dev_slot(0), pcie::PCIE_BLOCK, pcie::PCIE_BLOCK_LEN).ok()?;
-    let cfg = Mmio::map(drv::dev_slot(1), pcie::CFG_WINDOW, pcie::CFG_WINDOW_LEN).ok()?;
-    let padctl = Mmio::map(drv::dev_slot(2), pcie::PADCTL, 0x1000).ok()?;
-    let misc = Mmio::map(drv::dev_slot(3), pcie::APB_MISC, 0x1000).ok()?;
-    let pinmux = Mmio::map(drv::dev_slot(4), pcie::PINMUX, 0x1000).ok()?;
-    let gpio = Mmio::map(drv::dev_slot(5), pcie::GPIO, 0x1000).ok()?;
+/// Bring-up result: the chip and its interrupt, or the line describing
+/// where it stopped (reported by `wifi`, since hardware runs have no
+/// UART to read the boot log from).
+fn hardware() -> Result<(Hw, Irq, String), String> {
+    let map = |slot, base, len| {
+        Mmio::map(drv::dev_slot(slot), base, len)
+            .map_err(|e| format!("register page {} ({})", slot, err::name(e)))
+    };
+    let regs = map(0, pcie::PCIE_BLOCK, pcie::PCIE_BLOCK_LEN)?;
+    let cfg = map(1, pcie::CFG_WINDOW, pcie::CFG_WINDOW_LEN)?;
+    let padctl = map(2, pcie::PADCTL, 0x1000)?;
+    let misc = map(3, pcie::APB_MISC, 0x1000)?;
+    let pinmux = map(4, pcie::PINMUX, 0x1000)?;
+    let gpio = map(5, pcie::GPIO, 0x1000)?;
     let rc = pcie::Pcie::new(regs, cfg, padctl, misc, pinmux, gpio);
 
     let ep = match rc.bring_up() {
         Ok(ep) => ep,
-        Err(e) => {
-            println!("[wlan] no PCIe device ({})", err::name(e));
+        Err(f) => {
             rc.module_off();
-            return None;
+            let why = match f.value {
+                Some(v) => format!("{}: {} (read {:#010x})", f.step, err::name(f.err), v),
+                None => format!("{}: {}", f.step, err::name(f.err)),
+            };
+            println!("[wlan] no PCIe device, {}", why);
+            return Err(why);
         }
     };
     println!(
@@ -111,10 +124,12 @@ fn hardware() -> Option<(Hw, Irq)> {
         ep.vendor, ep.device, ep.port, ep.bars[0]
     );
     if ep.vendor != chip::VENDOR_BROADCOM {
-        println!("[wlan] not a Broadcom adapter");
-        return None;
+        return Err(format!(
+            "endpoint {:04x}:{:04x} is not Broadcom",
+            ep.vendor, ep.device
+        ));
     }
-    let bar0 = Mmio::map(drv::dev_slot(6), ep.bars[0], chip::BAR0_WINDOW_LEN).ok()?;
+    let bar0 = map(6, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
     let c = chip::identify(&bar0, &|addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr));
     println!(
         "[wlan] BCM{:x} revision {}, firmware {}",
@@ -129,18 +144,29 @@ fn hardware() -> Option<(Hw, Irq)> {
         );
     }
     // Errors reported by the AFI are worth seeing during bring-up.
-    let irq = Irq::new(drv::dev_slot(8)).ok()?;
-    Some((Hw { rc }, irq))
+    let irq = Irq::new(drv::dev_slot(8)).map_err(|e| format!("interrupt ({})", err::name(e)))?;
+    let what = format!(
+        "BCM{:x} rev {} on PCIe port {}, firmware {}, no data path yet",
+        c.id,
+        c.rev,
+        ep.port,
+        if c.firmware { "present" } else { "missing" }
+    );
+    Ok((Hw { rc }, irq, what))
 }
 
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let (mut backend, irq) = match hardware() {
-        Some((hw, irq)) => (Backend::Chip(hw), Some(irq)),
-        None => {
-            println!("[wlan] simulated adapter (no Wi-Fi hardware here)");
-            (Backend::Sim(sim::Sim::default()), None)
+    let (mut backend, irq, diag) = match hardware() {
+        Ok((hw, irq, what)) => (Backend::Chip(hw), Some(irq), what),
+        Err(why) => {
+            println!("[wlan] simulated adapter, {}", why);
+            (
+                Backend::Sim(sim::Sim::default()),
+                None,
+                format!("simulated adapter, {}", why),
+            )
         }
     };
 
@@ -226,6 +252,7 @@ fn main() -> i32 {
                             Backend::Chip(_) => Msg::error(-ENOSYS),
                         })
                     }
+                    (wifi::BADGE_CTRL, wifi::DIAG) => Some(ipc::pack(0, diag.as_bytes())),
                     (wifi::BADGE_CTRL, wifi::DISCONNECT) => {
                         if let Backend::Sim(s) = &mut backend {
                             s.disconnect();

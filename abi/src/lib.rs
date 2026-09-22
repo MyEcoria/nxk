@@ -803,6 +803,9 @@ pub mod proto {
         /// Reply: words = state (`ST_*`), channel, signal (-dBm, 0 =
         /// unknown), MAC (low 6 bytes); bytes = current SSID.
         pub const STATUS: u32 = 4;
+        /// What the adapter is, or why there is none: a line of text
+        /// naming the step that failed during bring-up. Reply: bytes.
+        pub const DIAG: u32 = 5;
         /// No adapter: no PCIe device, or its firmware is missing.
         pub const ST_DOWN: u64 = 0;
         pub const ST_IDLE: u64 = 1;
