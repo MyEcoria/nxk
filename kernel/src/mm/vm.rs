@@ -70,9 +70,10 @@ pub fn owned_pa(pte: u64) -> Option<u64> {
     (present && pte & SW_OWNED != 0).then_some(pte & ADDR_MASK)
 }
 
-/// Device-register page attributes.
-pub fn device_flags() -> u64 {
-    VALID | TABLE | AF | attr(ATTR_DEVICE_NGNRE) | NG | AP_RW_ALL | PXN | UXN
+/// Device-register page attributes, read-only unless `write`.
+pub fn device_flags(write: bool) -> u64 {
+    let ap = if write { AP_RW_ALL } else { AP_RO_ALL };
+    VALID | TABLE | AF | attr(ATTR_DEVICE_NGNRE) | NG | ap | PXN | UXN
 }
 
 /// New L1 table, prefilled with the kernel entries.

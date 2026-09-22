@@ -290,7 +290,8 @@ pub mod rights {
     pub const DMA: u16 = 1 << 8;
     /// Control: thread settings, process debugging, revocation.
     pub const CONTROL: u16 = 1 << 9;
-    /// Shared memory: writable mapping allowed.
+    /// Shared memory or registers: writable mapping allowed (registers
+    /// without it map read-only).
     pub const WRITE: u16 = 1 << 10;
     pub const ALL: u16 = 0x7FF;
 }

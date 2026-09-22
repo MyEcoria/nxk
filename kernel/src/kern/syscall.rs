@@ -539,9 +539,11 @@ fn mmio_map(pi: u16, h: u32, phys: u64, len: u64) -> SysResult {
     if va + len > MMIO_END {
         return Err(-ENOMEM);
     }
+    // Without WRITE (e.g. fuses for a driver): read-only mapping.
+    let flags = vm::device_flags(c.rights & rights::WRITE != 0);
     let mut off = 0;
     while off < len {
-        vm::map(proc.l1, va + off, phys + off, vm::device_flags())?;
+        vm::map(proc.l1, va + off, phys + off, flags)?;
         off += PAGE_SIZE;
     }
     vm::publish();
