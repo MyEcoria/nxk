@@ -1,0 +1,8 @@
+[package]
+name = "wlan"
+version = "0.1.0"
+edition = "2021"
+description = "Wi-Fi station: PCIe root complex, BCM4356, link and control"
+
+[dependencies]
+libnx = { path = "../libnx" }

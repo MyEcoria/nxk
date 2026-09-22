@@ -320,3 +320,17 @@ version = "0.1.0"
 dependencies = [
  "libnx",
 ]
+
+[[package]]
+name = "wifi"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+]
+
+[[package]]
+name = "wlan"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+]
