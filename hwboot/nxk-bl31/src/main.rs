@@ -5,10 +5,13 @@
 //! `bl31.bin` en TZDRAM a 0xFFF00000) -> nxk (charge comme `bl33.bin` a
 //! 0xAA000000, recopie a 0x80000000, entree en EL2, x0 = 0 = sans DTB).
 //!
-//! Le moniteur fait le minimum vital : horloge+reset d'UART-A puis logs,
-//! bascule du GIC en Groupe 1 (sans quoi EL1 non securise ne voit aucune
-//! IRQ), declaration de sa region TZ au controleur memoire (pour que nxk
-//! l'exclue de la DRAM libre), recopie de nxk et saut en EL2. Les appels
+//! Le moniteur fait le minimum vital : reglages EL3 de chaque coeur que
+//! l'emulateur n'exige pas mais le Cortex-A57 si (CNTFRQ_EL0, SMPEN,
+//! registres EL2 a valeur de reset inconnue), horloge+reset d'UART-A puis
+//! logs, compteur systeme en marche, bascule du GIC en Groupe 1 (sans quoi
+//! EL1 non securise ne voit aucune IRQ), declaration de sa region TZ au
+//! controleur memoire (pour que nxk l'exclue de la DRAM libre), recopie de
+//! nxk et saut en EL2. Les appels
 //! `smc` (dont la sonde PSCI de nxk) recoivent NOT_SUPPORTED : nxk demarre
 //! alors sur un seul coeur, sans PSCI. Pas de PSCI, pas de DTB, pas de
 //! DVFS : chaque ajout serait du risque materiel inutile pour un premier
@@ -49,6 +52,9 @@ const GICC: usize = 0x5004_2000;
 
 const MC_SECURITY_CFG0: usize = 0x7001_9070;
 const MC_SECURITY_CFG1: usize = 0x7001_9074;
+
+/// Compteur systeme (source de CNTPCT_EL0) : EN | HDBG, comme exosphere.
+const SYSCTR0_CNTCR: usize = 0x700F_0000;
 
 const PMC_SCRATCH110: usize = 0x7000_E400 + 0xB10;
 const IRAM_MAGIC: u32 = 0x4D41_5249; // "IRAM" : parametres hekate presents
@@ -145,6 +151,11 @@ extern "C" fn bl31_main() -> ! {
     uart_init();
     puts("\n[nxk-bl31] moniteur EL3 (entree L4T hekate)\n");
 
+    // Sans effet s'il tourne deja ; arrete, CNTPCT_EL0 resterait fige et
+    // toute attente bornee de nxk durerait toujours.
+    wr(SYSCTR0_CNTCR, rd(SYSCTR0_CNTCR) | 0b11);
+    puts("[nxk-bl31] compteur systeme en marche, CNTFRQ = 19,2 MHz\n");
+
     gic_secure_init();
     puts("[nxk-bl31] GIC : tout en Groupe 1\n");
 
@@ -224,6 +235,23 @@ global_asm!(
 .section .text.boot, "ax"
 .globl _start
 _start:
+    // Reglages EL3 de chaque coeur, ceux d'ATF et d'exosphere sur ce SoC
+    // (valeurs de reset INCONNUES sur le silicium, sensees sous QEMU) :
+    // - CNTFRQ_EL0 = 19,2 MHz (CLK_M), ecrivable en EL3 seulement ;
+    // - CPUECTLR_EL1.SMPEN, que le TRM du Cortex-A57 exige avant d'activer
+    //   caches et MMU (maintenance diffusee, acces exclusifs des verrous) ;
+    // - CPUACTLR_EL1[0] : IC IALLU invalide aussi le predicteur de
+    //   branchements (mitigation Spectre v2 de nxk, comme son boot.rs).
+    movz    x0, #0xF800
+    movk    x0, #0x0124, lsl #16
+    msr     cntfrq_el0, x0
+    mrs     x0, S3_1_C15_C2_1           // CPUECTLR_EL1
+    orr     x0, x0, #(1 << 6)
+    msr     S3_1_C15_C2_1, x0
+    mrs     x0, S3_1_C15_C2_0           // CPUACTLR_EL1
+    orr     x0, x0, #1
+    msr     S3_1_C15_C2_0, x0
+    isb
     mrs     x19, mpidr_el1
     and     x19, x19, #0xFF
     adrp    x0, __stack_top
@@ -263,6 +291,19 @@ drop_to_bl33:
     msr     cptr_el3, xzr
     msr     mdcr_el3, xzr
     msr     cntvoff_el2, xzr
+    // EL2 dans un etat connu (comme ATF) : SCTLR_EL2 reduit a ses bits
+    // RES1 (MMU et caches coupes, petit-boutiste), aucun piege de debogage
+    // ni de PMU vers EL2 (HPMN = PMCR_EL0.N), pas de piege AArch32, pas
+    // de traduction de niveau 2, timer d'hyperviseur arrete.
+    movz    x0, #0x0830
+    movk    x0, #0x30C5, lsl #16
+    msr     sctlr_el2, x0
+    mrs     x0, pmcr_el0
+    ubfx    x0, x0, #11, #5
+    msr     mdcr_el2, x0
+    msr     hstr_el2, xzr
+    msr     vttbr_el2, xzr
+    msr     cnthp_ctl_el2, xzr
     mov     x0, #1
     lsl     x0, x0, #31                // HCR_EL2.RW : EL1 en AArch64
     msr     hcr_el2, x0
