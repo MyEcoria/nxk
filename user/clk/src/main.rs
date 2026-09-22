@@ -19,13 +19,20 @@ const CLR: usize = 4;
 /// PMC page (registers from 0x400, hekate bdk/soc/pmc_t210.h).
 const PMC_PAGE: u64 = 0x7000_E000;
 const PMC_CLAMP_STATUS: usize = 0x400 + 0x2C;
+const PMC_PWRGATE_TOGGLE: usize = 0x400 + 0x30;
+const PMC_REMOVE_CLAMPING: usize = 0x400 + 0x34;
 const PMC_PWRGATE_STATUS: usize = 0x400 + 0x38;
+const PWRGATE_TOGGLE_START: u32 = 1 << 8;
 /// UTMIP ID and VBUS wake detectors: power-down bits 2, 3.
 const PMC_USB_AO: usize = 0x400 + 0xF0;
 /// XUSB partitions (hekate bdk/soc/pmc.h, POWER_RAIL_XUSBx): A = SuperSpeed,
 /// C = host.
 const PART_XUSBA: u32 = 1 << 20;
 const PART_XUSBC: u32 = 1 << 22;
+/// PCIe partition (POWER_RAIL_PCIE = 3): off at boot, unlike the XUSB
+/// ones the loader leaves on.
+const PART_PCIE_ID: u32 = 3;
+const PART_PCIE: u32 = 1 << PART_PCIE_ID;
 
 /// CAR bank (L, H, U, V, W, X): state in RST_DEVICES_x and CLK_OUT_ENB_x,
 /// driven via RST_DEV_x_SET and CLK_ENB_x_SET (+ CLR).
@@ -95,6 +102,41 @@ const UTMIPLL_LOCK: u32 = 1 << 31;
 /// XUSB_PADCTL reset (bank W bit 14): the pads are shared with XUSB.
 const RST_DEV_W_CLR: usize = 0x43C;
 const PADCTL_RESET: u32 = 1 << 14;
+/// PEX UPHY reset (bank Y bit 13, reset only): the PCIe lanes sit on
+/// the UPHY bricks the pad control block owns.
+const UPHY_PEX_RESET: u32 = 1 << 13;
+/// PCIe reference PLL (Linux drivers/clk/tegra/clk-pll.c,
+/// `clk_plle_tegra210_enable`): 38.4 MHz oscillator, M 2, N 125,
+/// CML divider code 14 -> 100 MHz for the UPHY bricks.
+const PLLE_BASE: usize = 0xE8;
+const PLLE_MISC: usize = 0xEC;
+const PLLE_SS_CNTL: usize = 0x68;
+const PLLE_AUX: usize = 0x48C;
+const PLLE_DIVM: u32 = 2;
+const PLLE_DIVN: u32 = 125;
+const PLLE_DIVCML: u32 = 14;
+const PLLE_ENABLE: u32 = 1 << 31;
+const PLLE_LOCK_OVERRIDE: u32 = 1 << 30;
+const PLLE_MISC_LOCK: u32 = 1 << 11;
+const PLLE_MISC_LOCK_ENABLE: u32 = 1 << 9;
+const PLLE_MISC_IDDQ_SW_CTRL: u32 = 1 << 14;
+const PLLE_MISC_IDDQ_SW_VALUE: u32 = 1 << 13;
+const PLLE_MISC_PTS: u32 = 1 << 8;
+/// Bandgap and regulator control fields, driven to their maximum as
+/// the reference sequence does.
+const PLLE_MISC_VREG: u32 = (3 << 4) | (3 << 2);
+const PLLE_AUX_SEQ_ENABLE: u32 = 1 << 24;
+const PLLE_AUX_ENABLE_SWCTL: u32 = 1 << 4;
+const PLLE_AUX_USE_LOCKDET: u32 = 1 << 3;
+const PLLE_AUX_SS_SWCTL: u32 = 1 << 6;
+/// Spread spectrum: interpolator reset, bypass, coefficients.
+const PLLE_SS_INTERP_RESET: u32 = 1 << 11;
+const PLLE_SS_BYPASS: u32 = 1 << 10;
+const PLLE_SS_SSC_BYP: u32 = 1 << 12;
+const PLLE_SS_CENTER: u32 = 1 << 14;
+const PLLE_SS_INVERT: u32 = 1 << 15;
+const PLLE_SS_COEFF_MASK: u32 = 0x1FF | (0xFF << 16) | (0x3F << 24);
+const PLLE_SS_COEFF: u32 = 0x25 | (1 << 16) | (0x14 << 24);
 /// Fuse registers visible (CFG_ALL_VISIBLE), set by hekate at boot.
 const MISC_CLK_ENB: usize = 0x48;
 const FUSE_VISIBLE: u32 = 1 << 28;
@@ -118,6 +160,9 @@ enum Needs {
     UsbPlls,
     /// Fuse registers visible.
     FuseVisible,
+    /// PCIe partition ungated and PLLE locked: the reference clock of
+    /// the UPHY lanes the Wi-Fi chip sits on.
+    Pcie,
 }
 
 /// One device: its clocks in enable order plus PMC partitions that must
@@ -211,6 +256,30 @@ const USB2_TRK: [Clock; 1] = [Clock {
     src: 6,
     reset: false,
 }];
+/// PCIe root complex: AFI bridge then the controller itself
+/// (hekate bdk/soc/clock.h, CLK_U_AFI 8 / CLK_U_PCIE 6). Sources are
+/// left alone: both run off PLLP and PLLE as the reset values say.
+const PCIE: [Clock; 2] = [
+    Clock {
+        bank: &U,
+        bit: 8,
+        source: 0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+    Clock {
+        bank: &U,
+        bit: 6,
+        source: 0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+];
+/// PCIEXCLK (bank U bit 10): a reset line without a gate of its own.
+const PCIEXCLK_RESET: u32 = 1 << 10;
+
 /// Fuse controller (bank H bit 7): status only, for readers of fuses.
 const FUSE: [Clock; 1] = [Clock {
     bank: &H,
@@ -225,6 +294,7 @@ fn table(dev: u64) -> Option<Device> {
     let needs = match dev {
         proto::USBD => Needs::UsbPlls,
         proto::FUSE => Needs::FuseVisible,
+        proto::PCIE => Needs::Pcie,
         _ => Needs::Nothing,
     };
     let (clocks, parts): (&'static [Clock], u32) = match dev {
@@ -240,6 +310,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::USBD => (&USBD, 0),
         proto::USB2_TRK => (&USB2_TRK, 0),
         proto::FUSE => (&FUSE, 0),
+        proto::PCIE => (&PCIE, PART_PCIE),
         _ => return None,
     };
     Some(Device {
@@ -276,6 +347,7 @@ fn status(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> u64 {
         Needs::Nothing => true,
         Needs::UsbPlls => car.r32(PLLU_BASE) & (PLL_ENABLE | PLL_LOCK) == PLL_ENABLE | PLL_LOCK,
         Needs::FuseVisible => car.r32(MISC_CLK_ENB) & FUSE_VISIBLE != 0,
+        Needs::Pcie => car.r32(PLLE_MISC) & PLLE_MISC_LOCK != 0,
     };
     if powered(pmc, d.parts) && extra {
         st |= proto::ST_POWERED;
@@ -335,7 +407,134 @@ fn usb_plls(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
     0
 }
 
+/// PCIe reference PLL, 100 MHz for the UPHY bricks. Sequence from
+/// Linux `clk_plle_tegra210_enable`: software control, out of IDDQ,
+/// dividers with spread spectrum bypassed, then enable, lock and
+/// spread spectrum back on.
+fn plle(car: &Mmio) -> i64 {
+    // Driven by the hardware sequencer already (loader): leave it be.
+    if car.r32(PLLE_AUX) & PLLE_AUX_SEQ_ENABLE != 0 {
+        return 0;
+    }
+    car.modify(PLLE_BASE, PLLE_LOCK_OVERRIDE, 0);
+    car.modify(
+        PLLE_AUX,
+        PLLE_AUX_SEQ_ENABLE,
+        PLLE_AUX_ENABLE_SWCTL | PLLE_AUX_SS_SWCTL,
+    );
+    time::sleep_us(1);
+    car.modify(
+        PLLE_MISC,
+        PLLE_MISC_IDDQ_SW_VALUE,
+        PLLE_MISC_IDDQ_SW_CTRL | PLLE_MISC_LOCK_ENABLE | PLLE_MISC_PTS | PLLE_MISC_VREG,
+    );
+    time::sleep_us(5);
+
+    // Dividers written with the modulation bypassed.
+    car.modify(
+        PLLE_SS_CNTL,
+        0,
+        PLLE_SS_BYPASS | PLLE_SS_INTERP_RESET | PLLE_SS_SSC_BYP,
+    );
+    let base = (PLLE_DIVCML << 24) | (PLLE_DIVN << 8) | PLLE_DIVM;
+    car.w32(PLLE_BASE, base);
+    time::sleep_us(1);
+    car.w32(PLLE_BASE, base | PLLE_ENABLE);
+    if !car.wait(PLLE_MISC, PLLE_MISC_LOCK, PLLE_MISC_LOCK, 1000) {
+        println!("[clk] PLLE: no lock");
+        return EIO;
+    }
+
+    // Spread spectrum back on: coefficients, then bypass off, then the
+    // interpolator out of reset.
+    let mut ss = car.r32(PLLE_SS_CNTL);
+    ss &= !(PLLE_SS_CENTER | PLLE_SS_INVERT | PLLE_SS_COEFF_MASK);
+    ss |= PLLE_SS_COEFF;
+    car.w32(PLLE_SS_CNTL, ss);
+    ss &= !(PLLE_SS_SSC_BYP | PLLE_SS_BYPASS);
+    car.w32(PLLE_SS_CNTL, ss);
+    time::sleep_us(1);
+    ss &= !PLLE_SS_INTERP_RESET;
+    car.w32(PLLE_SS_CNTL, ss);
+    time::sleep_us(1);
+    car.modify(PLLE_AUX, 0, PLLE_AUX_USE_LOCKDET);
+    0
+}
+
+/// Ungate a PMC power partition (hekate `pmc_domain_pwrgate_set`, then
+/// the clamp removal its own comment prescribes).
+fn ungate(pmc: &Mmio, part_id: u32) -> bool {
+    let mask = 1u32 << part_id;
+    if pmc.r32(PMC_PWRGATE_STATUS) & mask == 0 {
+        if !pmc.wait(PMC_PWRGATE_TOGGLE, PWRGATE_TOGGLE_START, 0, 5000) {
+            return false;
+        }
+        pmc.w32(PMC_PWRGATE_TOGGLE, part_id | PWRGATE_TOGGLE_START);
+        if !pmc.wait(PMC_PWRGATE_STATUS, mask, mask, 5000) {
+            return false;
+        }
+        time::sleep_us(10);
+    }
+    pmc.w32(PMC_REMOVE_CLAMPING, mask);
+    pmc.wait(PMC_CLAMP_STATUS, mask, 0, 5000)
+}
+
+/// PCIe root complex. Order from Linux `tegra_powergate_sequence_power_up`:
+/// clocks running but held in reset, partition on, clamps off, resets
+/// released. The AFI registers answer only at the end of it (a read
+/// before that hangs the bus).
+fn pcie_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
+    let Some(pmc) = pmc else {
+        return ENODEV;
+    };
+    for c in PCIE.iter() {
+        car.w32(c.bank.rst_set, 1 << c.bit);
+    }
+    car.w32(U.rst_set, PCIEXCLK_RESET);
+    car.w32(Y.rst_set, UPHY_PEX_RESET);
+    for c in PCIE.iter() {
+        car.w32(c.bank.enb_set, 1 << c.bit);
+    }
+    time::sleep_us(2);
+
+    if !ungate(pmc, PART_PCIE_ID) {
+        // Clocks back off: a block left half-powered hangs its bus.
+        for c in PCIE.iter() {
+            car.w32(c.bank.enb_set + CLR, 1 << c.bit);
+        }
+        println!("[clk] PCIe partition stays gated");
+        return EIO;
+    }
+    let r = plle(car);
+    if r != 0 {
+        return r;
+    }
+    // Pad control block shared with XUSB: released, never re-asserted.
+    car.w32(RST_DEV_W_CLR, PADCTL_RESET);
+    car.w32(Y.rst_set + CLR, UPHY_PEX_RESET);
+    for c in PCIE.iter() {
+        car.w32(c.bank.rst_set + CLR, 1 << c.bit);
+    }
+    car.w32(U.rst_set + CLR, PCIEXCLK_RESET);
+    let _ = car.r32(U.rst);
+    0
+}
+
 fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
+    if d.needs == Needs::Pcie {
+        if status(car, pmc, d) == proto::ST_READY {
+            return 0;
+        }
+        let r = pcie_up(car, pmc);
+        if r != 0 {
+            return r;
+        }
+        return if status(car, pmc, d) == proto::ST_READY {
+            0
+        } else {
+            EIO
+        };
+    }
     if d.parts != 0 {
         // PMC is not owned by clk: partition off, touch nothing.
         if !powered(pmc, d.parts) {
