@@ -20,6 +20,10 @@ const TMP451: u8 = 0x4C;
 const LDO2_CFG: u8 = 0x27;
 const LDO2_3V3: u8 = ((3_300_000 - 800_000) / 50_000) as u8;
 const LDO_MODE_NORMAL: u8 = 3 << 6;
+/// MAX77620 LDO1 (XUSB and PCIe rail, 25 mV steps): its documented
+/// default, 1.05 V. The Wi-Fi chip hangs off the PCIe UPHY lanes.
+const LDO1_CFG: u8 = 0x25;
+const LDO1_1V05: u8 = ((1_050_000 - 800_000) / 25_000) as u8;
 
 /// Only 3.3 V: 1.8 V needs the card's CMD11 handshake first.
 fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
@@ -30,6 +34,19 @@ fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
         i2c.write_reg(5, PMIC, LDO2_CFG, LDO_MODE_NORMAL | LDO2_3V3)?;
     } else {
         i2c.write_reg(5, PMIC, LDO2_CFG, v & !0xC0)?;
+    }
+    time::sleep_ms(1);
+    Ok(())
+}
+
+/// PCIe/XUSB rail at its default voltage: nothing else on the board
+/// shares LDO1, and XUSB is happy at the same 1.05 V.
+fn pcie_power(i2c: &I2c, on: bool) -> Result<(), i64> {
+    let v = i2c.read_reg(5, PMIC, LDO1_CFG)?;
+    if on {
+        i2c.write_reg(5, PMIC, LDO1_CFG, LDO_MODE_NORMAL | LDO1_1V05)?;
+    } else {
+        i2c.write_reg(5, PMIC, LDO1_CFG, v & !0xC0)?;
     }
     time::sleep_ms(1);
     Ok(())
@@ -142,6 +159,10 @@ fn main() -> i32 {
                 Err(e) => Msg::error(e),
             },
             proto::SD_POWER => match sd_power(&i2c, rx.msg.mr[0] != 0) {
+                Ok(()) => Msg::new(0, 0, 0),
+                Err(e) => Msg::error(e),
+            },
+            proto::PCIE_POWER => match pcie_power(&i2c, rx.msg.mr[0] != 0) {
                 Ok(()) => Msg::new(0, 0, 0),
                 Err(e) => Msg::error(e),
             },
