@@ -27,8 +27,10 @@ EL0  Rust programs (std) · shell
 EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 ```
 
-Everything has been verified in the `tegra_qemu` emulator, **never on a
-real Switch** (see "Limits").
+Everything has been verified in the `tegra_qemu` emulator. On a **real
+Switch** (Erista), nxk boots through hekate up to user space on one
+core: the `display` service takes over the screen; the shell has not
+been reached yet (see "Limits" and `hwboot/README.md`).
 
 ## Build, run, test
 
@@ -116,6 +118,7 @@ std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests
+hwboot/     physical Switch bring-up: RCM injector, hekate entry, nxk-bl31 EL3 monitor
 refs/       hekate, Atmosphere: hardware documentation (never compiled)
 ```
 
@@ -188,9 +191,11 @@ stops threads.
 
 **Boot**: directly from reset (EL3), or in EL2 under a PSCI monitor
 (as on a Switch with its secure firmware); DRAM size detected; device
-tree read when provided. If the loader left the screen on (hekate), the
-kernel log is copied there until the `display` service takes over: the
-only visible output without a UART adapter.
+tree read when provided. On a Switch, hekate's L4T entry loads
+`hwboot/nxk-bl31`, an EL3 monitor doing ATF's job, which enters nxk in
+EL2 on a single core (no PSCI yet). If the loader left the screen on
+(hekate), the kernel log is copied there until the `display` service
+takes over: the only visible output without a UART adapter.
 
 ## Services and drivers
 
@@ -198,13 +203,13 @@ All in EL0, started by `init` with only their capabilities.
 
 | Service | Role | State |
 |---|---|---|
-| `console` | UART-A, line editing | emulator |
+| `console` | UART-A, line editing | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
 | `clk` | clocks and resets (CAR), power-partition state (PMC, read-only) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
 | `sd` | SD card (SDHCI, ADMA2) | emulator; real reader power and pins not set up |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
-| `display` | screen (window A), text terminal (Terminus font) | emulator; real panel init missing |
+| `display` | screen (window A), text terminal (Terminus font) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
@@ -217,7 +222,7 @@ program that vanished without closing them (crash) are reclaimed.
 
 | Area | Done | Remaining |
 |---|---|---|
-| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection | boot on a real Switch |
+| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection; real Erista via hekate + nxk-bl31 (1 core, up to `display`) | PSCI in nxk-bl31 (4 cores on hardware), shell on hardware, Mariko hardware |
 | Memory | on demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas | |
 | Threads | priorities, affinity, migration, balancing, tickless, futex | deep sleep states |
 | IPC | synchronous, timeouts, handles, notifications, pipes, sender identity | wait on several objects (`poll`) |
@@ -231,10 +236,15 @@ program that vanished without closing them (crash) are reclaimed.
 
 ## Limits
 
-- **Nothing has run on a real Switch.** The real USB controller (xHCI)
-  needs a proprietary NVIDIA firmware; the SD reader needs power and pin
-  setup; the screen needs DSI panel init; buttons need GPIOs the
-  emulator cannot drive.
+- **On a real Switch, only the boot up to the `display` service has
+  been observed** (Erista, hekate L4T entry, single core). The shell
+  runs on UART-A, whose pads are internal: it stays unreachable until
+  the console moves to UART-B (right Joy-Con rail). A USB keyboard does
+  not help: its keys go to `input`, not to the shell, and hekate's L4T
+  path leaves the xHCI unpowered.
+- The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
+  the SD reader needs power and pin setup; without hekate the screen
+  needs DSI panel init; buttons need GPIOs the emulator cannot drive.
 - GPU, audio, Wi-Fi, Joy-Con and frequency scaling are not done (the
   last one risks damaging hardware).
 - A pipe has no buffer: the writer waits until a reader takes its data.

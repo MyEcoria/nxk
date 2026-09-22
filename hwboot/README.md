@@ -1,8 +1,9 @@
 # hwboot — physical Switch (Erista, AutoRCM) bring-up kit
 
 Host-side setup to boot a first-generation Switch into **hekate** over USB
-(fusée-gelée RCM exploit). Stage 1 of running nxk on real hardware: today
-nothing here boots nxk itself yet (see "Why nxk.bin can't be injected").
+(fusée-gelée RCM exploit), then nxk through hekate's L4T entry (Stage 2).
+Status: nxk boots to user space on hardware; the shell is not reachable
+yet (see "Hardware runs").
 
 ## What you need
 
@@ -53,13 +54,14 @@ console powers on to a black screen (AutoRCM) rather than the Nintendo logo
 - nxk DVFS/clock code is emulator-only and power-unsafe: never run
   experimental clock/voltage builds on hardware without review.
 
-## Stage 2: booting nxk via the hekate L4T entry (1st attempt: no visible output)
+## Stage 2: booting nxk via the hekate L4T entry
 
 Neither RCM injection nor `payload=` can boot nxk: it is a ~1.7 MB DRAM
 image linked at `0x80000000` (`kernel/link.ld`), not a BPMP/IRAM payload
 (~196 KiB ceiling, DRAM uninitialized in RCM).
 
-Chosen chain (all built and valid in the emulator, never on hardware):
+Chosen chain (validated in the emulator, and on hardware up to the
+`display` service):
 **hekate `[nxk]` (L4T) → `nxk/bl31.bin` (nxk-bl31 monitor)
 → `nxk/bl33.bin` (= nxk.bin)**.
 
@@ -105,26 +107,38 @@ console vertically). In order:
    here too.
 4. The `display` service takes over the screen: midnight-blue
    background, one `nxk - screen 720x1280, terminal 90x80` line. User
-   space is alive; the rest (shell) is UART-only.
+   space is alive. Nothing more appears on screen afterwards: service
+   logs and the shell go to UART-A only.
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
 monitor did not run or did not find the screen.
 
-First attempt (22/09/2026, before this screen console): exactly that
-case, 1 with nothing after. nxk then had no output outside UART-A, and
-the hardware path had gaps QEMU hides, all fixed since: EL2/EL3
-registers with unknown reset values (MDCR_EL2 can trap nxk OSLAR_EL1
-accesses to an EL2 with no vectors), locks (exclusive accesses) taken
-with the MMU off, hekate GPU carveouts not excluded from free memory.
+## Hardware runs
+
+1. 22/09/2026, Erista, before the screen console: stage 1 with nothing
+   after. nxk then had no output outside UART-A, and the hardware path
+   had gaps QEMU hides, all fixed since: EL2/EL3 registers with unknown
+   reset values (MDCR_EL2 can trap nxk OSLAR_EL1 accesses to an EL2 with
+   no vectors), locks (exclusive accesses) taken with the MMU off,
+   hekate GPU carveouts not excluded from free memory.
+2. 22/09/2026, Erista, commit `d5e53f6`: **stage 4 reached**,
+   `nxk - screen 720x1280, terminal 90x80`. Working on silicon: hekate
+   L4T → nxk-bl31 → EL2 entry, single core, DRAM detection, MMU, kernel
+   boot, `init`, spawning from the boot image, and `display` taking over
+   DC window A with its own DMA image. Not observed: the other services
+   and the shell (UART-A only, no way in yet: "Hardware test", step 3).
 
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
-3. Read the screen (see above). The UART adapter (right Joy-Con rail,
-   115200 8N1) is still needed for the shell: monitor and kernel still
-   write to UART-A, which hekate did not wire to the rail.
+3. Read the screen (see above). The shell is not reachable yet: the
+   monitor, the kernel and the `console` service use UART-A, whose pads
+   are internal. A right Joy-Con rail adapter (UART-B, 115200 8N1) will
+   only work once they switch to UART-B. A USB keyboard does not reach
+   the shell either: its keys go to the `input` service, and hekate's
+   L4T path leaves the xHCI unpowered (`usb` exits).
 4. Expected: `entry in EL2`, `1/4 cores online`, `launching init`,
    then the `display` service screen.
 5. Recovery: a failed boot is just a hang. Hold Power 12 s (forced

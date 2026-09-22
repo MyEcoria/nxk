@@ -19,6 +19,11 @@ This file guides AI coding agents working on **nxk**. Follow it on every task
   the simulator.** New code must be hardware-compatible (datasheets,
   `refs/`, real Tegra X1 behavior); use the emulator only as fallback
   validation, never as an excuse for emulator-only shortcuts.
+- Hardware status: nxk boots on a physical **Erista** Switch through
+  hekate's L4T entry and `hwboot/nxk-bl31` (EL2, single core, no PSCI)
+  up to the `display` service. The shell is not reachable there yet
+  (console on UART-A, whose pads are internal). Run log and expected
+  screen output: `hwboot/README.md`.
 - Syscall convention: `svc #0`, number in `x8`, args in `x0`–`x5`, result in
   `x0`, errors as `-errno` (Linux values). Single source of truth: `abi/`
   (`nxk-abi` crate shared by kernel, libnx, std).
@@ -35,6 +40,8 @@ std/        Rust std port: std/library overlay, target JSON, linker script
 apps/       ordinary std programs: hello-std, stdtest
 bench/      nxk vs L4T comparison (lbench, scripts, RESULTS.md)
 tools/      build.sh, mksd.py, run.sh, debug.sh, nxtest.py, mkstd.py, ...
+hwboot/     physical Switch bring-up: RCM injector, hekate entry, nxk-bl31
+            EL3 monitor, SD setup (mksd-hw.sh), test-bl31.sh
 refs/       hekate / Atmosphere — hardware documentation only, never compiled
 build/      generated artifacts (nxk.elf symlink, bootfs.img) — git-ignored
 ```
@@ -91,6 +98,9 @@ Key details agents must respect:
   `-c "run hello"`). Paste failures verbatim; on boot timeout use the
   per-CPU `PC/EL` dump `nxtest.py` prints (via `nm` symbolization) to
   localize hangs.
+- Boot-path changes (`kernel/src/boot.rs`, kernel console / framebuffer
+  mirror, early MMU, `hwboot/`) also run `./hwboot/test-bl31.sh`: it boots
+  the same `bl31.bin` used on hardware, with and without hekate's screen.
 - Debugging: `./tools/debug.sh` (like `run.sh` plus `-s -S`, GDB on `:1234`):
   `aarch64-none-elf-gdb build/nxk.elf -ex 'target remote :1234'`. Kernel keeps
   debug symbols (`debug = true` in release profile).
@@ -139,8 +149,9 @@ Key details agents must respect:
 - New syscall: add to `abi/`, wire kernel handler + libnx wrapper + std
   mapping if applicable, document in `README.md` syscall table, cover with a
   `ktest` case.
-- Keep `README.md`, `bench/README.md`, `bench/RESULTS.md` accurate when
-  behavior, tables, or numbers change.
+- Keep `README.md`, `hwboot/README.md` (hardware run log),
+  `bench/README.md`, `bench/RESULTS.md` accurate when behavior, tables,
+  or numbers change.
 
 ## 6. Guardrails (flexible, but be explicit)
 
