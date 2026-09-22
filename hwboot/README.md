@@ -191,7 +191,17 @@ The last `usbcon:` line locates a failure:
    `files`): hekate's `sd_end()` powers the card off before the L4T
    jump, and `sd` expected it on. `usb` and `net` exit (xHCI off).
    Both failures are fixed since (PSCI `CPU_ON` in the monitor, slot
-   power-up in `sd`), emulator-tested, awaiting a hardware run.
+   power-up in `sd`).
+4. 22/09/2026, Erista, commit `e35837f`: **4 cores and the SD card on
+   silicon**. `ktest` 27/27 (affinity, migration and load balancing
+   included), `stdtest` 17/17 (`files` on the card: 180 ms), `ls /`,
+   `df` (60890 MiB) and `run /bin/hello-std` from the card. `bench`:
+   null syscall 239 ns, IPC same core 1556 ns, cross core 9774 ns
+   (a real IPI now), IPC 4 KiB 314 MB/s, thread create+join 15 us,
+   spawn+wait 90 us. Two hardware-only lessons on the way: the masked
+   GPIO registers (0x80+) did not take, hekate's read-modify-write on
+   the plain ones does, and `sd` touching SDMMC1 before its clock was
+   enabled stalled the APB bus, which killed `usbcon` with it.
 
 ## Hardware test (once the SD card is back in the PC)
 

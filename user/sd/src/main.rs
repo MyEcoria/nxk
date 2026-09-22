@@ -372,7 +372,7 @@ fn bring_up(board: &Board) -> Result<(), i64> {
 
 fn main() -> i32 {
     let regs = map(0, SDMMC1);
-    let screen = ns::wait_for_timeout("display", 1_000_000_000).ok();
+    let screen = ns::wait_for_timeout("display", 5_000_000_000).ok();
     let board = Board::new(
         map(1, board::APB_MISC),
         map(2, board::PINMUX),

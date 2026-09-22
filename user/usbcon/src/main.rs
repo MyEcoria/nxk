@@ -439,7 +439,9 @@ libnx::entry!(main);
 fn main() -> i32 {
     // Resources: registers, APB_MISC, fuses, IRQ (init's order).
     let misc = Mmio::map(drv::dev_slot(1), APB_MISC, 0x1000).expect("usbcon: APB_MISC");
-    let screen = ns::wait_for_timeout("display", 1_000_000_000).ok();
+    // `display` publishes after its panel setup, and usbcon now starts
+    // before it finishes: without this wait the screen gets no status.
+    let screen = ns::wait_for_timeout("display", 5_000_000_000).ok();
     let mut dev = Dev {
         udc: {
             let regs = Mmio::map(drv::dev_slot(0), USB_BASE, 0x2000).expect("usbcon: registers");
