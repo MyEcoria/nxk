@@ -19,6 +19,7 @@ libnx::entry!(main);
 
 fn main() -> i32 {
     println!();
+    banner();
     println!("nxk - shell. Type 'help' for the command list.");
     let mut buf = [0u8; 256];
     loop {
@@ -33,6 +34,53 @@ fn main() -> i32 {
             command(line);
         }
     }
+}
+
+/// Logo of `docs/logo/`: each letter is a `#` cell, the letter picks its color.
+const LOGO: [&str; 11] = [
+    "       aaaa   bbbb",
+    "   aaaa           bbbb",
+    " aa      ddddddd      bb      ff",
+    "aa                     bb     ff",
+    "aa   dd    fff    aa   bb     fffff   ff  ff  ff  ff",
+    "     dd   fffff   aa          dd  dd   dddd   dd dd",
+    "bb   dd    fff    aa   cc     aa  aa    aa    aaaa",
+    "bb                     cc     aa  aa   aaaa   aa aa",
+    " bb      aaaaaaa      cc      bb  bb  bb  bb  bb  bb",
+    "   bbbb           cccc",
+    "       bbbb   cccc",
+];
+
+fn banner() {
+    // No ANSI colors on the debug_write fallback: the screen mirror prints them raw.
+    let color = console::handle() != 0;
+    let mut out = String::new();
+    for (i, row) in LOGO.iter().enumerate() {
+        let mut ink = ' ';
+        for c in row.chars() {
+            if color && c != ' ' && c != ink {
+                ink = c;
+                out.push_str(match c {
+                    'a' => "\x1b[38;5;208m",
+                    'b' => "\x1b[38;5;166m",
+                    'c' => "\x1b[38;5;130m",
+                    'd' => "\x1b[38;5;215m",
+                    _ => "\x1b[38;5;223m",
+                });
+            }
+            out.push(if c == ' ' { ' ' } else { '#' });
+        }
+        if color {
+            out.push_str("\x1b[0m");
+        }
+        if i == LOGO.len() - 1 {
+            out.push_str("            AArch64 microkernel for Tegra X1");
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    // One message (< ipc::MAX_BYTES): services logging at boot cannot interleave.
+    console::write(out.as_bytes());
 }
 
 /// Split a line into arguments; single or double quotes group
