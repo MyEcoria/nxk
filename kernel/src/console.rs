@@ -2,8 +2,15 @@
 //!
 //! Les macros `kprint!`/`kprintln!` prennent le verrou le temps d'un message,
 //! ce qui garde les lignes entieres meme quand plusieurs coeurs ecrivent.
+//!
+//! Pas de verrou avant la MMU : ses atomiques sont des acces exclusifs
+//! (LDXR/STXR, pas de LSE sur Cortex-A57) qui visent alors de la memoire
+//! Device. L'architecture ne garantit pas le moniteur exclusif global pour
+//! ce type de memoire : sur le SoC, un STXR peut echouer indefiniment
+//! (l'emulateur, lui, reussit toujours). Seul le coeur 0 tourne a ce stade.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::drivers::uart::{Uart, UART_A};
 use crate::sync::SpinLock;
@@ -13,11 +20,13 @@ pub static CONSOLE: SpinLock<Console> = SpinLock::new(Console {
     ready: false,
 });
 
+/// MMU et caches actifs : le verrou de la console est utilisable.
+static LOCKED: AtomicBool = AtomicBool::new(false);
+
 pub struct Console {
     uart: Uart,
     ready: bool,
 }
-
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -28,28 +37,45 @@ impl Write for Console {
     }
 }
 
+/// Acces a la console : sous verrou une fois la MMU active, direct avant.
+fn with<R>(f: impl FnOnce(&mut Console) -> R) -> R {
+    if LOCKED.load(Ordering::Acquire) {
+        f(&mut CONSOLE.lock_irqsafe())
+    } else {
+        f(unsafe { CONSOLE.get_unlocked() })
+    }
+}
+
+/// A appeler MMU coupee, coeur 0 seul.
 pub fn init() {
-    let mut c = CONSOLE.lock_irqsafe();
-    c.uart.init(115_200);
-    c.ready = true;
+    with(|c| {
+        c.uart.init(115_200);
+        c.ready = true;
+    });
+}
+
+/// La MMU est active : les messages suivants passent par le verrou.
+pub fn enable_lock() {
+    LOCKED.store(true, Ordering::Release);
 }
 
 /// Ecrit des octets bruts (appel systeme `debug_write`).
 pub fn write_bytes(b: &[u8]) {
-    let c = CONSOLE.lock_irqsafe();
-    if c.ready {
-        for &x in b {
-            if x == b'\n' {
-                c.uart.put(b'\r');
+    with(|c| {
+        if c.ready {
+            for &x in b {
+                if x == b'\n' {
+                    c.uart.put(b'\r');
+                }
+                c.uart.put(x);
             }
-            c.uart.put(x);
         }
-    }
+    });
 }
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let _ = CONSOLE.lock_irqsafe().write_fmt(args);
+    let _ = with(|c| c.write_fmt(args));
 }
 
 /// Ecriture d'urgence : ignore le verrou (panique, exception fatale).

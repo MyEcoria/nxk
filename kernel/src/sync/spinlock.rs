@@ -52,6 +52,13 @@ impl<T> SpinLock<T> {
         arch::sev();
     }
 
+    /// Acces sans verrou, quand aucun acces concurrent n'est possible
+    /// (demarrage mono-coeur, MMU coupee : voir `console`).
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get_unlocked(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
+
     /// Verrouille en masquant les interruptions : indispensable des qu'un
     /// gestionnaire d'interruption peut prendre le meme verrou.
     #[inline]

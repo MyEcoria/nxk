@@ -58,6 +58,16 @@ _start:
     mrs     x0, S3_1_C15_C2_0            // CPUACTLR_EL1
     orr     x0, x0, #1
     msr     S3_1_C15_C2_0, x0
+    // CPUECTLR_EL1.SMPEN : le TRM du Cortex-A57 l'exige avant d'activer
+    // caches et MMU (maintenance diffusee, acces exclusifs des verrous).
+    mrs     x0, S3_1_C15_C2_1            // CPUECTLR_EL1
+    orr     x0, x0, #(1 << 6)
+    msr     S3_1_C15_C2_1, x0
+    // Frequence du compteur systeme : ecrivable en EL3 seulement, valeur
+    // au reset INCONNUE sur le SoC (19,2 MHz = CLK_M, SYSCTR0_CNTFID0).
+    movz    x0, #0xF800
+    movk    x0, #0x0124, lsl #16
+    msr     cntfrq_el0, x0
     isb
 
     // Le GIC demarre avec toutes ses lignes en Groupe 0 (monde securise) :
@@ -77,6 +87,16 @@ _start:
     eret
 
 .Lel2:
+    // Registres EL2 a valeur de reset INCONNUE sur le SoC (l'emulateur les
+    // met a zero) : EL2 sans MMU ni caches, petit-boutiste ; aucun piege des
+    // registres de debogage et de performance (OSLAR_EL1, MDSCR_EL1... en
+    // EL1), tous les compteurs PMU laisses a EL1 (HPMN = PMCR_EL0.N).
+    movz    x0, #0x0830
+    movk    x0, #0x30C5, lsl #16         // SCTLR_EL2 : bits RES1 seuls
+    msr     sctlr_el2, x0
+    mrs     x0, pmcr_el0
+    ubfx    x0, x0, #11, #5
+    msr     mdcr_el2, x0
     mov     x0, #1
     lsl     x0, x0, #31                  // HCR_EL2.RW : EL1 en AArch64
     msr     hcr_el2, x0

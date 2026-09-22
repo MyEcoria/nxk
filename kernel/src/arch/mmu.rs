@@ -77,24 +77,49 @@ static mut L3_KERNEL: Table = Table::zeroed();
 const L2_POOL: usize = 4;
 static mut L2_DRAM_POOL: [Table; L2_POOL] = [const { Table::zeroed() }; L2_POOL];
 
-/// Zones de DRAM reservees par un moniteur securise (carveouts du controleur
-/// memoire), alignees sur 2 MiB. Ni allouees, ni meme projetees : un acces
-/// speculatif non securise y provoquerait une erreur asynchrone.
-pub const MAX_HOLES: usize = 2;
+/// Zones de DRAM reservees par un moniteur securise ou un chargeur
+/// (carveouts du controleur memoire), alignees sur 2 MiB. Ni allouees, ni
+/// meme projetees : un acces speculatif non securise y provoquerait une
+/// erreur asynchrone, et le controleur y ignore en silence les ecritures du
+/// CPU qu'il refuse.
+///
+/// TZ-DRAM, carveout securise, VPR et les cinq carveouts generalises
+/// (GSC1-5). Sur l'entree L4T, hekate place sous la TZ-DRAM le firmware BPMP
+/// en cours d'execution et les zones du GPU (0xffd00000..0xffe00000,
+/// inaccessibles au CPU) : voir `launch_l4t` dans refs/hekate.
+pub const MAX_HOLES: usize = 8;
 
 pub fn detect_holes() -> [(u64, u64); MAX_HOLES] {
     const MC: usize = 0x7001_9000;
     let rd = |off: usize| unsafe { core::ptr::read_volatile((MC + off) as *const u32) } as u64;
-    let mut holes = [(0u64, 0u64); MAX_HOLES];
+    let mut zones = [(0u64, 0u64); MAX_HOLES];
     // TZ-DRAM : MC_SECURITY_CFG0 (base, Mo), CFG3 (bits 33:32), CFG1 (taille, Mo).
-    let tz = ((rd(0x9BC) & 3) << 32) | (rd(0x70) & 0xFFF0_0000);
-    let tz_size = (rd(0x74) & 0x3FFF) << 20;
+    zones[0] = (
+        ((rd(0x9BC) & 3) << 32) | (rd(0x70) & 0xFFF0_0000),
+        (rd(0x74) & 0x3FFF) << 20,
+    );
+    // Carveout securise : MC_SEC_CARVEOUT_BOM / ADR_HI / SIZE_MB.
+    zones[1] = (
+        ((rd(0x9D4) & 3) << 32) | (rd(0x670) & 0xFFF0_0000),
+        (rd(0x674) & 0xFFF) << 20,
+    );
     // VPR : MC_VIDEO_PROTECT_BOM / BOM_ADR_HI / SIZE_MB.
-    let vpr = ((rd(0x978) & 3) << 32) | (rd(0x648) & 0xFFF0_0000);
-    let vpr_size = (rd(0x64C) & 0x3FFF) << 20;
-    for (k, (b, sz)) in [(tz, tz_size), (vpr, vpr_size)].into_iter().enumerate() {
+    zones[2] = (
+        ((rd(0x978) & 3) << 32) | (rd(0x648) & 0xFFF0_0000),
+        (rd(0x64C) & 0x3FFF) << 20,
+    );
+    // GSC n : MC_SECURITY_CARVEOUTn_BOM / BOM_HI / SIZE_128KB, pas de 0x50.
+    for n in 0..5 {
+        let r = 0xC0C + n * 0x50;
+        zones[3 + n] = (
+            ((rd(r + 4) & 3) << 32) | (rd(r) & !0x1_FFFF),
+            (rd(r + 8) & 0xFFF) << 17,
+        );
+    }
+    let mut holes = [(0u64, 0u64); MAX_HOLES];
+    for (h, (b, sz)) in holes.iter_mut().zip(zones) {
         if sz != 0 {
-            holes[k] = round_hole(b, sz);
+            *h = round_hole(b, sz);
         }
     }
     holes

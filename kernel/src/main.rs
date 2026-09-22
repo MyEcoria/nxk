@@ -92,6 +92,7 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
         mmu::build_tables(dram_size, &holes);
         mmu::enable();
     }
+    console::enable_lock();
     bkl::acquire();
     percpu::init(0, kstack_top(0), mmu::kernel_ttbr());
     arch::cpu_init();

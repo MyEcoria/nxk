@@ -247,6 +247,16 @@ disparu sans les fermer (plantage) sont repris.
 2. Réveiller un cœur secondaire exige, dans l'ordre : vecteur de reset dans le
    bloc SB, partition d'alimentation au PMC, retrait des verrous de tension,
    lignes de reset du CAR.
+3. Plusieurs registres ont une valeur de reset inconnue sur le silicium mais
+   sage sous QEMU : CNTFRQ_EL0 et CPUECTLR_EL1.SMPEN (à poser en EL3 avant
+   caches et MMU), SCTLR_EL2 et MDCR_EL2 (ce dernier peut piéger vers EL2 les
+   accès d'EL1 aux registres de débogage).
+4. MMU coupée, la mémoire est de type Device : les accès exclusifs des
+   atomiques (LDXR/STXR, pas de LSE sur A57) n'y sont pas garantis. Aucun
+   verrou avant l'activation de la MMU.
+5. hekate (entrée L4T) place sous la TZ-DRAM des carveouts du contrôleur
+   mémoire (firmware BPMP en cours d'exécution, zones du GPU interdites au
+   CPU) : ils sont exclus de la mémoire libre comme la TZ-DRAM.
 
 ## Comparaison avec L4T
 
