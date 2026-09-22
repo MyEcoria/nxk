@@ -8,6 +8,10 @@
 //!
 //! Sur la console, le xHCI du Tegra X1 est anime par un microcode NVIDIA
 //! (non fourni) : ce pilote vise le xHCI standard (emulateur, autres cartes).
+//! Il ne touche au controleur qu'une fois le service clk assure qu'il est
+//! cadence, sorti du reset et alimente (partitions XUSBA et XUSBC) : hekate
+//! laisse l'hote sans horloge et en reset, ses partitions peut-etre coupees,
+//! et le premier acces bloquerait le bus, donc tout le systeme.
 
 #![no_std]
 #![no_main]
@@ -17,10 +21,11 @@ extern crate alloc;
 mod xhci;
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EAGAIN, EINVAL, ENODEV, ETIMEDOUT};
-use libnx::abi::proto::{eth, input};
+use libnx::abi::err::{self, EAGAIN, EINVAL, ENODEV, ETIMEDOUT};
+use libnx::abi::proto::{clk, eth, input};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
 use libnx::{ns, println, sys, time};
@@ -252,15 +257,49 @@ fn events(hc: &mut Xhci, kbd: &mut Option<Keyboard>, net: &mut Option<Net>, inpu
     }
 }
 
+/// Demande au service clk d'activer le controleur, puis s'assure qu'il est
+/// pret (`clk::ST_READY`). Erreur : ce qui manque.
+fn controller_ready() -> Result<(), String> {
+    let c = ns::wait_for_timeout("clk", 2_000_000_000).map_err(|_| String::from("service clk injoignable"))?;
+    let ask = |label| {
+        let mut m = Msg::new(label, 1, 0);
+        m.mr[0] = clk::XUSB_HOST;
+        ipc::call(c, &m)
+    };
+    let _ = ask(clk::ENABLE);
+    let r = ask(clk::STATUS);
+    let _ = sys::handle_close(c);
+    let st = match r {
+        Ok(m) if m.label() == 0 => m.mr[0],
+        Ok(m) => return Err(alloc::format!("clk : {}", err::name(m.label() as i64))),
+        Err(e) => return Err(alloc::format!("clk : {}", err::name(e))),
+    };
+    let missing: Vec<&str> =
+        [(clk::ST_POWERED, "partition coupee"), (clk::ST_CLOCK, "horloge coupee"), (clk::ST_OUT_OF_RESET, "en reset")]
+            .iter()
+            .filter(|b| st & b.0 == 0)
+            .map(|b| b.1)
+            .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing.join(", "))
+    }
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
+    if let Err(why) = controller_ready() {
+        println!("[usb] controleur xHCI non alimente ({})", why);
+        return 0;
+    }
     let regs = Mmio::map(drv::dev_slot(0), XHCI_BASE, 0x4000).expect("usb : registres");
     let irq = Irq::new(drv::dev_slot(1)).expect("usb : interruption");
     let mut hc = match Xhci::new(regs, irq) {
         Ok(h) => h,
         Err(e) => {
-            println!("[usb] controleur xHCI absent ({})", libnx::abi::err::name(e));
+            println!("[usb] controleur xHCI absent ({})", err::name(e));
             return 0;
         }
     };
@@ -311,7 +350,7 @@ fn main() -> i32 {
             Ok(())
         })();
         if let Err(e) = r {
-            println!("[usb] port {} : echec a l'etape {} ({})", port, step, libnx::abi::err::name(e));
+            println!("[usb] port {} : echec a l'etape {} ({})", port, step, err::name(e));
         }
     }
     let input = if kbd.is_some() { ns::wait_for_timeout("input", 3_000_000_000).unwrap_or(0) } else { 0 };

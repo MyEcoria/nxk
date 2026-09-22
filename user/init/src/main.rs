@@ -46,7 +46,8 @@ struct Driver {
 /// Ordre de lancement : un service ne depend que de ceux qui le precedent
 /// (et les attend par `ns::wait_for`).
 const DRIVERS: &[Driver] = &[
-    Driver { name: "clk", mmio: &[(0x6000_6000, 0x1000)], irqs: &[], sysctl: false, prio: 6 },
+    // CAR, et la page du PMC pour y lire l'etat des partitions d'alimentation.
+    Driver { name: "clk", mmio: &[(0x6000_6000, 0x1000), (0x7000_E000, 0x1000)], irqs: &[], sysctl: false, prio: 6 },
     Driver {
         name: "i2c",
         mmio: &[(0x7000_C000, 0x1000), (0x7000_D000, 0x1000)],

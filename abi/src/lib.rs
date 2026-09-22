@@ -676,8 +676,24 @@ pub mod proto {
     /// Horloges et resets des peripheriques (CAR).
     pub mod clk {
         /// mot 0 = peripherique : active son horloge et le sort du reset.
+        /// Un bloc dont une partition d'alimentation (PMC) est coupee n'est
+        /// pas touche : ENODEV (clk n'allume pas les partitions). Un bloc de
+        /// partition deja pret est laisse tel quel. EIO si l'etat lu ensuite
+        /// n'est pas `ST_READY`.
         pub const ENABLE: u32 = 1;
         pub const DISABLE: u32 = 2;
+        /// mot 0 = peripherique. Reponse : mot 0 = etat (bits `ST_*`). Sur
+        /// Tegra, acceder a un bloc sans horloge, en reset ou hors tension
+        /// bloque le bus : un pilote ne touche a ses registres qu'avec
+        /// `ST_READY` complet.
+        pub const STATUS: u32 = 3;
+        /// Toutes ses horloges actives.
+        pub const ST_CLOCK: u64 = 1;
+        /// Sorti du reset.
+        pub const ST_OUT_OF_RESET: u64 = 2;
+        /// Partitions d'alimentation allumees et sans verrou (clamp).
+        pub const ST_POWERED: u64 = 4;
+        pub const ST_READY: u64 = ST_CLOCK | ST_OUT_OF_RESET | ST_POWERED;
         pub const I2C1: u64 = 1;
         pub const I2C2: u64 = 2;
         pub const I2C3: u64 = 3;
@@ -686,6 +702,9 @@ pub mod proto {
         pub const I2C6: u64 = 6;
         pub const SDMMC1: u64 = 10;
         pub const SDMMC4: u64 = 13;
+        /// Hote xHCI : horloges de l'hote et de la logique SuperSpeed,
+        /// partitions XUSBA et XUSBC.
+        pub const XUSB_HOST: u64 = 20;
     }
     /// Bus I2C.
     pub mod i2c {

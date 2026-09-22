@@ -198,14 +198,14 @@ Tous en EL0, lancés par `init` avec leurs seules capacités.
 | Service | Rôle | État |
 |---|---|---|
 | `console` | UART-A, édition de ligne | émulateur |
-| `clk` | horloges et resets (CAR) | émulateur |
+| `clk` | horloges et resets (CAR), état des partitions d'alimentation (PMC, en lecture) | émulateur |
 | `i2c` | six bus I2C | émulateur |
 | `power` | extinction et redémarrage (PMIC MAX77620), horloge temps réel, températures (TMP451) | émulateur |
 | `sd` | carte SD (SDHCI, ADMA2) | émulateur ; alimentation et broches du vrai lecteur non réglées |
 | `fs` | FAT32 (noms longs), cache en écriture différée avec lecture anticipée | émulateur |
 | `display` | écran (fenêtre A), terminal texte (police Terminus) | émulateur ; initialisation du panneau réel absente |
 | `input` | écran tactile (FTM3BD56), clavier USB | émulateur ; interrogé seulement quand quelqu'un lit |
-| `usb` | xHCI : clavier HID, carte réseau CDC-ECM | émulateur ; le vrai xHCI exige un firmware NVIDIA |
+| `usb` | xHCI : clavier HID, carte réseau CDC-ECM | émulateur ; le vrai xHCI exige un firmware NVIDIA ; s'arrête si `clk` ne le dit pas alimenté |
 | `net` | TCP/IP (smoltcp) : DHCP, DNS, TCP, UDP | émulateur |
 
 Les services `fs` et `net` rattachent chaque fichier ou socket au processus
@@ -259,6 +259,11 @@ disparu sans les fermer (plantage) sont repris.
 5. hekate (entrée L4T) place sous la TZ-DRAM des carveouts du contrôleur
    mémoire (firmware BPMP en cours d'exécution, zones du GPU interdites au
    CPU) : ils sont exclus de la mémoire libre comme la TZ-DRAM.
+6. Lire un bloc sans horloge, en reset ou dont la partition PMC est coupée
+   bloque le bus : tout le système s'arrête quand il n'a qu'un cœur. L'émulateur
+   répond quand même. Un pilote de bloc à partition (XUSB) demande donc
+   `ENABLE` puis `STATUS` à `clk`, qui n'allume jamais une partition lui-même,
+   et ne touche à ses registres qu'avec `ST_READY` complet.
 
 ## Comparaison avec L4T
 
