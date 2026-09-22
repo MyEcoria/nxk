@@ -37,12 +37,14 @@ pub fn identify(bar0: &Mmio, window: &dyn Fn(u32)) -> Chip {
     let chipid = bar0.r32(CC_CHIPID);
     let id = chipid as u16;
     let rev = ((chipid >> 16) & 0xF) as u8;
-    let firmware = fs::stat(FW_PATH).is_ok() && fs::stat(NVRAM_PATH).is_ok();
-    if !firmware {
-        println!(
-            "[wlan] firmware missing: put {} and {} on the SD card",
-            FW_PATH, NVRAM_PATH
-        );
+    // Name the file that is actually missing: the calibration data is
+    // public, the firmware itself comes off the console.
+    let mut firmware = true;
+    for path in [FW_PATH, NVRAM_PATH] {
+        if fs::stat(path).is_err() {
+            println!("[wlan] missing {}", path);
+            firmware = false;
+        }
     }
     Chip { id, rev, firmware }
 }
