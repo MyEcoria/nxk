@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Construit un initramfs minimal (cpio « newc ») : /init, /dev/console,
-/proc, /sys. Aucune distribution : seul le noyau L4T est mesure."""
+"""Build a minimal initramfs (cpio "newc"): /init, /dev/console, /proc,
+/sys. No distro: only the L4T kernel is measured."""
 import argparse, os
 
 
@@ -30,7 +30,7 @@ def main():
     img += entry("TRAILER!!!", 0)
     img += b"\0" * ((-len(img)) % 512)
     open(a.output, "wb").write(img)
-    print(f"initramfs : {len(img)} octets -> {a.output}")
+    print(f"initramfs: {len(img)} bytes -> {a.output}")
 
 
 main()

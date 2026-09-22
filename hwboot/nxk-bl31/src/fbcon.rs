@@ -1,23 +1,12 @@
-//! Ecran laisse allume par hekate : seule sortie visible sans adaptateur UART.
-//!
-//! En lancant L4T, hekate garde le panneau allume (affichage « sans
-//! couture ») : la fenetre A du controleur DC-A balaie encore son image
-//! (720x1280, 32 bits par pixel, en DRAM), celle du logo de demarrage. Le
-//! moniteur l'efface et y recopie ses messages (police 8x16 du service
-//! d'affichage, sens portrait comme le menu texte de hekate), puis laisse a
-//! nxk, dans les deux derniers pixels, la ligne ou reprendre (meme protocole
-//! que `kernel/src/drivers/fbcon.rs`).
-//!
-//! MMU coupee en EL3 : les ecritures vont droit en DRAM, sans cache a
-//! nettoyer. Rien ne s'active si la fenetre A n'est pas allumee (emulateur).
+//! Hekate-lit screen: only output without UART. Monitor clears the boot logo, mirrors logs
+//! (8x16 font, portrait), leaves nxk the resume row in the last two pixels. MMU off: direct DRAM writes.
 
 use core::ptr::{read_volatile, write_volatile};
 
 const CAR: usize = 0x6000_6000;
 const RST_DEVICES_L: usize = CAR + 0x004;
 const CLK_OUT_ENB_L: usize = CAR + 0x010;
-/// DISP1 (bit 27) et HOST1X (bit 28) : lire le DC horloge coupee ou en reset
-/// bloquerait le bus.
+/// DISP1 + HOST1X clocks on and out of reset required (else bus hangs).
 const DISP1_HOST1X: u32 = (1 << 27) | (1 << 28);
 
 // Controleur d'affichage A (indices de mots de 32 bits).
@@ -30,10 +19,10 @@ const WIN_LINE_STRIDE: usize = 0x70A;
 const WINBUF_START_ADDR: usize = 0x800;
 const WINDOW_A_SELECT: u32 = 1 << 4;
 const WIN_ENABLE: u32 = 1 << 30;
-/// B8G8R8A8 (hekate) et R8G8B8A8.
+/// B8G8R8A8 (hekate) and R8G8B8A8.
 const DEPTH_32BPP: [u32; 2] = [12, 13];
 
-/// Couleurs identiques dans les deux formats (composantes egales).
+/// Same colors in both formats (equal components).
 const BG: u32 = 0xFF00_0000;
 const FG: u32 = 0xFFD8_D8D8;
 const HANDOFF_MAGIC: u32 = 0x304B_584E; // "NXK0"
@@ -46,13 +35,13 @@ struct Fb {
     base: usize,
     w: usize,
     h: usize,
-    /// Pas d'une ligne, en pixels.
+    /// One row stride, in pixels.
     stride: usize,
     col: usize,
     row: usize,
 }
 
-/// Coeur 0 seul (les secondaires sont parques).
+/// Core 0 only (secondaries are parked).
 static mut FB: Option<Fb> = None;
 
 fn fb() -> Option<&'static mut Fb> {
@@ -69,8 +58,8 @@ fn dc(i: usize) -> usize {
     DC + i * 4
 }
 
-/// Fenetre A allumee sur une image 32 bits en DRAM : (base, largeur, hauteur,
-/// pas en pixels).
+/// Window A lit on a 32-bit DRAM image: (base, width, height, stride in
+/// pixels).
 fn probe() -> Option<(usize, usize, usize, usize)> {
     if rd(CLK_OUT_ENB_L) & DISP1_HOST1X != DISP1_HOST1X || rd(RST_DEVICES_L) & DISP1_HOST1X != 0 {
         return None;
@@ -95,8 +84,7 @@ fn probe() -> Option<(usize, usize, usize, usize)> {
     sane.then_some((base, w, h, pitch / 4))
 }
 
-/// Efface l'ecran s'il est allume : le logo de hekate disparait, preuve
-/// visible que le moniteur s'execute.
+/// Clear the screen if on (logo vanishes: visible proof of life).
 pub fn init() {
     let Some((base, w, h, stride)) = probe() else {
         return;
@@ -127,7 +115,7 @@ pub fn write_str(s: &str) {
     }
 }
 
-/// Laisse a nxk la ligne ou continuer (juste avant le saut).
+/// Leave nxk the row to continue on (just before the jump).
 pub fn handoff() {
     let Some(f) = fb() else { return };
     let next = if f.col == 0 {

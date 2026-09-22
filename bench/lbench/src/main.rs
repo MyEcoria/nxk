@@ -1,9 +1,5 @@
-//! lbench : mesures cote Linux, executees comme /init d'un initramfs minimal.
-//!
-//! Aucune libc : appels systeme Linux bruts, pour que seul le noyau soit
-//! mesure. Chaque mesure reproduit celle de `bench` sous nxk (memes charges,
-//! meme horloge CNTVCT_EL0) ; les resultats sortent en lignes
-//! `RESULT <cle> <valeur> <unite>`.
+//! lbench: Linux-side measures as /init of a minimal initramfs, raw syscalls (no libc).
+//! Mirrors nxk `bench` (same loads, CNTVCT_EL0 clock); prints `RESULT <key> <value> <unit>`.
 
 #![no_std]
 #![no_main]
@@ -106,8 +102,8 @@ fn ns(t: u64) -> u64 {
 
 // ------------------------------------------------------------- threads ---
 
-// long clone_run(flags, stack_top, ctid, fn, arg) : l'enfant appelle fn(arg)
-// sur sa propre pile puis se termine.
+// long clone_run(flags, stack_top, ctid, fn, arg): the child calls fn(arg)
+// on its own stack then exits.
 global_asm!(
     r#"
 .globl clone_run
@@ -155,10 +151,10 @@ struct Thread {
     ctid: &'static AtomicU32,
 }
 
-/// Lance `f(arg)` dans un nouveau thread du processus.
+/// Spawn `f(arg)` in a new thread of the process.
 fn spawn_thread(f: extern "C" fn(u64), arg: u64) -> Thread {
     let stack = mmap(STACK);
-    // Le mot de fin vit en bas de la pile : il reste valide apres la sortie.
+    // The exit word lives at the stack bottom: still valid after exit.
     let ctid: &'static AtomicU32 = unsafe { &*(stack as *const AtomicU32) };
     ctid.store(1, Ordering::SeqCst);
     let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID;
@@ -168,9 +164,8 @@ fn spawn_thread(f: extern "C" fn(u64), arg: u64) -> Thread {
 
 impl Thread {
     fn join(self) {
-        // Le noyau signale la fin par un FUTEX_WAKE *partage* sur le mot du
-        // TID (comme glibc, on attend donc sans FUTEX_PRIVATE_FLAG : les deux
-        // cles doivent concorder, sinon le reveil se perd).
+        // Kernel signals exit with a *shared* FUTEX_WAKE on the TID word; wait
+        // without FUTEX_PRIVATE_FLAG (both keys must match, like glibc).
         loop {
             let v = self.ctid.load(Ordering::SeqCst);
             if v == 0 {
@@ -183,7 +178,7 @@ impl Thread {
     }
 }
 
-// ------------------------------------------------------------- sortie ---
+// ------------------------------------------------------------- output ---
 
 struct Out;
 
@@ -202,7 +197,7 @@ fn result(key: &str, v: u64, unit: &str) {
     out!("RESULT {} {} {}\n", key, v, unit);
 }
 
-// ------------------------------------------------------------ mesures ---
+// ------------------------------------------------------------ measure ---
 
 const N: u64 = 20_000;
 
@@ -219,7 +214,7 @@ static mut P_RSP: (u64, u64) = (0, 0);
 static mut SERVER_CPU: u32 = 0;
 
 extern "C" fn pipe_server(bytes: u64) {
-    write(1, b"  [tube] serveur demarre\n");
+    write(1, b"  [pipe] server started\n");
     unsafe { pin(SERVER_CPU) };
     let mut buf = [0u8; 4096];
     let (req, rsp) = unsafe { (P_REQ.0, P_RSP.1) };
@@ -229,7 +224,7 @@ extern "C" fn pipe_server(bytes: u64) {
             let n = read(req, &mut buf[got..bytes as usize]);
             if n <= 0 {
                 if n < 0 {
-                    out!("  [tube] serveur : read -> {}\n", n);
+                    out!("  [pipe] server: read -> {}\n", n);
                 }
                 return;
             }
@@ -237,23 +232,23 @@ extern "C" fn pipe_server(bytes: u64) {
         }
         let w = unsafe { sc(SYS_WRITE, rsp, buf.as_ptr() as u64, 8, 0, 0, 0) };
         if w != 8 {
-            out!("  [tube] serveur : write -> {}\n", w);
+            out!("  [pipe] server: write -> {}\n", w);
         }
     }
 }
 
-/// Aller-retour par tubes : `bytes` octets aller, 8 octets retour.
+/// Pipe round-trip: `bytes` bytes out, 8 bytes back.
 fn bench_pipe(client_cpu: u32, server_cpu: u32, bytes: u64, iters: u64) -> u64 {
     pin(client_cpu);
-    out!("  [tube {}->{} {} o] affinite ok\n", client_cpu, server_cpu, bytes);
+    out!("  [pipe {}->{} {} B] affinity ok\n", client_cpu, server_cpu, bytes);
     unsafe {
         P_REQ = pipe();
         P_RSP = pipe();
         SERVER_CPU = server_cpu;
     }
-    out!("  [tube] tubes {:?} {:?}\n", unsafe { P_REQ }, unsafe { P_RSP });
+    out!("  [pipe] pipes {:?} {:?}\n", unsafe { P_REQ }, unsafe { P_RSP });
     let t = spawn_thread(pipe_server, bytes);
-    out!("  [tube] thread serveur cree\n");
+    out!("  [pipe] server thread created\n");
     let (req, rsp) = unsafe { (P_REQ.1, P_RSP.0) };
     let data = [0x5Au8; 4096];
     let mut back = [0u8; 8];
@@ -261,16 +256,16 @@ fn bench_pipe(client_cpu: u32, server_cpu: u32, bytes: u64, iters: u64) -> u64 {
         write(req, &data[..bytes as usize]);
         read(rsp, &mut back);
         if k == 0 {
-            out!("  [tube] premier aller-retour ok\n");
+            out!("  [pipe] first round-trip ok\n");
         }
     }
-    out!("  [tube] echauffement ok\n");
+    out!("  [pipe] warmup ok\n");
     let t0 = ticks();
     for k in 0..iters {
         let w = unsafe { sc(SYS_WRITE, req, data.as_ptr() as u64, bytes, 0, 0, 0) };
         let r = read(rsp, &mut back);
         if w != bytes as i64 || r != 8 {
-            out!("  [tube] client iteration {} : write -> {}, read -> {}\n", k, w, r);
+            out!("  [pipe] client iter {}: write -> {}, read -> {}\n", k, w, r);
         }
         PROGRESS.fetch_add(1, Ordering::Relaxed);
     }
@@ -295,8 +290,8 @@ fn sysrq(c: u8) {
     }
 }
 
-/// Surveille la progression ; en cas de blocage, fait afficher par le noyau
-/// les piles des taches bloquees (sysrq w) et des coeurs actifs (sysrq l).
+/// Watch progress; on stall, ask the kernel to dump blocked-task stacks
+/// (sysrq w) and busy cores (sysrq l).
 extern "C" fn watchdog(_: u64) {
     pin(3);
     let mut last = u64::MAX;
@@ -305,7 +300,7 @@ extern "C" fn watchdog(_: u64) {
         unsafe { sc(SYS_NANOSLEEP, ts.as_ptr() as u64, 0, 0, 0, 0, 0) };
         let p = PROGRESS.load(Ordering::Relaxed);
         if p == last && p != 0 {
-            out!("WATCHDOG : aucun progres depuis 10 s (iteration {})\n", p);
+            out!("WATCHDOG: no progress for 10 s (iter {})\n", p);
             sysrq(b'w');
             sysrq(b'l');
         }
@@ -334,8 +329,8 @@ extern "C" fn futex_server(cpu: u64) {
     }
 }
 
-/// Aller-retour par futex : la primitive de synchronisation la plus directe
-/// de Linux (reveil + attente, sans copie de donnees).
+/// Futex round-trip: the most direct Linux sync primitive (wake + wait,
+/// no data copy).
 fn bench_futex(client_cpu: u32, server_cpu: u32) -> u64 {
     pin(client_cpu);
     REQ.store(0, Ordering::SeqCst);
@@ -386,8 +381,8 @@ extern "C" fn exec_child(_: u64) {
     exit_thread(127);
 }
 
-/// Lancement d'un programme et attente de sa fin (vfork + execve + wait4,
-/// soit ce que fait posix_spawn).
+/// Program spawn and wait (vfork + execve + wait4, i.e. what posix_spawn
+/// does).
 fn bench_spawn() -> u64 {
     let _ = &ARGV;
     let stack = mmap(STACK);
@@ -402,8 +397,7 @@ fn bench_spawn() -> u64 {
     ns(ticks() - t0) / n
 }
 
-/// Calcul entier pur, identique au code de `bench` sous nxk : sert de
-/// temoin (il ne depend pas du noyau).
+/// Pure integer compute, same as `bench` on nxk: a control (kernel-free).
 fn bench_compute() -> u64 {
     let t0 = ticks();
     let mut acc: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -415,7 +409,7 @@ fn bench_compute() -> u64 {
     ns(ticks() - t0) / 1_000_000
 }
 
-// ------------------------------------------------------------- memoire ---
+// ------------------------------------------------------------- memory ---
 
 fn read_file(path: &[u8], buf: &mut [u8]) -> usize {
     // openat(AT_FDCWD, path, O_RDONLY)
@@ -453,7 +447,7 @@ extern "C" fn lmain(sp: *const u64) -> ! {
     let start = ticks();
     let argc = unsafe { *sp };
     if argc > 1 {
-        exit_group(0); // enfant du test de lancement
+        exit_group(0); // child of the spawn test
     }
     unsafe {
         sc(SYS_MOUNT, b"proc\0".as_ptr() as u64, b"/proc\0".as_ptr() as u64, b"proc\0".as_ptr() as u64, 0, 0, 0);
@@ -496,7 +490,7 @@ extern "C" fn lmain(sp: *const u64) -> ! {
     }
 }
 
-/// Cle de resultat derivee du nom de champ /proc/meminfo.
+/// Result key derived from the /proc/meminfo field name.
 fn alloc_key(k: &str) -> heapless_key::Key {
     heapless_key::Key::new("meminfo_", k)
 }
@@ -526,6 +520,6 @@ mod heapless_key {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    write(1, b"lbench : panique\n");
+    write(1, b"lbench: panic\n");
     exit_group(101)
 }

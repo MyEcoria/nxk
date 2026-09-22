@@ -1,12 +1,5 @@
-//! l4tboot : moniteur EL3 minimal pour demarrer le noyau L4T (Linux 4.9) sur
-//! le Tegra X1 emule, sans hekate ni ATF.
-//!
-//! Il fait ce que font normalement ATF (bl31) et le chargeur d'amorcage :
-//! bascule le GIC en mode non securise, prepare EL2, puis saute dans le noyau
-//! avec x0 = arbre de peripheriques. Il reste ensuite resident en EL3 pour
-//! repondre aux appels PSCI (`smc`), dont CPU_ON pour les coeurs secondaires.
-//! Le demarrage d'un coeur reprend la sequence validee dans nxk : vecteur SB,
-//! partition PMC, verrous de tension, resets CAR.
+//! l4tboot: minimal EL3 monitor booting L4T (Linux 4.9) on emulated Tegra X1, no hekate/ATF.
+//! Switches GIC to non-secure, sets up EL2, jumps to the kernel (x0 = DTB), stays resident for PSCI.
 
 #![no_std]
 #![no_main]
@@ -14,15 +7,15 @@
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
 
-/// Charge utile : Linux par defaut ; `L4TBOOT_ENTRY=0x80000000
-/// L4TBOOT_EL=2` a la compilation pour lancer nxk en EL2 (chemin PSCI).
+/// Payload: Linux by default; build with `L4TBOOT_ENTRY=0x80000000
+/// L4TBOOT_EL=2` to launch nxk in EL2 (PSCI path).
 const KERNEL_ENTRY: u64 = parse_hex(option_env!("L4TBOOT_ENTRY"), 0x8008_0000);
 const ENTRY_EL2: bool = match option_env!("L4TBOOT_EL") {
     Some(s) => s.len() == 1 && s.as_bytes()[0] == b'2',
     None => false,
 };
 const DTB_ADDR: u64 = 0x8D00_0000;
-/// Zone du moniteur declaree au controleur memoire (TZ-DRAM), comme ATF.
+/// Monitor area declared to the memory controller (TZ-DRAM), as ATF does.
 const MC_SECURITY_CFG0: usize = 0x7001_9070;
 const MC_SECURITY_CFG1: usize = 0x7001_9074;
 
@@ -40,7 +33,7 @@ const fn parse_hex(s: Option<&str>, default: u64) -> u64 {
                 i += 1;
                 continue;
             }
-            _ => panic!("L4TBOOT_ENTRY invalide"),
+            _ => panic!("invalid L4TBOOT_ENTRY"),
         };
         v = v * 16 + d as u64;
         i += 1;
@@ -73,7 +66,7 @@ const PSCI_FEATURES: u64 = 0x8400_000A;
 const NOT_SUPPORTED: u64 = -1i64 as u64;
 const ALREADY_ON: u64 = -4i64 as u64;
 
-/// Point d'entree et argument de chaque coeur secondaire (ecrits par CPU_ON).
+/// Entry point and argument of each secondary core (written by CPU_ON).
 static mut ENTRY: [u64; 4] = [0; 4];
 static mut CONTEXT: [u64; 4] = [0; 4];
 static mut ON: [bool; 4] = [true, false, false, false];
@@ -105,7 +98,7 @@ fn puthex(v: u64) {
     }
 }
 
-/// Toutes les interruptions en Groupe 1 : Linux tourne en non securise.
+/// All interrupts to Group 1: Linux runs non-secure.
 fn gic_secure_init(core: usize) {
     if core == 0 {
         wr(GICD, 0);
@@ -126,25 +119,25 @@ fn core_id() -> usize {
     (m & 0xFF) as usize
 }
 
-/// Coeur 0 : initialisation puis saut dans Linux. Coeurs secondaires :
-/// saut vers le point d'entree fourni par CPU_ON.
+/// Core 0: init then jump into Linux. Secondary cores: jump to the entry
+/// point given by CPU_ON.
 #[no_mangle]
 extern "C" fn boot_main(core: usize) -> ! {
     gic_secure_init(core);
     let (entry, arg) = if core == 0 {
-        // Le moniteur (2 MiB a 0xFFE00000) se declare comme zone securisee.
+        // The monitor (2 MiB at 0xFFE00000) declares itself a secure zone.
         wr(MC_SECURITY_CFG0, 0xFFE0_0000);
         wr(MC_SECURITY_CFG1, 2);
         if ENTRY_EL2 {
-            puts("\n[l4tboot] moniteur EL3 : GIC non securise, PSCI 1.0 ; saut dans la charge utile (EL2)\n");
+            puts("\n[l4tboot] EL3 monitor: non-secure GIC, PSCI 1.0; jumping to payload (EL2)\n");
         } else {
-            puts("\n[l4tboot] moniteur EL3 : GIC non securise, PSCI 1.0 ; saut dans Linux (EL1)\n");
+            puts("\n[l4tboot] EL3 monitor: non-secure GIC, PSCI 1.0; jumping to Linux (EL1)\n");
         }
         (KERNEL_ENTRY, DTB_ADDR)
     } else {
         unsafe { (read_volatile(&raw const ENTRY[core]), read_volatile(&raw const CONTEXT[core])) }
     };
-    // EL2h ou EL1h, interruptions masquees.
+    // EL2h or EL1h, interrupts masked.
     let spsr = if ENTRY_EL2 { 0x3C9 } else { 0x3C5 };
     unsafe { enter_el2(entry, arg, spsr) }
 }
@@ -173,7 +166,7 @@ fn power_on(core: usize) {
     wr(CAR_RST_CPUG_CMPLX_CLR, mask);
 }
 
-/// Gestionnaire des `smc` venus d'EL2/EL1 : x0 = fonction, x1-x3 = arguments.
+/// Handler for `smc` from EL2/EL1: x0 = function, x1-x3 = args.
 #[no_mangle]
 extern "C" fn smc_handler(regs: &mut [u64; 31]) {
     let (f, a1, a2, a3) = (regs[0], regs[1], regs[2], regs[3]);
@@ -215,7 +208,7 @@ extern "C" fn smc_handler(regs: &mut [u64; 31]) {
             }
         }
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => {
-            puts("\n[l4tboot] arret demande par Linux\n");
+            puts("\n[l4tboot] shutdown requested by Linux\n");
             loop {
                 unsafe { core::arch::asm!("wfi") };
             }
@@ -225,7 +218,7 @@ extern "C" fn smc_handler(regs: &mut [u64; 31]) {
     let _ = a3;
 }
 
-/// Toute autre exception prise en EL3 est un bug : on l'affiche.
+/// Any other EL3-taken exception is a bug: print it.
 #[no_mangle]
 extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
     let esr: u64;
@@ -234,12 +227,12 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
         core::arch::asm!("mrs {}, esr_el3", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el3", out(reg) elr);
     }
-    puts("\n[l4tboot] exception inattendue en EL3, ESR=");
+    puts("\n[l4tboot] unexpected EL3 exception, ESR=");
     puthex(esr);
     puts(" ELR=");
     puthex(elr);
     puts("\n");
-    // Acces a un registre systeme piege (EC 0x18) : on l'ignore et on avance.
+    // Trapped system-register access (EC 0x18): skip over it.
     if esr >> 26 == 0x18 {
         unsafe { core::arch::asm!("msr elr_el3, {}", in(reg) elr + 4) };
         regs[0] = regs[0];
@@ -252,7 +245,7 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    puts("\n[l4tboot] panique\n");
+    puts("\n[l4tboot] panic\n");
     loop {}
 }
 
@@ -290,24 +283,24 @@ enter_el2:
     mov     x20, x0
     mov     x21, x1
     mov     x22, x2
-    // SCR_EL3 : NS | RES1 | HCE | RW  (SMD=0 : smc autorise pour PSCI)
+    // SCR_EL3: NS | RES1 | HCE | RW (SMD=0: smc allowed for PSCI)
     mov     x2, #0x531
     msr     scr_el3, x2
     msr     cptr_el3, xzr
     msr     mdcr_el3, xzr
-    mov     x2, #0x73                // ACTLR : registres IMPDEF accessibles
+    mov     x2, #0x73                // ACTLR: IMPDEF registers accessible
     msr     actlr_el3, x2
     msr     actlr_el2, x2
     msr     cntvoff_el2, xzr
     movz    x2, #0x0830
-    movk    x2, #0x30C5, lsl #16      // SCTLR_EL2 : MMU et caches coupes
+    movk    x2, #0x30C5, lsl #16      // SCTLR_EL2: MMU and caches off
     msr     sctlr_el2, x2
-    // Entree en EL1 : Linux utilise alors le mode EOI simple du GIC (une
-    // seule ecriture d'EOIR). En EL2 il passerait en EOI separe (GICC_DIR).
+    // Entry into EL1: Linux then uses the simple GIC EOI mode (single
+    // EOIR write). In EL2 it would use separate EOI (GICC_DIR).
     mov     x2, #1
-    lsl     x2, x2, #31              // HCR_EL2.RW : EL1 en AArch64
+    lsl     x2, x2, #31              // HCR_EL2.RW: EL1 in AArch64
     msr     hcr_el2, x2
-    mov     x2, #3                   // CNTHCTL_EL2 : timer physique visible en EL1
+    mov     x2, #3                   // CNTHCTL_EL2: physical timer visible in EL1
     msr     cnthctl_el2, x2
     mrs     x2, midr_el1
     msr     vpidr_el2, x2
@@ -316,7 +309,7 @@ enter_el2:
     mov     x2, #0x33FF
     msr     cptr_el2, x2
     msr     sctlr_el1, xzr
-    msr     spsr_el3, x22                // EL2h ou EL1h, interruptions masquees
+    msr     spsr_el3, x22                // EL2h or EL1h, interrupts masked
     msr     elr_el3, x20
     mov     x0, x21
     mov     x1, xzr
@@ -369,7 +362,7 @@ enter_el2:
     mrs     x9, esr_el3
     lsr     x9, x9, #26
     mov     x0, sp
-    cmp     x9, #0x17                // SMC depuis AArch64
+    cmp     x9, #0x17                // SMC from AArch64
     b.ne    2f
     bl      smc_handler
     b       3f
@@ -402,7 +395,7 @@ el3_vectors:
     b .Lbad
     .align 7
     b .Lbad
-    // niveau inferieur AArch64 : sync (smc), irq, fiq, serror
+    // lower level AArch64: sync (smc), irq, fiq, serror
     .align 7
     b .Lsmc_entry
     .align 7

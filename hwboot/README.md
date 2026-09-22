@@ -53,87 +53,87 @@ console powers on to a black screen (AutoRCM) rather than the Nintendo logo
 - nxk DVFS/clock code is emulator-only and power-unsafe: never run
   experimental clock/voltage builds on hardware without review.
 
-## Stage 2 : demarrer nxk via l'entree L4T de hekate (1er essai : aucune sortie visible)
+## Stage 2: booting nxk via the hekate L4T entry (1st attempt: no visible output)
 
-Ni l'injection RCM ni `payload=` ne peuvent demarrer nxk : c'est une image
-DRAM de ~1,7 Mo liee a `0x80000000` (`kernel/link.ld`), pas un payload
-BPMP/IRAM (plafond ~196 Kio, DRAM non initialisee en RCM).
+Neither RCM injection nor `payload=` can boot nxk: it is a ~1.7 MB DRAM
+image linked at `0x80000000` (`kernel/link.ld`), not a BPMP/IRAM payload
+(~196 KiB ceiling, DRAM uninitialized in RCM).
 
-Chaine retenue (tout est construit et valide en emulateur, jamais sur
-hardware) : **hekate `[nxk]` (L4T) → `nxk/bl31.bin` (moniteur nxk-bl31)
+Chosen chain (all built and valid in the emulator, never on hardware):
+**hekate `[nxk]` (L4T) → `nxk/bl31.bin` (nxk-bl31 monitor)
 → `nxk/bl33.bin` (= nxk.bin)**.
 
-- `bootloader/ini/nxk.ini` : `l4t=1`, `boot_prefixes=nxk/`, `uart_port=2`
-  (hekate active pinmux+horloge d'UART-B, rail Joy-Con droit ; moniteur et
-  noyau ecrivent encore sur UART-A). Apparait dans More Configs.
-- `nxk/bl31.bin` : construit par `mkbl31.py` depuis `hwboot/nxk-bl31/`
-  (Rust `no_std`, ~12 Kio). Charge par hekate en TZDRAM a `0xFFF00000`, il
-  pose sur chaque coeur les registres EL3 que le silicium laisse a une valeur
-  inconnue (CNTFRQ_EL0, CPUECTLR_EL1.SMPEN, CPUACTLR_EL1), ouvre UART-A,
-  efface l'ecran laisse allume par hekate et y recopie ses logs, met en
-  marche le compteur systeme, bascule le GIC en Groupe 1, declare son Mo en
-  carveout TZ (nxk l'exclut via `detect_holes`), recopie bl33 de
-  `0xAA000000` vers `0x80000000`, refuse les `smc` (pas de PSCI -> nxk
-  mono-coeur), et saute en EL2 (SCTLR_EL2, MDCR_EL2... dans un etat connu)
-  avec x0 = 0 (sans DTB : DRAM via `MC_EMEM_CFG` + sondage).
-- `nxk/bl33.bin` : copie byte-identique de `build/nxk.bin`.
-- `bootloader/sys/l4t/` + `libsys_*.bso` : firmware BPMP/SC7/Minerva du
-  pack Nyx (DRAM init par hekate) ; installes par `mksd-hw.sh` si absents.
+- `bootloader/ini/nxk.ini`: `l4t=1`, `boot_prefixes=nxk/`, `uart_port=2`
+  (hekate enables UART-B pinmux+clock, right Joy-Con rail; monitor and
+  kernel still write to UART-A). Shows up under More Configs.
+- `nxk/bl31.bin`: built by `mkbl31.py` from `hwboot/nxk-bl31/`
+  (Rust `no_std`, ~12 KiB). Loaded by hekate into TZDRAM at `0xFFF00000`,
+  it sets on each core the EL3 registers silicon leaves at an unknown
+  value (CNTFRQ_EL0, CPUECTLR_EL1.SMPEN, CPUACTLR_EL1), opens UART-A,
+  clears the screen hekate left on and copies its logs there, starts the
+  system counter, switches the GIC to Group 1, declares its MB as a TZ
+  carveout (nxk excludes it via `detect_holes`), copies bl33 from
+  `0xAA000000` to `0x80000000`, refuses `smc` (no PSCI -> nxk
+  single-core), and jumps to EL2 (SCTLR_EL2, MDCR_EL2... in a known
+  state) with x0 = 0 (no DTB: DRAM via `MC_EMEM_CFG` + probing).
+- `nxk/bl33.bin`: byte-identical copy of `build/nxk.bin`.
+- `bootloader/sys/l4t/` + `libsys_*.bso`: BPMP/SC7/Minerva firmware from
+  the Nyx pack (DRAM init by hekate); installed by `mksd-hw.sh` if missing.
 
-Validation emulateur (`./test-bl31.sh`, meme binaire bl31 que sur hardware),
-deux scenarios : sans ecran (banniere moniteur, recopie, `entree en EL2`,
-`sans PSCI : un seul coeur`, invite `nxk>`) ; puis avec l'ecran tel que
-hekate le laisse, reproduit par `fakehekate.py` (fenetre A du DC allumee
-sur un faux logo a `0xF5A00000`) : l'image est relue en texte, le logo doit
-avoir disparu et les lignes du moniteur puis du noyau y figurer jusqu'au
-lancement de `init`. Le chemin EL2+PSCI 4 coeurs est aussi couvert par
+Emulator validation (`./test-bl31.sh`, same bl31 binary as on hardware),
+two scenarios: without screen (monitor banner, copy, `entry in EL2`,
+`no PSCI: single core`, `nxk>` prompt); then with the screen as hekate
+leaves it, reproduced by `fakehekate.py` (DC window A on over a fake
+logo at `0xF5A00000`): the image is read back as text, the logo must be
+gone and the monitor then kernel lines must appear up to the launch of
+`init`. The EL2+PSCI 4-core path is also covered by
 `nxtest.py --monitor <l4tboot> --dtb build/moniteur.dtb`.
 
-## Ecran : ce qu'on doit voir
+## Screen: what to expect
 
-Sans adaptateur UART, l'ecran est la seule sortie : hekate le laisse allume
-en lancant une entree L4T, et le moniteur puis le noyau y ecrivent (texte
-blanc sur noir, en portrait comme le menu texte de hekate : tenir la
-console verticalement). Dans l'ordre :
+Without a UART adapter, the screen is the only output: hekate leaves it
+on when launching an L4T entry, and the monitor then the kernel write to
+it (white text on black, portrait like the hekate text menu: hold the
+console vertically). In order:
 
-1. Logo de hekate, puis une **ligne** qui se remplit en bas de l'ecran : le
-   compte a rebours de hekate (`bootwait`), effacee juste avant le saut vers
-   `bl31.bin`. Normal.
-2. Ecran noir, lignes `[nxk-bl31] ...` : le moniteur tourne.
-3. Banniere `nxk v0.1.0`, lignes `[mem]`, `[ecran]`, `[boot] ... lancement
-   de init` : le noyau tourne. Une panique ou une faute du noyau s'affiche
-   ici aussi.
-4. Le service `display` reprend l'ecran : fond bleu nuit, une ligne
-   `nxk - ecran 720x1280, terminal 90x80`. Espace utilisateur vivant ; la
-   suite (shell) n'est que sur l'UART.
+1. hekate logo, then one **line** filling up at the bottom of the
+   screen: the hekate countdown (`bootwait`), cleared just before the
+   jump to `bl31.bin`. Normal.
+2. Black screen, `[nxk-bl31] ...` lines: the monitor is running.
+3. `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ... launching
+   init` lines: the kernel is running. A kernel panic or fault shows up
+   here too.
+4. The `display` service takes over the screen: midnight-blue
+   background, one `nxk - screen 720x1280, terminal 90x80` line. User
+   space is alive; the rest (shell) is UART-only.
 
-Photographier l'ecran la ou ca s'arrete : la derniere ligne situe la panne.
-Si le logo reste affiche apres l'effacement de la ligne (1 sans 2), le
-moniteur n'a pas tourne ou n'a pas trouve l'ecran.
+Photograph the screen wherever it stops: the last line locates the
+failure. If the logo stays on after the line clears (1 without 2), the
+monitor did not run or did not find the screen.
 
-Premier essai (22/09/2026, avant cette console d'ecran) : exactement ce cas
-1 sans suite visible. nxk n'avait alors aucune sortie hors UART-A, et le
-chemin materiel laissait des trous que QEMU masque, tous corriges depuis :
-registres EL2/EL3 a valeur de reset inconnue (MDCR_EL2 peut pieger vers un
-EL2 sans vecteurs les acces de nxk a OSLAR_EL1), verrous (acces exclusifs)
-pris MMU coupee, carveouts du GPU de hekate non exclus de la memoire libre.
+First attempt (22/09/2026, before this screen console): exactly that
+case, 1 with nothing after. nxk then had no output outside UART-A, and
+the hardware path had gaps QEMU hides, all fixed since: EL2/EL3
+registers with unknown reset values (MDCR_EL2 can trap nxk OSLAR_EL1
+accesses to an EL2 with no vectors), locks (exclusive accesses) taken
+with the MMU off, hekate GPU carveouts not excluded from free memory.
 
-## Test hardware (quand la carte SD est de retour sur le PC)
+## Hardware test (once the SD card is back in the PC)
 
-1. `./mksd-hw.sh /mount/point` (reconstruit nxk + bl31, installe l'entree).
-2. Remettre la carte dans la Switch, injecter hekate, **More Configs → nxk**.
-3. Lire l'ecran (voir ci-dessus). L'adaptateur UART (rail Joy-Con droit,
-   115200 8N1) reste necessaire pour le shell : moniteur et noyau ecrivent
-   encore sur UART-A, que hekate n'a pas relie au rail.
-4. Attendu : `entree en EL2`, `1/4 coeurs en ligne`, `lancement de init`,
-   puis l'ecran du service `display`.
-5. Recuperation : un boot rate se resume a un hang. Maintenir Power 12 s
-   (extinction forcee), relancer en RCM, reessayer. Aucune ecriture NAND,
-   eMMC ou SD par nxk : rien de persistant ne peut etre corrompu.
+1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
+2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
+3. Read the screen (see above). The UART adapter (right Joy-Con rail,
+   115200 8N1) is still needed for the shell: monitor and kernel still
+   write to UART-A, which hekate did not wire to the rail.
+4. Expected: `entry in EL2`, `1/4 cores online`, `launching init`,
+   then the `display` service screen.
+5. Recovery: a failed boot is just a hang. Hold Power 12 s (forced
+   off), reboot into RCM, retry. No NAND, eMMC or SD writes by nxk:
+   nothing persistent can be corrupted.
 
-## Pourquoi nxk.bin ne peut pas etre injecte directement
+## Why nxk.bin can't be injected directly
 
-Rappel : payloads RCM = BPMP en IRAM, ~196 Kio max, DRAM eteinte.
-`build/nxk.bin` fait ~1,7 Mo (noyau + bootfs embarquee) et s'execute a
-`0x80000000` en EL3/EL2 avec MMU coupee. D'ou le moniteur intermediaire,
-qui fait ce que fait normalement ATF : GIC securise + saut EL2.
+Reminder: RCM payloads = BPMP in IRAM, ~196 KiB max, DRAM off.
+`build/nxk.bin` is ~1.7 MB (kernel + embedded bootfs) and runs at
+`0x80000000` in EL3/EL2 with the MMU off. Hence the intermediate
+monitor, which does what ATF normally does: secure GIC + EL2 jump.

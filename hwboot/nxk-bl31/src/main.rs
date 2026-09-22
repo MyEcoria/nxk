@@ -1,26 +1,5 @@
-//! nxk-bl31 : moniteur EL3 minimal qui lance nxk depuis l'entree L4T de
-//! hekate, sans ATF externe.
-//!
-//! Chaine materiellle (Erista) : RCM -> hekate -> ce moniteur (charge comme
-//! `bl31.bin` en TZDRAM a 0xFFF00000) -> nxk (charge comme `bl33.bin` a
-//! 0xAA000000, recopie a 0x80000000, entree en EL2, x0 = 0 = sans DTB).
-//!
-//! Le moniteur fait le minimum vital : reglages EL3 de chaque coeur que
-//! l'emulateur n'exige pas mais le Cortex-A57 si (CNTFRQ_EL0, SMPEN,
-//! registres EL2 a valeur de reset inconnue), horloge+reset d'UART-A puis
-//! logs, recopies aussi sur l'ecran laisse allume par hekate (`fbcon`),
-//! compteur systeme en marche, bascule du GIC en Groupe 1 (sans quoi EL1 non
-//! securise ne voit aucune IRQ), declaration de sa region TZ au controleur
-//! memoire (pour que nxk l'exclue de la DRAM libre), recopie de nxk et saut
-//! en EL2. Les appels
-//! `smc` (dont la sonde PSCI de nxk) recoivent NOT_SUPPORTED : nxk demarre
-//! alors sur un seul coeur, sans PSCI. Pas de PSCI, pas de DTB, pas de
-//! DVFS : chaque ajout serait du risque materiel inutile pour un premier
-//! demarrage.
-//!
-//! Le meme binaire sert sous l'emulateur : QEMU depose le moniteur a
-//! 0xFFF00000 et nxk.bin a 0xAA000000, vecteur de reset sur le moniteur
-//! (voir `hwboot/test-bl31.sh`).
+//! nxk-bl31: minimal EL3 monitor launching nxk from hekate's L4T entry (RCM -> hekate -> monitor -> nxk).
+//! Vital minimum only (EL3 per-core setup, UART-A, screen mirror, counter, GIC Group 1, TZ carveout, copy, EL2 jump); no PSCI/DTB/DVFS. Same binary runs under QEMU (see `hwboot/test-bl31.sh`).
 
 #![no_std]
 #![no_main]
@@ -30,8 +9,8 @@ mod fbcon;
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
 
-/// Taille de nxk.bin, fournie a la compilation par `mkbl31.py`
-/// (`NXK_BL33_SIZE`) : le moniteur ne fait pas confiance a son environnement.
+/// nxk.bin size, baked in at compile time by `mkbl31.py` (`NXK_BL33_SIZE`):
+/// the monitor trusts nothing from its environment.
 fn bl33_size() -> u64 {
     match option_env!("NXK_BL33_SIZE") {
         Some(s) => parse_u64(s),
@@ -39,9 +18,9 @@ fn bl33_size() -> u64 {
     }
 }
 
-const BL33_SRC: usize = 0xAA00_0000; // ou hekate depose bl33.bin
-const BL33_DST: usize = 0x8000_0000; // adresse de liaison de nxk
-const MON_BASE: u32 = 0xFFF0_0000; // TZDRAM 1 Mo (Erista non-b01)
+const BL33_SRC: usize = 0xAA00_0000; // where hekate drops bl33.bin
+const BL33_DST: usize = 0x8000_0000; // nxk link address
+const MON_BASE: u32 = 0xFFF0_0000; // 1 MiB TZDRAM (non-b01 Erista)
 
 const UART_A: usize = 0x7000_6000;
 const UART_CLK_HZ: u32 = 408_000_000;
@@ -56,11 +35,11 @@ const GICC: usize = 0x5004_2000;
 const MC_SECURITY_CFG0: usize = 0x7001_9070;
 const MC_SECURITY_CFG1: usize = 0x7001_9074;
 
-/// Compteur systeme (source de CNTPCT_EL0) : EN | HDBG, comme exosphere.
+/// System counter (CNTPCT_EL0 source): EN | HDBG, as in exosphere.
 const SYSCTR0_CNTCR: usize = 0x700F_0000;
 
 const PMC_SCRATCH110: usize = 0x7000_E400 + 0xB10;
-const IRAM_MAGIC: u32 = 0x4D41_5249; // "IRAM" : parametres hekate presents
+const IRAM_MAGIC: u32 = 0x4D41_5249; // "IRAM": hekate params present
 
 const fn parse_u64(s: &str) -> u64 {
     let b = s.as_bytes();
@@ -73,7 +52,7 @@ const fn parse_u64(s: &str) -> u64 {
                 i += 1;
                 continue;
             }
-            _ => panic!("NXK_BL33_SIZE invalide"),
+            _ => panic!("invalid NXK_BL33_SIZE"),
         };
         v = v * 10 + d as u64;
         i += 1;
@@ -88,13 +67,11 @@ fn rd(a: usize) -> u32 {
     unsafe { read_volatile(a as *const u32) }
 }
 
-/// UART-A a 115200 8N1. Ouvre d'abord horloge+reset via le CAR : sans cela
-/// LSR ne bouge jamais et le premier `putc` attendrait pour toujours (c'est
-/// aussi ce que fait le pilote UART de nxk).
+/// UART-A at 115200 8N1; enable clock+reset via CAR first (else LSR never moves).
 fn uart_init() {
     wr(CAR_CLK_ENB_L_SET, CAR_BIT_UARTA);
     wr(CAR_RST_DEV_L_CLR, CAR_BIT_UARTA);
-    // Indices 16550 espaces de 4 octets (registres * 4).
+    // 16550 indexes spaced 4 bytes apart (registers x4).
     let r = |i: usize| UART_A + i * 4;
     wr(r(1), 0);
     wr(r(3), 1 << 7); // DLAB
@@ -102,7 +79,7 @@ fn uart_init() {
     wr(r(0), div & 0xFF);
     wr(r(1), (div >> 8) & 0xFF);
     wr(r(3), 0b11); // 8N1
-    wr(r(2), (1 << 0) | (1 << 1) | (1 << 2)); // FIFO on + raz
+    wr(r(2), (1 << 0) | (1 << 1) | (1 << 2)); // FIFO on + clear
 }
 
 fn putc(c: u8) {
@@ -127,8 +104,8 @@ fn puthex(v: u64) {
     puts(core::str::from_utf8(&buf).unwrap_or("0x?"));
 }
 
-/// Toutes les lignes en Groupe 1 : EL1 non securise recoit ses IRQ.
-/// Secure-only (IGROUPR) : ne passe qu'en EL3, d'ou le moniteur.
+/// All lines to Group 1: non-secure EL1 gets its IRQs. Secure-only
+/// (IGROUPR): EL3-only, hence the monitor.
 fn gic_secure_init() {
     wr(GICD, 0);
     let lines = ((rd(GICD + 4) & 0x1F) + 1) * 32;
@@ -136,13 +113,13 @@ fn gic_secure_init() {
         wr(GICD + 0x80 + (i as usize / 32) * 4, 0xFFFF_FFFF);
     }
     wr(GICD, 0b11); // EnableGrp0 | EnableGrp1
-    wr(GICD + 0x80, 0xFFFF_FFFF); // SGI/PPI du coeur 0
+    wr(GICD + 0x80, 0xFFFF_FFFF); // core 0 SGI/PPI
     wr(GICC, (1 << 0) | (1 << 1) | (1 << 3));
     wr(GICC + 4, 0xFF);
 }
 
-/// Recopie `size` octets puis invalide le cache d'instructions : on vient
-/// d'ecrire du code qu'on va executer, MMU coupee.
+/// Copy `size` bytes then invalidate the instruction cache: we just wrote
+/// code we are about to run, MMU off.
 fn relocate(src: usize, dst: usize, size: u64) {
     unsafe {
         core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, size as usize);
@@ -150,49 +127,49 @@ fn relocate(src: usize, dst: usize, size: u64) {
     }
 }
 
-/// Entree du coeur 0. Les secondaires sont parques en assembleur.
+/// Core 0 entry. Secondaries park in assembly.
 #[no_mangle]
 extern "C" fn bl31_main() -> ! {
     uart_init();
     fbcon::init();
-    puts("\n[nxk-bl31] moniteur EL3 (entree L4T hekate)\n");
+    puts("\n[nxk-bl31] EL3 monitor (hekate L4T entry)\n");
 
-    // Sans effet s'il tourne deja ; arrete, CNTPCT_EL0 resterait fige et
-    // toute attente bornee de nxk durerait toujours.
+    // No-op if already running; stopped, CNTPCT_EL0 would stay frozen and
+    // every bounded nxk wait would last forever.
     wr(SYSCTR0_CNTCR, rd(SYSCTR0_CNTCR) | 0b11);
-    puts("[nxk-bl31] compteur systeme en marche, CNTFRQ = 19,2 MHz\n");
+    puts("[nxk-bl31] system counter on, CNTFRQ = 19.2 MHz\n");
 
     gic_secure_init();
-    puts("[nxk-bl31] GIC : tout en Groupe 1\n");
+    puts("[nxk-bl31] GIC: all to Group 1\n");
 
-    // Declare notre Mo comme zone securisee : nxk lit ces registres
-    // (`detect_holes`) et l'exclut de la DRAM libre. Meme paire que l4tboot.
+    // Declare our MiB a secure zone: nxk reads these registers
+    // (`detect_holes`) and excludes it from free DRAM. Same pair as l4tboot.
     wr(MC_SECURITY_CFG0, MON_BASE);
     wr(MC_SECURITY_CFG1, 1);
-    puts("[nxk-bl31] carveout TZ : 0xfff00000 (1 Mo)\n");
+    puts("[nxk-bl31] TZ carveout: 0xfff00000 (1 MiB)\n");
 
     if rd(PMC_SCRATCH110) == IRAM_MAGIC {
-        puts("[nxk-bl31] parametres hekate presents (IRAM)\n");
+        puts("[nxk-bl31] hekate params present (IRAM)\n");
     } else {
-        puts("[nxk-bl31] pas de magie IRAM : lancement de test (emulateur)\n");
+        puts("[nxk-bl31] no IRAM magic: test launch (emulator)\n");
     }
 
     let size = bl33_size();
     if size == 0 || size > 8 << 20 {
-        puts("[nxk-bl31] ERREUR : taille bl33 invalide (NXK_BL33_SIZE)\n");
+        puts("[nxk-bl31] ERROR: bad bl33 size (NXK_BL33_SIZE)\n");
         loop {
             unsafe { core::arch::asm!("wfe") };
         }
     }
-    puts("[nxk-bl31] recopie bl33 : ");
+    puts("[nxk-bl31] copying bl33: ");
     puthex(BL33_SRC as u64);
     puts(" -> ");
     puthex(BL33_DST as u64);
     puts(" (");
     puthex(size);
-    puts(" octets)\n");
+    puts(" bytes)\n");
     relocate(BL33_SRC, BL33_DST, size);
-    puts("[nxk-bl31] saut en EL2, x0 = 0 (sans DTB)\n");
+    puts("[nxk-bl31] jumping to EL2, x0 = 0 (no DTB)\n");
     fbcon::handoff();
 
     unsafe { drop_to_bl33() }
@@ -202,15 +179,13 @@ extern "C" {
     fn drop_to_bl33() -> !;
 }
 
-/// `smc` venu d'EL2/EL1 : tout est refuse (pas de PSCI v1). nxk interprete
-/// PSCI_VERSION = NOT_SUPPORTED comme "pas de moniteur PSCI" et demarre
-/// sur un seul coeur. Tout autre piege EL3 est mortel (avec message).
+/// Refuse all EL2/EL1 `smc` (no PSCI v1); any other EL3 trap is fatal.
 #[no_mangle]
 extern "C" fn smc_handler(regs: &mut [u64; 31]) {
     regs[0] = -1i64 as u64; // NOT_SUPPORTED
 }
 
-/// Acces piege ou exception inattendue : on l'affiche puis on parque.
+/// Trapped access or unexpected exception: print then park.
 #[no_mangle]
 extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
     let (esr, elr): (u64, u64);
@@ -218,7 +193,7 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
         core::arch::asm!("mrs {}, esr_el3", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el3", out(reg) elr);
     }
-    puts("\n[nxk-bl31] piege EL3 inattendu, ESR=");
+    puts("\n[nxk-bl31] unexpected EL3 trap, ESR=");
     puthex(esr);
     puts(" ELR=");
     puthex(elr);
@@ -231,7 +206,7 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    puts("\n[nxk-bl31] panique\n");
+    puts("\n[nxk-bl31] panic\n");
     loop {
         unsafe { core::arch::asm!("wfe") };
     }
@@ -242,13 +217,8 @@ global_asm!(
 .section .text.boot, "ax"
 .globl _start
 _start:
-    // Reglages EL3 de chaque coeur, ceux d'ATF et d'exosphere sur ce SoC
-    // (valeurs de reset INCONNUES sur le silicium, sensees sous QEMU) :
-    // - CNTFRQ_EL0 = 19,2 MHz (CLK_M), ecrivable en EL3 seulement ;
-    // - CPUECTLR_EL1.SMPEN, que le TRM du Cortex-A57 exige avant d'activer
-    //   caches et MMU (maintenance diffusee, acces exclusifs des verrous) ;
-    // - CPUACTLR_EL1[0] : IC IALLU invalide aussi le predicteur de
-    //   branchements (mitigation Spectre v2 de nxk, comme son boot.rs).
+    // Per-core EL3 setup (ATF/exosphere values; UNKNOWN reset on silicon): CNTFRQ_EL0,
+    // CPUECTLR_EL1.SMPEN, CPUACTLR_EL1[0] (Spectre-v2 IALLU, as in nxk boot.rs).
     movz    x0, #0xF800
     movk    x0, #0x0124, lsl #16
     msr     cntfrq_el0, x0
@@ -270,7 +240,7 @@ _start:
     add     x0, x0, :lo12:el3_vectors
     msr     vbar_el3, x0
     isb
-    cbnz    x19, .Lpark                 // secondaires : parques
+    cbnz    x19, .Lpark                 // secondaries: parked
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
@@ -291,17 +261,15 @@ _start:
 // void drop_to_bl33() -> ! : EL3 -> EL2, ELR = 0x80000000, x0 = 0.
 .globl drop_to_bl33
 drop_to_bl33:
-    // SCR_EL3 = NS | RES1 | SMD=0 | HCE | RW : les `smc` piegent en EL3
-    // (notre gestionnaire les refuse proprement).
+    // SCR_EL3 = NS | RES1 | SMD=0 | HCE | RW: `smc` traps to EL3 (our
+    // handler cleanly refuses them).
     mov     x0, #0x531
     msr     scr_el3, x0
     msr     cptr_el3, xzr
     msr     mdcr_el3, xzr
     msr     cntvoff_el2, xzr
-    // EL2 dans un etat connu (comme ATF) : SCTLR_EL2 reduit a ses bits
-    // RES1 (MMU et caches coupes, petit-boutiste), aucun piege de debogage
-    // ni de PMU vers EL2 (HPMN = PMCR_EL0.N), pas de piege AArch32, pas
-    // de traduction de niveau 2, timer d'hyperviseur arrete.
+    // EL2 in a known state (ATF-like): SCTLR_EL2 RES1-only, no debug/PMU/AArch32
+    // traps, no stage-2 translation, hypervisor timer stopped.
     movz    x0, #0x0830
     movk    x0, #0x30C5, lsl #16
     msr     sctlr_el2, x0
@@ -312,9 +280,9 @@ drop_to_bl33:
     msr     vttbr_el2, xzr
     msr     cnthp_ctl_el2, xzr
     mov     x0, #1
-    lsl     x0, x0, #31                // HCR_EL2.RW : EL1 en AArch64
+    lsl     x0, x0, #31                // HCR_EL2.RW: EL1 in AArch64
     msr     hcr_el2, x0
-    mov     x0, #3                     // timer physique visible en EL1
+    mov     x0, #3                     // physical timer visible in EL1
     msr     cnthctl_el2, x0
     mrs     x0, midr_el1
     msr     vpidr_el2, x0
@@ -325,11 +293,11 @@ drop_to_bl33:
     movz    x0, #0x0800
     movk    x0, #0x30D0, lsl #16
     msr     sctlr_el1, x0
-    mov     x0, #0x3C9                 // SPSR : EL2h, tout masque
+    mov     x0, #0x3C9                 // SPSR: EL2h, all masked
     msr     spsr_el3, x0
     movz    x0, #0x8000, lsl #16       // ELR = 0x80000000
     msr     elr_el3, x0
-    mov     x0, xzr                    // x0 = 0 : pas de DTB
+    mov     x0, xzr                    // x0 = 0: no DTB
     mov     x1, xzr
     mov     x2, xzr
     mov     x3, xzr
@@ -380,19 +348,19 @@ drop_to_bl33:
     mrs     x9, esr_el3
     lsr     x9, x9, #26
     mov     x0, sp
-    cmp     x9, #0x17                  // SMC depuis AArch64 ?
+    cmp     x9, #0x17                  // SMC from AArch64?
     b.ne    .Lsmc_bad
     bl      smc_handler
     RESTORE
     eret
 .Lsmc_bad:
-    bl      el3_unexpected             // ne revient pas
+    bl      el3_unexpected             // does not return
     RESTORE
     eret
 .Lbad:
     SAVE
     mov     x0, sp
-    bl      el3_unexpected             // ne revient pas
+    bl      el3_unexpected             // does not return
     RESTORE
     eret
 
@@ -414,7 +382,7 @@ el3_vectors:
     b .Lbad
     .align 7
     b .Lbad
-    // niveau inferieur AArch64 : sync (smc), irq, fiq, serror
+    // lower level AArch64: sync (smc), irq, fiq, serror
     .align 7
     b .Lsmc_entry
     .align 7

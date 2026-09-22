@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Populates a FAT32 microSD card (already mounted) for Switch bring-up.
+# Populate a mounted FAT32 microSD for Switch bring-up (hekate + /bin userland).
 # Usage: ./mksd-hw.sh /mount/point
-# Layout: bootloader/ (hekate+Nx), bootloader/hekate_ipl.ini,
-# bootloader/payloads/nxk.bin (stage-2 marker, not bootable yet),
-# /bin/* + /etc/motd (same userland as tools/mksd.py puts in sd.img).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -51,9 +48,9 @@ appdir="$cache/target-apps/aarch64-unknown-nxk/release"
 for prog in hello-std stdtest; do
     [ -x "$appdir/$prog" ] && cp "$appdir/$prog" "$sd/bin/$prog"
 done
-printf 'Bienvenue sur nxk : ce fichier vient de la carte SD (FAT32).\n' > "$sd/motd-nxk.txt"
+printf 'Welcome to nxk: this file comes from the SD card (FAT32).\n' > "$sd/motd-nxk.txt"
 
-echo "[mksd-hw] entree L4T nxk -> $sd"
+echo "[mksd-hw] nxk L4T entry -> $sd"
 python3 "$here/mkbl31.py" -o "$here/dl/bl31.bin"
 mkdir -p "$sd/nxk"
 cp "$here/dl/bl31.bin" "$sd/nxk/bl31.bin"
@@ -64,7 +61,7 @@ if [ ! -d "$sd/bootloader/sys/l4t" ]; then
     echo "[mksd-hw] firmware L4T hekate (BPMP/SC7/Minerva)"
     unzip -oq "$nyx" -d "$sd" 'bootloader/sys/l4t/*' 'bootloader/sys/libsys_*.bso'
 else
-    echo "[mksd-hw] firmware L4T deja present"
+    echo "[mksd-hw] L4T firmware already present"
 fi
 sync
 echo "[mksd-hw] SD ready:"

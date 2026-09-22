@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Test de bout en bout du moniteur nxk-bl31 sous QEMU (meme binaire que sur
-# le materiel) : moniteur a 0xFFF00000, nxk.bin a 0xAA000000.
-#  1. Sans ecran, reset sur le moniteur. Succes = banniere nxk "entree en
-#     EL2", 1 seul coeur (pas de PSCI v1), puis invite du shell.
-#  2. Ecran laisse allume par hekate (fakehekate.py : fenetre A sur un faux
-#     logo). Succes = logo efface, lignes du moniteur puis du noyau lisibles
-#     dans l'image jusqu'au lancement de init.
+# End-to-end test of nxk-bl31 under QEMU (same binary as hardware).
+# 1. No screen: nxk banner, single core (no PSCI), shell prompt. 2. Hekate-lit screen: logo cleared, monitor + kernel lines readable.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
 qemu="${QEMU:-$HOME/.cache/tegra_qemu/build/qemu-system-aarch64}"
-[ -x "$qemu" ] || { echo "qemu introuvable : $qemu" >&2; exit 1; }
+[ -x "$qemu" ] || { echo "qemu not found: $qemu" >&2; exit 1; }
 
-[ -e "$root/build/nxk.elf" ] || { echo "lancez tools/build.sh d'abord" >&2; exit 1; }
+[ -e "$root/build/nxk.elf" ] || { echo "run tools/build.sh first" >&2; exit 1; }
 OBJCOPY="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy"
 "$OBJCOPY" -O binary "$root/build/nxk.elf" "$root/build/nxk.bin"
 
@@ -21,8 +16,8 @@ python3 "$here/mkbl31.py" -o "$here/dl/bl31-test.bin"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# Lance QEMU jusqu'a l'invite du shell (60 s au plus), vide l'image de
-# l'ecran de hekate dans $tmp/fb.raw, puis arrete. $1 : vecteur de reset.
+# Run QEMU until the shell prompt (60 s max), dump the hekate screen image
+# to $tmp/fb.raw, then stop. $1: reset vector.
 run() {
     local reset="$1"
     shift
@@ -55,16 +50,16 @@ check() {
     local f="$1"
     shift
     for motif in "$@"; do
-        grep -q -- "$motif" "$f" || { echo "MANQUANT : $motif"; ok=0; }
+        grep -q -- "$motif" "$f" || { echo "MISSING: $motif"; ok=0; }
     done
 }
 
-echo "== sans ecran"
+echo "== no screen"
 run 0xFFF00000
-check "$tmp/uart.log" "nxk-bl31.*saut en EL2" "entree en EL2" "sans PSCI : un seul coeur" "nxk> "
-tr -d '\r' <"$tmp/uart.log" | grep -E "nxk-bl31|entree en EL2|coeurs en ligne" | head -12
+check "$tmp/uart.log" "nxk-bl31.*jumping to EL2" "entered in EL2" "without PSCI: single core" "nxk> "
+tr -d '\r' <"$tmp/uart.log" | grep -E "nxk-bl31|entered in EL2|cores online" | head -12
 
-echo "== ecran laisse par hekate"
+echo "== screen left on by hekate"
 python3 "$here/fakehekate.py" amorce "$tmp/amorce.bin"
 python3 "$here/fakehekate.py" logo "$tmp/logo.raw"
 run 0xF0000000 \
@@ -72,8 +67,8 @@ run 0xF0000000 \
     -device "loader,file=$tmp/logo.raw,addr=0xF5A00000,force-raw=on"
 check "$tmp/uart.log" "nxk> "
 python3 "$here/fakehekate.py" lire "$tmp/fb.raw" >"$tmp/fb.txt"
-check "$tmp/fb.txt" "^\[nxk-bl31\] moniteur EL3" "^\[nxk-bl31\] saut en EL2" "micro-noyau Tegra X1" \
-    "^\[ecran\] messages recopies" "lancement de init" "^pixels hors texte : 0$"
-grep -E "nxk-bl31\] (moniteur|saut)|micro-noyau|\[ecran\]|lancement de init|pixels hors texte" "$tmp/fb.txt"
+check "$tmp/fb.txt" "^\[nxk-bl31\] EL3 monitor" "^\[nxk-bl31\] jumping to EL2" "Tegra X1 microkernel" \
+    "^\[screen\] messages mirrored" "launching init" "^pixels outside text: 0$"
+grep -E "nxk-bl31\] (EL3 monitor|jumping)|microkernel|\[screen\]|launching init|pixels outside text" "$tmp/fb.txt"
 
-[ "$ok" = 1 ] && echo "TEST-BL31 OK" || { echo "TEST-BL31 ECHEC"; exit 1; }
+[ "$ok" = 1 ] && echo "TEST-BL31 OK" || { echo "TEST-BL31 FAIL"; exit 1; }

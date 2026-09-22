@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""DTB minimal que passe un moniteur securise a nxk (tests du chemin PSCI) :
-4 GiB de DRAM et la zone du moniteur l4tboot (2 MiB a 0xFFE00000) reservee.
+"""Minimal DTB a secure monitor passes to nxk (PSCI path tests): 4 GiB of
+DRAM and the l4tboot monitor area (2 MiB at 0xFFE00000) reserved.
 
     mkdtb-moniteur.py -o build/moniteur.dtb
 """

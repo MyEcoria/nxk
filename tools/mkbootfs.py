@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Assemble l'image de demarrage de nxk a partir d'executables.
+"""Assemble the nxk boot image from executables.
 
-Format (nxk_abi::bootfs) : en-tete "NXKBOOT1" + nombre d'entrees, table
-d'entrees (nom sur 24 octets, position, taille), puis les fichiers alignes
-sur 16 octets. L'image entiere est completee a un multiple de 4 KiB.
+Format (nxk_abi::bootfs): "NXKBOOT1" header + entry count, entry table
+(24-byte name, offset, size), then files aligned to 16 bytes.
+The whole image is padded to a 4 KiB multiple.
 """
 import argparse, os, struct
 
@@ -22,7 +22,7 @@ def main():
     for path in a.files:
         name = os.path.basename(path).encode()
         if len(name) >= NAME_LEN:
-            raise SystemExit(f"nom trop long : {name}")
+            raise SystemExit(f"name too long: {name}")
         data = open(path, "rb").read()
         entries.append((name, off, len(data)))
         blobs.append((off, data))
@@ -38,9 +38,9 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(a.output)), exist_ok=True)
     open(a.output, "wb").write(img)
-    print(f"bootfs : {len(entries)} programmes, {len(img) // 1024} KiB -> {a.output}")
+    print(f"bootfs: {len(entries)} programs, {len(img) // 1024} KiB -> {a.output}")
     for name, o, size in entries:
-        print(f"  {name.decode():<12} {size:>7} octets")
+        print(f"  {name.decode():<12} {size:>7} bytes")
 
 
 main()

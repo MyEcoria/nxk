@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Pilote nxk dans tegra_qemu : demarrage, commandes au shell, capture.
+"""Drive nxk in tegra_qemu: boot, shell commands, capture.
 
-    nxtest.py                          # demarre et affiche jusqu'a l'invite
-    nxtest.py -c "ps" -c "run hello"   # enchaine des commandes
+    nxtest.py                          # boot and print until the prompt
+    nxtest.py -c "ps" -c "run hello"   # chain commands
     nxtest.py -c "ipcbench" --timeout 120
 
-La console UART-A est reliee a une socket : le script lit tout depuis le
-premier octet emis par le noyau et tape les commandes comme un utilisateur.
-Code de sortie 1 si une commande n'a pas rendu l'invite a temps.
+UART-A console is bound to a socket: the script reads everything from the
+first kernel byte and types commands like a user. Exit code 1 if a command
+missed the prompt in time.
 """
 import argparse, bisect, os, re, shutil, socket, subprocess, sys, tempfile, time
 
@@ -18,7 +18,7 @@ PROMPT = b"nxk> "
 
 
 def read_until(sock, marker, timeout, out):
-    """Lit jusqu'a `marker` (ou fin du delai). Rend (texte, trouve)."""
+    """Read until `marker` (or timeout). Returns (text, found)."""
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
@@ -38,7 +38,7 @@ def read_until(sock, marker, timeout, out):
 
 
 def symbolizer(elf):
-    """Adresse -> 'symbole+decalage' d'apres la table des symboles du noyau."""
+    """Address -> 'symbol+offset' from the kernel symbol table."""
     try:
         out = subprocess.run(["nm", "-C", "--defined-only", elf], capture_output=True, text=True).stdout
     except OSError:
@@ -58,7 +58,7 @@ def symbolizer(elf):
 
 
 def dump_cpus(mon, elf):
-    """Etat de chaque coeur (PC, niveau) via le moniteur QEMU."""
+    """Per-core state (PC, level) via the QEMU monitor."""
     try:
         m = socket.socket(socket.AF_UNIX)
         m.connect(mon)
@@ -81,32 +81,32 @@ def dump_cpus(mon, elf):
             data += c
         m.close()
     except OSError as e:
-        print(f"[nxtest] moniteur injoignable : {e}", file=sys.stderr)
+        print(f"[nxtest] monitor unreachable: {e}", file=sys.stderr)
         return
     name = symbolizer(elf)
     text = data.decode("utf-8", "replace")
     for cpu, pc, el in re.findall(r"CPU#(\d+).*?PC=([0-9a-f]+).*?EL(\d)", text, re.S):
         a = int(pc, 16)
-        where = name(a) if a >= 0x80000000 and a < 0x100000000 else "espace utilisateur"
+        where = name(a) if a >= 0x80000000 and a < 0x100000000 else "userland"
         print(f"[nxtest] cpu{cpu} EL{el} PC={a:#x} {where}", file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--cmd", action="append", default=[])
-    ap.add_argument("--timeout", type=float, default=60, help="delai par etape (s)")
+    ap.add_argument("--timeout", type=float, default=60, help="per-step timeout (s)")
     ap.add_argument("--kernel", default=os.path.join(ROOT, "build", "nxk.elf"))
-    ap.add_argument("--smp", default=None, help="(reserve)")
-    ap.add_argument("--machine", default="tegrax1", help="tegrax1 (Erista) ou tegrax1plus (Mariko)")
+    ap.add_argument("--smp", default=None, help="(reserved)")
+    ap.add_argument("--machine", default="tegrax1", help="tegrax1 (Erista) or tegrax1plus (Mariko)")
     ap.add_argument("--monitor", default=None,
-                    help="moniteur EL3 (ELF, ex. l4tboot) lance avant nxk : chemin PSCI")
-    ap.add_argument("--dtb", default=None, help="arbre de peripheriques charge a 0x8D000000 (x0 du moniteur)")
-    ap.add_argument("--sd", default=None, help="image de carte SD (lecteur SDMMC1)")
-    ap.add_argument("--screendump", default=None, help="capture de l'ecran (PPM) apres les commandes")
-    ap.add_argument("--usb-kbd", action="store_true", help="clavier USB sur le xHCI")
+                    help="EL3 monitor (ELF, e.g. l4tboot) started before nxk: PSCI path")
+    ap.add_argument("--dtb", default=None, help="device tree loaded at 0x8D000000 (monitor x0)")
+    ap.add_argument("--sd", default=None, help="SD card image (SDMMC1 slot)")
+    ap.add_argument("--screendump", default=None, help="screen capture (PPM) after the commands")
+    ap.add_argument("--usb-kbd", action="store_true", help="USB keyboard on xHCI")
     ap.add_argument("--net", default=None, nargs="?", const="",
-                    help="carte reseau USB (QEMU usb-net) ; valeur : redirections, ex. tcp::8080-:80")
-    ap.add_argument("--keys", default=None, help="touches envoyees au clavier USB (sendkey) apres la 1re commande")
+                    help="USB net card (QEMU usb-net); value: forwards, e.g. tcp::8080-:80")
+    ap.add_argument("--keys", default=None, help="keys sent to the USB keyboard (sendkey) after the 1st command")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
@@ -147,7 +147,7 @@ def main():
                 time.sleep(0.1)
         _, found = read_until(s, PROMPT, a.timeout, sys.stdout)
         if not found:
-            print("\n[nxtest] pas d'invite du shell", file=sys.stderr)
+            print("\n[nxtest] no shell prompt", file=sys.stderr)
             dump_cpus(mon, a.kernel)
             ok = False
         for i, c in enumerate(a.cmd if found else []):
@@ -162,7 +162,7 @@ def main():
                 m.close()
             _, found = read_until(s, PROMPT, a.timeout, sys.stdout)
             if not found:
-                print(f"\n[nxtest] '{c}' n'a pas rendu l'invite en {a.timeout} s", file=sys.stderr)
+                print(f"\n[nxtest] '{c}' missed the prompt in {a.timeout} s", file=sys.stderr)
                 dump_cpus(mon, a.kernel)
                 ok = False
                 break

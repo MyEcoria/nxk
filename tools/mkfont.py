@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Police 8x16 du pilote d'affichage : les 256 premiers points de code
-Unicode (ASCII et Latin-1), extraits d'une police console PSF du systeme.
+"""8x16 font of the display driver: the first 256 Unicode code points
+(ASCII and Latin-1), extracted from a system PSF console font.
 
-Par defaut Terminus (Lat15-Terminus16, licence SIL Open Font License 1.1,
-fournie par console-setup). Sans police disponible, des paves pleins.
-La police n'est pas copiee dans le projet : elle est convertie a la
-compilation dans build/font.bin (256 x 16 octets).
+Defaults to Terminus (Lat15-Terminus16, SIL Open Font License 1.1, from
+console-setup). Without any font, solid blocks. The font is not vendored:
+it is converted at build time into build/font.bin (256 x 16 bytes).
 
-    mkfont.py -o build/font.bin [--psf fichier.psf.gz]
+    mkfont.py -o build/font.bin [--psf file.psf.gz]
 """
 import argparse, gzip, os, struct
 
@@ -32,7 +31,7 @@ def load_psf(path):
                     uni.setdefault(cp, g)
         return w, h, glyphs, uni
     magic, ver, hdr, flags, n, size, h, w = struct.unpack("<8I", raw[:32])
-    assert magic == 0x864AB572, "format PSF inconnu"
+    assert magic == 0x864AB572, "unknown PSF format"
     glyphs = [raw[hdr + i * size: hdr + (i + 1) * size] for i in range(n)]
     uni, p, g = {}, hdr + n * size, 0
     if flags & 1:
@@ -57,7 +56,7 @@ a = ap.parse_args()
 out = bytearray()
 if os.path.exists(a.psf):
     w, h, glyphs, uni = load_psf(a.psf)
-    assert (w, h) == (8, 16), f"police {w}x{h} : 8x16 attendue"
+    assert (w, h) == (8, 16), f"font {w}x{h}: expected 8x16"
     for cp in range(256):
         g = uni.get(cp, uni.get(ord("?"), 0)) if uni else cp
         out += glyphs[g][:16]

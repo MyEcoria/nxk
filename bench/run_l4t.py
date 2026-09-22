@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Demarre le noyau L4T sur le Tegra X1 emule (meme machine que nxk) et
-capture la console UART-A.
+"""Boot the L4T kernel on the emulated Tegra X1 (same machine as nxk) and
+capture the UART-A console.
 
     run_l4t.py --dir ~/.cache/tegra_qemu/l4t/run --until 'RESULT END' --timeout 900
 
-Charge : moniteur l4tboot (EL3, PSCI) a 0xFFE00000, Image a 0x80080000,
-DTB a 0x8D000000, initramfs a 0x92000000 (adresses de boot.scr).
+Loads: l4tboot monitor (EL3, PSCI) at 0xFFE00000, Image at 0x80080000, DTB
+at 0x8D000000, initramfs at 0x92000000 (boot.scr addresses).
 """
 import argparse, os, re, shutil, socket, subprocess, sys, tempfile, time
 
@@ -13,7 +13,7 @@ QEMU = os.environ.get("QEMU", os.path.expanduser("~/.cache/tegra_qemu/build/qemu
 
 
 def dump_pcs(mon):
-    """Releve 3 fois les PC des 4 coeurs via le moniteur QEMU."""
+    """Sample the 4 cores PCs 3 times via the QEMU monitor."""
     m = socket.socket(socket.AF_UNIX)
     m.connect(mon)
     m.settimeout(3)
@@ -31,18 +31,18 @@ def dump_pcs(mon):
             pass
         txt = data.decode(errors="replace")
         pcs = re.findall(r"CPU#(\d+)\s*\n\s*PC=([0-9a-f]{16})[\s\S]*?PSTATE=([0-9a-f]+)", txt)
-        print(f"[run_l4t] releve {k}: " + "  ".join(f"cpu{c}={pc}/{ps}" for c, pc, ps in pcs[:4]))
+        print(f"[run_l4t] sample {k}: " + "  ".join(f"cpu{c}={pc}/{ps}" for c, pc, ps in pcs[:4]))
     m.close()
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", required=True, help="dossier contenant Image, board.dtb, initramfs.cpio, l4tboot.elf")
+    ap.add_argument("--dir", required=True, help="dir with Image, board.dtb, initramfs.cpio, l4tboot.elf")
     ap.add_argument("--timeout", type=float, default=600)
-    ap.add_argument("--until", default=None, help="expression qui termine la capture")
+    ap.add_argument("--until", default=None, help="pattern ending the capture")
     ap.add_argument("--log", default=None)
     ap.add_argument("--stall", type=float, default=0,
-                    help="si > 0 : apres ce silence (s), releve les PC de chaque coeur et s'arrete")
+                    help="if > 0: after this silence (s), dump each core PC and stop")
     a = ap.parse_args()
     d = os.path.expanduser(a.dir)
 
@@ -95,7 +95,7 @@ def main():
             buf += txt
             if a.until and re.search(a.until, buf):
                 break
-        print(f"\n[run_l4t] fin de capture apres {time.time() - t0:.0f} s")
+        print(f"\n[run_l4t] capture done after {time.time() - t0:.0f} s")
     finally:
         try:
             m = socket.socket(socket.AF_UNIX)

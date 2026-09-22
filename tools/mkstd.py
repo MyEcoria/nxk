@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Prepare la chaine Rust de nxk (bibliotheque standard portee).
+"""""Prepare the nxk Rust toolchain (ported standard library).
 
-1. Copie la chaine stable de rustup dans ~/.cache/nxk/toolchain (liens durs :
-   ni place ni temps), sauf les sources de la bibliotheque, copiees pour de
-   bon puisqu'on les modifie.
-2. Y installe le portage : les fichiers de std/library (nouveaux modules
-   `nxk`), l'ABI du noyau (abi/src/lib.rs, source unique) et les branchements
-   dans les fichiers d'aiguillage de std (une ligne `target_os = "nxk"` a cote
-   de celle de Motor OS, autre systeme sans libc).
-3. Ecrit la cible std/aarch64-unknown-nxk.json (script de liaison inclus).
-4. Declare la chaine a rustup sous le nom `nxk`.
+1. Copy the rustup stable toolchain to ~/.cache/nxk/toolchain (hardlinks: no
+   space or time cost), except the library sources, really copied since we
+   patch them.
+2. Install the port there: std/library files (new `nxk` modules), the kernel
+   ABI (abi/src/lib.rs, single source) and hooks in std dispatch files (one
+   `target_os = "nxk"` line next to Motor OS, another libc-less system).
+3. Write the std/aarch64-unknown-nxk.json target (link script included).
+4. Register the toolchain with rustup as `nxk`.
 
-Idempotent : un fichier n'est recrit que si son contenu change. Quand le
-portage change, les empreintes de std sont effacees dans ~/.cache/nxk/target-apps
-(cargo -Z build-std ne surveille pas les sources de la chaine) ; pour un autre
-dossier de compilation, faire `cargo clean`.
+Idempotent: a file is rewritten only when its content changes. When the port
+changes, std fingerprints are wiped in ~/.cache/nxk/target-apps (cargo -Z
+build-std does not watch toolchain sources); for another build dir, run
+`cargo clean`.
 
-Ensuite :  cargo +nxk build -Z build-std=std,panic_abort \\
-               --target std/aarch64-unknown-nxk.json   (voir apps/)
+Then:  cargo +nxk build -Z build-std=std,panic_abort \\
+               --target std/aarch64-unknown-nxk.json   (see apps/)
 """
 import json
 import os
@@ -44,13 +43,13 @@ def write_if_changed(path, data):
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        path.unlink()  # casse un eventuel lien dur vers la chaine d'origine
+        path.unlink()  # break any hardlink to the pristine toolchain
     path.write_bytes(data)
     return True
 
 
-# Branchements : (fichier, ancien texte, nouveau texte). L'ancien texte doit
-# figurer exactement une fois dans la source d'origine.
+# Hooks: (file, old text, new text). The old text must occur exactly once in
+# the pristine source.
 def arm_after(anchor, arm):
     return (anchor, anchor + arm)
 
@@ -119,7 +118,7 @@ PATCHES = {
             '    target_os = "motor" => {\n        mod motor;\n        use motor as imp;\n    }\n',
             '    target_os = "nxk" => {\n        mod nxk;\n        use nxk as imp;\n    }\n',
         ),
-        # `output` generique (tubes + lecture des deux sorties).
+        # Generic `output` (pipes + both-output read).
         ('    target_os = "windows",\n    target_os = "motor"\n))]\n', '    target_os = "windows",\n    target_os = "motor",\n    target_os = "nxk"\n))]\n'),
         ('    target_os = "windows",\n    target_os = "motor"\n)))]\n', '    target_os = "windows",\n    target_os = "motor",\n    target_os = "nxk"\n)))]\n'),
     ],
@@ -174,7 +173,7 @@ PATCHES = {
     ],
 }
 
-# Primitives de synchronisation par futex : nxk rejoint la liste de Motor.
+# Futex sync primitives: nxk joins the Motor list.
 for f in ["mutex", "condvar", "once", "rwlock", "thread_parking"]:
     PATCHES[f"std/src/sys/sync/{f}/mod.rs"] = ["motor-line"]
 
@@ -185,7 +184,7 @@ def patch(src, rules, name):
             lines = src.split("\n")
             idx = [i for i, l in enumerate(lines) if l.strip() == 'target_os = "motor",']
             if len(idx) != 1:
-                sys.exit(f"mkstd: {name}: ligne motor introuvable ou multiple")
+                sys.exit(f"mkstd: {name}: motor line missing or repeated")
             i = idx[0]
             lines.insert(i + 1, lines[i].replace('"motor"', '"nxk"'))
             src = "\n".join(lines)
@@ -193,7 +192,7 @@ def patch(src, rules, name):
         old, new = rule
         n = src.count(old)
         if n != 1:
-            sys.exit(f"mkstd: {name}: motif trouve {n} fois :\n{old}")
+            sys.exit(f"mkstd: {name}: pattern found {n} times:\n{old}")
         src = src.replace(old, new)
     return src
 
@@ -221,10 +220,10 @@ TARGET = {
     "eh-frame-header": False,
     "emit-debug-gdb-scripts": False,
     "pre-link-args": {"gnu-lld": ["--pack-dyn-relocs=none", "-z", "max-page-size=4096"]},
-    # Apres le « -z text » que rustc ajoute pour un static-PIE : le segment
-    # RELRO est en lecture seule et c'est le noyau qui le reloge.
+    # After the "-z text" rustc adds for static-PIE: the RELRO segment is
+    # read-only and the kernel relocates it.
     "post-link-args": {"gnu-lld": ["-z", "notext"]},
-    "metadata": {"description": "ARM64 nxk (micro-noyau Rust, Tegra X1)", "host_tools": False, "std": True, "tier": 3},
+    "metadata": {"description": "ARM64 nxk (Rust microkernel, Tegra X1)", "host_tools": False, "std": True, "tier": 3},
 }
 
 
@@ -233,11 +232,11 @@ def main():
     version = run("rustup", "run", "stable", "rustc", "-V")
     orig_lib = sysroot / LIB
     if not (orig_lib / "std").is_dir():
-        sys.exit("mkstd: sources de la bibliotheque absentes (rustup component add rust-src)")
+        sys.exit("mkstd: library sources missing (rustup component add rust-src)")
 
     stamp = TC / ".nxk-version"
     if not stamp.exists() or stamp.read_text() != version:
-        print(f"mkstd: copie de la chaine {version} -> {TC}")
+        print(f"mkstd: copying toolchain {version} -> {TC}")
         if TC.exists():
             shutil.rmtree(TC)
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -248,25 +247,24 @@ def main():
 
     changed = []
     lib = TC / LIB
-    # Fichiers d'aiguillage, depuis la source d'origine.
+    # Dispatch files, from the pristine source.
     for rel, rules in PATCHES.items():
         src = (orig_lib / rel).read_text()
         if write_if_changed(lib / rel, patch(src, rules, rel)):
             changed.append(rel)
-    # Nouveaux modules.
+    # New modules.
     port = ROOT / "std" / "library"
     for p in sorted(port.rglob("*.rs")):
         rel = p.relative_to(port)
         if write_if_changed(lib / rel, p.read_bytes()):
             changed.append(str(rel))
-    # ABI du noyau, source unique partagee avec le noyau et libnx.
+    # Kernel ABI, single source shared with the kernel and libnx.
     abi = (ROOT / "abi" / "src" / "lib.rs").read_text().replace("#![no_std]\n", "")
     if write_if_changed(lib / "std/src/sys/pal/nxk/abi.rs", abi):
         changed.append("std/src/sys/pal/nxk/abi.rs")
 
-    # cargo -Z build-std tient les sources de la chaine pour immuables : il ne
-    # recompile pas std quand elles changent. On efface donc ses empreintes
-    # dans les dossiers de compilation connus (les autres : `cargo clean`).
+    # cargo -Z build-std ignores toolchain sources: wipe its fingerprints here
+    # in the known build dirs (others: `cargo clean`).
     if changed:
         for fp in CACHE.glob("target-apps/*/*/.fingerprint/std-*"):
             shutil.rmtree(fp)
@@ -279,9 +277,9 @@ def main():
     toolchains = run("rustup", "toolchain", "list", "-v")
     if not any(l.split()[0] == "nxk" for l in toolchains.splitlines() if l.strip()):
         subprocess.run(["rustup", "toolchain", "link", "nxk", str(TC)], check=True)
-        print("mkstd: chaine « nxk » declaree a rustup")
+        print("mkstd: toolchain \"nxk\" registered with rustup")
 
-    print(f"mkstd: {len(changed)} fichier(s) mis a jour" + (" : " + ", ".join(changed) if changed and len(changed) < 12 else ""))
+    print(f"mkstd: {len(changed)} file(s) updated" + (" : " + ", ".join(changed) if changed and len(changed) < 12 else ""))
 
 
 if __name__ == "__main__":

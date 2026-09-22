@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Image de carte SD pour nxk : table de partitions MBR, une partition FAT32,
-puis des fichiers copies dedans (sans monter l'image).
+"""SD card image for nxk: MBR partition table, one FAT32 partition, then
+files copied inside (without mounting).
 
-    mksd.py -o build/sd.img                   # 128 Mio, programmes dans /bin
-    mksd.py -o sd.img --size 256 --add fichier:/dossier/nom
+    mksd.py -o build/sd.img                   # 128 MiB, programs in /bin
+    mksd.py -o sd.img --size 256 --add file:/dir/name
 
-Utilise mkfs.fat (dosfstools) et pyfatfs (environnement ~/.cache/tegra_qemu/fsvenv).
+Uses mkfs.fat (dosfstools) and pyfatfs (~/.cache/tegra_qemu/fsvenv env).
 """
 import argparse, os, struct, subprocess, sys
 
@@ -17,25 +17,25 @@ try:
 except ImportError:
     if os.path.exists(VENV) and sys.executable != VENV:
         os.execv(VENV, [VENV] + sys.argv)
-    raise SystemExit("pyfatfs introuvable (pip install pyfatfs)")
+    raise SystemExit("pyfatfs missing (pip install pyfatfs)")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CACHE = os.environ.get("NXK_CACHE", os.path.expanduser("~/.cache/nxk"))
-START = 2048  # secteur de debut de la partition (alignement 1 Mio)
+START = 2048  # first partition sector (1 MiB alignment)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-o", required=True)
-ap.add_argument("--size", type=int, default=128, help="taille en Mio (puissance de 2 pour QEMU)")
+ap.add_argument("--size", type=int, default=128, help="size in MiB (power of 2 for QEMU)")
 ap.add_argument("--add", action="append", default=[], help="SOURCE:DESTINATION")
-ap.add_argument("--no-bin", action="store_true", help="ne pas copier les programmes dans /bin")
+ap.add_argument("--no-bin", action="store_true", help="skip copying programs to /bin")
 a = ap.parse_args()
 
 size = a.size << 20
 sectors = size // 512
 with open(a.o, "wb") as f:
     f.truncate(size)
-    # MBR : une partition FAT32 (LBA, type 0x0C) de START a la fin.
+    # MBR: one FAT32 LBA partition (type 0x0C) from START to the end.
     entry = struct.pack("<B3sB3sII", 0x00, b"\xfe\xff\xff", 0x0C, b"\xfe\xff\xff", START, sectors - START)
     f.seek(446)
     f.write(entry)
@@ -58,18 +58,18 @@ if not a.no_bin:
         p = os.path.join(bindir, prog)
         if os.path.exists(p):
             put("/bin/" + prog, open(p, "rb").read())
-    # Programmes std (dossier apps/).
+    # std programs (apps/ dir).
     appdir = os.path.join(CACHE, "target-apps", "aarch64-unknown-nxk", "release")
     for prog in ["hello-std", "stdtest"]:
         p = os.path.join(appdir, prog)
         if os.path.exists(p):
             put("/bin/" + prog, open(p, "rb").read())
-put("/etc/motd", "Bienvenue sur nxk : ce fichier vient de la carte SD (FAT32).\n".encode())
-put("/Documents/Lisez-moi du système.txt",
-    "Nom long, accents et espaces : les entrees LFN de FAT32.\n".encode())
-put("/Documents/Données/chiffres.txt", "".join(f"{i}\n" for i in range(1000)).encode())
+put("/etc/motd", "Welcome to nxk: this file comes from the SD card (FAT32).\n".encode())
+put("/Documents/Read me.txt",
+    "Long name and spaces: FAT32 LFN entries.\n".encode())
+put("/Documents/Data/numbers.txt", "".join(f"{i}\n" for i in range(1000)).encode())
 for spec in a.add:
     src, dst = spec.split(":", 1)
     put(dst, open(src, "rb").read())
 fs.close()
-print(f"{a.o} : {a.size} Mio, FAT32 a partir du secteur {START}")
+print(f"{a.o}: {a.size} MiB, FAT32 from sector {START}")
