@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{EINVAL, ENOENT, ENOSYS, EPERM};
-use libnx::abi::proto::pm;
+use libnx::abi::proto::{console as con, pm};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::abi::spawn::{self, HandleGrant};
 use libnx::abi::{layout, slots, startup};
@@ -158,8 +158,10 @@ fn main() -> i32 {
     .expect("spawn console");
 
     // init keeps send rights only: the driver alone may receive,
-    // and clients learn of its death via EPIPE.
-    let console_send = sys::handle_dup(ep_console, SEND | GRANT | DUP, 0).expect("dup console");
+    // and clients learn of its death via EPIPE. A badged handle cannot
+    // be re-minted: nobody can forge the terminal badge from it.
+    let console_send =
+        sys::handle_dup(ep_console, SEND | GRANT | DUP, con::BADGE_CLIENT).expect("dup console");
     for h in [ep_console, uart, uart_irq, console_drv] {
         let _ = sys::handle_close(h);
     }

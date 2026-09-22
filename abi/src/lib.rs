@@ -618,6 +618,17 @@ pub mod proto {
         pub const WRITE: u32 = 1;
         /// Read a line: reply has the same shape as WRITE.
         pub const READ_LINE: u32 = 2;
+        /// Terminal driver only (`BADGE_TERMINAL`): typed bytes, same
+        /// shape as WRITE, edited and echoed like UART input.
+        pub const INPUT: u32 = 3;
+        /// Terminal driver only: next console output (echo included),
+        /// deferred until there is some. Reply shaped like WRITE.
+        pub const OUTPUT: u32 = 4;
+        /// Badge of the console handle init gives a terminal driver.
+        pub const BADGE_TERMINAL: u64 = 1;
+        /// Badge of all other console handles: a badged handle cannot
+        /// be re-minted, so holders cannot forge `BADGE_TERMINAL`.
+        pub const BADGE_CLIENT: u64 = 2;
     }
     pub mod pm {
         /// Spawn: bytes = argc, envc, flags, 0 (u32 each) then the
