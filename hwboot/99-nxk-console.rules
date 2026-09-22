@@ -1,0 +1,6 @@
+# udev rules: nxk's USB-C console (usbcon, CDC-ACM 1209:0001) for regular users.
+# Install: sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
+# The ttyACM gets /dev/nxk-console; ModemManager does not probe it (probes
+# would be typed into the shell).
+ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", MODE="0666", SYMLINK+="nxk-console"

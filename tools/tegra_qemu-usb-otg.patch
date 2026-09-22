@@ -1,0 +1,848 @@
+diff --git a/hw/arm/tegra2/ahb/usb/usb.c b/hw/arm/tegra2/ahb/usb/usb.c
+index 76ff784818..68ee600ba1 100644
+--- a/hw/arm/tegra2/ahb/usb/usb.c
++++ b/hw/arm/tegra2/ahb/usb/usb.c
+@@ -20,14 +20,107 @@
+ #include "tegra_common.h"
+ 
+ #include "hw/usb/hcd-ehci.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties-system.h"
++#include "chardev/char-fe.h"
++#include "exec/address-spaces.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
+ 
+ #include "usb.h"
+ #include "tegra_trace.h"
+ 
+ #define TYPE_TEGRA_USB "tegra.usb"
+ #define TEGRA_USB(obj) OBJECT_CHECK(tegra_usb, (obj), TYPE_TEGRA_USB)
++#define TEGRA_USB_GET_CLASS(obj) OBJECT_GET_CLASS(tegra_usb_class, (obj), TYPE_TEGRA_USB)
+ #define DEFINE_REG32(reg) reg##_t reg
+ 
++/*
++ * Device mode (USBMODE.CM = 2): the ChipIdea-style device controller used
++ * by the boot ROM for RCM and by hekate (bdk/usb/usbd.c). Queue heads sit
++ * at ENDPOINTLISTADDR (the controller's own RAM at +0x1000, or DRAM),
++ * transfer descriptors and buffers in DRAM.
++ *
++ * The USB bus goes to chardev "chardev": a virtual host (nxk
++ * tools/usbterm.py) sends one request per USB token and gets the
++ * device's handshake back.
++ *   request:  op, endpoint, length (LE16), payload (SETUP: 8, OUT: length)
++ *   response: status, length (LE16), payload (IN data, QUERY state)
++ */
++#define DEV_REGS_BASE   0x100
++#define DEV_REGS_SIZE   0x160
++
++#define R_CAPS          0x100
++#define R_DCIVERSION    0x120
++#define R_DCCPARAMS     0x124
++#define R_USBCMD        0x130
++#define R_USBSTS        0x134
++#define R_USBINTR       0x138
++#define R_FRINDEX       0x13C
++#define R_DEVICEADDR    0x144
++#define R_EPLISTADDR    0x148
++#define R_PORTSC1       0x174
++#define R_DEVLC         0x1B4
++#define R_OTGSC         0x1F4
++#define R_USBMODE       0x1F8
++#define R_ENDPTNAK      0x200
++#define R_ENDPTNAKEN    0x204
++#define R_SETUPSTAT     0x208
++#define R_PRIME         0x20C
++#define R_FLUSH         0x210
++#define R_STATUS        0x214
++#define R_COMPLETE      0x218
++#define R_EPCTRL0       0x21C
++#define NUM_EPS         16
++
++#define CMD_RUN         BIT(0)
++#define CMD_RST         BIT(1)
++#define CMD_SUTW        BIT(13)
++#define STS_UI          BIT(0)
++#define STS_PCI         BIT(2)
++#define STS_URI         BIT(6)
++#define STS_W1C         0x5FF
++#define PORTSC_CCS      BIT(0)
++#define PORTSC_PE       BIT(2)
++#define PORTSC_HSP      BIT(9)
++#define PORTSC_PFSC     BIT(24)
++#define DEVLC_PSPD_SHIFT 25
++#define OTGSC_ID        BIT(8)
++#define OTGSC_AVV       BIT(9)
++#define OTGSC_ASV       BIT(10)
++#define OTGSC_BSV       BIT(11)
++#define OTGSC_BSE       BIT(12)
++#define OTGSC_STS_MASK  (0x7F << 16)
++#define MODE_CM_MASK    3
++#define MODE_CM_DEVICE  2
++#define EPCTRL_RXS      BIT(0)
++#define EPCTRL_RXR      BIT(6)
++#define EPCTRL_RXE      BIT(7)
++#define EPCTRL_TXS      BIT(16)
++#define EPCTRL_TXR      BIT(22)
++#define EPCTRL_TXE      BIT(23)
++
++#define QH_SIZE         64
++#define QH_CAPS         0x00
++#define QH_CUR          0x04
++#define QH_NEXT         0x08
++#define QH_TOKEN        0x0C
++#define QH_SETUP        0x28
++#define QH_CAPS_IOS     BIT(15)
++#define QH_CAPS_ZLT_DIS BIT(29)
++#define TD_NEXT         0x00
++#define TD_TOKEN        0x04
++#define TD_PAGE0        0x08
++#define TD_TERMINATE    BIT(0)
++#define TOK_ACTIVE      BIT(7)
++#define TOK_IOC         BIT(15)
++#define TOK_BYTES_MASK  (0x7FFFu << 16)
++
++enum { OP_QUERY = 'Q', OP_RESET = 'R', OP_SETUP = 'S', OP_IN = 'I', OP_OUT = 'O' };
++enum { ST_ACK = 'A', ST_NAK = 'N', ST_STALL = 'S', ST_DATA = 'D' };
++#define LINK_MAX        1024
++
+ typedef struct tegra_usb_state {
+     EHCISysBusState parent_obj;
+ 
+@@ -42,8 +135,29 @@ typedef struct tegra_usb_state {
+     MemoryRegion iomem_controller;
+     MemoryRegion iomem;
+     MemoryRegion iomem_queue;
++
++    /* Device mode: iomem_dev overlays the host registers while active. */
++    MemoryRegion iomem_dev;
++    CharBackend chr;
++    bool dev_mode;
++    bool host;              /* virtual host connected: cable plugged in */
++    bool bus_reset;         /* port enabled by a bus reset */
++    uint32_t dregs[DEV_REGS_SIZE >> 2];
++    uint32_t usbcmd, usbsts, usbintr, devaddr, eplist, portsc, devlc, otgsc;
++    uint32_t usbmode, setupstat, status, complete, nak, naken;
++    uint32_t epctrl[NUM_EPS];
++    uint32_t td[NUM_EPS][2];        /* dTD in progress, 0: none */
++    uint32_t done[NUM_EPS][2];      /* its bytes moved so far */
++    bool zlp[NUM_EPS][2];           /* IN: zero-length packet still owed */
++    uint8_t rx[4 + LINK_MAX];
++    uint32_t rxlen;
+ } tegra_usb;
+ 
++typedef struct tegra_usb_class {
++    SysBusEHCIClass parent_class;
++    DeviceRealize parent_realize;
++} tegra_usb_class;
++
+ static const VMStateDescription vmstate_tegra_usb = {
+     .name = "tegra.usb",
+     .version_id = 1,
+@@ -59,6 +173,574 @@ static const VMStateDescription vmstate_tegra_usb = {
+     }
+ };
+ 
++static EHCIState *tegra_usb_ehci(tegra_usb *s)
++{
++    return &s->parent_obj.ehci;
++}
++
++/* Guest memory; the queue-head RAM directly (no re-entrant MMIO). */
++static bool dev_qram(tegra_usb *s, hwaddr a, unsigned len)
++{
++    hwaddr b = s->iomem_queue.addr;
++
++    return a >= b && a + len <= b + sizeof(s->regs_queue);
++}
++
++static uint32_t dev_rd32(tegra_usb *s, hwaddr a)
++{
++    uint32_t v = 0;
++
++    if (dev_qram(s, a, 4)) {
++        return s->regs_queue[(a - s->iomem_queue.addr) >> 2];
++    }
++    address_space_read(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED, &v, 4);
++    return le32_to_cpu(v);
++}
++
++static void dev_wr32(tegra_usb *s, hwaddr a, uint32_t v)
++{
++    if (dev_qram(s, a, 4)) {
++        s->regs_queue[(a - s->iomem_queue.addr) >> 2] = v;
++        return;
++    }
++    v = cpu_to_le32(v);
++    address_space_write(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED, &v, 4);
++}
++
++static uint32_t ep_bit(int ep, int dir)
++{
++    return BIT(ep + (dir ? 16 : 0));
++}
++
++static hwaddr dev_qh(tegra_usb *s, int ep, int dir)
++{
++    return (s->eplist & ~0x7FFu) + (ep * 2 + dir) * QH_SIZE;
++}
++
++static bool dev_attached(tegra_usb *s)
++{
++    return s->dev_mode && (s->usbcmd & CMD_RUN);
++}
++
++static bool dev_high_speed(tegra_usb *s)
++{
++    return !(s->portsc & PORTSC_PFSC);
++}
++
++static void dev_update_irq(tegra_usb *s)
++{
++    if (s->dev_mode) {
++        qemu_set_irq(tegra_usb_ehci(s)->irq, !!(s->usbsts & s->usbintr & STS_W1C));
++    }
++}
++
++static void dev_enter(tegra_usb *s, uint32_t mode)
++{
++    s->usbcmd = s->usbsts = s->usbintr = s->devaddr = s->eplist = 0;
++    s->portsc = s->devlc = s->otgsc = 0;
++    s->setupstat = s->status = s->complete = s->nak = s->naken = 0;
++    memset(s->dregs, 0, sizeof(s->dregs));
++    memset(s->epctrl, 0, sizeof(s->epctrl));
++    memset(s->td, 0, sizeof(s->td));
++    memset(s->done, 0, sizeof(s->done));
++    memset(s->zlp, 0, sizeof(s->zlp));
++    s->bus_reset = false;
++    s->usbmode = mode;
++    s->dev_mode = true;
++    memory_region_set_enabled(&s->iomem_dev, true);
++}
++
++static void dev_leave(tegra_usb *s)
++{
++    if (s->dev_mode) {
++        qemu_set_irq(tegra_usb_ehci(s)->irq, 0);
++    }
++    s->dev_mode = false;
++    s->bus_reset = false;
++    memory_region_set_enabled(&s->iomem_dev, false);
++    s->regs_controller[(R_USBMODE - 0x1B4) >> 2] = s->usbmode;
++}
++
++/* Start the dTD at `td` on an endpoint: copy it into the queue head. */
++static void dev_load(tegra_usb *s, int ep, int dir, uint32_t td)
++{
++    hwaddr qh = dev_qh(s, ep, dir);
++    uint32_t tok = dev_rd32(s, td + TD_TOKEN);
++
++    s->td[ep][dir] = 0;
++    s->status &= ~ep_bit(ep, dir);
++    if (!(tok & TOK_ACTIVE)) {
++        return;
++    }
++    s->td[ep][dir] = td;
++    s->done[ep][dir] = 0;
++    s->zlp[ep][dir] = false;
++    s->status |= ep_bit(ep, dir);
++    dev_wr32(s, qh + QH_CUR, td);
++    dev_wr32(s, qh + QH_NEXT, dev_rd32(s, td + TD_NEXT));
++    dev_wr32(s, qh + QH_TOKEN, tok);
++}
++
++/* Write back the dTD and its queue-head copy with `left` bytes to go. */
++static void dev_set_left(tegra_usb *s, int ep, int dir, uint32_t left, bool retire)
++{
++    uint32_t td = s->td[ep][dir];
++    uint32_t tok = dev_rd32(s, td + TD_TOKEN);
++
++    tok = (tok & ~TOK_BYTES_MASK) | (left << 16);
++    if (retire) {
++        tok &= ~TOK_ACTIVE;
++    }
++    dev_wr32(s, td + TD_TOKEN, tok);
++    dev_wr32(s, dev_qh(s, ep, dir) + QH_TOKEN, tok);
++}
++
++static void dev_complete(tegra_usb *s, int ep, int dir, uint32_t left)
++{
++    uint32_t td = s->td[ep][dir];
++    uint32_t next;
++
++    dev_set_left(s, ep, dir, left, true);
++    s->complete |= ep_bit(ep, dir);
++    if (dev_rd32(s, td + TD_TOKEN) & TOK_IOC) {
++        s->usbsts |= STS_UI;
++    }
++    next = dev_rd32(s, td + TD_NEXT);
++    s->td[ep][dir] = 0;
++    s->status &= ~ep_bit(ep, dir);
++    if (!(next & TD_TERMINATE)) {
++        dev_load(s, ep, dir, next & ~0x1Fu);
++    }
++    dev_update_irq(s);
++}
++
++static void dev_prime(tegra_usb *s, uint32_t bits)
++{
++    for (int b = 0; b < 32; b++) {
++        int ep = b & 15, dir = b >> 4;
++        uint32_t next;
++
++        if (!(bits & BIT(b)) || (s->status & BIT(b))) {
++            continue;
++        }
++        next = dev_rd32(s, dev_qh(s, ep, dir) + QH_NEXT);
++        if (!(next & TD_TERMINATE)) {
++            dev_load(s, ep, dir, next & ~0x1Fu);
++        }
++    }
++}
++
++static void dev_flush(tegra_usb *s, uint32_t bits)
++{
++    for (int b = 0; b < 32; b++) {
++        if (bits & BIT(b)) {
++            s->td[b & 15][b >> 4] = 0;
++        }
++    }
++    s->status &= ~bits;
++}
++
++/* Move `len` bytes between `buf` and the dTD buffer at byte `off`. */
++static void dev_copy(tegra_usb *s, uint32_t td, uint32_t off, uint8_t *buf,
++                     uint32_t len, bool to_guest)
++{
++    uint32_t page0 = dev_rd32(s, td + TD_PAGE0);
++
++    while (len) {
++        uint32_t pos = (page0 & 0xFFF) + off;
++        uint32_t idx = pos >> 12;
++        hwaddr a;
++        uint32_t n;
++
++        if (idx > 4) {
++            qemu_log_mask(LOG_GUEST_ERROR, "tegra.usb: dTD 0x%x overrun\n", td);
++            return;
++        }
++        a = (idx ? dev_rd32(s, td + TD_PAGE0 + 4 * idx) : page0) & ~0xFFFu;
++        a += pos & 0xFFF;
++        n = MIN(len, 0x1000 - (pos & 0xFFF));
++        if (to_guest) {
++            address_space_write(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED, buf, n);
++        } else {
++            address_space_read(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED, buf, n);
++        }
++        buf += n;
++        off += n;
++        len -= n;
++    }
++}
++
++static uint32_t dev_max_packet(tegra_usb *s, int ep, int dir, uint32_t *caps)
++{
++    uint32_t mps;
++
++    *caps = dev_rd32(s, dev_qh(s, ep, dir) + QH_CAPS);
++    mps = (*caps >> 16) & 0x7FF;
++    return mps ? mps : 64;
++}
++
++static uint32_t dev_ctrl(tegra_usb *s, int ep)
++{
++    /* Control endpoint 0 is always enabled. */
++    return ep ? s->epctrl[ep] : s->epctrl[0] | EPCTRL_RXE | EPCTRL_TXE;
++}
++
++static int dev_setup(tegra_usb *s, const uint8_t *pkt)
++{
++    hwaddr qh = dev_qh(s, 0, 0);
++
++    if (!dev_attached(s) || !s->bus_reset) {
++        return ST_NAK;
++    }
++    dev_wr32(s, qh + QH_SETUP, ldl_le_p(pkt));
++    dev_wr32(s, qh + QH_SETUP + 4, ldl_le_p(pkt + 4));
++    /* A SETUP clears the control endpoint stall and the setup tripwire. */
++    s->epctrl[0] &= ~(EPCTRL_RXS | EPCTRL_TXS);
++    s->usbcmd &= ~CMD_SUTW;
++    s->setupstat |= BIT(0);
++    if (dev_rd32(s, qh + QH_CAPS) & QH_CAPS_IOS) {
++        s->usbsts |= STS_UI;
++    }
++    dev_update_irq(s);
++    return ST_ACK;
++}
++
++static int dev_in(tegra_usb *s, int ep, uint32_t maxlen, uint8_t *out, uint32_t *outlen)
++{
++    uint32_t ctrl = dev_ctrl(s, ep);
++    uint32_t td, caps, mps, left, n;
++
++    *outlen = 0;
++    if (!dev_attached(s) || !s->bus_reset) {
++        return ST_NAK;
++    }
++    if (ctrl & EPCTRL_TXS) {
++        return ST_STALL;
++    }
++    td = s->td[ep][1];
++    if (!(ctrl & EPCTRL_TXE) || !td) {
++        return ST_NAK;
++    }
++    if (s->zlp[ep][1]) {
++        dev_complete(s, ep, 1, 0);
++        return ST_DATA;
++    }
++    mps = dev_max_packet(s, ep, 1, &caps);
++    left = (dev_rd32(s, td + TD_TOKEN) & TOK_BYTES_MASK) >> 16;
++    n = MIN(MIN(left, mps), maxlen);
++    dev_copy(s, td, s->done[ep][1], out, n, false);
++    s->done[ep][1] += n;
++    left -= n;
++    *outlen = n;
++    if (left && n == mps) {
++        dev_set_left(s, ep, 1, left, false);
++    } else if (!left && n && n == mps && !(caps & QH_CAPS_ZLT_DIS)) {
++        /* Transfer ends on a full packet: a zero-length one follows. */
++        dev_set_left(s, ep, 1, 0, false);
++        s->zlp[ep][1] = true;
++    } else {
++        dev_complete(s, ep, 1, left);
++    }
++    return ST_DATA;
++}
++
++static int dev_out(tegra_usb *s, int ep, uint8_t *data, uint32_t len)
++{
++    uint32_t ctrl = dev_ctrl(s, ep);
++    uint32_t td, caps, mps, left, n;
++
++    if (!dev_attached(s) || !s->bus_reset) {
++        return ST_NAK;
++    }
++    if (ctrl & EPCTRL_RXS) {
++        return ST_STALL;
++    }
++    td = s->td[ep][0];
++    if (!(ctrl & EPCTRL_RXE) || !td) {
++        return ST_NAK;
++    }
++    mps = dev_max_packet(s, ep, 0, &caps);
++    left = (dev_rd32(s, td + TD_TOKEN) & TOK_BYTES_MASK) >> 16;
++    n = MIN(len, left);
++    if (n < len) {
++        qemu_log_mask(LOG_GUEST_ERROR, "tegra.usb: EP%d OUT babble (%u > %u)\n", ep, len, left);
++    }
++    dev_copy(s, td, s->done[ep][0], data, n, true);
++    s->done[ep][0] += n;
++    left -= n;
++    if (left && len == mps) {
++        dev_set_left(s, ep, 0, left, false);
++    } else {
++        /* Buffer full or short packet: the transfer is over. */
++        dev_complete(s, ep, 0, left);
++    }
++    return ST_ACK;
++}
++
++static int dev_bus_reset(tegra_usb *s)
++{
++    if (!dev_attached(s)) {
++        return ST_NAK;
++    }
++    s->bus_reset = true;
++    s->usbsts |= STS_URI | STS_PCI;
++    dev_update_irq(s);
++    return ST_ACK;
++}
++
++static uint32_t dev_portsc(tegra_usb *s)
++{
++    uint32_t v = s->portsc & ~(PORTSC_CCS | PORTSC_PE | PORTSC_HSP);
++
++    if (s->host && dev_attached(s)) {
++        v |= PORTSC_CCS;
++        if (s->bus_reset) {
++            v |= PORTSC_PE | (dev_high_speed(s) ? PORTSC_HSP : 0);
++        }
++    }
++    return v;
++}
++
++static uint64_t tegra_usb_dev_read(void *opaque, hwaddr offset, unsigned size)
++{
++    tegra_usb *s = opaque;
++    hwaddr a = DEV_REGS_BASE + (offset & ~3);
++    uint32_t v;
++
++    switch (a) {
++    case R_CAPS ... R_CAPS + 0xC:
++        v = ldl_le_p(&tegra_usb_ehci(s)->caps[a - R_CAPS]);
++        break;
++    case R_DCIVERSION:
++        v = 0x0001;
++        break;
++    case R_DCCPARAMS:
++        v = BIT(8) | BIT(7) | NUM_EPS; /* host and device capable */
++        break;
++    case R_USBCMD:
++        v = s->usbcmd;
++        break;
++    case R_USBSTS:
++        v = s->usbsts;
++        break;
++    case R_USBINTR:
++        v = s->usbintr;
++        break;
++    case R_FRINDEX:
++        v = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 125000) & 0x3FFF;
++        break;
++    case R_DEVICEADDR:
++        v = s->devaddr;
++        break;
++    case R_EPLISTADDR:
++        v = s->eplist;
++        break;
++    case R_PORTSC1:
++        v = dev_portsc(s);
++        break;
++    case R_DEVLC:
++        v = s->devlc & ~(3u << DEVLC_PSPD_SHIFT);
++        if (s->bus_reset && dev_high_speed(s)) {
++            v |= 2u << DEVLC_PSPD_SHIFT;
++        }
++        break;
++    case R_OTGSC:
++        v = (s->otgsc & ~0xFF00u) | OTGSC_ID;
++        v |= s->host ? OTGSC_AVV | OTGSC_ASV | OTGSC_BSV : OTGSC_BSE;
++        break;
++    case R_USBMODE:
++        v = s->usbmode;
++        break;
++    case R_ENDPTNAK:
++        v = s->nak;
++        break;
++    case R_ENDPTNAKEN:
++        v = s->naken;
++        break;
++    case R_SETUPSTAT:
++        v = s->setupstat;
++        break;
++    case R_PRIME:
++    case R_FLUSH:
++        v = 0; /* primes and flushes finish at once */
++        break;
++    case R_STATUS:
++        v = s->status;
++        break;
++    case R_COMPLETE:
++        v = s->complete;
++        break;
++    case R_EPCTRL0 ... R_EPCTRL0 + 4 * (NUM_EPS - 1):
++        v = dev_ctrl(s, (a - R_EPCTRL0) >> 2);
++        break;
++    default:
++        v = s->dregs[(a - DEV_REGS_BASE) >> 2];
++        break;
++    }
++    v >>= (offset & 3) * 8;
++    return size >= 4 ? v : v & ((1u << (size * 8)) - 1);
++}
++
++static void tegra_usb_dev_write(void *opaque, hwaddr offset, uint64_t value,
++                                unsigned size)
++{
++    tegra_usb *s = opaque;
++    hwaddr a = DEV_REGS_BASE + (offset & ~3);
++    uint32_t v = value;
++
++    if (size < 4) {
++        uint32_t shift = (offset & 3) * 8, mask = ((1u << (size * 8)) - 1) << shift;
++
++        v = (tegra_usb_dev_read(s, offset & ~3, 4) & ~mask) | ((v << shift) & mask);
++    }
++
++    switch (a) {
++    case R_USBCMD:
++        if (v & CMD_RST) {
++            /* Controller reset: back to idle mode, host registers. */
++            s->usbmode = 0;
++            dev_leave(s);
++            return;
++        }
++        s->usbcmd = v;
++        if (!(v & CMD_RUN)) {
++            s->bus_reset = false;
++        }
++        break;
++    case R_USBSTS:
++        s->usbsts &= ~(v & STS_W1C);
++        break;
++    case R_USBINTR:
++        s->usbintr = v;
++        break;
++    case R_DEVICEADDR:
++        s->devaddr = v & 0xFF000000;
++        break;
++    case R_EPLISTADDR:
++        s->eplist = v & ~0x7FFu;
++        break;
++    case R_PORTSC1:
++        s->portsc = v;
++        break;
++    case R_DEVLC:
++        s->devlc = v;
++        break;
++    case R_OTGSC:
++        s->otgsc = (s->otgsc & OTGSC_STS_MASK & ~(v & OTGSC_STS_MASK)) | (v & ~OTGSC_STS_MASK);
++        break;
++    case R_USBMODE:
++        s->usbmode = v;
++        if ((v & MODE_CM_MASK) != MODE_CM_DEVICE) {
++            dev_leave(s);
++            return;
++        }
++        break;
++    case R_ENDPTNAK:
++        s->nak &= ~v;
++        break;
++    case R_ENDPTNAKEN:
++        s->naken = v;
++        break;
++    case R_SETUPSTAT:
++        s->setupstat &= ~v;
++        break;
++    case R_PRIME:
++        dev_prime(s, v);
++        break;
++    case R_FLUSH:
++        dev_flush(s, v);
++        break;
++    case R_STATUS:
++        break;
++    case R_COMPLETE:
++        s->complete &= ~v;
++        break;
++    case R_EPCTRL0 ... R_EPCTRL0 + 4 * (NUM_EPS - 1):
++        s->epctrl[(a - R_EPCTRL0) >> 2] = v & ~(EPCTRL_RXR | EPCTRL_TXR);
++        break;
++    default:
++        s->dregs[(a - DEV_REGS_BASE) >> 2] = v;
++        break;
++    }
++    dev_update_irq(s);
++}
++
++static int tegra_usb_can_read(void *opaque)
++{
++    tegra_usb *s = opaque;
++
++    return sizeof(s->rx) - s->rxlen;
++}
++
++static void tegra_usb_link_read(void *opaque, const uint8_t *buf, int size)
++{
++    tegra_usb *s = opaque;
++    uint8_t resp[3 + LINK_MAX];
++
++    memcpy(s->rx + s->rxlen, buf, size);
++    s->rxlen += size;
++    while (s->rxlen >= 4) {
++        uint8_t op = s->rx[0], ep = s->rx[1] & 0xF;
++        uint32_t len = lduw_le_p(s->rx + 2);
++        uint32_t plen = op == OP_SETUP || op == OP_OUT ? len : 0;
++        uint32_t rlen = 0;
++        int st;
++
++        if (plen > LINK_MAX || (op == OP_SETUP && len != 8)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "tegra.usb: bad link request '%c'\n", op);
++            s->rxlen = 0;
++            return;
++        }
++        if (s->rxlen < 4 + plen) {
++            return;
++        }
++        switch (op) {
++        case OP_QUERY:
++            resp[3] = dev_attached(s) | (dev_high_speed(s) << 1);
++            resp[4] = s->devaddr >> 25;
++            rlen = 2;
++            st = ST_ACK;
++            break;
++        case OP_RESET:
++            st = dev_bus_reset(s);
++            break;
++        case OP_SETUP:
++            st = dev_setup(s, s->rx + 4);
++            break;
++        case OP_IN:
++            st = dev_in(s, ep, MIN(len, LINK_MAX), resp + 3, &rlen);
++            break;
++        case OP_OUT:
++            st = dev_out(s, ep, s->rx + 4, len);
++            break;
++        default:
++            st = ST_STALL;
++            break;
++        }
++        resp[0] = st;
++        stw_le_p(resp + 1, rlen);
++        qemu_chr_fe_write_all(&s->chr, resp, 3 + rlen);
++        s->rxlen -= 4 + plen;
++        memmove(s->rx, s->rx + 4 + plen, s->rxlen);
++    }
++}
++
++static void tegra_usb_link_event(void *opaque, QEMUChrEvent event)
++{
++    tegra_usb *s = opaque;
++
++    if (event == CHR_EVENT_OPENED || event == CHR_EVENT_CLOSED) {
++        /* Cable plugged or pulled: a new host starts from reset. */
++        s->host = event == CHR_EVENT_OPENED;
++        s->bus_reset = false;
++        s->rxlen = 0;
++        if (dev_attached(s)) {
++            s->usbsts |= STS_PCI;
++            dev_update_irq(s);
++        }
++    }
++}
++
+ static uint64_t tegra_usb_config_priv_read(void *opaque, hwaddr offset,
+                                            unsigned size)
+ {
+@@ -112,6 +794,12 @@ static void tegra_usb_controller_priv_write(void *opaque, hwaddr offset,
+ 
+     TRACE_WRITE(s->iomem_controller.addr, offset, 0, value);
+ 
++    if (offset + 0x1B4 == R_USBMODE && size == 4 &&
++        (value & MODE_CM_MASK) == MODE_CM_DEVICE) {
++        dev_enter(s, value);
++        return;
++    }
++
+     s->regs_controller[offset/sizeof(uint32_t)] = (s->regs_controller[offset/sizeof(uint32_t)] & ~((1ULL<<size*8)-1)) | value;
+ }
+ 
+@@ -128,7 +816,7 @@ static uint64_t tegra_usb_priv_read(void *opaque, hwaddr offset,
+     default:
+         if (offset+size <= sizeof(s->regs_susp)+0x4) {
+             offset-=0x4;
+-            ret = s->regs_config[offset/sizeof(uint32_t)] & ((1ULL<<size*8)-1);
++            ret = s->regs_susp[offset/sizeof(uint32_t)] & ((1ULL<<size*8)-1);
+         }
+         break;
+     }
+@@ -212,6 +900,10 @@ static void tegra_usb_priv_reset(DeviceState *dev)
+     memset(s->regs_susp, 0, sizeof(s->regs_susp));
+     memset(s->regs_queue, 0, sizeof(s->regs_queue));
+ 
++    s->usbmode = 0;
++    dev_leave(s);
++    s->rxlen = 0;
++
+     ehci_reset(ehci);
+ }
+ 
+@@ -239,6 +931,14 @@ static const MemoryRegionOps tegra_usb_queue_mem_ops = {
+     .endianness = DEVICE_NATIVE_ENDIAN,
+ };
+ 
++static const MemoryRegionOps tegra_usb_dev_mem_ops = {
++    .read = tegra_usb_dev_read,
++    .write = tegra_usb_dev_write,
++    .endianness = DEVICE_NATIVE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
+ static void tegra_usb_priv_init(Object *obj)
+ {
+     EHCISysBusState *i = SYS_BUS_EHCI(obj);
+@@ -268,14 +968,42 @@ static void tegra_usb_priv_init(Object *obj)
+     memory_region_add_subregion(&ehci->mem, 0x1B4, &s->iomem_controller);
+     memory_region_add_subregion(&ehci->mem, 0x400, &s->iomem);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem_queue);
++
++    memory_region_init_io(&s->iomem_dev, OBJECT(s), &tegra_usb_dev_mem_ops, s,
++                          "tegra.usb_device", DEV_REGS_SIZE);
++    memory_region_set_enabled(&s->iomem_dev, false);
++    memory_region_add_subregion_overlap(&ehci->mem, DEV_REGS_BASE, &s->iomem_dev, 1);
+ }
+ 
++static void tegra_usb_realize(DeviceState *dev, Error **errp)
++{
++    tegra_usb *s = TEGRA_USB(dev);
++    tegra_usb_class *tc = TEGRA_USB_GET_CLASS(dev);
++    Error *err = NULL;
++
++    tc->parent_realize(dev, &err);
++    if (err) {
++        error_propagate(errp, err);
++        return;
++    }
++    qemu_chr_fe_set_handlers(&s->chr, tegra_usb_can_read, tegra_usb_link_read,
++                             tegra_usb_link_event, NULL, s, NULL, true);
++}
++
++static Property tegra_usb_properties[] = {
++    DEFINE_PROP_CHR("chardev", tegra_usb, chr),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void tegra_usb_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    tegra_usb_class *tc = (tegra_usb_class *)klass;
+ 
+     dc->vmsd = &vmstate_tegra_usb;
+     device_class_set_legacy_reset(dc, tegra_usb_priv_reset);
++    device_class_set_parent_realize(dc, tegra_usb_realize, &tc->parent_realize);
++    device_class_set_props(dc, tegra_usb_properties);
+ 
+     set_bit(DEVICE_CATEGORY_USB, dc->categories);
+ }
+@@ -285,6 +1013,7 @@ static const TypeInfo tegra_usb_info = {
+     .parent = TYPE_SYS_BUS_EHCI,
+     .instance_size = sizeof(tegra_usb),
+     .instance_init = tegra_usb_priv_init,
++    .class_size = sizeof(tegra_usb_class),
+     .class_init = tegra_usb_class_init,
+ };
+ 
+diff --git a/hw/arm/tegra2/tegrax1.c b/hw/arm/tegra2/tegrax1.c
+index f31c03fb8a..c538fc6e05 100644
+--- a/hw/arm/tegra2/tegrax1.c
++++ b/hw/arm/tegra2/tegrax1.c
+@@ -38,6 +38,8 @@
+ #include "hw/arm/boot.h"
+ #include "hw/loader.h"
+ #include "hw/char/serial-mm.h"
++#include "chardev/char.h"
++#include "hw/qdev-properties-system.h"
+ #include "hw/sd/sdhci.h"
+ #include "hw/cpu/a9mpcore.h"
+ #include "sysemu/reset.h"
+@@ -1052,9 +1054,15 @@ static void __tegrax1_init(MachineState *machine)
+     /* CLUSTER_CLOCK */
+     tegra_cluster_clock_dev = tegra_init_dummyio(TEGRA_CLK13_RESET_BASE, SZ_256K, "tegra.cluster_clock", false);
+ 
+-    /* USB2 controllers */
+-    tegra_ehci1_dev = sysbus_create_simple("tegra.usb",
+-                                           TEGRA_USB_BASE, DIRQ(INT_USB));
++    /* USB2 controllers. The OTG one (USB-C port) gets chardev "usbotg",
++     * when given, as its virtual host (device mode). */
++    tegra_ehci1_dev = qdev_new("tegra.usb");
++    if (qemu_chr_find("usbotg")) {
++        qdev_prop_set_chr(tegra_ehci1_dev, "chardev", qemu_chr_find("usbotg"));
++    }
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(tegra_ehci1_dev), &error_fatal);
++    sysbus_mmio_map(SYS_BUS_DEVICE(tegra_ehci1_dev), 0, TEGRA_USB_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(tegra_ehci1_dev), 0, DIRQ(INT_USB));
+     sysbus_mmio_map(SYS_BUS_DEVICE(tegra_ehci1_dev), 1, TEGRA_USB_BASE+0x1000);
+     tegra_ehci2_dev = sysbus_create_simple("tegra.usb",
+                                            TEGRA_USB2_BASE, DIRQ(INT_USB2));

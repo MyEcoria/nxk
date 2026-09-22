@@ -4,12 +4,13 @@
     nxtest.py                          # boot and print until the prompt
     nxtest.py -c "ps" -c "run hello"   # chain commands
     nxtest.py -c "ipcbench" --timeout 120
+    nxtest.py --usb-cmd "ps"             # type over the USB-C console (usbterm.py host)
 
 UART-A console is bound to a socket: the script reads everything from the
 first kernel byte and types commands like a user. Exit code 1 if a command
 missed the prompt in time.
 """
-import argparse, bisect, os, re, shutil, socket, subprocess, sys, tempfile, time
+import argparse, bisect, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -107,10 +108,13 @@ def main():
     ap.add_argument("--net", default=None, nargs="?", const="",
                     help="USB net card (QEMU usb-net); value: forwards, e.g. tcp::8080-:80")
     ap.add_argument("--keys", default=None, help="keys sent to the USB keyboard (sendkey) after the 1st command")
+    ap.add_argument("--usb-cmd", action="append", default=[],
+                    help="command typed on the USB-C console (usbcon), the script acting as the PC")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
     uart = os.path.join(tmp, "uart.sock")
+    usb = os.path.join(tmp, "usb.sock")
     mon = os.path.join(tmp, "mon.sock")
     cmd = [
         QEMU, "-machine", a.machine, "-m", "4G", "-display", "none",
@@ -129,6 +133,7 @@ def main():
     ] + (["-drive", f"if=sd,index=0,format=raw,file={a.sd}"] if a.sd else []) \
       + (["-global", "driver=tegra.xusb,property=slots,value=8"] if a.usb_kbd or a.net is not None else []) \
       + (["-device", "usb-kbd,bus=usb-bus.2"] if a.usb_kbd else []) \
+      + (["-chardev", f"socket,id=usbotg,path={usb},server=on,wait=off"] if a.usb_cmd else []) \
       + (["-netdev", "user,id=n0" + "".join(f",hostfwd={f}" for f in a.net.split()), "-device", "usb-net,netdev=n0,bus=usb-bus.2"]
          if a.net is not None else []) \
       + os.environ.get("NXTEST_QEMU_ARGS", "").split()
@@ -167,6 +172,25 @@ def main():
                 ok = False
                 break
         print()
+        if ok and a.usb_cmd:
+            sys.path.insert(0, HERE)
+            sys.dont_write_bytecode = True
+            import usbterm
+            # Unread, the emulated UART stalls the console that feeds USB too.
+            s.settimeout(None)
+            threading.Thread(target=lambda: all(iter(lambda: s.recv(65536), b"")), daemon=True).start()
+            print("[nxtest] USB-C console: typing as the PC")
+            try:
+                link = usbterm.EmuHost(usb, timeout=a.timeout)
+                print(f"[nxtest] {link.name}")
+                if not usbterm.run(link, a.usb_cmd, a.timeout):
+                    dump_cpus(mon, a.kernel)
+                    ok = False
+                link.close()
+            except (OSError, ConnectionError, TimeoutError, usbterm.Stall) as e:
+                print(f"\n[nxtest] USB console: {e}", file=sys.stderr)
+                dump_cpus(mon, a.kernel)
+                ok = False
         if a.screendump:
             m = socket.socket(socket.AF_UNIX)
             m.connect(mon)
