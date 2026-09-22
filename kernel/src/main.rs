@@ -155,6 +155,13 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
             e
         );
     }
+    let prefetch = mm::ahb_prefetch_off();
+    if prefetch > 0 {
+        kprintln!(
+            "[mem] AHB memory prefetch turned off ({} were on)",
+            prefetch
+        );
+    }
 
     thread::init();
     process::init();
