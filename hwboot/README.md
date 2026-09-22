@@ -96,7 +96,8 @@ gone and the monitor then kernel lines must appear up to the launch of
 Without a UART adapter, the screen is the only output: hekate leaves it
 on when launching an L4T entry, and the monitor then the kernel write to
 it (white text on black, portrait like the hekate text menu: hold the
-console vertically). In order:
+console vertically) until the `display` service turns it landscape. In
+order:
 
 1. hekate logo, then one **line** filling up at the bottom of the
    screen: the hekate countdown (`bootwait`), cleared just before the
@@ -105,8 +106,10 @@ console vertically). In order:
 3. `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ... launching
    init` lines: the kernel is running. A kernel panic or fault shows up
    here too.
-4. The `display` service takes over the screen: midnight-blue
-   background, one `nxk - screen 720x1280, terminal 90x80` line. User
+4. The `display` service takes over the screen, in landscape (hold the
+   console normally): midnight-blue background, the nxk logo centered
+   with `AArch64 microkernel for Tegra X1` under it, then one
+   `nxk - screen 720x1280 turned landscape, terminal 160x45` line. User
    space is alive. Nothing more appears on screen afterwards: service
    logs and the shell go to UART-A only.
 

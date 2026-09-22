@@ -13,6 +13,8 @@ apps=(hello-std stdtest)
 echo "== userland"
 # Screen font, converted from a system console font.
 python3 "$ici/tools/mkfont.py" -o "$ici/build/font.bin"
+# Boot screen logo of the display service.
+python3 "$ici/tools/mklogo.py" --raw "$ici/build/logo.bin"
 # cargo reads .cargo/config.toml from cwd: enter it.
 (cd "$ici/user" && CARGO_TARGET_DIR="$cache/target-user" cargo build --release)
 bins=()

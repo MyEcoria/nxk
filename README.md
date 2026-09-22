@@ -217,7 +217,7 @@ All in EL0, started by `init` with only their capabilities.
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
 | `sd` | SD card (SDHCI, ADMA2) | emulator; real reader power and pins not set up |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
-| `display` | screen (window A), text terminal (Terminus font) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
+| `display` | screen (window A), boot logo and landscape text terminal (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |

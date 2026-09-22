@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Generate the nxk pixel-art logo into docs/logo/.
+"""Generate the nxk pixel-art logo.
+
+    mklogo.py [DIR]          # SVGs, default docs/logo/
+    mklogo.py --raw FILE     # boot screen image for the display service
 
 The icon draws the microkernel as rings: the EL1 core at the center, driver
-arcs around it, then isolated EL0 service arcs. Each file comes in a `dark`
-variant (for dark backgrounds) and a `light` one.
+arcs around it, then isolated EL0 service arcs. Each SVG comes in a `dark`
+variant (for dark backgrounds) and a `light` one. The raw image is: width,
+height (1 byte each), 8 palette entries as R G B A bytes (index 0 unused:
+transparent), then one palette index per pixel, row by row.
 """
 import sys
 from pathlib import Path
@@ -132,11 +137,24 @@ def svg(g, pal, scale=8):
     return "\n".join(out) + "\n"
 
 
+def raw(g, pal):
+    out = bytearray([len(g[0]), len(g)])
+    for i in range(8):
+        out += bytes.fromhex(pal[i][1:]) + b"\xff" if i in pal else bytes(4)
+    for row in g:
+        out += bytes(row)
+    return bytes(out)
+
+
 def main():
+    ic = icon()
+    logo = compose([ic, wordmark()], gap=5)
+    if sys.argv[1:2] == ["--raw"]:
+        Path(sys.argv[2]).write_bytes(raw(logo, PAL_DARK))
+        return
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "docs" / "logo"
     out.mkdir(parents=True, exist_ok=True)
-    ic = icon()
-    for name, g in (("nxk-icon", ic), ("nxk-logo", compose([ic, wordmark()], gap=5))):
+    for name, g in (("nxk-icon", ic), ("nxk-logo", logo)):
         for theme, pal in (("dark", PAL_DARK), ("light", PAL_LIGHT)):
             (out / f"{name}-{theme}.svg").write_text(svg(g, pal))
             print(out / f"{name}-{theme}.svg")

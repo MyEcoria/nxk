@@ -1,5 +1,6 @@
 //! display: Tegra X1 DC-A screen; window A on shared image + 8x16 terminal.
-//! Panel init is left to the bootloader; only the window is changed.
+//! Panel init is left to the bootloader; only the window is changed. Text
+//! and boot logo are landscape: a portrait panel (Switch) is drawn turned.
 
 #![no_std]
 #![no_main]
@@ -17,6 +18,9 @@ use libnx::{println, sys};
 
 const DC: u64 = 0x5420_0000;
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
+/// tools/mklogo.py --raw: width, height, 8 R G B A palette entries, indices.
+const LOGO: &[u8] = include_bytes!("../../../build/logo.bin");
+const TAGLINE: &str = "AArch64 microkernel for Tegra X1";
 
 // 32-bit word register indices.
 const CMD_DISPLAY_COMMAND: usize = 0x32;
@@ -43,8 +47,14 @@ const BG: u32 = 0xFF3A_1E10;
 
 struct Screen {
     fb: SharedMemory,
+    /// Image size, in panel scan order.
     w: usize,
     h: usize,
+    /// Portrait panel: landscape view turned 90 degrees counterclockwise,
+    /// as hekate stores its boot logo.
+    rot: bool,
+    cols: usize,
+    rows: usize,
     col: usize,
     row: usize,
     /// Pending UTF-8 bytes for an incomplete character.
@@ -53,8 +63,35 @@ struct Screen {
 }
 
 impl Screen {
-    fn pixels(&self) -> &mut [u32] {
+    fn pixels(&mut self) -> &mut [u32] {
         unsafe { core::slice::from_raw_parts_mut(self.fb.as_ptr() as *mut u32, self.w * self.h) }
+    }
+
+    /// Landscape size.
+    fn size(&self) -> (usize, usize) {
+        if self.rot {
+            (self.h, self.w)
+        } else {
+            (self.w, self.h)
+        }
+    }
+
+    /// Image index of landscape pixel (x, y).
+    fn at(&self, x: usize, y: usize) -> usize {
+        if self.rot {
+            (self.h - 1 - x) * self.w + y
+        } else {
+            y * self.w + x
+        }
+    }
+
+    fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32) {
+        for y in y..y + h {
+            for x in x..x + w {
+                let i = self.at(x, y);
+                self.pixels()[i] = c;
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -63,29 +100,73 @@ impl Screen {
         self.row = 0;
     }
 
-    fn glyph(&mut self, cp: u32) {
+    /// Glyph at landscape pixel (x, y), `scale` times enlarged.
+    fn draw_glyph(&mut self, x: usize, y: usize, cp: u32, scale: usize, fg: u32) {
         let g = if cp < 256 { cp } else { b'?' as u32 } as usize;
-        let (x0, y0, w) = (self.col * 8, self.row * 16, self.w);
-        let px = self.pixels();
         for (dy, &bits) in FONT[g * 16..g * 16 + 16].iter().enumerate() {
-            let line = &mut px[(y0 + dy) * w + x0..(y0 + dy) * w + x0 + 8];
-            for (dx, p) in line.iter_mut().enumerate() {
-                *p = if bits & (0x80 >> dx) != 0 { FG } else { BG };
+            for dx in 0..8 {
+                let c = if bits & (0x80 >> dx) != 0 { fg } else { BG };
+                self.fill(x + dx * scale, y + dy * scale, scale, scale, c);
             }
         }
+    }
+
+    fn glyph(&mut self, cp: u32) {
+        self.draw_glyph(self.col * 8, self.row * 16, cp, 1, FG);
+    }
+
+    /// Boot screen: logo centered, tagline under it; text starts below.
+    fn splash(&mut self) {
+        let (sw, sh) = self.size();
+        let (w, h) = (LOGO[0] as usize, LOGO[1] as usize);
+        let color = |i: usize| {
+            u32::from_le_bytes([
+                LOGO[2 + 4 * i],
+                LOGO[3 + 4 * i],
+                LOGO[4 + 4 * i],
+                LOGO[5 + 4 * i],
+            ])
+        };
+        let s = (sw * 55 / 100 / w).min(sh * 2 / 5 / h).max(1);
+        let ts = if sw >= 1024 { 2 } else { 1 };
+        let (x0, y0) = (
+            (sw.saturating_sub(w * s)) / 2,
+            (sh.saturating_sub(h * s + 32 * ts)) / 2,
+        );
+        for (i, &p) in LOGO[34..34 + w * h].iter().enumerate() {
+            if p != 0 {
+                self.fill(x0 + i % w * s, y0 + i / w * s, s, s, color(p as usize));
+            }
+        }
+        let (tx, ty) = (
+            (sw.saturating_sub(TAGLINE.len() * 8 * ts)) / 2,
+            y0 + h * s + 16 * ts,
+        );
+        if TAGLINE.len() * 8 * ts <= sw {
+            for (k, c) in TAGLINE.bytes().enumerate() {
+                self.draw_glyph(tx + k * 8 * ts, ty, c as u32, ts, color(6));
+            }
+        }
+        self.row = ((ty + 16 * ts).div_ceil(16) + 1).min(self.rows - 1);
     }
 
     fn newline(&mut self) {
         self.col = 0;
         self.row += 1;
-        if self.row == self.h / 16 {
-            // Scroll up one text line.
-            let (w, line) = (self.w, 16 * self.w);
+        if self.row == self.rows {
+            // Scroll up one text line: image columns when turned.
+            let (w, rot) = (self.w, self.rot);
             let px = self.pixels();
-            px.copy_within(line.., 0);
-            let n = px.len();
-            px[n - line..].fill(BG);
-            let _ = w;
+            if rot {
+                for line in px.chunks_exact_mut(w) {
+                    line.copy_within(16.., 0);
+                    line[w - 16..].fill(BG);
+                }
+            } else {
+                px.copy_within(16 * w.., 0);
+                let n = px.len();
+                px[n - 16 * w..].fill(BG);
+            }
             self.row -= 1;
         }
     }
@@ -100,7 +181,7 @@ impl Screen {
                 }
             }
             c if c >= 0x20 => {
-                if self.col == self.w / 8 {
+                if self.col == self.cols {
                     self.newline();
                 }
                 self.glyph(c);
@@ -161,16 +242,26 @@ fn main() -> i32 {
     }
     let fb = SharedMemory::new(w * h * 4, CONTIGUOUS | DMA32 | UNCACHED).expect("display: image");
     let pa = fb.paddr(0).expect("display: image address") as u32;
+    let rot = h > w;
+    let (cols, rows) = if rot {
+        (h / 8, w / 16)
+    } else {
+        (w / 8, h / 16)
+    };
     let mut scr = Screen {
         fb,
         w,
         h,
+        rot,
+        cols,
+        rows,
         col: 0,
         row: 0,
         pending: [0; 4],
         npending: 0,
     };
     scr.clear();
+    scr.splash();
 
     wr(&dc, CMD_DISPLAY_WINDOW_HEADER, 1 << 4); // window A
     wr(&dc, WIN_COLOR_DEPTH, R8G8B8A8);
@@ -190,8 +281,17 @@ fn main() -> i32 {
     wr(&dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(&dc, CMD_STATE_CONTROL, 1 | 2);
 
+    let turned = if rot { " turned landscape" } else { "" };
     scr.write(
-        alloc::format!("nxk - screen {}x{}, terminal {}x{}\n", w, h, w / 8, h / 16).as_bytes(),
+        alloc::format!(
+            "nxk - screen {}x{}{}, terminal {}x{}\n",
+            w,
+            h,
+            turned,
+            cols,
+            rows
+        )
+        .as_bytes(),
     );
     println!(
         "[display] screen {}x{} (window A, image at {:#x})",
