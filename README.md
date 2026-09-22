@@ -233,6 +233,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification; publishes the link as `wlan0` once associated and its control as `wifi` | firmware upload and the ring protocol that carries frames are missing: the chip is found, the link stays down. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -249,7 +250,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Programs | static-PIE ELF, arguments, environment, TLS, load from SD card | dynamic linking (ruled out) |
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
-| Network | USB-Ethernet, TCP/IP, sockets | Wi-Fi, IPv6 |
+| Network | USB-Ethernet, TCP/IP, sockets, Wi-Fi control (`wifi`) and PCIe root complex | BCM4356 firmware and data path, IPv6 |
 | Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB host, USB device (serial console) | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 27, `stdtest` 18), debugger (gdb), L4T comparison, USB-C terminal | |
@@ -270,8 +271,20 @@ program that vanished without closing them (crash) are reclaimed.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.
-- GPU, audio, Wi-Fi, Joy-Con and frequency scaling are not done (the
-  last one risks damaging hardware).
+- Wi-Fi reaches the chip but not the air: `wlan` powers the module
+  (PMIC LDO1, WIFI_EN on PH0, WIFI_RST on PH1), brings the PCIe root
+  complex up, trains the link and reads the BCM4356 chip identity, but
+  the firmware upload and Broadcom's ring protocol are not written yet,
+  so no frame moves. Its firmware and calibration data are proprietary
+  and never in the repository: put `brcmfmac4356-pcie.bin` and
+  `brcmfmac4356-pcie.txt` in a directory and pass it to
+  `tools/mksd.py --firmware DIR` (they land in `/firmware/brcm`). The
+  station MAC is a locally administered one: the real address lives in
+  CAL0 on the eMMC, which nxk cannot read. None of the PCIe path runs
+  in the emulator, which has no root complex to model: there a
+  simulated adapter answers `wifi` instead.
+- GPU, audio, Joy-Con and frequency scaling are not done (the last one
+  risks damaging hardware).
 - A pipe has no buffer: the writer waits until a reader takes its data.
   `output()` reads both outputs in parallel for this reason.
 - The `fs` service refuses to delete a file that is still open
