@@ -275,11 +275,13 @@ fn system_power(cmd: u64) -> SysResult {
             unsafe { crate::mmio::write32(0x7000_E400, crate::mmio::read32(0x7000_E400) | 1 << 4) };
             crate::arch::park()
         }
-        nxk_abi::power::OFF if psci::present() => {
-            crate::kprintln!("[nxk] poweroff");
-            psci::system_off()
+        nxk_abi::power::OFF => {
+            if psci::present() {
+                crate::kprintln!("[nxk] poweroff");
+                psci::system_off();
+            }
+            Err(-ENOSYS)
         }
-        nxk_abi::power::OFF => Err(-ENOSYS),
         _ => Err(-EINVAL),
     }
 }

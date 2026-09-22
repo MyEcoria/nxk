@@ -47,12 +47,12 @@ pub fn cpu_on(mpidr: u64, entry: u64) -> i64 {
     smc(CPU_ON_64, mpidr, entry, 0) as i64
 }
 
-pub fn system_off() -> ! {
+/// Returns only if the monitor refuses (nxk-bl31 has no PMIC access).
+pub fn system_off() {
     smc(SYSTEM_OFF, 0, 0, 0);
-    crate::arch::park()
 }
 
-pub fn system_reset() -> ! {
+/// Returns only if the monitor refuses.
+pub fn system_reset() {
     smc(SYSTEM_RESET, 0, 0, 0);
-    crate::arch::park()
 }
