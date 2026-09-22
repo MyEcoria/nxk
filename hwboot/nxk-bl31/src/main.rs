@@ -8,10 +8,11 @@
 //! Le moniteur fait le minimum vital : reglages EL3 de chaque coeur que
 //! l'emulateur n'exige pas mais le Cortex-A57 si (CNTFRQ_EL0, SMPEN,
 //! registres EL2 a valeur de reset inconnue), horloge+reset d'UART-A puis
-//! logs, compteur systeme en marche, bascule du GIC en Groupe 1 (sans quoi
-//! EL1 non securise ne voit aucune IRQ), declaration de sa region TZ au
-//! controleur memoire (pour que nxk l'exclue de la DRAM libre), recopie de
-//! nxk et saut en EL2. Les appels
+//! logs, recopies aussi sur l'ecran laisse allume par hekate (`fbcon`),
+//! compteur systeme en marche, bascule du GIC en Groupe 1 (sans quoi EL1 non
+//! securise ne voit aucune IRQ), declaration de sa region TZ au controleur
+//! memoire (pour que nxk l'exclue de la DRAM libre), recopie de nxk et saut
+//! en EL2. Les appels
 //! `smc` (dont la sonde PSCI de nxk) recoivent NOT_SUPPORTED : nxk demarre
 //! alors sur un seul coeur, sans PSCI. Pas de PSCI, pas de DTB, pas de
 //! DVFS : chaque ajout serait du risque materiel inutile pour un premier
@@ -23,6 +24,8 @@
 
 #![no_std]
 #![no_main]
+
+mod fbcon;
 
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -113,13 +116,15 @@ fn puts(s: &str) {
         }
         putc(b);
     }
+    fbcon::write_str(s);
 }
 fn puthex(v: u64) {
-    puts("0x");
-    for i in (0..16).rev() {
-        let d = ((v >> (i * 4)) & 0xF) as u8;
-        putc(if d < 10 { b'0' + d } else { b'a' + d - 10 });
+    let mut buf = *b"0x0000000000000000";
+    for i in 0..16 {
+        let d = ((v >> ((15 - i) * 4)) & 0xF) as u8;
+        buf[2 + i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
     }
+    puts(core::str::from_utf8(&buf).unwrap_or("0x?"));
 }
 
 /// Toutes les lignes en Groupe 1 : EL1 non securise recoit ses IRQ.
@@ -149,6 +154,7 @@ fn relocate(src: usize, dst: usize, size: u64) {
 #[no_mangle]
 extern "C" fn bl31_main() -> ! {
     uart_init();
+    fbcon::init();
     puts("\n[nxk-bl31] moniteur EL3 (entree L4T hekate)\n");
 
     // Sans effet s'il tourne deja ; arrete, CNTPCT_EL0 resterait fige et
@@ -187,6 +193,7 @@ extern "C" fn bl31_main() -> ! {
     puts(" octets)\n");
     relocate(BL33_SRC, BL33_DST, size);
     puts("[nxk-bl31] saut en EL2, x0 = 0 (sans DTB)\n");
+    fbcon::handoff();
 
     unsafe { drop_to_bl33() }
 }
