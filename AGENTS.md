@@ -20,11 +20,10 @@ This file guides AI coding agents working on **nxk**. Follow it on every task
   `refs/`, real Tegra X1 behavior); use the emulator only as fallback
   validation, never as an excuse for emulator-only shortcuts.
 - Hardware status: nxk boots on a physical **Erista** Switch through
-  hekate's L4T entry and `hwboot/nxk-bl31` (EL2, single core, no PSCI)
-  up to the `display` service. The shell is not reachable there yet
-  (console on UART-A, whose pads are internal); `usbcon`, a USB-C serial
-  console (`tools/usbterm.py` on the PC), is the way in, emulator-tested
-  only. Run log and expected screen output: `hwboot/README.md`.
+  hekate's L4T entry and `hwboot/nxk-bl31` (EL2; PSCI `CPU_ON` for
+  cores 1-3) to the shell, reached over `usbcon`, the USB-C serial
+  console (`tools/usbterm.py` on the PC; UART-A pads are internal).
+  Run log and expected screen output: `hwboot/README.md`.
 - Syscall convention: `svc #0`, number in `x8`, args in `x0`–`x5`, result in
   `x0`, errors as `-errno` (Linux values). Single source of truth: `abi/`
   (`nxk-abi` crate shared by kernel, libnx, std).

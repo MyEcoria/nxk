@@ -77,21 +77,34 @@ Chosen chain (validated in the emulator, and on hardware up to the
   clears the screen hekate left on and copies its logs there, starts the
   system counter, switches the GIC to Group 1, declares its MB as a TZ
   carveout (nxk excludes it via `detect_holes`), copies bl33 from
-  `0xAA000000` to `0x80000000`, refuses `smc` (no PSCI -> nxk
-  single-core), and jumps to EL2 (SCTLR_EL2, MDCR_EL2... in a known
-  state) with x0 = 0 (no DTB: DRAM via `MC_EMEM_CFG` + probing).
+  `0xAA000000` to `0x80000000`, and jumps to EL2 (SCTLR_EL2,
+  MDCR_EL2... in a known state) with x0 = 0 (no DTB: DRAM via
+  `MC_EMEM_CFG` + probing). It then serves PSCI 1.0 (`psci.rs`:
+  VERSION, FEATURES, CPU_ON, AFFINITY_INFO, SYSTEM_RESET; no
+  SYSTEM_OFF, which needs the PMIC). CPU_ON follows exosphere: assert
+  the core's CPU/CORE reset, ungate its PMC partition (CE1-CE3), release
+  the reset; the core restarts at the monitor's `_start` (SB AA64 reset
+  vector, set by hekate and rewritten by the monitor: hekate's lock only
+  blocks non-secure writes, which is why nxk in EL2 cannot wake cores
+  itself), gets its EL3 and banked GIC setup, then enters nxk in EL2.
 - `nxk/bl33.bin`: byte-identical copy of `build/nxk.bin`.
 - `bootloader/sys/l4t/` + `libsys_*.bso`: BPMP/SC7/Minerva firmware from
   the Nyx pack (DRAM init by hekate); installed by `mksd-hw.sh` if missing.
 
 Emulator validation (`./test-bl31.sh`, same bl31 binary as on hardware),
 two scenarios: without screen (monitor banner, copy, `entry in EL2`,
-`no PSCI: single core`, `nxk>` prompt); then with the screen as hekate
+`PSCI 1.0`, `4/4 cores online`, `nxk>` prompt); then with the screen as hekate
 leaves it, reproduced by `fakehekate.py` (DC window A on over a fake
 logo at `0xF5A00000`): the image is read back as text, the logo must be
 gone and the monitor then kernel lines must appear up to the launch of
-`init`. The EL2+PSCI 4-core path is also covered by
-`nxtest.py --monitor <l4tboot> --dtb build/moniteur.dtb`.
+`init`. ktest/stdtest through this same monitor:
+
+```bash
+NXTEST_QEMU_ARGS="-device loader,file=hwboot/dl/bl31-test.bin,addr=0xFFF00000,force-raw=on \
+  -device loader,file=build/nxk.bin,addr=0xAA000000,force-raw=on \
+  -global driver=tegra.evp,property=cpu-reset-vector,value=0xFFF00000" \
+  ./tools/nxtest.py -c ktest -c stdtest --sd build/sd.img
+```
 
 ## Screen: what to expect
 
@@ -169,6 +182,14 @@ The last `usbcon:` line locates a failure:
    boot, `init`, spawning from the boot image, and `display` taking over
    DC window A with its own DMA image. Not observed: the other services
    and the shell (UART-A only, no way in yet: "Hardware test", step 3).
+3. 22/09/2026, Erista, commit `d0d478c`: **shell reached over the USB-C
+   console** (`usbterm.py`), stable under load (ktest, stdtest, bench,
+   ~8 min, no fault, 30 C). `bench`: null syscall 239 ns, IPC round
+   trip 1554 ns, IPC 4 KiB 317 MB/s, thread create+join 6 us,
+   spawn+wait 89 us. Failures: single core (ktest affinity and load
+   balancing: no PSCI then), and no SD card (`ls /`: ENOSYS, stdtest
+   `files`): hekate's `sd_end()` powers the card off before the L4T
+   jump, and `sd` expected it on. `usb` and `net` exit (xHCI off).
 
 ## Hardware test (once the SD card is back in the PC)
 
@@ -181,7 +202,7 @@ The last `usbcon:` line locates a failure:
    UART-B. A USB keyboard does not reach the shell: its keys go to the
    `input` service, and hekate's L4T path leaves the xHCI unpowered
    (`usb` exits).
-4. Expected: `entry in EL2`, `1/4 cores online`, `launching init`,
+4. Expected: `entry in EL2`, `PSCI 1.0`, `4/4 cores online`, `launching init`,
    then the `display` service screen and the `usbcon:` lines.
 5. Recovery: a failed boot is just a hang. Hold Power 12 s (forced
    off), reboot into RCM, retry. No NAND, eMMC or SD writes by nxk:

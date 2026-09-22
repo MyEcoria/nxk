@@ -1,10 +1,11 @@
 //! nxk-bl31: minimal EL3 monitor launching nxk from hekate's L4T entry (RCM -> hekate -> monitor -> nxk).
-//! Vital minimum only (EL3 per-core setup, UART-A, screen mirror, counter, GIC Group 1, TZ carveout, copy, EL2 jump); no PSCI/DTB/DVFS. Same binary runs under QEMU (see `hwboot/test-bl31.sh`).
+//! EL3 per-core setup, UART-A, screen mirror, counter, GIC Group 1, TZ carveout, copy, EL2 jump, PSCI CPU_ON; no DTB/DVFS. Same binary runs under QEMU (see `hwboot/test-bl31.sh`).
 
 #![no_std]
 #![no_main]
 
 mod fbcon;
+mod psci;
 
 use core::arch::global_asm;
 use core::ptr::{read_volatile, write_volatile};
@@ -38,7 +39,8 @@ const MC_SECURITY_CFG1: usize = 0x7001_9074;
 /// System counter (CNTPCT_EL0 source): EN | HDBG, as in exosphere.
 const SYSCTR0_CNTCR: usize = 0x700F_0000;
 
-const PMC_SCRATCH110: usize = 0x7000_E400 + 0xB10;
+const PMC_BASE: usize = 0x7000_E400;
+const PMC_SCRATCH110: usize = PMC_BASE + 0xB10;
 const IRAM_MAGIC: u32 = 0x4D41_5249; // "IRAM": hekate params present
 
 const fn parse_u64(s: &str) -> u64 {
@@ -113,9 +115,20 @@ fn gic_secure_init() {
         wr(GICD + 0x80 + (i as usize / 32) * 4, 0xFFFF_FFFF);
     }
     wr(GICD, 0b11); // EnableGrp0 | EnableGrp1
-    wr(GICD + 0x80, 0xFFFF_FFFF); // core 0 SGI/PPI
+    gic_secure_init_cpu();
+}
+
+/// Banked per core: SGI/PPI to Group 1, secure CPU interface on.
+fn gic_secure_init_cpu() {
+    wr(GICD + 0x80, 0xFFFF_FFFF);
     wr(GICC, (1 << 0) | (1 << 1) | (1 << 3));
     wr(GICC + 4, 0xFF);
+}
+
+fn park() -> ! {
+    loop {
+        unsafe { core::arch::asm!("msr daifset, #0xF", "wfe", options(nostack)) };
+    }
 }
 
 /// Copy `size` bytes then invalidate the instruction cache: we just wrote
@@ -148,6 +161,9 @@ extern "C" fn bl31_main() -> ! {
     wr(MC_SECURITY_CFG1, 1);
     puts("[nxk-bl31] TZ carveout: 0xfff00000 (1 MiB)\n");
 
+    psci::init();
+    puts("[nxk-bl31] PSCI 1.0: CPU_ON for cores 1-3\n");
+
     if rd(PMC_SCRATCH110) == IRAM_MAGIC {
         puts("[nxk-bl31] hekate params present (IRAM)\n");
     } else {
@@ -157,9 +173,7 @@ extern "C" fn bl31_main() -> ! {
     let size = bl33_size();
     if size == 0 || size > 8 << 20 {
         puts("[nxk-bl31] ERROR: bad bl33 size (NXK_BL33_SIZE)\n");
-        loop {
-            unsafe { core::arch::asm!("wfe") };
-        }
+        park();
     }
     puts("[nxk-bl31] copying bl33: ");
     puthex(BL33_SRC as u64);
@@ -172,17 +186,18 @@ extern "C" fn bl31_main() -> ! {
     puts("[nxk-bl31] jumping to EL2, x0 = 0 (no DTB)\n");
     fbcon::handoff();
 
-    unsafe { drop_to_bl33() }
+    unsafe { drop_to_el2(BL33_DST as u64, 0) }
 }
 
 extern "C" {
-    fn drop_to_bl33() -> !;
+    /// EL3 -> EL2h at `entry` with x0 = `ctx`; per-core EL2 state reset.
+    fn drop_to_el2(entry: u64, ctx: u64) -> !;
 }
 
-/// Refuse all EL2/EL1 `smc` (no PSCI v1); any other EL3 trap is fatal.
+/// PSCI from EL2/EL1 (silent: nxk owns UART and screen after the jump).
 #[no_mangle]
 extern "C" fn smc_handler(regs: &mut [u64; 31]) {
-    regs[0] = -1i64 as u64; // NOT_SUPPORTED
+    psci::smc(regs);
 }
 
 /// Trapped access or unexpected exception: print then park.
@@ -199,17 +214,13 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
     puthex(elr);
     puts("\n");
     let _ = regs;
-    loop {
-        unsafe { core::arch::asm!("wfe") };
-    }
+    park()
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     puts("\n[nxk-bl31] panic\n");
-    loop {
-        unsafe { core::arch::asm!("wfe") };
-    }
+    park()
 }
 
 global_asm!(
@@ -240,7 +251,7 @@ _start:
     add     x0, x0, :lo12:el3_vectors
     msr     vbar_el3, x0
     isb
-    cbnz    x19, .Lpark                 // secondaries: parked
+    cbnz    x19, .Lsecondary            // woken by PSCI CPU_ON
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
     adrp    x1, __bss_end
@@ -252,17 +263,16 @@ _start:
     b       .Lbss
 .Lbss_done:
     bl      bl31_main
-.Lpark:
-    msr     daifset, #0xF
-.Lpark_loop:
-    wfe
-    b       .Lpark_loop
+.Lsecondary:
+    mov     x0, x19
+    bl      bl31_secondary              // does not return
 
-// void drop_to_bl33() -> ! : EL3 -> EL2, ELR = 0x80000000, x0 = 0.
-.globl drop_to_bl33
-drop_to_bl33:
-    // SCR_EL3 = NS | RES1 | SMD=0 | HCE | RW: `smc` traps to EL3 (our
-    // handler cleanly refuses them).
+// drop_to_el2(entry, ctx) -> ! : EL3 -> EL2h, ELR = entry, x0 = ctx.
+.globl drop_to_el2
+drop_to_el2:
+    mov     x19, x0
+    mov     x20, x1
+    // SCR_EL3 = NS | RES1 | SMD=0 | HCE | RW: `smc` traps to EL3 (PSCI).
     mov     x0, #0x531
     msr     scr_el3, x0
     msr     cptr_el3, xzr
@@ -295,9 +305,8 @@ drop_to_bl33:
     msr     sctlr_el1, x0
     mov     x0, #0x3C9                 // SPSR: EL2h, all masked
     msr     spsr_el3, x0
-    movz    x0, #0x8000, lsl #16       // ELR = 0x80000000
-    msr     elr_el3, x0
-    mov     x0, xzr                    // x0 = 0: no DTB
+    msr     elr_el3, x19
+    mov     x0, x20                    // boot core: 0 = no DTB
     mov     x1, xzr
     mov     x2, xzr
     mov     x3, xzr

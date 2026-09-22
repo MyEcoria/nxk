@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test of nxk-bl31 under QEMU (same binary as hardware).
-# 1. No screen: nxk banner, single core (no PSCI), shell prompt. 2. Hekate-lit screen: logo cleared, monitor + kernel lines readable.
+# 1. No screen: nxk banner, PSCI 1.0, 4 cores via CPU_ON, shell prompt. 2. Hekate-lit screen: logo cleared, monitor + kernel lines readable.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -56,7 +56,7 @@ check() {
 
 echo "== no screen"
 run 0xFFF00000
-check "$tmp/uart.log" "nxk-bl31.*jumping to EL2" "entered in EL2" "without PSCI: single core" "nxk> "
+check "$tmp/uart.log" "nxk-bl31.*jumping to EL2" "entered in EL2" "by a monitor: PSCI 1.0" "4/4 cores online" "nxk> "
 tr -d '\r' <"$tmp/uart.log" | grep -E "nxk-bl31|entered in EL2|cores online" | head -12
 
 echo "== screen left on by hekate"
@@ -65,7 +65,7 @@ python3 "$here/fakehekate.py" logo "$tmp/logo.raw"
 run 0xF0000000 \
     -device "loader,file=$tmp/amorce.bin,addr=0xF0000000,force-raw=on" \
     -device "loader,file=$tmp/logo.raw,addr=0xF5A00000,force-raw=on"
-check "$tmp/uart.log" "nxk> "
+check "$tmp/uart.log" "4/4 cores online" "nxk> "
 python3 "$here/fakehekate.py" lire "$tmp/fb.raw" >"$tmp/fb.txt"
 check "$tmp/fb.txt" "^\[nxk-bl31\] EL3 monitor" "^\[nxk-bl31\] jumping to EL2" "Tegra X1 microkernel" \
     "^\[screen\] messages mirrored" "launching init" "^pixels outside text: 0$"

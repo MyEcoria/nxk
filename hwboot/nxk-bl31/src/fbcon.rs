@@ -41,7 +41,7 @@ struct Fb {
     row: usize,
 }
 
-/// Core 0 only (secondaries are parked).
+/// Core 0 only, before the jump (secondaries and PSCI never log).
 static mut FB: Option<Fb> = None;
 
 fn fb() -> Option<&'static mut Fb> {

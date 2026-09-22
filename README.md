@@ -212,7 +212,7 @@ stops threads.
 (as on a Switch with its secure firmware); DRAM size detected; device
 tree read when provided. On a Switch, hekate's L4T entry loads
 `hwboot/nxk-bl31`, an EL3 monitor doing ATF's job, which enters nxk in
-EL2 on a single core (no PSCI yet). If the loader left the screen on
+EL2 and starts the other cores through PSCI `CPU_ON`. If the loader left the screen on
 (hekate), the kernel log is copied there until the `display` service
 takes over: the only visible output without a UART adapter.
 
@@ -242,7 +242,7 @@ program that vanished without closing them (crash) are reclaimed.
 
 | Area | Done | Remaining |
 |---|---|---|
-| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection; real Erista via hekate + nxk-bl31 (1 core, up to `display`) | PSCI in nxk-bl31 (4 cores on hardware), shell on hardware, Mariko hardware |
+| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection; real Erista via hekate + nxk-bl31 (shell over USB-C), PSCI `CPU_ON` in nxk-bl31 | 4 cores observed on hardware, Mariko hardware |
 | Memory | on demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas | |
 | Threads | priorities, affinity, migration, balancing, tickless, futex | deep sleep states |
 | IPC | synchronous, timeouts, handles, notifications, pipes, sender identity | wait on several objects (`poll`) |
@@ -256,13 +256,12 @@ program that vanished without closing them (crash) are reclaimed.
 
 ## Limits
 
-- **On a real Switch, only the boot up to the `display` service has
-  been observed** (Erista, hekate L4T entry, single core). The shell
-  runs on UART-A, whose pads are internal; the USB-C console (`usbcon`)
-  mirrors it to a PC over the injection cable, but has only run against
-  the emulator's virtual host. A USB keyboard does not help: its keys go
-  to `input`, not to the shell, and hekate's L4T path leaves the xHCI
-  unpowered.
+- **On a real Switch** (Erista, hekate L4T entry) nxk reaches the
+  shell over the USB-C console (`usbcon`, `tools/usbterm.py`): UART-A
+  pads are internal. Last hardware run: single core (before PSCI in
+  nxk-bl31) and no SD card (see `hwboot/README.md`, "Hardware runs").
+  A USB keyboard does not help: its keys go to `input`, not to the
+  shell, and hekate's L4T path leaves the xHCI unpowered.
 - Kernel messages (`[nxk]` fault reports) go to UART-A and the loader's
   screen only, not to the USB console. Mariko lacks the USB2 OTG device
   controller (its OTG port belongs to XUSB): no USB console there.
