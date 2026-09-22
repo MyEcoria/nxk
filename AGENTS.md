@@ -181,7 +181,18 @@ Key details agents must respect:
   still correct for real hardware (datasheet section, `refs/` reference,
   register sequence).
 
-## 7. Commits (mandatory)
+## 7. Technical choices (mandatory)
+
+- For every technical choice (design, hardware sequence, boot path,
+  protocol, data structure, crate, trade-off between approaches), propose
+  **several solutions** (at least two) to the user before implementing:
+  for each, what it involves, pros/cons (hardware safety, complexity,
+  performance, maintenance) and which one you recommend. Wait for the
+  user's pick before writing the code.
+- Mechanical changes with a single sensible option (typo, rename,
+  following an existing pattern) need no proposal; say so when skipping.
+
+## 8. Commits (mandatory)
 
 - After every task, `commit` **and** `push` the result (do not leave changes
   unpushed in the working tree).
