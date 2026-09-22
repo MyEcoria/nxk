@@ -1,9 +1,5 @@
-//! Appels systeme.
-//!
-//! Convention Linux arm64 : numero dans x8, arguments dans x0-x5, resultat
-//! dans x0 (`-errno` en cas d'echec). Un appel bloquant ne rend rien tout de
-//! suite : son resultat sera ecrit dans le `Frame` du thread par celui qui le
-//! reveillera, et le coeur repart entre-temps avec un autre thread.
+//! Syscalls: Linux arm64 numbers in x8, `-errno` results in x0.
+//! Parking calls complete later via the waker's Frame write.
 
 use nxk_abi::err::*;
 use nxk_abi::info::{self, CpuInfo, MemInfo, ProcInfo};
@@ -21,8 +17,8 @@ use crate::kern::thread::{self, State};
 use crate::kern::{debug, futex, ipc, irq, notify, percpu, sched, shm};
 use crate::mm::{pmm, uaccess, vm};
 
-/// `Ok(Some(v))` : valeur a rendre ; `Ok(None)` : le Frame est deja rempli ou
-/// le thread est bloque ; `Err(e)` : erreur a rendre.
+/// `Ok(Some(v))`: value to return; `Ok(None)`: Frame already filled or thread
+/// parked; `Err(e)`: error to return.
 type SysResult = Result<Option<u64>, i64>;
 
 #[inline]
@@ -30,13 +26,20 @@ fn val(v: u64) -> SysResult {
     Ok(Some(v))
 }
 
-/// Registres de peripheriques reserves au noyau (GIC) : jamais projetables.
+/// Kernel-reserved device registers (GIC): never mappable.
 const KERNEL_MMIO: core::ops::Range<u64> = 0x5004_0000..0x5006_0000;
 
 pub fn dispatch(ti: u16) {
     let t = thread::get(ti);
     let nr = t.frame.x[8];
-    let a = [t.frame.x[0], t.frame.x[1], t.frame.x[2], t.frame.x[3], t.frame.x[4], t.frame.x[5]];
+    let a = [
+        t.frame.x[0],
+        t.frame.x[1],
+        t.frame.x[2],
+        t.frame.x[3],
+        t.frame.x[4],
+        t.frame.x[5],
+    ];
     let pi = t.proc_idx;
     percpu::this().stats.syscalls += 1;
 
@@ -71,7 +74,11 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
         },
         sys::GETCPU => val(t.home as u64),
         sys::GETPID => {
-            let target = if a[0] == 0 { pi } else { cap::lookup(pi, a[0] as u32, Kind::Process, 0)?.obj as u16 };
+            let target = if a[0] == 0 {
+                pi
+            } else {
+                cap::lookup(pi, a[0] as u32, Kind::Process, 0)?.obj as u16
+            };
             val(process::get(target).pid as u64)
         }
         sys::GETTID => val(t.tid as u64),
@@ -96,11 +103,16 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
         sys::MEM_PROTECT => mem_protect(pi, a[0], a[1], a[2]),
         sys::SHM_CREATE => {
             let (i, gen) = shm::create(a[0], a[1])?;
-            let r = rights::MAP | rights::WRITE | rights::GRANT | rights::DUP | rights::DMA | rights::CONTROL;
+            let r = rights::MAP
+                | rights::WRITE
+                | rights::GRANT
+                | rights::DUP
+                | rights::DMA
+                | rights::CONTROL;
             match cap::insert(pi, Cap::new(Kind::Shm, i as u32, gen, r)) {
                 Ok(h) => val(h as u64),
                 Err(e) => {
-                    // Aucune reference prise : l'objet n'a jamais existe.
+                    // No reference taken: the object never existed.
                     shm::incref(i);
                     shm::decref(i);
                     Err(e)
@@ -135,7 +147,8 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
                 return Err(-EINVAL);
             }
             let (i, gen) = ipc::create(a[0] & nxk_abi::endpoint::PIPE != 0).ok_or(-ENOMEM)?;
-            cap::insert(pi, Cap::new(Kind::Endpoint, i as u32, gen, rights::ALL)).map(|h| Some(h as u64))
+            cap::insert(pi, Cap::new(Kind::Endpoint, i as u32, gen, rights::ALL))
+                .map(|h| Some(h as u64))
         }
         sys::IPC_CALL => ipc::call(ti, a[0] as u32).map(|_| None),
         sys::IPC_SEND => ipc::send(ti, a[0] as u32).map(|_| None),
@@ -146,7 +159,8 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
 
         sys::NOTIFY_CREATE => {
             let (i, gen) = notify::create().ok_or(-ENOMEM)?;
-            cap::insert(pi, Cap::new(Kind::Notification, i as u32, gen, rights::ALL)).map(|h| Some(h as u64))
+            cap::insert(pi, Cap::new(Kind::Notification, i as u32, gen, rights::ALL))
+                .map(|h| Some(h as u64))
         }
         sys::NOTIFY_SIGNAL => {
             let c = cap::lookup(pi, a[0] as u32, Kind::Notification, rights::SIGNAL)?;
@@ -248,59 +262,63 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
     }
 }
 
-/// Redemarrage ou extinction de la machine.
+/// Machine reboot or poweroff.
 fn system_power(cmd: u64) -> SysResult {
     use crate::arch::psci;
     match cmd {
         nxk_abi::power::REBOOT => {
-            crate::kprintln!("[nxk] redemarrage");
+            crate::kprintln!("[nxk] reboot");
             if psci::present() {
                 psci::system_reset();
             }
-            // Sans moniteur : reset principal du SoC (PMC_CNTRL.MAIN_RST).
+            // No monitor: main SoC reset (PMC_CNTRL.MAIN_RST).
             unsafe { crate::mmio::write32(0x7000_E400, crate::mmio::read32(0x7000_E400) | 1 << 4) };
             crate::arch::park()
         }
         nxk_abi::power::OFF if psci::present() => {
-            crate::kprintln!("[nxk] extinction");
+            crate::kprintln!("[nxk] poweroff");
             psci::system_off()
         }
-        nxk_abi::power::OFF => Err(-ENOSYS), // coupure par le PMIC (I2C) : pilote utilisateur
+        nxk_abi::power::OFF => Err(-ENOSYS),
         _ => Err(-EINVAL),
     }
 }
 
 fn debug_write(ptr: u64, len: u64) -> SysResult {
-    let len = len.min(64 * 1024);
-    let mut buf = [0u8; 256];
-    let mut off = 0;
-    while off < len {
-        let n = (len - off).min(buf.len() as u64) as usize;
+    chunked(len, |buf, off, n| {
         uaccess::copy_from_user(&mut buf[..n], ptr + off)?;
         crate::console::write_bytes(&buf[..n]);
-        off += n as u64;
-    }
-    val(len)
+        Ok(())
+    })
 }
 
 fn getrandom(ptr: u64, len: u64) -> SysResult {
+    chunked(len, |buf, off, n| {
+        crate::kern::random::fill(&mut buf[..n]);
+        let r = uaccess::copy_to_user(ptr + off, &buf[..n]);
+        buf.fill(0);
+        r
+    })
+}
+
+/// Run `f` over `[0, len)` in 256-byte chunks; returns `len`.
+fn chunked(
+    len: u64,
+    mut f: impl FnMut(&mut [u8; 256], u64, usize) -> Result<(), i64>,
+) -> SysResult {
     let len = len.min(64 * 1024);
     let mut buf = [0u8; 256];
     let mut off = 0;
     while off < len {
         let n = (len - off).min(buf.len() as u64) as usize;
-        crate::kern::random::fill(&mut buf[..n]);
-        let r = uaccess::copy_to_user(ptr + off, &buf[..n]);
-        buf.fill(0);
-        r?;
+        f(&mut buf, off, n)?;
         off += n as u64;
     }
     val(len)
 }
 
-/// Fin du thread courant. Si une notification est fournie, elle est signalee
-/// apres que le thread a quitte EL0 pour de bon : celui qui l'attend peut
-/// liberer sa pile sans risque.
+/// Exit the current thread; an optional notification fires after EL0 exit.
+///
 fn thread_exit(ti: u16, code: i64, notif: u32, bits: u64) -> SysResult {
     if notif != 0 {
         let pi = thread::get(ti).proc_idx;
@@ -313,7 +331,7 @@ fn thread_exit(ti: u16, code: i64, notif: u32, bits: u64) -> SysResult {
     if p.nthreads == 1 {
         p.exit_code = code;
     }
-    t.state = State::Zombie; // libere a la sortie du noyau
+    t.state = State::Zombie;
     Ok(None)
 }
 
@@ -334,7 +352,7 @@ fn handle_dup(pi: u16, h: u32, mask: u16, badge: u64) -> SysResult {
     }
     c.rights &= mask;
     if badge != 0 {
-        // Seul un endpoint sans insigne peut en recevoir un (comme `mint`).
+        // Only a badgeless endpoint may gain one (like `mint`).
         if c.kind != Kind::Endpoint || c.badge != 0 {
             return Err(-EINVAL);
         }
@@ -351,28 +369,53 @@ fn page_range_ok(va: u64, len: u64) -> bool {
         && va.checked_add(len).is_some_and(|e| e <= USER_MAX)
 }
 
-fn mem_map(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
-    let len = pmm::align_up(len, PAGE_SIZE);
-    if len == 0 || len > 1 << 32 || p & !(prot::READ | prot::WRITE | prot::EXEC | prot::POPULATE) != 0 {
+fn overlaps_utcb(va: u64, len: u64) -> bool {
+    let utcb_end = UTCB_BASE + MAX_THREADS_PER_PROCESS as u64 * PAGE_SIZE;
+    va < utcb_end && va + len > UTCB_BASE
+}
+
+/// Page-aligned user range outside the UTCB area.
+fn user_range_ok(va: u64, len: u64) -> bool {
+    page_range_ok(va, len) && !overlaps_utcb(va, len)
+}
+
+/// W^X: no page is both writable and executable.
+fn check_no_wx(p: u64) -> Result<(), i64> {
+    if p & prot::WRITE != 0 && p & prot::EXEC != 0 {
+        return Err(-EACCES);
+    }
+    Ok(())
+}
+
+/// Mask check for rwx-style prot bits.
+fn check_prot_mask(p: u64, extra: u64) -> Result<(), i64> {
+    if p & !(prot::READ | prot::WRITE | prot::EXEC | extra) != 0 {
         return Err(-EINVAL);
     }
-    if p & prot::WRITE != 0 && p & prot::EXEC != 0 {
-        return Err(-EACCES); // W^X
+    Ok(())
+}
+
+fn mem_map(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
+    let len = pmm::align_up(len, PAGE_SIZE);
+    if len == 0 || len > 1 << 32 {
+        return Err(-EINVAL);
     }
+    check_prot_mask(p, prot::POPULATE)?;
+    check_no_wx(p)?;
     let proc = process::get(pi);
     let va = if addr == 0 {
         let va = proc.heap_next;
         if va + len > HEAP_END {
             return Err(-ENOMEM);
         }
-        proc.heap_next += len + PAGE_SIZE; // page de garde entre deux projections
+        proc.heap_next += len + PAGE_SIZE;
         va
     } else {
-        if !page_range_ok(addr, len) || overlaps_utcb(addr, len) {
+        if !user_range_ok(addr, len) {
             return Err(-EINVAL);
         }
-        // Adresse imposee : la plage doit etre libre, sinon l'echec (et le
-        // nettoyage qui le suit) toucherait des pages deja projetees.
+        // Fixed address: the range must be free, else failure (and its cleanup)
+        // would touch already-mapped pages.
         let l1 = proc.l1;
         if (0..len / PAGE_SIZE).any(|k| crate::mm::vm::is_mapped(l1, addr + k * PAGE_SIZE)) {
             return Err(-EEXIST);
@@ -391,11 +434,11 @@ fn mem_map(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
     val(va)
 }
 
-/// Zone de `len` octets pour une projection : `addr` impose, ou prise dans
-/// le tas du processus (avec une page de garde apres).
+/// `len`-byte area for a mapping: fixed `addr`, or taken from the process heap
+/// (with a guard page after).
 fn place(pi: u16, addr: u64, len: u64) -> Result<u64, i64> {
     if addr != 0 {
-        if !page_range_ok(addr, len) || overlaps_utcb(addr, len) {
+        if !user_range_ok(addr, len) {
             return Err(-EINVAL);
         }
         return Ok(addr);
@@ -410,12 +453,8 @@ fn place(pi: u16, addr: u64, len: u64) -> Result<u64, i64> {
 }
 
 fn shm_map(pi: u16, h: u32, addr: u64, p: u64) -> SysResult {
-    if p & !(prot::READ | prot::WRITE | prot::EXEC) != 0 {
-        return Err(-EINVAL);
-    }
-    if p & prot::WRITE != 0 && p & prot::EXEC != 0 {
-        return Err(-EACCES);
-    }
+    check_prot_mask(p, 0)?;
+    check_no_wx(p)?;
     let c = cap::lookup(pi, h, Kind::Shm, rights::MAP)?;
     let max = shm::check_prot(p, c.rights)?;
     let va = place(pi, addr, shm::size(c.obj as u16))?;
@@ -425,17 +464,13 @@ fn shm_map(pi: u16, h: u32, addr: u64, p: u64) -> SysResult {
 
 fn mem_protect(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
     let len = pmm::align_up(len, PAGE_SIZE);
-    if p & !(prot::READ | prot::WRITE | prot::EXEC) != 0 {
-        return Err(-EINVAL);
-    }
-    if p & prot::WRITE != 0 && p & prot::EXEC != 0 {
-        return Err(-EACCES); // W^X
-    }
-    if !page_range_ok(addr, len) || overlaps_utcb(addr, len) {
+    check_prot_mask(p, 0)?;
+    check_no_wx(p)?;
+    if !user_range_ok(addr, len) {
         return Err(-EINVAL);
     }
     let proc = process::get(pi);
-    // Tout verifier avant de toucher a quoi que ce soit.
+    // Check everything before touching anything.
     let mut va = addr;
     while va < addr + len {
         let pte = vm::lookup(proc.l1, va);
@@ -450,7 +485,7 @@ fn mem_protect(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
         }
         va += PAGE_SIZE;
     }
-    // AArch64 n'a pas d'ecriture ni d'execution sans lecture en EL0.
+    // AArch64 has no EL0 write or execute without read.
     let p = if p != 0 { p | prot::READ } else { 0 };
     let pages = len / PAGE_SIZE;
     let mut flush = false;
@@ -473,15 +508,10 @@ fn mem_protect(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
     val(0)
 }
 
-fn overlaps_utcb(va: u64, len: u64) -> bool {
-    let utcb_end = UTCB_BASE + MAX_THREADS_PER_PROCESS as u64 * PAGE_SIZE;
-    va < utcb_end && va + len > UTCB_BASE
-}
-
 fn mem_unmap(pi: u16, addr: u64, len: u64) -> SysResult {
     let len = pmm::align_up(len, PAGE_SIZE);
-    // Les UTCB restent en place : le noyau y ecrit par adresse physique.
-    if !page_range_ok(addr, len) || overlaps_utcb(addr, len) {
+    // UTCBs stay put: the kernel writes them by physical address.
+    if !user_range_ok(addr, len) {
         return Err(-EINVAL);
     }
     process::unmap(pi, addr, len);
@@ -491,7 +521,8 @@ fn mem_unmap(pi: u16, addr: u64, len: u64) -> SysResult {
 fn mmio_range(c: &Cap, phys: u64, len: u64) -> Result<(), i64> {
     let base = (c.obj as u64) << 12;
     let end = base + c.extra;
-    if len == 0 || phys % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || phys < base || phys + len > end {
+    if len == 0 || phys % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || phys < base || phys + len > end
+    {
         return Err(-EINVAL);
     }
     if phys < KERNEL_MMIO.end && phys + len > KERNEL_MMIO.start {
@@ -541,7 +572,7 @@ fn thread_create(pi: u16, entry: u64, sp: u64, arg: u64, flags: u64) -> SysResul
     cap::insert(pi, Cap::new(Kind::Thread, ti as u32, gen, r)).map(|h| Some(h as u64))
 }
 
-/// Reglage d'un thread : `h` = 0 designe le thread appelant.
+/// Thread setting: `h` = 0 names the calling thread.
 fn thread_set(ti: u16, pi: u16, h: u32, what: u64, v: u64) -> SysResult {
     use nxk_abi::thread as abi;
     let target = if h == 0 {
@@ -583,19 +614,26 @@ fn spawn(ti: u16, pi: u16, args_ptr: u64) -> SysResult {
 
     let child = process::create(&name[..a.name_len as usize], pi)?;
     let r = (|| -> Result<(), i64> {
-        let src = UserSource { va: a.elf_ptr, len: a.elf_len };
+        let src = UserSource {
+            va: a.elf_ptr,
+            len: a.elf_len,
+        };
         let loaded = elf::load(&src, child)?;
-        let strings = exec::Strings::User { va: a.strings_ptr, len: a.strings_len };
+        let strings = exec::Strings::User {
+            va: a.strings_ptr,
+            len: a.strings_len,
+        };
         let start = exec::prepare(child, &src, &loaded, strings, a.argc, a.envc)?;
         for k in 0..a.grants_len {
-            let g: HandleGrant = uaccess::read(a.grants_ptr + k * core::mem::size_of::<HandleGrant>() as u64)?;
+            let g: HandleGrant =
+                uaccess::read(a.grants_ptr + k * core::mem::size_of::<HandleGrant>() as u64)?;
             cap::grant(pi, g.handle, child, Some(g.slot as usize))?;
         }
         let cpu = (a.cpu >= 0).then_some(a.cpu as usize);
         let args = [a.arg0, a.arg1, start.block];
         let ti = process::create_thread(child, loaded.entry, start.sp, args, a.prio as u8, cpu)?;
         if a.flags & nxk_abi::spawn::SUSPENDED != 0 {
-            // Immobilise avant sa premiere instruction, jusqu'au debogueur.
+            // Parked before its first instruction, until the debugger.
             thread::get(ti).stop_request = true;
         }
         Ok(())
@@ -626,8 +664,16 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
                         threads: p.nthreads as u32,
                         pages: p.pages,
                         name: [0; 16],
-                        state: if p.state == PState::Alive { info::PSTATE_ALIVE } else { info::PSTATE_ZOMBIE },
-                        parent: if p.parent == thread::NIL { 0 } else { process::get(p.parent).pid },
+                        state: if p.state == PState::Alive {
+                            info::PSTATE_ALIVE
+                        } else {
+                            info::PSTATE_ZOMBIE
+                        },
+                        parent: if p.parent == thread::NIL {
+                            0
+                        } else {
+                            process::get(p.parent).pid
+                        },
                         cpu_ns: timer::ticks_to_ns(p.cpu_time),
                     };
                     pi.name.copy_from_slice(&p.name);
@@ -639,7 +685,11 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
         }
         info::MEMORY => {
             let (total, free, kernel) = pmm::stats();
-            let m = MemInfo { total_pages: total, free_pages: free, kernel_pages: kernel };
+            let m = MemInfo {
+                total_pages: total,
+                free_pages: free,
+                kernel_pages: kernel,
+            };
             if len < core::mem::size_of::<MemInfo>() as u64 {
                 return Err(-EINVAL);
             }
@@ -653,7 +703,7 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
                     break;
                 }
                 let pc = percpu::get(c);
-                // Intervalle en cours compris, pour un coeur longtemps au repos.
+                // Current slice included, for a long-idle core.
                 let (mut idle, mut busy) = (pc.stats.idle_time, pc.stats.busy_time);
                 if pc.online {
                     let dt = timer::counter().saturating_sub(pc.acct_start);

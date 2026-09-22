@@ -1,18 +1,10 @@
-//! Vecteurs d'exception et entrees dans le noyau.
-//!
-//! Depuis EL0, `SP_EL1` pointe exactement sur la fin du `Frame` du thread
-//! courant (positionne a la derniere sortie) : les registres utilisateur sont
-//! donc ranges directement dans son TCB, sans copie. Le noyau bascule ensuite
-//! sur la pile de son coeur, traite l'evenement et repart par `exit_to_user`,
-//! qui peut reprendre un autre thread que celui qui est entre.
-//!
-//! Depuis EL1, seules deux choses arrivent : une interruption pendant que le
-//! coeur est au repos, ou une faute du noyau lui-meme (fatale).
+//! Exception vectors and kernel entries.
+//! EL0 entries land in the current TCB; EL1 faults are fatal.
 
 use core::arch::global_asm;
 
-use crate::kern::{bkl, fault, irq, percpu, sched, syscall};
 use crate::arch::{self, fpu};
+use crate::kern::{bkl, fault, irq, percpu, sched, syscall};
 use crate::{keprintln, sysreg_read, sysreg_write};
 
 const KIND_SYNC: u64 = 0;
@@ -22,8 +14,8 @@ const KIND_SERROR: u64 = 3;
 const KIND_AARCH32: u64 = 4;
 const KIND_SP0: u64 = 9;
 
-/// Cadre empile par les exceptions prises en EL1 (meme disposition que le
-/// `Frame` des threads, champ `sp` inutilise).
+/// Frame pushed by EL1-taken exceptions (same layout as thread `Frame`,
+/// unused `sp` field).
 #[repr(C)]
 pub struct KFrame {
     pub x: [u64; 31],
@@ -40,10 +32,8 @@ extern "C" {
 
 #[no_mangle]
 extern "C" fn nxk_el0_trap(_frame: u64, kind: u64) -> ! {
-    // Chemin rapide : appels sans etat partage, traites sans verrou global ni
-    // passage par l'ordonnanceur. Si un autre coeur demande une preemption
-    // pendant ce temps, son IPI est en attente et se declenche des le retour
-    // en EL0 : aucun reveil ne peut etre perdu.
+    // Fast path: stateless calls skip lock and scheduler; pending preemption
+    // IPIs fire on EL0 return, so no wakeup is lost.
     if kind == KIND_SYNC && sysreg_read!("esr_el1") >> 26 == 0x15 {
         let c = percpu::this();
         if !c.need_resched {
@@ -75,7 +65,7 @@ extern "C" fn nxk_el0_trap(_frame: u64, kind: u64) -> ! {
             match esr >> 26 {
                 0x15 => syscall::dispatch(cur),
                 0x07 => fpu::trap(cur),
-                0x01 => sched::yield_current(cur), // WFI piege : traite comme yield
+                0x01 => sched::yield_current(cur),
                 _ => fault::user_fault(cur, esr, sysreg_read!("far_el1")),
             }
         }
@@ -88,11 +78,15 @@ extern "C" fn nxk_el0_trap(_frame: u64, kind: u64) -> ! {
 #[no_mangle]
 extern "C" fn nxk_el1_trap(frame: &mut KFrame, kind: u64) {
     if kind == KIND_IRQ {
-        // Coeur au repos : une interruption a pu rendre un thread pret.
+        // Idle core: an interrupt may have readied a thread.
         bkl::acquire();
         irq::handle();
         if cfg!(feature = "trace-sched") {
-            crate::kprintln!("[s{}] irq au repos, travail {}", percpu::this().id, sched::has_work());
+            crate::kprintln!(
+                "[s{}] idle irq, work {}",
+                percpu::this().id,
+                sched::has_work()
+            );
         }
         if sched::has_work() {
             sched::exit_to_user();
@@ -110,18 +104,28 @@ extern "C" fn nxk_el1_trap(frame: &mut KFrame, kind: u64) {
 fn kernel_fault(frame: &KFrame, kind: u64) -> ! {
     let esr = sysreg_read!("esr_el1");
     keprintln!("");
-    keprintln!("*** FAUTE NOYAU (cpu{}) ***", arch::core_id());
+    keprintln!("*** KERNEL FAULT (cpu{}) ***", arch::core_id());
     keprintln!("  type : {}  ESR {:#x} (EC {:#x})", kind, esr, esr >> 26);
-    keprintln!("  ELR  : {:#018x}  FAR {:#018x}", frame.elr, sysreg_read!("far_el1"));
+    keprintln!(
+        "  ELR  : {:#018x}  FAR {:#018x}",
+        frame.elr,
+        sysreg_read!("far_el1")
+    );
     keprintln!("  SPSR : {:#018x}", frame.spsr);
     for i in (0..30).step_by(2) {
-        keprintln!("  x{:<2} {:#018x}  x{:<2} {:#018x}", i, frame.x[i], i + 1, frame.x[i + 1]);
+        keprintln!(
+            "  x{:<2} {:#018x}  x{:<2} {:#018x}",
+            i,
+            frame.x[i],
+            i + 1,
+            frame.x[i + 1]
+        );
     }
     keprintln!("  x30 {:#018x}", frame.x[30]);
     arch::park()
 }
 
-/// Installe la table de vecteurs sur le coeur courant.
+/// Install the vector table on the current core.
 pub fn init() {
     extern "C" {
         static nxk_vectors: u8;
@@ -137,7 +141,7 @@ global_asm!(
 
 .equ FRAME_SIZE, 288
 
-// Entree depuis EL0 : SP_EL1 = fin du Frame du thread courant.
+// Entry from EL0: SP_EL1 = end of the current thread's Frame.
 .macro EL0_ENTRY kind
     sub     sp, sp, #FRAME_SIZE
     stp     x0, x1, [sp, #16 * 0]
@@ -145,7 +149,7 @@ global_asm!(
     b       .Lel0_common
 .endm
 
-// Entree depuis EL1 : cadre empile sur la pile courante.
+// Entry from EL1: frame pushed on the current stack.
 .macro EL1_ENTRY kind
     sub     sp, sp, #FRAME_SIZE
     stp     x0, x1, [sp, #16 * 0]
@@ -198,7 +202,7 @@ global_asm!(
     mrs     x12, tpidr_el0
     str     x12, [sp, #16 * 17]
     mov     x0, sp
-    // Bascule sur la pile noyau du coeur (PerCpu.kstack_top, offset 0).
+    // Switch to this core's kernel stack (PerCpu.kstack_top, offset 0).
     mrs     x9, tpidr_el1
     ldr     x10, [x9]
     mov     sp, x10
@@ -225,8 +229,7 @@ global_asm!(
     eret
 
 // void nxk_return_to_user(const Frame *f) -> !
-// Recharge les registres du thread choisi et laisse SP_EL1 sur la fin de son
-// Frame : la prochaine entree depuis EL0 y rangera ses registres.
+// Reload chosen registers; SP_EL1 stays at Frame end for the next entry.
 .globl nxk_return_to_user
 .type nxk_return_to_user, @function
 nxk_return_to_user:
@@ -255,7 +258,7 @@ nxk_enter_idle:
 .align 11
 .globl nxk_vectors
 nxk_vectors:
-    // EL courant, SP_EL0 : jamais utilise par le noyau
+    // Current EL, SP_EL0: never used by the kernel
     .align 7
     EL1_ENTRY 9
     .align 7
@@ -264,7 +267,7 @@ nxk_vectors:
     EL1_ENTRY 9
     .align 7
     EL1_ENTRY 9
-    // EL courant, SP_ELx : repos ou faute noyau
+    // Current EL, SP_ELx: idle or kernel fault
     .align 7
     EL1_ENTRY 0
     .align 7
@@ -273,7 +276,7 @@ nxk_vectors:
     EL1_ENTRY 2
     .align 7
     EL1_ENTRY 3
-    // EL0 en AArch64
+    // EL0 in AArch64
     .align 7
     EL0_ENTRY 0
     .align 7
@@ -282,7 +285,7 @@ nxk_vectors:
     EL0_ENTRY 2
     .align 7
     EL0_ENTRY 3
-    // EL0 en AArch32 : non supporte
+    // EL0 in AArch32: unsupported
     .align 7
     EL0_ENTRY 4
     .align 7

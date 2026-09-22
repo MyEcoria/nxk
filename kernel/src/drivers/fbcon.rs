@@ -1,31 +1,16 @@
-//! Console de secours sur l'ecran laisse allume par le chargeur d'amorcage.
-//!
-//! Lance par hekate (entree L4T), nxk trouve le panneau encore allume : hekate
-//! garde l'affichage « sans couture », la fenetre A du controleur DC-A balaie
-//! toujours une image en DRAM (720x1280, 32 bits par pixel). Sans adaptateur
-//! UART, c'est la seule sortie visible avant que le service `display` ne
-//! reprenne l'ecran : le noyau y recopie ses messages (police 8x16 du service
-//! d'affichage, sens portrait comme le menu texte de hekate).
-//!
-//! Rien ne s'active si la fenetre A n'est pas allumee sur une image 32 bits
-//! en DRAM (emulateur, chargeur qui a eteint l'ecran). Le moniteur nxk-bl31
-//! ecrit ses lignes d'abord et laisse dans les deux derniers pixels la ligne
-//! ou reprendre (`HANDOFF_MAGIC`) ; sinon l'ecran est efface.
-//!
-//! L'image est de la DRAM ordinaire : une fois la MMU active (cache WB), chaque
-//! ecriture est nettoyee jusqu'au point de coherence, le controleur
-//! d'affichage lisant la memoire sans passer par les caches du CPU.
+//! Fallback console on the loader-left screen (hekate seamless display).
+//! Off unless window A scans a 32-bit DRAM image; cleaned to coherency.
 
 use crate::mmio::{read32, write32};
 
 const CAR: usize = 0x6000_6000;
 const RST_DEVICES_L: usize = CAR + 0x004;
 const CLK_OUT_ENB_L: usize = CAR + 0x010;
-/// DISP1 (bit 27) et HOST1X (bit 28) : lire le DC horloge coupee ou en reset
-/// bloquerait le bus.
+/// DISP1 (bit 27) and HOST1X (bit 28): reading the DC with clock off or in
+/// reset would hang the bus.
 const DISP1_HOST1X: u32 = (1 << 27) | (1 << 28);
 
-// Controleur d'affichage A (indices de mots de 32 bits).
+// Display controller A (32-bit word indices).
 const DC: usize = 0x5420_0000;
 const CMD_DISPLAY_WINDOW_HEADER: usize = 0x42;
 const WIN_OPTIONS: usize = 0x700;
@@ -35,13 +20,13 @@ const WIN_LINE_STRIDE: usize = 0x70A;
 const WINBUF_START_ADDR: usize = 0x800;
 const WINDOW_A_SELECT: u32 = 1 << 4;
 const WIN_ENABLE: u32 = 1 << 30;
-/// B8G8R8A8 (hekate) et R8G8B8A8 (service `display`).
+/// B8G8R8A8 (hekate) and R8G8B8A8 (`display` service).
 const DEPTH_32BPP: [u32; 2] = [12, 13];
 
-/// Couleurs identiques dans les deux formats (composantes egales).
+/// Same colors in both formats (equal components).
 const BG: u32 = 0xFF00_0000;
 const FG: u32 = 0xFFD8_D8D8;
-/// Deux derniers pixels : `HANDOFF_MAGIC` puis la ligne de texte suivante.
+/// Last two pixels: `HANDOFF_MAGIC` then the next text row.
 pub const HANDOFF_MAGIC: u32 = 0x304B_584E; // "NXK0"
 
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
@@ -53,14 +38,14 @@ struct Fb {
     base: usize,
     w: usize,
     h: usize,
-    /// Pas d'une ligne, en pixels.
+    /// Row stride, in pixels.
     stride: usize,
     col: usize,
     row: usize,
 }
 
-/// Coeur 0 seul avant la MMU, puis sous le verrou de la console ; les
-/// chemins de panique ecrivent sans verrou, comme sur l'UART.
+/// Core 0 alone before the MMU, then under the console lock; panic paths
+/// write lock-free, like the UART.
 static mut FB: Option<Fb> = None;
 
 fn fb() -> Option<&'static mut Fb> {
@@ -71,8 +56,7 @@ fn dc(i: usize) -> usize {
     DC + i * 4
 }
 
-/// Fenetre A allumee sur une image 32 bits en DRAM : (base, largeur, hauteur,
-/// pas en pixels).
+/// Window A on with a 32-bit DRAM image: (base, width, height, stride px).
 fn probe() -> Option<(usize, usize, usize, usize)> {
     unsafe {
         if read32(CLK_OUT_ENB_L) & DISP1_HOST1X != DISP1_HOST1X
@@ -101,7 +85,7 @@ fn probe() -> Option<(usize, usize, usize, usize)> {
     }
 }
 
-/// A appeler MMU coupee, coeur 0 seul, avant tout message.
+/// Call with MMU off, core 0 alone, before any message.
 pub fn init() {
     let Some((base, w, h, stride)) = probe() else {
         return;
@@ -128,8 +112,8 @@ pub fn init() {
     unsafe { *core::ptr::addr_of_mut!(FB) = Some(f) };
 }
 
-/// Plage physique de l'image, arrondie aux pages : a soustraire de la
-/// memoire libre tant que la console y ecrit.
+/// Physical image range, page-rounded: kept out of free memory while the
+/// console writes to it.
 pub fn region() -> Option<(u64, u64)> {
     fb().map(|f| {
         let (b, e) = (f.base as u64, (f.base + f.stride * 4 * f.h) as u64);
@@ -137,7 +121,7 @@ pub fn region() -> Option<(u64, u64)> {
     })
 }
 
-/// Coupe la console d'ecran (image hors de la DRAM projetee).
+/// Shut the screen console off (image outside mapped DRAM).
 pub fn disable() {
     unsafe { *core::ptr::addr_of_mut!(FB) = None };
 }
@@ -149,7 +133,7 @@ pub fn write_str(s: &str) {
             b'\n' => f.newline(),
             b'\r' => f.col = 0,
             0x20..=0x7E => f.put(b),
-            0xC0..=0xFF => f.put(b'?'), // premier octet UTF-8 : un caractere
+            0xC0..=0xFF => f.put(b'?'),
             _ => {}
         }
     }
@@ -200,8 +184,8 @@ impl Fb {
         self.col += 1;
     }
 
-    /// Ligne suivante ; en bas de l'ecran, on repart du haut (pas de
-    /// defilement : recopier l'image entiere a chaque ligne serait lent).
+    /// Next row; at the bottom wrap to the top (no scrolling: copying the
+    /// whole image per row would be slow).
     fn newline(&mut self) {
         self.col = 0;
         self.row = (self.row + 1) % (self.h / GH);
@@ -209,8 +193,8 @@ impl Fb {
     }
 }
 
-/// Nettoie `[addr, addr+len)` jusqu'au point de coherence (sans effet MMU
-/// coupee : rien n'est alors en cache).
+/// Clean `[addr, addr+len)` to the point of coherency (no-op with MMU off:
+/// nothing is cached then).
 fn clean(addr: usize, len: usize) {
     let mut a = addr & !(CACHE_LINE - 1);
     while a < addr + len {

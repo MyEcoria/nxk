@@ -1,4 +1,4 @@
-//! Coeur du micro-noyau : objets, ordonnancement, IPC, appels systeme.
+//! Microkernel core: objects, scheduling, IPC, syscalls.
 
 pub mod bkl;
 pub mod bootfs;

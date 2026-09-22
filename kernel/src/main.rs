@@ -1,18 +1,10 @@
-//! nxk - micro-noyau AArch64 pour Tegra X1 (Nintendo Switch).
-//!
-//! Le noyau ne fait que ce qui exige le privilege EL1 : espaces d'adressage,
-//! threads, ordonnancement, IPC, capacites et routage des interruptions. Les
-//! pilotes et les services tournent en EL0, comme des programmes ordinaires,
-//! avec pour seuls droits ceux que leurs capacites leur donnent.
-//!
-//! Demarrage (coeur 0) : console -> MMU -> vecteurs -> GIC -> timer -> memoire
-//! physique -> objets -> coeurs secondaires -> premier processus (`init`).
+//! nxk: AArch64 Tegra X1 microkernel; EL1 keeps core mechanisms only.
+//! Boot: console -> MMU -> GIC/timer -> memory -> SMP -> init.
 
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-// Les pilotes exposent l'ensemble des registres et primitives du materiel meme
-// si le noyau n'en utilise qu'une partie.
+// Drivers expose the full register set even if the kernel uses a subset.
 #![allow(dead_code)]
 
 mod arch;
@@ -38,7 +30,7 @@ use mm::{pmm, vm};
 
 const KSTACK_SIZE: u64 = 0x4000;
 
-/// Plage de peripheriques confiee a `init` (le noyau en retire le GIC).
+/// Device range handed to `init` (the kernel keeps the GIC for itself).
 const MMIO_ROOT: (u64, u64) = (0x5000_0000, 0x3000_0000);
 
 extern "C" {
@@ -56,14 +48,14 @@ fn kstack_top(core: usize) -> u64 {
     sym(unsafe { &__stack_top }) - core as u64 * KSTACK_SIZE
 }
 
-/// Niveau d'exception auquel nxk a ete lance : 3 sans moniteur securise.
+/// Exception level nxk was started at: 3 with no secure monitor.
 static mut BOOT_EL: usize = 3;
 
 pub fn boot_el() -> usize {
     unsafe { BOOT_EL }
 }
 
-/// Point d'entree du coeur 0, appele par `_start` une fois `.bss` efface.
+/// Core 0 entry point, called by `_start` once `.bss` is cleared.
 #[no_mangle]
 pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     unsafe { BOOT_EL = entry_el };
@@ -73,16 +65,19 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     let (mut dram_size, dram_src) = mmu::detect_dram();
     let mut holes = [(0u64, 0u64); mmu::MAX_HOLES + fdt::MAX_RESERVED];
     holes[..mmu::MAX_HOLES].copy_from_slice(&mmu::detect_holes());
-    // Lance par un moniteur ou un chargeur : l'arbre de peripheriques dit
-    // quelles zones lui appartiennent.
+    // Started by a monitor or loader: the device tree owns some regions.
     let dram = (mmu::DRAM_BASE as u64, (mmu::DRAM_BASE + dram_size) as u64);
-    let fdt_info = if entry_el < 3 { fdt::parse(dtb, dram) } else { None };
+    let fdt_info = if entry_el < 3 {
+        fdt::parse(dtb, dram)
+    } else {
+        None
+    };
     if let Some(f) = &fdt_info {
         for (k, &(b, s)) in f.reserved[..f.nreserved].iter().enumerate() {
             holes[mmu::MAX_HOLES + k] = mmu::round_hole(b, s);
         }
-        // `/memory` peut annoncer moins que le controleur (memoire gardee
-        // par le chargeur au-dela) : la plus petite des deux tailles gagne.
+        // `/memory` may report less than the controller (loader-kept
+        // memory above): the smaller size wins.
         if let Some((base, size)) = f.memory {
             if base == mmu::DRAM_BASE as u64 && size >= 1 << 30 {
                 dram_size = dram_size.min(size as usize & !(mmu::L2_SIZE - 1));
@@ -94,8 +89,8 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
         mmu::enable();
     }
     console::enable_lock();
-    // Image de l'ecran de secours : reste projetee (le noyau y ecrit) mais
-    // n'est pas distribuee. Hors DRAM projetee ou dans un trou : abandon.
+    // Fallback screen image: kept mapped (kernel writes to it) but never
+    // handed out. Outside mapped DRAM or inside a hole: give up.
     let fb = fbcon::region().filter(|&(b, e)| {
         b >= dram.0 && e <= mmu::dram_end() && !holes.iter().any(|&(hb, he)| hb < e && he > b)
     });
@@ -111,8 +106,12 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     timer::init_global();
     let se = random::init();
     kprintln!(
-        "[rng] ChaCha20 amorce par {}",
-        if se { "le generateur materiel du SE et la gigue du compteur" } else { "la gigue du compteur seule" }
+        "[rng] ChaCha20 seeded by {}",
+        if se {
+            "the SE hardware RNG and counter jitter"
+        } else {
+            "counter jitter only"
+        }
     );
 
     let kend = sym(unsafe { &__kernel_end });
@@ -122,30 +121,39 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     pmm::init(kend, mmu::dram_end(), &reserved);
     let (total, free, kpages) = pmm::stats();
     kprintln!(
-        "[mem] {} MiB de DRAM, {} MiB libres (noyau et metadonnees : {} KiB)",
+        "[mem] {} MiB DRAM, {} MiB free (kernel and metadata: {} KiB)",
         total * PAGE_SIZE >> 20,
         free * PAGE_SIZE >> 20,
         kpages * PAGE_SIZE >> 10
     );
     if let mmu::DramSource::Probed { announced_mb } = dram_src {
         kprintln!(
-            "[mem] MC_EMEM_CFG annonce {} MiB : taille retenue apres sondage",
+            "[mem] MC_EMEM_CFG announces {} MiB: kept size after probing",
             announced_mb
         );
     }
     if let Some(f) = &fdt_info {
         kprintln!(
-            "[boot] arbre de peripheriques a {:#x} ({} octets), {} zone(s) reservee(s)",
+            "[boot] device tree at {:#x} ({} bytes), {} reserved region(s)",
             f.blob.0,
             f.blob.1,
             f.nreserved
         );
     }
     for &(b, e) in holes.iter().filter(|h| h.1 > h.0) {
-        kprintln!("[mem] zone reservee par le moniteur : {:#x}..{:#x} ({} MiB)", b, e, (e - b) >> 20);
+        kprintln!(
+            "[mem] monitor-reserved region: {:#x}..{:#x} ({} MiB)",
+            b,
+            e,
+            (e - b) >> 20
+        );
     }
     if let Some((b, e)) = fb {
-        kprintln!("[ecran] messages recopies sur l'image du chargeur : {:#x}..{:#x}", b, e);
+        kprintln!(
+            "[screen] messages mirrored to loader image: {:#x}..{:#x}",
+            b,
+            e
+        );
     }
 
     thread::init();
@@ -158,23 +166,28 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     } else {
         match arch::psci::probe() {
             Some((maj, min)) => {
-                kprintln!("[boot] lance en EL{} par un moniteur : PSCI {}.{}", entry_el, maj, min);
+                kprintln!(
+                    "[boot] started in EL{} by a monitor: PSCI {}.{}",
+                    entry_el,
+                    maj,
+                    min
+                );
                 smp::start_secondaries_psci(_start as *const () as usize)
             }
             None => {
-                kprintln!("[boot] lance en EL{} sans PSCI : un seul coeur", entry_el);
+                kprintln!("[boot] started in EL{} without PSCI: single core", entry_el);
                 1
             }
         }
     };
-    kprintln!("[smp] {}/{} coeurs en ligne", online, percpu::NR_CPUS);
+    kprintln!("[smp] {}/{} cores online", online, percpu::NR_CPUS);
 
     start_init();
     timer::init_cpu();
     sched::exit_to_user()
 }
 
-/// Point d'entree des coeurs secondaires.
+/// Secondary core entry point.
 #[no_mangle]
 pub extern "C" fn ksecondary(core: usize) -> ! {
     unsafe { mmu::enable() };
@@ -188,38 +201,51 @@ pub extern "C" fn ksecondary(core: usize) -> ! {
     sched::exit_to_user()
 }
 
-/// Cree le premier processus. Il recoit l'image de demarrage en lecture seule
-/// et les capacites racines : controle des interruptions et plage des
-/// peripheriques. C'est lui qui les distribuera aux pilotes.
+/// First process: read-only boot image plus root IRQ/MMIO/sysctl caps.
 fn start_init() {
-    let elf_image = bootfs::find("init").expect("image de demarrage sans 'init'");
-    let pi = process::create(b"init", thread::NIL).expect("init : processus");
+    let elf_image = bootfs::find("init").expect("boot image without 'init'");
+    let pi = process::create(b"init", thread::NIL).expect("init: process");
     let src = elf::KernelSource(elf_image);
-    let loaded = elf::load(&src, pi).expect("init : ELF invalide");
-    let start = exec::prepare(pi, &src, &loaded, exec::Strings::Kernel(b"init\0"), 1, 0).expect("init : pile");
+    let loaded = elf::load(&src, pi).expect("init: invalid ELF");
+    let start = exec::prepare(pi, &src, &loaded, exec::Strings::Kernel(b"init\0"), 1, 0)
+        .expect("init: stack");
 
     let img = bootfs::image();
     let base = img.as_ptr() as u64;
     let l1 = process::get(pi).l1;
     let mut off = 0;
     while off < img.len() as u64 {
-        vm::map(l1, BOOTFS_BASE + off, base + off, vm::user_flags(prot::READ)).expect("init : bootfs");
+        vm::map(
+            l1,
+            BOOTFS_BASE + off,
+            base + off,
+            vm::user_flags(prot::READ),
+        )
+        .expect("init: bootfs");
         off += PAGE_SIZE;
     }
     vm::publish();
 
-    cap::insert_at(pi, slots::INIT_IRQ_CONTROL as usize, Cap::new(Kind::IrqControl, 0, 0, rights::ALL))
-        .expect("init : IRQ");
+    cap::insert_at(
+        pi,
+        slots::INIT_IRQ_CONTROL as usize,
+        Cap::new(Kind::IrqControl, 0, 0, rights::ALL),
+    )
+    .expect("init: IRQ");
     let mut m = Cap::new(Kind::Mmio, (MMIO_ROOT.0 >> 12) as u32, 0, rights::ALL);
     m.extra = MMIO_ROOT.1;
-    cap::insert_at(pi, slots::INIT_MMIO_ROOT as usize, m).expect("init : MMIO");
-    cap::insert_at(pi, slots::INIT_SYSCTL as usize, Cap::new(Kind::SysControl, 0, 0, rights::ALL))
-        .expect("init : controle systeme");
+    cap::insert_at(pi, slots::INIT_MMIO_ROOT as usize, m).expect("init: MMIO");
+    cap::insert_at(
+        pi,
+        slots::INIT_SYSCTL as usize,
+        Cap::new(Kind::SysControl, 0, 0, rights::ALL),
+    )
+    .expect("init: system control");
 
     let args = [startup::IS_INIT, img.len() as u64, start.block];
-    process::create_thread(pi, loaded.entry, start.sp, args, 8, Some(0)).expect("init : thread");
+    process::create_thread(pi, loaded.entry, start.sp, args, 8, Some(0)).expect("init: thread");
     kprintln!(
-        "[boot] image de demarrage : {} programmes, {} KiB ; lancement de init",
+        "[boot] boot image: {} programs, {} KiB; launching init",
         bootfs::count(),
         img.len() / 1024
     );
@@ -228,19 +254,33 @@ fn start_init() {
 fn banner(core: usize) {
     kprintln!();
     kprintln!("================================================");
-    kprintln!(" nxk v{}  -  micro-noyau Tegra X1", env!("CARGO_PKG_VERSION"));
+    kprintln!(
+        " nxk v{}  -  Tegra X1 microkernel",
+        env!("CARGO_PKG_VERSION")
+    );
     kprintln!("================================================");
-    kprintln!("  coeur de demarrage : {}   niveau : EL{} (entree en EL{})", core, arch::current_el(), boot_el());
-    kprintln!("  MIDR_EL1           : {:#010x}", sysreg_read!("midr_el1"));
-    let (start, end) = (sym(unsafe { &__kernel_start }), sym(unsafe { &__kernel_end }));
-    kprintln!("  image noyau        : {:#x}..{:#x} ({} KiB)", start, end, (end - start) / 1024);
+    kprintln!(
+        "  boot core : {}   level : EL{} (entered in EL{})",
+        core,
+        arch::current_el(),
+        boot_el()
+    );
+    kprintln!("  MIDR_EL1  : {:#010x}", sysreg_read!("midr_el1"));
+    let (start, end) = (
+        sym(unsafe { &__kernel_start }),
+        sym(unsafe { &__kernel_end }),
+    );
+    kprintln!(
+        "  kernel    : {:#x}..{:#x} ({} KiB)",
+        start,
+        end,
+        (end - start) / 1024
+    );
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Ecriture brute : aucune machinerie `core::fmt` hors du message, pour
-    // que la panique sorte meme si elle vient du formatage lui-meme. UART et
-    // ecran de secours, sans verrou.
+    // Raw lock-free output (UART plus screen): survives broken formatting.
     use drivers::uart::{Uart, UART_A};
     struct Out(Uart);
     impl core::fmt::Write for Out {
@@ -270,17 +310,17 @@ fn panic(info: &PanicInfo) -> ! {
         put_str(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
     };
 
-    put_str("\n*** PANIQUE NOYAU cpu");
+    put_str("\n*** KERNEL PANIC cpu");
     put_num(arch::core_id() as u64);
     put_str(" ***\n");
     if let Some(loc) = info.location() {
-        put_str("  ou   : ");
+        put_str("  at   : ");
         put_str(loc.file());
         put_str(":");
         put_num(loc.line() as u64);
         put_str("\n");
     }
-    put_str("  quoi : ");
+    put_str("  what : ");
     let _ = core::fmt::write(&mut out, format_args!("{}", info.message()));
     put_str("\n");
     arch::park()

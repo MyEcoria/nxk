@@ -1,20 +1,5 @@
-//! Memoire partagee.
-//!
-//! Un objet `Shm` est un ensemble de pages physiques, allouees et mises a zero
-//! a sa creation, qu'on designe par une capacite et qu'on projette dans un ou
-//! plusieurs espaces d'adressage (ou plusieurs fois dans le meme). C'est le
-//! support des echanges volumineux entre processus (tampons de fichiers, de
-//! paquets reseau, d'image) et des tampons DMA des pilotes :
-//!
-//! - `CONTIGUOUS` : pages physiquement contigues (4 MiB au plus), pour un
-//!   peripherique sans IOMMU ; `shm_paddr` (droit DMA) donne leur adresse ;
-//! - `UNCACHED` : projection Normal non cachee, coherente avec un
-//!   peripherique qui ne sonde pas les caches du processeur.
-//!
-//! Chaque projection tient une reference : fermer le dernier handle ne libere
-//! rien tant qu'une projection subsiste. Les projections d'un processus sont
-//! chainees dans son descripteur ; retirer la derniere page d'une projection
-//! (ou la fin du processus) rend sa reference.
+//! Shared-memory objects mapped into processes; DMA capable.
+//! Each mapping holds a ref; CONTIGUOUS suits IOMMU-less devices.
 
 use nxk_abi::err::{EACCES, EINVAL, ENOMEM};
 use nxk_abi::layout::PAGE_SIZE;
@@ -24,34 +9,35 @@ use crate::kern::bkl::BklCell;
 use crate::kern::objtab::Table;
 use crate::kern::process;
 use crate::kern::thread::NIL;
+use crate::mm::pmm::clean_inval;
 use crate::mm::{pmm, vm};
 
-/// Taille maximale d'un objet non contigu (1 GiB).
+/// Max non-contiguous object size (1 GiB).
 const MAX_PAGES: u64 = 1 << 18;
 
 pub struct Shm {
     pub used: bool,
     pub free_link: u16,
     pub gen: u16,
-    /// Capacites et projections.
+    /// Capabilities and mappings.
     pub refs: u32,
     pub pages: u32,
     pub order: u8,
     pub flags: u64,
-    /// Contigu : adresse du bloc ; sinon : tableau des adresses de pages.
+    /// Contiguous: block address; else: page address array.
     pub base: u64,
 }
 
-/// Une projection d'un objet dans un processus.
+/// One mapping of an object in a process.
 pub struct Mapping {
     pub free_link: u16,
     pub next: u16,
     pub shm: u16,
     pub va: u64,
     pub pages: u32,
-    /// Pages encore projetees ; a zero, la projection disparait.
+    /// Pages still mapped; at zero the mapping goes away.
     pub mapped: u32,
-    /// Droits maximaux (ceux de la capacite au moment de la projection).
+    /// Max rights (the capability's at map time).
     pub max_prot: u64,
 }
 
@@ -85,22 +71,7 @@ pub fn alive(i: u16, gen: u16) -> bool {
     (i as usize) < SHMS.get().capacity() && s(i).used && s(i).gen == gen
 }
 
-/// Nettoie et invalide les lignes de cache d'une zone (vue identite) : la
-/// mise a zero faite par le noyau atteint la memoire avant tout acces non
-/// cache ou tout DMA.
-fn clean_inval(pa: u64, len: u64) {
-    let ctr: u64;
-    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-    let line = 4u64 << ((ctr >> 16) & 0xF);
-    let mut a = pa & !(line - 1);
-    while a < pa + len {
-        unsafe { core::arch::asm!("dc civac, {}", in(reg) a, options(nostack)) };
-        a += line;
-    }
-    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
-}
-
-/// Cree un objet de `len` octets (arrondis a la page).
+/// Create a `len`-byte object (page-rounded).
 pub fn create(len: u64, fl: u64) -> Result<(u16, u16), i64> {
     if len == 0 || fl & !(flags::CONTIGUOUS | flags::UNCACHED | flags::DMA32) != 0 {
         return Err(-EINVAL);
@@ -167,7 +138,7 @@ fn release_pages(base: u64, order: usize, fl: u64, pages: u32) {
     pmm::free(base, order);
 }
 
-/// Adresse physique de la page `k`.
+/// Physical address of page `k`.
 #[inline]
 pub fn page_pa(i: u16, k: u32) -> u64 {
     let x = s(i);
@@ -197,7 +168,7 @@ pub fn decref(i: u16) {
     }
 }
 
-/// Adresse physique d'un octet de l'objet (programmation DMA).
+/// Physical address of an object byte (DMA setup).
 pub fn paddr(i: u16, offset: u64) -> Result<u64, i64> {
     if offset >= size(i) {
         return Err(-EINVAL);
@@ -205,11 +176,15 @@ pub fn paddr(i: u16, offset: u64) -> Result<u64, i64> {
     Ok(page_pa(i, (offset / PAGE_SIZE) as u32) + offset % PAGE_SIZE)
 }
 
-/// Projette tout l'objet a `va` dans le processus `pi`.
+/// Map the whole object at `va` in process `pi`.
 pub fn map(pi: u16, i: u16, va: u64, p: u64, max_prot: u64) -> Result<(), i64> {
     let x = s(i);
     let pr = process::get(pi);
-    let base_flags = if x.flags & flags::UNCACHED != 0 { vm::user_flags_nc(p) } else { vm::user_flags(p) };
+    let base_flags = if x.flags & flags::UNCACHED != 0 {
+        vm::user_flags_nc(p)
+    } else {
+        vm::user_flags(p)
+    };
     let fl = base_flags | vm::SW_SHM;
     let m = MAPS.get().alloc().ok_or(-ENOMEM)?;
     for k in 0..x.pages {
@@ -238,7 +213,7 @@ pub fn map(pi: u16, i: u16, va: u64, p: u64, max_prot: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// Projection du processus `pi` contenant `va`.
+/// Mapping of process `pi` containing `va`.
 fn find(pi: u16, va: u64) -> Option<(u16, u16)> {
     let mut prev = NIL;
     let mut cur = process::get(pi).shm_head;
@@ -253,14 +228,18 @@ fn find(pi: u16, va: u64) -> Option<(u16, u16)> {
     None
 }
 
-/// Droits maximaux d'une page partagee projetee a `va`.
+/// Max rights of a shared page mapped at `va`.
 pub fn max_prot(pi: u16, va: u64) -> u64 {
-    find(pi, va).map(|(_, m)| MAPS.get().get(m).max_prot).unwrap_or(0)
+    find(pi, va)
+        .map(|(_, m)| MAPS.get().get(m).max_prot)
+        .unwrap_or(0)
 }
 
-/// Une page partagee vient d'etre retiree de l'espace de `pi`.
+/// A shared page was just removed from `pi`'s space.
 pub fn page_unmapped(pi: u16, va: u64) {
-    let Some((prev, cur)) = find(pi, va) else { return };
+    let Some((prev, cur)) = find(pi, va) else {
+        return;
+    };
     let m = MAPS.get().get(cur);
     m.mapped -= 1;
     if m.mapped == 0 {
@@ -276,8 +255,8 @@ pub fn page_unmapped(pi: u16, va: u64) {
     }
 }
 
-/// Fin de processus : les tables de pages sont deja detruites, il reste a
-/// rendre les references de ses projections.
+/// Process exit: page tables already destroyed, still must drop the
+/// mappings' references.
 pub fn drop_mappings(pi: u16) {
     let p = process::get(pi);
     while p.shm_head != NIL {
@@ -290,7 +269,7 @@ pub fn drop_mappings(pi: u16) {
     }
 }
 
-/// Droits demandes compatibles avec la capacite ?
+/// Requested rights within the capability?
 pub fn check_prot(p: u64, cap_rights: u16) -> Result<u64, i64> {
     let mut max = prot::READ | prot::EXEC;
     if cap_rights & nxk_abi::rights::WRITE != 0 {

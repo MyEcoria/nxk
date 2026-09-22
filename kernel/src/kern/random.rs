@@ -1,13 +1,8 @@
-//! Aleatoire du noyau : ChaCha20 avec effacement de cle.
-//!
-//! Graine prise au demarrage dans le generateur materiel du moteur de
-//! securite (SE) du Tegra, melangee a la gigue du compteur. Chaque bloc de
-//! flux fournit d'abord une nouvelle cle, aussitot substituee a l'ancienne :
-//! une fuite de l'etat ne revele rien des valeurs deja produites.
-//! Sert a la disposition aleatoire des espaces d'adressage et a `getrandom`.
+//! ChaCha20 RNG with key erasure, seeded by SE hardware plus jitter.
 
 use crate::arch::timer;
 use crate::kern::bkl::BklCell;
+use crate::mm::pmm::clean_inval;
 use crate::mmio::{read32, write32};
 
 struct Rng {
@@ -17,7 +12,12 @@ struct Rng {
     pos: usize,
 }
 
-static RNG: BklCell<Rng> = BklCell::new(Rng { key: [0; 8], counter: 0, buf: [0; 64], pos: 64 });
+static RNG: BklCell<Rng> = BklCell::new(Rng {
+    key: [0; 8],
+    counter: 0,
+    buf: [0; 64],
+    pos: 64,
+});
 
 #[inline(always)]
 fn qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
@@ -57,7 +57,7 @@ fn block(key: &[u32; 8], counter: u64, out: &mut [u8; 64]) {
 }
 
 impl Rng {
-    /// Un bloc de flux : 32 octets deviennent la nouvelle cle, 32 sont livres.
+    /// One keystream block: 32 bytes become the new key, 32 are delivered.
     fn refill(&mut self) {
         let mut out = [0u8; 64];
         block(&self.key, self.counter, &mut out);
@@ -107,7 +107,7 @@ pub fn next_u64() -> u64 {
     u64::from_le_bytes(b)
 }
 
-// --- Moteur de securite (SE) : generateur SP 800-90 ---
+// --- Security engine (SE): SP 800-90 RNG ---
 const SE: usize = 0x7001_2000;
 const SE_OPERATION: usize = SE + 0x008;
 const SE_INT_STATUS: usize = SE + 0x010;
@@ -124,25 +124,28 @@ const SE_INT_OP_DONE: u32 = 1 << 4;
 
 #[repr(C, align(64))]
 struct SeBuf {
-    ll: [u32; 4], // num, adresse, taille
+    ll: [u32; 4],
     data: [u8; 64],
 }
 
-static mut SE_BUF: SeBuf = SeBuf { ll: [0; 4], data: [0; 64] };
+static mut SE_BUF: SeBuf = SeBuf {
+    ll: [0; 4],
+    data: [0; 64],
+};
 
-/// 64 octets du generateur materiel, ou `None` si le SE ne repond pas.
+/// 64 bytes from the hardware RNG, or `None` if the SE stays silent.
 fn se_random() -> Option<[u8; 64]> {
     let b = unsafe { &mut *core::ptr::addr_of_mut!(SE_BUF) };
     let data_pa = b.data.as_ptr() as u64;
     b.ll = [0, data_pa as u32, 64, 0];
     let ll_pa = b.ll.as_ptr() as u64;
-    // Le SE lit et ecrit la memoire sans passer par les caches du CPU.
+    // The SE reads/writes memory bypassing CPU caches.
     clean_inval(ll_pa, 16);
     clean_inval(data_pa, 64);
     unsafe {
-        write32(SE_CONFIG, 2 << 12); // ENC_ALG RNG, DST memoire, cle 128 bits
-        write32(SE_CRYPTO_CONFIG, 1 << 3); // INPUT_SEL aleatoire
-        write32(SE_RNG_CONFIG, 1 << 2); // SRC_ENTROPY, mode normal
+        write32(SE_CONFIG, 2 << 12);
+        write32(SE_CRYPTO_CONFIG, 1 << 3);
+        write32(SE_RNG_CONFIG, 1 << 2);
         write32(SE_RNG_SRC_CONFIG, read32(SE_RNG_SRC_CONFIG) | (1 << 1));
         write32(SE_RNG_RESEED_INTERVAL, 4096);
         write32(SE_CRYPTO_LAST_BLOCK, 64 / 16 - 1);
@@ -150,7 +153,7 @@ fn se_random() -> Option<[u8; 64]> {
         write32(SE_OUT_LL_ADDR, ll_pa as u32);
         write32(SE_ERR_STATUS, read32(SE_ERR_STATUS));
         write32(SE_INT_STATUS, read32(SE_INT_STATUS));
-        write32(SE_OPERATION, 1); // START
+        write32(SE_OPERATION, 1);
     }
     let deadline = timer::counter() + timer::ns_to_ticks(10_000_000);
     while unsafe { read32(SE_INT_STATUS) } & SE_INT_OP_DONE == 0 {
@@ -168,16 +171,7 @@ fn se_random() -> Option<[u8; 64]> {
     (out.iter().any(|&x| x != 0)).then_some(out)
 }
 
-fn clean_inval(pa: u64, len: u64) {
-    let mut a = pa & !63;
-    while a < pa + len {
-        unsafe { core::arch::asm!("dc civac, {}", in(reg) a, options(nostack)) };
-        a += 64;
-    }
-    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
-}
-
-/// Graine initiale : SE si disponible, plus la gigue du compteur.
+/// Initial seed: SE if available, plus counter jitter.
 pub fn init() -> bool {
     let r = RNG.get();
     let hw = se_random();

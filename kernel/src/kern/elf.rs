@@ -1,16 +1,5 @@
-//! Chargeur ELF : executables statiques AArch64, a adresse fixe ou
-//! independants de la position (static-PIE).
-//!
-//! Un static-PIE est lie a partir de 0 : le noyau tire une base aleatoire
-//! (ASLR, 20 bits d'entropie par pas de 64 KiB), y projette les segments puis
-//! applique les relocations `R_AARCH64_RELATIVE` (`*(base+off) = base+addend`)
-//! directement dans les pages physiques du processus. Les donnees relogees
-//! peuvent donc vivre dans un segment en lecture seule (RELRO complet) : elles
-//! sont figees avant que le programme ne demarre.
-//!
-//! Les octets sont lus a la source (image du noyau ou memoire de l'appelant,
-//! via `uaccess`) et ecrits directement dans les pages du nouveau processus :
-//! une seule copie, aucun tampon intermediaire.
+//! ELF loader for static and static-PIE AArch64 executables.
+//! Random base plus in-place RELATIVE relocs; single copy.
 
 use nxk_abi::err::{EFAULT, EINVAL, ENOEXEC, ENOMEM};
 use nxk_abi::layout::{HEAP_BASE, PAGE_SIZE, TEXT_BASE, USER_MIN};
@@ -50,7 +39,10 @@ impl Source for UserSource {
         self.len
     }
     fn read(&self, off: u64, dst: &mut [u8]) -> Result<(), i64> {
-        if off.checked_add(dst.len() as u64).is_none_or(|e| e > self.len) {
+        if off
+            .checked_add(dst.len() as u64)
+            .is_none_or(|e| e > self.len)
+        {
             return Err(-ENOEXEC);
         }
         uaccess::copy_from_user(dst, self.va + off)
@@ -120,13 +112,13 @@ const DT_RELR: i64 = 36;
 const R_AARCH64_NONE: u64 = 0;
 const R_AARCH64_RELATIVE: u64 = 1027;
 pub const MAX_PHDRS: u16 = 16;
-/// Granularite de la base aleatoire.
+/// Random base granularity.
 const ASLR_ALIGN: u64 = 64 * 1024;
 
-/// Resultat du chargement.
+/// Load result.
 pub struct Loaded {
     pub entry: u64,
-    /// Base de chargement (0 : executable a adresse fixe).
+    /// Load base (0: fixed-address executable).
     pub base: u64,
     pub phoff: u64,
     pub phnum: u16,
@@ -134,7 +126,9 @@ pub struct Loaded {
 
 fn read_struct<T: Copy + Default>(src: &dyn Source, off: u64) -> Result<T, i64> {
     let mut v = T::default();
-    let bytes = unsafe { core::slice::from_raw_parts_mut(&mut v as *mut T as *mut u8, core::mem::size_of::<T>()) };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(&mut v as *mut T as *mut u8, core::mem::size_of::<T>())
+    };
     src.read(off, bytes)?;
     Ok(v)
 }
@@ -143,7 +137,7 @@ pub fn phdr(src: &dyn Source, phoff: u64, k: u16) -> Result<Phdr, i64> {
     read_struct(src, phoff + k as u64 * core::mem::size_of::<Phdr>() as u64)
 }
 
-/// Charge l'executable dans le processus `pi`.
+/// Load the executable into process `pi`.
 pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
     let eh: Ehdr = read_struct(src, 0)?;
     if &eh.ident[..4] != b"\x7fELF" || eh.ident[4] != 2 || eh.ident[5] != 1 {
@@ -154,11 +148,14 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
         ET_DYN => true,
         _ => return Err(-ENOEXEC),
     };
-    if eh.machine != EM_AARCH64 || eh.phentsize as usize != core::mem::size_of::<Phdr>() || eh.phnum > MAX_PHDRS {
+    if eh.machine != EM_AARCH64
+        || eh.phentsize as usize != core::mem::size_of::<Phdr>()
+        || eh.phnum > MAX_PHDRS
+    {
         return Err(-ENOEXEC);
     }
 
-    // Etendue des segments, pour placer une image independante de la position.
+    // Segment span, to place a position-independent image.
     let mut span = 0u64;
     for k in 0..eh.phnum {
         let ph = phdr(src, eh.phoff, k)?;
@@ -167,7 +164,9 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
         }
     }
     let base = if pie {
-        let room = (HEAP_BASE - TEXT_BASE).checked_sub(pmm::align_up(span, ASLR_ALIGN)).ok_or(-ENOEXEC)?;
+        let room = (HEAP_BASE - TEXT_BASE)
+            .checked_sub(pmm::align_up(span, ASLR_ALIGN))
+            .ok_or(-ENOEXEC)?;
         TEXT_BASE + (random::next_u64() % (room / ASLR_ALIGN + 1)) * ASLR_ALIGN
     } else {
         0
@@ -185,7 +184,7 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
             return Err(-ENOEXEC);
         }
         if ph.pflags & PF_W != 0 && ph.pflags & PF_X != 0 {
-            return Err(-ENOEXEC); // W^X, y compris pour les executables
+            return Err(-ENOEXEC);
         }
         let mut p = prot::READ;
         if ph.pflags & PF_W != 0 {
@@ -205,11 +204,13 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
                 return Err(e);
             }
             process::get(pi).pages += 1;
-            // Portion du fichier qui tombe dans cette page.
+            // File portion falling in this page.
             let lo = va.max(vaddr);
             let hi = (va + PAGE_SIZE).min(file_end);
             if lo < hi {
-                let dst = unsafe { core::slice::from_raw_parts_mut((pa + (lo - va)) as *mut u8, (hi - lo) as usize) };
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut((pa + (lo - va)) as *mut u8, (hi - lo) as usize)
+                };
                 src.read(ph.offset + (lo - vaddr), dst)?;
             }
             va += PAGE_SIZE;
@@ -218,8 +219,8 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
     if pie {
         relocate(src, &eh, base, l1)?;
     }
-    // Code eventuellement retouche par les relocations : le cache
-    // d'instructions ne doit voir que la version finale.
+    // Code possibly patched by relocations: the instruction cache must only
+    // see the final version.
     for k in 0..eh.phnum {
         let ph = phdr(src, eh.phoff, k)?;
         if ph.ptype == PT_LOAD && ph.pflags & PF_X != 0 {
@@ -231,10 +232,15 @@ pub fn load(src: &dyn Source, pi: u16) -> Result<Loaded, i64> {
         }
     }
     vm::publish();
-    Ok(Loaded { entry: base + eh.entry, base, phoff: eh.phoff, phnum: eh.phnum })
+    Ok(Loaded {
+        entry: base + eh.entry,
+        base,
+        phoff: eh.phoff,
+        phnum: eh.phnum,
+    })
 }
 
-/// Decalage dans le fichier d'une adresse (non relogee) d'un segment.
+/// File offset of a (non-relocated) segment address.
 fn file_offset(src: &dyn Source, eh: &Ehdr, vaddr: u64) -> Result<u64, i64> {
     for k in 0..eh.phnum {
         let ph = phdr(src, eh.phoff, k)?;
@@ -245,7 +251,7 @@ fn file_offset(src: &dyn Source, eh: &Ehdr, vaddr: u64) -> Result<u64, i64> {
     Err(-ENOEXEC)
 }
 
-/// Applique les relocations d'un static-PIE charge a `base`.
+/// Apply relocations of a static-PIE loaded at `base`.
 fn relocate(src: &dyn Source, eh: &Ehdr, base: u64, l1: u64) -> Result<(), i64> {
     let mut dynamic = None;
     for k in 0..eh.phnum {
@@ -264,7 +270,7 @@ fn relocate(src: &dyn Source, eh: &Ehdr, base: u64, l1: u64) -> Result<(), i64> 
             DT_RELA => rela = d.val,
             DT_RELASZ => relasz = d.val,
             DT_RELAENT => relaent = d.val,
-            DT_REL | DT_RELR => return Err(-ENOEXEC), // formats non pris en charge
+            DT_REL | DT_RELR => return Err(-ENOEXEC),
             _ => {}
         }
     }
@@ -281,7 +287,11 @@ fn relocate(src: &dyn Source, eh: &Ehdr, base: u64, l1: u64) -> Result<(), i64> 
             R_AARCH64_NONE => {}
             R_AARCH64_RELATIVE => {
                 let value = base.wrapping_add(r.addend as u64);
-                poke(l1, base.checked_add(r.offset).ok_or(-ENOEXEC)?, &value.to_le_bytes())?;
+                poke(
+                    l1,
+                    base.checked_add(r.offset).ok_or(-ENOEXEC)?,
+                    &value.to_le_bytes(),
+                )?;
             }
             _ => return Err(-ENOEXEC),
         }
@@ -289,8 +299,8 @@ fn relocate(src: &dyn Source, eh: &Ehdr, base: u64, l1: u64) -> Result<(), i64> 
     Ok(())
 }
 
-/// Ecrit dans une page deja projetee du processus, quelles que soient ses
-/// protections (par l'adresse physique).
+/// Write into an already-mapped process page, whatever its protections (via
+/// the physical address).
 fn poke(l1: u64, va: u64, bytes: &[u8]) -> Result<(), i64> {
     for (k, &b) in bytes.iter().enumerate() {
         let a = va + k as u64;

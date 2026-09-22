@@ -1,10 +1,4 @@
-//! Capacites : tables de handles par processus.
-//!
-//! Un handle est un indice dans la table du processus, complete d'une
-//! generation (`(gen << 16) | slot`) pour qu'un handle ferme puis reutilise ne
-//! designe jamais silencieusement un autre objet. Chaque entree porte le type
-//! d'objet, les droits et un insigne (badge) transmis au serveur a chaque
-//! message. La recherche est en O(1).
+//! Per-process capability tables: `(gen << 16) | slot` handles, O(1).
 
 use nxk_abi::err::{EACCES, EBADF, ENOSPC};
 
@@ -12,7 +6,7 @@ use crate::kern::process;
 use crate::kern::{ipc, irq, notify, shm};
 use crate::mm::pmm;
 
-/// Table initiale : une page (128 entrees), doublee a la demande.
+/// Initial table: one page (128 entries), doubled on demand.
 const INITIAL_CAPS: usize = 128;
 pub const MAX_CAPS: usize = 0x10000;
 
@@ -27,9 +21,9 @@ pub enum Kind {
     Irq,
     IrqControl,
     Mmio,
-    /// Controle du systeme (heure murale).
+    /// System control (wall clock).
     SysControl,
-    /// Objet de memoire partagee.
+    /// Shared-memory object.
     Shm,
 }
 
@@ -41,11 +35,11 @@ pub struct Cap {
     pub rights: u16,
     pub slot_gen: u16,
     pub obj_gen: u16,
-    /// Indice d'objet ; pour Mmio, base physique >> 12 ; pour Irq, INTID.
+    /// Object index; for Mmio, physical base >> 12; for Irq, INTID.
     pub obj: u32,
     pub _pad: u32,
     pub badge: u64,
-    /// Mmio : taille de la plage.
+    /// Mmio: range size.
     pub extra: u64,
 }
 
@@ -85,7 +79,7 @@ pub fn free_table(pa: u64, len: u32) {
     pmm::free(pa, order_for_len(len as usize));
 }
 
-/// Double la table (copie des entrees, generations comprises).
+/// Double the table (entries copied, generations included).
 fn grow(p: u16) -> Result<(), i64> {
     let pr = process::get(p);
     let old_len = pr.caps_len as usize;
@@ -106,7 +100,7 @@ pub const fn handle(slot: usize, gen: u16) -> u32 {
     ((gen as u32) << 16) | slot as u32
 }
 
-/// L'objet designe existe-t-il encore (meme generation) ?
+/// Does the named object still exist (same generation)?
 fn object_alive(c: &Cap) -> bool {
     match c.kind {
         Kind::Endpoint => ipc::alive(c.obj as u16, c.obj_gen),
@@ -121,7 +115,7 @@ fn object_alive(c: &Cap) -> bool {
     }
 }
 
-/// Resout un handle : type attendu, droits requis, objet toujours vivant.
+/// Resolve a handle: expected type, required rights, object still alive.
 #[inline]
 pub fn lookup(p: u16, h: u32, kind: Kind, need: u16) -> Result<Cap, i64> {
     let slot = (h & 0xFFFF) as usize;
@@ -142,7 +136,7 @@ pub fn lookup(p: u16, h: u32, kind: Kind, need: u16) -> Result<Cap, i64> {
     Ok(c)
 }
 
-/// Resout un handle sans contrainte de type (dup, transfert).
+/// Resolve a handle with no type constraint (dup, transfer).
 pub fn lookup_any(p: u16, h: u32) -> Result<Cap, i64> {
     let slot = (h & 0xFFFF) as usize;
     let t = table(p);
@@ -167,12 +161,16 @@ fn incref(c: &Cap) {
     }
 }
 
-/// Rend la reference d'une capacite. Une capacite revoquee (generation
-/// perimee) n'en porte plus : la revocation a remis le compte a zero.
+/// Drop a capability reference. A revoked capability (stale generation)
+/// holds none: revocation already zeroed the count.
 fn decref(c: &Cap) {
     match c.kind {
-        Kind::Endpoint if ipc::alive(c.obj as u16, c.obj_gen) => ipc::decref(c.obj as u16, c.rights),
-        Kind::Notification if notify::alive(c.obj as u16, c.obj_gen) => notify::decref(c.obj as u16),
+        Kind::Endpoint if ipc::alive(c.obj as u16, c.obj_gen) => {
+            ipc::decref(c.obj as u16, c.rights)
+        }
+        Kind::Notification if notify::alive(c.obj as u16, c.obj_gen) => {
+            notify::decref(c.obj as u16)
+        }
         Kind::Shm if shm::alive(c.obj as u16, c.obj_gen) => shm::decref(c.obj as u16),
         Kind::Process => process::decref(c.obj as u16),
         Kind::Irq => irq::decref(c.obj),
@@ -180,8 +178,8 @@ fn decref(c: &Cap) {
     }
 }
 
-/// Revoque toutes les autres capacites designant l'objet de `h` : l'objet
-/// change de generation, seul `h` (mis a jour sur place) reste valide.
+/// Revoke all other capabilities naming `h`'s object: the object moves to a
+/// new generation, only `h` (updated in place) stays valid.
 pub fn revoke(p: u16, h: u32) -> Result<(), i64> {
     let c = lookup_any(p, h)?;
     if c.rights & nxk_abi::rights::CONTROL == 0 {
@@ -196,7 +194,7 @@ pub fn revoke(p: u16, h: u32) -> Result<(), i64> {
     Ok(())
 }
 
-/// Range une capacite dans un emplacement libre et prend une reference.
+/// Store a capability in a free slot and take a reference.
 pub fn insert(p: u16, cap: Cap) -> Result<u32, i64> {
     let hint = (process::get(p).cap_hint as usize).max(1);
     let found = {
@@ -215,7 +213,7 @@ pub fn insert(p: u16, cap: Cap) -> Result<u32, i64> {
     insert_at(p, slot, cap)
 }
 
-/// Range une capacite a un emplacement impose (handles de demarrage).
+/// Store a capability at a fixed slot (boot handles).
 pub fn insert_at(p: u16, slot: usize, mut cap: Cap) -> Result<u32, i64> {
     if slot == 0 || slot >= MAX_CAPS {
         return Err(-ENOSPC);
@@ -233,7 +231,7 @@ pub fn insert_at(p: u16, slot: usize, mut cap: Cap) -> Result<u32, i64> {
     Ok(handle(slot, cap.slot_gen))
 }
 
-/// Ferme un handle ; l'objet disparait avec sa derniere reference.
+/// Close a handle; the object dies with its last reference.
 pub fn remove(p: u16, h: u32) -> Result<(), i64> {
     let slot = (h & 0xFFFF) as usize;
     let t = table(p);
@@ -254,7 +252,7 @@ pub fn remove(p: u16, h: u32) -> Result<(), i64> {
     Ok(())
 }
 
-/// Ferme tout (fin de processus).
+/// Close everything (process exit).
 pub fn close_all(p: u16) {
     for slot in 1..process::get(p).caps_len as usize {
         let c = table(p)[slot];
@@ -265,8 +263,8 @@ pub fn close_all(p: u16) {
     }
 }
 
-/// Copie une capacite d'un processus a un autre (transfert ou spawn). Exige le
-/// droit GRANT sur l'original.
+/// Copy a capability between processes (transfer or spawn). Needs GRANT on
+/// the source.
 pub fn grant(from: u16, h: u32, to: u16, slot: Option<usize>) -> Result<u32, i64> {
     let c = lookup_any(from, h)?;
     if c.rights & nxk_abi::rights::GRANT == 0 {

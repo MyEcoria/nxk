@@ -1,10 +1,5 @@
-//! Interruptions : distribution noyau et routage vers les pilotes utilisateur.
-//!
-//! Une ligne materielle (SPI) peut etre confiee a un processus via une
-//! capacite. Quand elle se declenche, le noyau la masque au niveau du GIC et
-//! signale la notification associee ; le pilote traite son peripherique puis
-//! appelle `irq_ack`, qui la demasque. Le noyau ne touche jamais au
-//! peripherique lui-meme.
+//! Hardware SPI dispatch to user drivers via bound notifications.
+//! Kernel masks at GIC on fire; driver unmasks with `irq_ack`.
 
 use nxk_abi::err::{EBUSY, EINVAL};
 
@@ -18,7 +13,7 @@ pub const MAX_IRQ: usize = 256;
 #[derive(Clone, Copy)]
 pub struct Line {
     pub owned: bool,
-    /// Capacites designant la ligne ; liberee a la derniere fermeture.
+    /// Capabilities naming the line; freed on last close.
     pub refs: u32,
     pub owner: u16,
     pub notif: u16,
@@ -37,7 +32,7 @@ static LINES: BklCell<[Line; MAX_IRQ]> = BklCell::new(
     }; MAX_IRQ],
 );
 
-/// Attribue une ligne libre. La capacite creee ensuite en porte la reference.
+/// Claim a free line. The capability created next holds the reference.
 pub fn claim(intid: u32, proc_idx: u16) -> Result<(), i64> {
     if intid < 32 || intid as usize >= MAX_IRQ || intid >= gic::num_irqs() {
         return Err(-EINVAL);
@@ -70,8 +65,8 @@ pub fn bind(intid: u32, notif: u16, notif_gen: u16, bits: u64) {
     l.notif = notif;
     l.notif_gen = notif_gen;
     l.bits = bits;
-    // L'interruption est dirigee vers le coeur du thread qui s'y abonne : la
-    // notification est alors livree sans IPI.
+    // The interrupt targets the subscribing thread's core: the notification
+    // then delivers with no IPI.
     gic::set_target(intid, 1 << percpu::this().id);
     gic::set_priority(intid, 0xA0);
     gic::enable_irq(intid);
@@ -99,7 +94,7 @@ pub fn forget_notification(notif: u16) {
     }
 }
 
-/// Traite toutes les interruptions en attente sur ce coeur.
+/// Handle all pending interrupts on this core.
 pub fn handle() {
     percpu::this().stats.irqs += 1;
     loop {
@@ -123,7 +118,7 @@ pub fn handle() {
 
 fn route(id: u32) {
     let l = LINES.get()[id as usize];
-    // Masquee jusqu'a l'acquittement du pilote (lignes a niveau).
+    // Masked until the driver acks (level lines).
     gic::disable_irq(id);
     if l.owned && l.notif != NIL && notify::alive(l.notif, l.notif_gen) {
         notify::signal(l.notif, l.bits);

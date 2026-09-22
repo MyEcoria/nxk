@@ -1,12 +1,4 @@
-//! FP/SIMD paresseux.
-//!
-//! Le noyau est compile sans FP : il ne touche jamais ces registres, donc rien
-//! a sauvegarder sur un appel systeme ou une interruption. En EL0, l'acces est
-//! piege tant que le thread n'est pas « proprietaire » du FP de son coeur. Au
-//! premier usage, on sauve l'etat de l'ancien proprietaire et on charge le
-//! sien. Un thread qui ne calcule qu'en entiers ne paie jamais ces 528 octets.
-//! Un thread ne s'execute que sur son coeur d'attache, et c'est ce coeur qui
-//! le fait migrer (apres `save_owner`) : un proprietaire par coeur suffit.
+//! Lazy FP/SIMD: one owner per core, trapped until first use.
 
 use core::arch::global_asm;
 
@@ -29,7 +21,7 @@ pub fn init_cpu() {
     percpu::this().fp_enabled = false;
 }
 
-/// Avant de rendre la main a `i` : piege le FP sauf s'il en est proprietaire.
+/// Before returning to `i`: trap FP unless it owns the core's.
 #[inline]
 pub fn prepare(c: &mut PerCpu, i: u16) {
     let want = c.fp_owner == i;
@@ -40,17 +32,17 @@ pub fn prepare(c: &mut PerCpu, i: u16) {
     }
 }
 
-/// Sauve dans son TCB l'etat FP du proprietaire courant (avant sa migration) :
-/// le coeur ne detient plus rien pour lui.
+/// Save the current owner's FP state into its TCB (before migrating it):
+/// the core then holds nothing for it.
 pub fn save_owner(c: &mut PerCpu) {
     if c.fp_owner != NIL {
-        // FPEN=01 ne piege que l'EL0 : EL1 peut lire les registres FP.
+        // FPEN=01 only traps EL0: EL1 can read the FP registers.
         unsafe { nxk_fp_save(&mut thread::get(c.fp_owner).fp) };
         c.fp_owner = NIL;
     }
 }
 
-/// Premier usage du FP par `i` sur ce coeur.
+/// First FP use by `i` on this core.
 pub fn trap(i: u16) {
     let c = percpu::this();
     if c.fp_owner != i {

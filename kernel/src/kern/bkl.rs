@@ -1,11 +1,4 @@
-//! Verrou global du noyau.
-//!
-//! Tout l'etat du noyau (objets, files, tables de pages) est protege par un
-//! verrou unique, pris a chaque entree dans le noyau et rendu juste avant le
-//! retour en EL0. Le noyau n'est jamais interrompu (IRQ masquees en EL1) et ses
-//! chemins durent quelques microsecondes : pour un micro-noyau, un verrou global
-//! se montre aussi performant qu'un verrouillage fin, sans risque d'inversion
-//! d'ordre entre verrous. C'est le choix de seL4 en multiprocesseur.
+//! Global kernel lock (seL4 SMP style): held across kernel entries.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -33,7 +26,7 @@ pub fn held() -> bool {
     OWNER.load(Ordering::Relaxed) == arch::core_id()
 }
 
-/// Donnee protegee par le verrou global : l'acces n'est valide que verrou pris.
+/// Data guarded by the global lock: only valid to touch while held.
 pub struct BklCell<T>(UnsafeCell<T>);
 
 unsafe impl<T> Sync for BklCell<T> {}
@@ -46,7 +39,7 @@ impl<T> BklCell<T> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     pub fn get(&self) -> &mut T {
-        debug_assert!(held(), "etat noyau touche sans le verrou global");
+        debug_assert!(held(), "kernel state touched without the global lock");
         unsafe { &mut *self.0.get() }
     }
 }

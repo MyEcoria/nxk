@@ -1,4 +1,4 @@
-//! Processus : espace d'adressage, table de capacites, threads.
+//! Process: address space, capability table, threads.
 
 use nxk_abi::err::{EINVAL, ENOMEM, ESRCH, ETIMEDOUT};
 use nxk_abi::layout::{MAX_THREADS_PER_PROCESS, PAGE_SIZE, UTCB_BASE};
@@ -17,7 +17,7 @@ use crate::{kprintln, sysreg_write};
 pub enum PState {
     Free = 0,
     Alive,
-    /// Termine ; subsiste tant que des handles le designent (code de sortie).
+    /// Exited; lingers while handles name it (exit code).
     Zombie,
 }
 
@@ -29,18 +29,18 @@ pub struct Process {
     pub name: [u8; 16],
     pub asid: u16,
     pub l1: u64,
-    /// Valeur de TTBR0_EL1 : table | ASID << 48.
+    /// TTBR0_EL1 value: table | ASID << 48.
     pub ttbr: u64,
-    /// Table de capacites (adresse physique) et nombre d'entrees.
+    /// Capability table (physical address) and entry count.
     pub caps: u64,
     pub caps_len: u32,
     pub cap_hint: u32,
     pub nthreads: u16,
-    /// Liste des threads du processus (chainee par `Tcb::proc_next`).
+    /// Process thread list (chained via `Tcb::proc_next`).
     pub threads_head: u16,
-    /// Projections de memoire partagee (liste de `shm::Mapping`).
+    /// Shared-memory mappings (list of `shm::Mapping`).
     pub shm_head: u16,
-    /// Endpoint du debogueur (`NIL` : pas de debogueur) et sa generation.
+    /// Debugger endpoint (`NIL`: none) and its generation.
     pub debug_ep: u16,
     pub debug_gen: u16,
     pub refs: u32,
@@ -48,15 +48,15 @@ pub struct Process {
     pub waiters: Queue,
     pub heap_next: u64,
     pub mmio_next: u64,
-    /// Sommet de la pile principale (aleatoire).
+    /// Main stack top (randomized).
     pub stack_top: u64,
-    /// Base de chargement de l'executable (rapports de faute).
+    /// Executable load base (fault reports).
     pub load_base: u64,
-    /// Emplacements d'UTCB occupes (un bit par thread).
+    /// Occupied UTCB slots (one bit per thread).
     pub utcb_map: [u64; MAX_THREADS_PER_PROCESS / 64],
     pub pages: u64,
     pub parent: u16,
-    /// Temps processeur de tous ses threads (unites du compteur).
+    /// CPU time of all its threads (counter units).
     pub cpu_time: u64,
 }
 
@@ -115,7 +115,7 @@ pub fn name(i: u16) -> &'static str {
     core::str::from_utf8(&n[..len]).unwrap_or("?")
 }
 
-/// Cree un processus vide (espace d'adressage + table de capacites).
+/// Create an empty process (address space + capability table).
 pub fn create(name: &[u8], parent: u16) -> Result<u16, i64> {
     let i = PROCS.get().alloc().ok_or(-ENOMEM)?;
     let l1 = match vm::create() {
@@ -135,9 +135,9 @@ pub fn create(name: &[u8], parent: u16) -> Result<u16, i64> {
     };
     let p = get(i);
     let gen = p.gen;
-    let asid = i + 1; // unique tant que le processus vit ; 0 reste au noyau
-    // ASLR : tas, peripheriques et pile decales d'un nombre aleatoire de
-    // pages (16 bits chacun, jusqu'a 256 MiB).
+    let asid = i + 1;
+    // ASLR: heap, devices and stack shifted by a random page count (16 bits
+    // each, up to 256 MiB).
     let r = crate::kern::random::next_u64();
     let shift = |k: u32| ((r >> (16 * k)) & 0xFFFF) * PAGE_SIZE;
     *p = Process {
@@ -178,7 +178,7 @@ pub fn create(name: &[u8], parent: u16) -> Result<u16, i64> {
     Ok(i)
 }
 
-/// Projette des pages neuves (mises a zero) et possedees par le processus.
+/// Map fresh (zeroed) pages owned by the process.
 pub fn map_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     let p = get(i);
     let flags = vm::user_flags(prot) | vm::SW_OWNED;
@@ -196,7 +196,7 @@ pub fn map_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// Reserve des pages anonymes allouees au premier acces (comme `mmap`).
+/// Reserve anonymous pages allocated on first touch (like `mmap`).
 pub fn reserve_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     let p = get(i);
     let flags = vm::user_flags(prot) | vm::SW_OWNED;
@@ -208,17 +208,18 @@ pub fn reserve_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// Peuple une page reservee du processus courant (acces noyau a sa memoire).
+/// Populate a reserved page of the current process (kernel access to its own
+/// memory).
 pub fn populate_current(va: u64) -> bool {
     let cur = percpu::this().current;
     cur != NIL && populate(thread::get(cur).proc_idx, va)
 }
 
-/// Faute de traduction : peuple la page si elle etait reservee.
+/// Translation fault: populate the page if it was reserved.
 pub fn populate(i: u16, va: u64) -> bool {
     let p = get(i);
-    // Deja peuplee : deux threads ont touche la meme page neuve sur deux
-    // coeurs, et l'autre est passe le premier. La faute est resolue.
+    // Already populated: two threads touched the same fresh page on two cores,
+    // and the other won the race. The fault is resolved.
     if vm::lookup(p.l1, va & !(PAGE_SIZE - 1)) & 1 != 0 {
         return true;
     }
@@ -231,8 +232,8 @@ pub fn populate(i: u16, va: u64) -> bool {
     }
 }
 
-/// Retire et libere des pages (seules les pages possedees retournent a
-/// l'allocateur ; registres de peripheriques et memoire partagee restent).
+/// Remove and free pages (only owned pages return to the allocator; device
+/// registers and shared memory stay).
 pub fn unmap(i: u16, va: u64, len: u64) {
     let p = get(i);
     let mut off = 0;
@@ -249,9 +250,16 @@ pub fn unmap(i: u16, va: u64, len: u64) {
     }
 }
 
-/// Cree un thread utilisateur dans le processus. Il ne demarre qu'au prochain
-/// passage de l'ordonnanceur sur son coeur.
-pub fn create_thread(i: u16, entry: u64, sp: u64, args: [u64; 3], prio: u8, cpu: Option<usize>) -> Result<u16, i64> {
+/// Create a user thread in the process. It starts at the scheduler's next
+/// pass on its core.
+pub fn create_thread(
+    i: u16,
+    entry: u64,
+    sp: u64,
+    args: [u64; 3],
+    prio: u8,
+    cpu: Option<usize>,
+) -> Result<u16, i64> {
     let p = get(i);
     if p.state != PState::Alive {
         return Err(-ESRCH);
@@ -265,8 +273,8 @@ pub fn create_thread(i: u16, entry: u64, sp: u64, args: [u64; 3], prio: u8, cpu:
         .ok_or(-ENOMEM)?;
     let ti = thread::alloc().ok_or(-ENOMEM)?;
 
-    // UTCB : une page en lecture/ecriture pour le thread, lue par le noyau
-    // via son adresse physique.
+    // UTCB: one RW page for the thread, read by the kernel via its physical
+    // address.
     let utcb_va = UTCB_BASE + slot as u64 * PAGE_SIZE;
     let utcb_pa = match pmm::alloc_zeroed(0) {
         Some(pa) => pa,
@@ -275,7 +283,12 @@ pub fn create_thread(i: u16, entry: u64, sp: u64, args: [u64; 3], prio: u8, cpu:
             return Err(-ENOMEM);
         }
     };
-    if let Err(e) = vm::map(p.l1, utcb_va, utcb_pa, vm::user_flags(prot::READ | prot::WRITE) | vm::SW_OWNED) {
+    if let Err(e) = vm::map(
+        p.l1,
+        utcb_va,
+        utcb_pa,
+        vm::user_flags(prot::READ | prot::WRITE) | vm::SW_OWNED,
+    ) {
         pmm::free(utcb_pa, 0);
         thread::free(ti);
         return Err(e);
@@ -292,13 +305,17 @@ pub fn create_thread(i: u16, entry: u64, sp: u64, args: [u64; 3], prio: u8, cpu:
     t.utcb_slot = slot as u16;
     t.utcb_va = utcb_va;
     t.utcb_pa = utcb_pa;
-    t.prio = if prio == 0 { nxk_abi::thread::DEFAULT_PRIO } else { prio.min(nxk_abi::thread::MAX_PRIO) };
+    t.prio = if prio == 0 {
+        nxk_abi::thread::DEFAULT_PRIO
+    } else {
+        prio.min(nxk_abi::thread::MAX_PRIO)
+    };
     let pinned = cpu.filter(|&c| c < percpu::NR_CPUS && percpu::get(c).online);
     t.affinity = pinned.map(|c| c as u8).unwrap_or(thread::ANY_CPU);
     t.home = pinned.unwrap_or_else(sched::least_loaded) as u8;
     t.frame.elr = entry;
     t.frame.sp = sp & !0xF;
-    t.frame.spsr = 0; // EL0t, interruptions actives
+    t.frame.spsr = 0;
     t.frame.x[0] = args[0];
     t.frame.x[1] = args[1];
     t.frame.x[2] = args[2];
@@ -307,7 +324,7 @@ pub fn create_thread(i: u16, entry: u64, sp: u64, args: [u64; 3], prio: u8, cpu:
     Ok(ti)
 }
 
-/// Termine un processus : tous ses threads, puis ses ressources.
+/// Kill a process: all its threads, then its resources.
 pub fn kill(i: u16, code: i64) {
     let p = get(i);
     if p.state != PState::Alive {
@@ -323,14 +340,15 @@ pub fn kill(i: u16, code: i64) {
             ti = next;
             continue;
         }
-        let running_elsewhere = (0..percpu::NR_CPUS).any(|c| c != this_cpu && percpu::get(c).current == ti);
+        let running_elsewhere =
+            (0..percpu::NR_CPUS).any(|c| c != this_cpu && percpu::get(c).current == ti);
         sched::detach(ti);
         if running_elsewhere {
-            // Le coeur qui l'execute le liberera a sa prochaine entree noyau.
+            // The core running it frees it at its next kernel entry.
             t.state = State::Zombie;
             sched::kick(t.home as usize);
         } else if percpu::this().current == ti {
-            t.state = State::Zombie; // libere a la sortie du noyau
+            t.state = State::Zombie;
         } else {
             reap(ti);
         }
@@ -338,7 +356,7 @@ pub fn kill(i: u16, code: i64) {
     }
 }
 
-/// Thread du processus `i` d'identifiant `tid`.
+/// Thread of process `i` with ID `tid`.
 pub fn find_thread(i: u16, tid: u32) -> Option<u16> {
     let mut ti = get(i).threads_head;
     while ti != NIL {
@@ -351,7 +369,7 @@ pub fn find_thread(i: u16, tid: u32) -> Option<u16> {
     None
 }
 
-/// Libere un thread mort. Si c'etait le dernier, le processus disparait.
+/// Free a dead thread. If it was the last, the process goes away.
 pub fn reap(ti: u16) {
     let t = thread::get(ti);
     let i = t.proc_idx;
@@ -363,8 +381,8 @@ pub fn reap(ti: u16) {
     if t.bound_notif != NIL {
         notify::unbind(t.bound_notif);
     }
-    // Un serveur qui devait repondre a ce thread ne doit pas, plus tard,
-    // repondre a son successeur dans le meme emplacement.
+    // A server owing this thread a reply must not later answer its slot
+    // successor.
     if t.reply_holder != NIL && thread::get(t.reply_holder).reply_to == ti {
         thread::get(t.reply_holder).reply_to = NIL;
     }
@@ -375,15 +393,15 @@ pub fn reap(ti: u16) {
     let p = get(i);
     p.nthreads -= 1;
     if p.nthreads == 0 {
-        finalize(i); // l'espace d'adressage part en entier, UTCB comprises
+        finalize(i);
     } else if slot != NIL {
-        // L'emplacement sera repris par un futur thread : sa page doit partir.
+        // Slot reused by a future thread: its page must go.
         unmap(i, UTCB_BASE + slot as u64 * PAGE_SIZE, PAGE_SIZE);
         p.utcb_map[slot as usize / 64] &= !(1 << (slot % 64));
     }
 }
 
-/// Annule un processus dont le lancement a echoue avant tout thread.
+/// Drop a process whose launch failed before any thread.
 pub fn abort_unstarted(i: u16) {
     get(i).exit_code = 0;
     finalize(i);
@@ -406,10 +424,10 @@ fn unlink_thread(i: u16, ti: u16) {
     }
 }
 
-/// Derniere etape de la fin d'un processus, une fois tous ses threads liberes.
+/// Last step of process exit, once all threads are freed.
 fn finalize(i: u16) {
     let p = get(i);
-    // Aucun coeur ne doit garder un pointeur vers ces tables de pages.
+    // No core may keep a pointer to these page tables.
     let cpu = percpu::this();
     if cpu.cur_ttbr == p.ttbr {
         let k = crate::arch::mmu::kernel_ttbr();
@@ -427,9 +445,14 @@ fn finalize(i: u16) {
 
     let code = p.exit_code;
     if code != 0 {
-        kprintln!("[nxk] processus {} '{}' termine (code {})", p.pid, name(i), code);
+        kprintln!(
+            "[nxk] process {} '{}' exited (code {})",
+            p.pid,
+            name(i),
+            code
+        );
     }
-    // Reveille ceux qui attendaient cette fin.
+    // Wake those waiting for this exit.
     while let Some(w) = p.waiters.pop() {
         let wt = thread::get(w);
         wt.frame.x[0] = code as u64;
@@ -442,7 +465,7 @@ fn finalize(i: u16) {
     }
 }
 
-/// `process_wait` : code de sortie immediat, ou blocage jusqu'a la fin.
+/// `process_wait`: immediate exit code, or park until exit.
 pub fn wait(ti: u16, target: u16, tmo: Timeout) -> Result<Option<u64>, i64> {
     let p = get(target);
     match p.state {

@@ -1,4 +1,4 @@
-//! Primitives AArch64 : registres systeme, barrieres, masquage d'interruptions.
+//! AArch64 primitives: system registers, barriers, interrupt masking.
 
 pub mod exceptions;
 pub mod fpu;
@@ -11,7 +11,7 @@ pub mod timer;
 
 use core::arch::asm;
 
-/// Lit un registre systeme.
+/// Read a system register.
 #[macro_export]
 macro_rules! sysreg_read {
     ($name:literal) => {{
@@ -21,7 +21,7 @@ macro_rules! sysreg_read {
     }};
 }
 
-/// Ecrit un registre systeme.
+/// Write a system register.
 #[macro_export]
 macro_rules! sysreg_write {
     ($name:literal, $val:expr) => {{
@@ -60,13 +60,13 @@ pub fn nop() {
     unsafe { asm!("nop", options(nomem, nostack)) };
 }
 
-/// Barriere de synchronisation de donnees, domaine interne partageable.
+/// Data synchronization barrier, inner-shareable domain.
 #[inline(always)]
 pub fn dsb_ish() {
     unsafe { asm!("dsb ish", options(nostack)) };
 }
 
-/// Barriere de donnees complete (peripheriques compris).
+/// Full data barrier (devices included).
 #[inline(always)]
 pub fn dsb_sy() {
     unsafe { asm!("dsb sy", options(nostack)) };
@@ -87,7 +87,7 @@ pub fn irq_disable() {
     unsafe { asm!("msr daifset, #2", options(nomem, nostack)) };
 }
 
-/// Masque les IRQ et renvoie l'etat precedent de DAIF.
+/// Mask IRQs and return the previous DAIF state.
 #[inline(always)]
 pub fn irq_save() -> u64 {
     let flags = sysreg_read!("daif");
@@ -100,27 +100,27 @@ pub fn irq_restore(flags: u64) {
     sysreg_write!("daif", flags);
 }
 
-/// Reglages EL1 propres a chaque coeur, apres activation de la MMU.
+/// Per-core EL1 setup, after MMU enable.
 pub fn cpu_init() {
     let mut s = sysreg_read!("sctlr_el1");
-    s |= (1 << 3)   // SA  : pile EL1 alignee sur 16
-        | (1 << 4)  // SA0 : pile EL0 alignee sur 16
-        | (1 << 14) // DZE : DC ZVA autorise en EL0 (memset rapide)
-        | (1 << 15) // UCT : CTR_EL0 lisible en EL0
-        | (1 << 18) // nTWE : WFE autorise en EL0 (verrous utilisateur)
-        | (1 << 26); // UCI : maintenance de cache en EL0
+    s |= (1 << 3)   // SA  : 16-byte aligned EL1 stack
+        | (1 << 4)  // SA0 : 16-byte aligned EL0 stack
+        | (1 << 14) // DZE : DC ZVA allowed in EL0 (fast memset)
+        | (1 << 15) // UCT : CTR_EL0 readable in EL0
+        | (1 << 18) // nTWE : WFE allowed in EL0 (user locks)
+        | (1 << 26); // UCI : cache maintenance in EL0
     sysreg_write!("sctlr_el1", s);
-    // Compteur virtuel lisible en EL0 : l'heure sans appel systeme.
+    // Virtual counter readable in EL0: time without a syscall.
     sysreg_write!("cntkctl_el1", 1 << 1);
-    // Verrou « OS » du debogage leve (il l'est au reset a froid) : sans cela,
-    // aucune exception de pas a pas ne serait jamais prise.
+    // Clear the debug OS lock (set at cold reset): otherwise single-step
+    // exceptions would never be taken.
     sysreg_write!("oslar_el1", 0);
     sysreg_write!("mdscr_el1", 0);
     isb();
     fpu::init_cpu();
 }
 
-/// Boucle d'attente definitive (coeur arrete).
+/// Definitive wait loop (stopped core).
 pub fn park() -> ! {
     loop {
         unsafe { asm!("msr daifset, #0xF", "wfi", options(nomem, nostack)) };

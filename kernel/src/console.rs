@@ -1,14 +1,5 @@
-//! Console noyau : un UART unique partage, protege par un verrou, et recopie
-//! sur l'ecran laisse allume par le chargeur (`drivers::fbcon`).
-//!
-//! Les macros `kprint!`/`kprintln!` prennent le verrou le temps d'un message,
-//! ce qui garde les lignes entieres meme quand plusieurs coeurs ecrivent.
-//!
-//! Pas de verrou avant la MMU : ses atomiques sont des acces exclusifs
-//! (LDXR/STXR, pas de LSE sur Cortex-A57) qui visent alors de la memoire
-//! Device. L'architecture ne garantit pas le moniteur exclusif global pour
-//! ce type de memoire : sur le SoC, un STXR peut echouer indefiniment
-//! (l'emulateur, lui, reussit toujours). Seul le coeur 0 tourne a ce stade.
+//! Locked UART console mirrored to the loader screen (`fbcon`).
+//! Lock-free before MMU: exclusives are unsafe on Device memory.
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +13,7 @@ pub static CONSOLE: SpinLock<Console> = SpinLock::new(Console {
     ready: false,
 });
 
-/// MMU et caches actifs : le verrou de la console est utilisable.
+/// MMU and caches on: the console lock is usable.
 static LOCKED: AtomicBool = AtomicBool::new(false);
 
 pub struct Console {
@@ -40,7 +31,7 @@ impl Write for Console {
     }
 }
 
-/// Acces a la console : sous verrou une fois la MMU active, direct avant.
+/// Console access: locked once the MMU is on, direct before that.
 fn with<R>(f: impl FnOnce(&mut Console) -> R) -> R {
     if LOCKED.load(Ordering::Acquire) {
         f(&mut CONSOLE.lock_irqsafe())
@@ -49,7 +40,7 @@ fn with<R>(f: impl FnOnce(&mut Console) -> R) -> R {
     }
 }
 
-/// A appeler MMU coupee, coeur 0 seul.
+/// Call with MMU off, core 0 alone.
 pub fn init() {
     with(|c| {
         c.uart.init(115_200);
@@ -58,12 +49,12 @@ pub fn init() {
     fbcon::init();
 }
 
-/// La MMU est active : les messages suivants passent par le verrou.
+/// MMU is on: further messages go through the lock.
 pub fn enable_lock() {
     LOCKED.store(true, Ordering::Release);
 }
 
-/// Ecrit des octets bruts (appel systeme `debug_write`).
+/// Write raw bytes (`debug_write` syscall).
 pub fn write_bytes(b: &[u8]) {
     with(|c| {
         if c.ready {
@@ -85,7 +76,7 @@ pub fn _print(args: fmt::Arguments) {
     let _ = with(|c| c.write_fmt(args));
 }
 
-/// Ecriture d'urgence : ignore le verrou (panique, exception fatale).
+/// Emergency output: ignores the lock (panic, fatal exception).
 #[doc(hidden)]
 pub fn _print_emergency(args: fmt::Arguments) {
     struct Emergency(Uart);
@@ -110,7 +101,7 @@ macro_rules! kprintln {
     ($($arg:tt)*) => { $crate::console::_print(format_args!("{}\n", format_args!($($arg)*))) };
 }
 
-/// Variante sans verrou, pour les chemins ou le verrou peut etre deja pris.
+/// Lock-free variant, for paths where the lock may already be held.
 #[macro_export]
 macro_rules! keprintln {
     ($($arg:tt)*) => { $crate::console::_print_emergency(format_args!("{}\n", format_args!($($arg)*))) };

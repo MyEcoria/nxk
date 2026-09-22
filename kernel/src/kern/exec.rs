@@ -1,11 +1,4 @@
-//! Preparation d'un programme : pile principale et bloc de demarrage.
-//!
-//! Le bloc (`nxk_abi::startup::Block`) est ecrit en haut de la pile du thread
-//! principal, suivi d'une copie des en-tetes de programme et des chaines
-//! (arguments puis environnement). Le programme le recoit dans x2 : c'est
-//! l'equivalent de argv/envp/auxv, et ce qu'il faut a une bibliotheque
-//! standard pour ses arguments, son environnement et son stockage local de
-//! thread (en-tete PT_TLS).
+//! Main stack plus startup block (argv/envp/auxv equivalent in x2).
 
 use nxk_abi::err::{E2BIG, EFAULT};
 use nxk_abi::layout::{PAGE_SIZE, STACK_SIZE};
@@ -16,11 +9,14 @@ use crate::kern::elf::{self, Loaded, Phdr, Source};
 use crate::kern::{process, random};
 use crate::mm::{uaccess, vm};
 
-/// Origine des chaines arguments + environnement.
+/// Origin of args + environment strings.
 pub enum Strings {
     Kernel(&'static [u8]),
-    /// Memoire du processus appelant (celui dont les tables sont chargees).
-    User { va: u64, len: u64 },
+    /// Caller process memory (whose tables are loaded).
+    User {
+        va: u64,
+        len: u64,
+    },
 }
 
 impl Strings {
@@ -32,7 +28,7 @@ impl Strings {
     }
 }
 
-/// Pointeur de pile et adresse du bloc pour le thread principal.
+/// Stack pointer and block address for the main thread.
 pub struct Start {
     pub sp: u64,
     pub block: u64,
@@ -42,8 +38,15 @@ fn bytes_of<T>(v: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
-/// Reserve la pile principale et y ecrit le bloc de demarrage.
-pub fn prepare(pi: u16, src: &dyn Source, l: &Loaded, strings: Strings, argc: u32, envc: u32) -> Result<Start, i64> {
+/// Reserve the main stack and write the startup block there.
+pub fn prepare(
+    pi: u16,
+    src: &dyn Source,
+    l: &Loaded,
+    strings: Strings,
+    argc: u32,
+    envc: u32,
+) -> Result<Start, i64> {
     let slen = strings.len();
     if slen > MAX_STRINGS {
         return Err(-E2BIG);
@@ -95,11 +98,14 @@ pub fn prepare(pi: u16, src: &dyn Source, l: &Loaded, strings: Strings, argc: u3
             }
         }
     }
-    Ok(Start { sp: block_va, block: block_va })
+    Ok(Start {
+        sp: block_va,
+        block: block_va,
+    })
 }
 
-/// Ecrit dans la memoire d'un processus (qui n'est pas forcement le courant),
-/// en peuplant les pages reservees au passage.
+/// Write into a process memory (not necessarily current), populating reserved
+/// pages on the way.
 pub fn write_mem(pi: u16, va: u64, bytes: &[u8]) -> Result<(), i64> {
     let l1 = process::get(pi).l1;
     let mut off = 0usize;

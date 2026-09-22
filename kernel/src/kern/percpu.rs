@@ -1,4 +1,4 @@
-//! Donnees propres a chaque coeur, atteintes via `TPIDR_EL1`.
+//! Per-core data, reached via `TPIDR_EL1`.
 
 use core::sync::atomic::AtomicBool;
 
@@ -9,8 +9,7 @@ use crate::{sysreg_read, sysreg_write};
 
 pub const NR_CPUS: usize = 4;
 
-/// Compteurs d'activite. Les durees sont en unites du compteur materiel,
-/// converties en ns seulement quand on les lit.
+/// Activity counters. Durations are counter units, converted to ns on read.
 #[derive(Default, Clone, Copy)]
 pub struct CpuStats {
     pub switches: u64,
@@ -22,44 +21,43 @@ pub struct CpuStats {
 
 #[repr(C, align(64))]
 pub struct PerCpu {
-    /// Sommet de la pile noyau du coeur. Offset 0 : lu par l'assembleur a
-    /// chaque entree depuis EL0.
+    /// Core kernel-stack top. Offset 0: read by asm on each EL0 entry.
     pub kstack_top: u64,
     pub id: usize,
-    /// Thread logiquement courant (`NIL` = coeur au repos).
+    /// Logically current thread (`NIL` = idle core).
     pub current: u16,
-    /// Dernier thread rendu a EL0 : son UTCB et ses registres sont en place.
+    /// Last thread returned to EL0: its UTCB and registers are in place.
     pub last_run: u16,
-    /// Proprietaire actuel des registres FP/SIMD du coeur.
+    /// Current owner of the core FP/SIMD registers.
     pub fp_owner: u16,
-    /// Echeances (dormeurs, attentes bornees), triees par date croissante.
+    /// Deadlines (sleepers, bounded waits), sorted ascending.
     pub tmo_head: u16,
-    /// Threads a faire migrer par ce coeur (il detient peut-etre leur FP).
+    /// Threads for this core to migrate (it may hold their FP).
     pub mig_head: u16,
-    /// Thread dont le temps d'execution est en cours de decompte.
+    /// Thread whose runtime is being accounted.
     pub acct_thread: u16,
     pub fp_enabled: bool,
     pub need_resched: bool,
-    /// Le quantum du thread courant est epuise.
+    /// Current thread's quantum is spent.
     pub slice_expired: bool,
-    /// Echeances modifiees : le timer doit etre reprogramme.
+    /// Deadlines changed: the timer needs reprogramming.
     pub timer_dirty: bool,
-    /// Un coeur au repos attend qu'on lui cede un thread pret.
+    /// Idle core waits to be handed a ready thread.
     pub push_pending: bool,
-    /// MDSCR_EL1.SS pose (pas a pas du thread courant).
+    /// MDSCR_EL1.SS set (current thread single-step).
     pub ss_enabled: bool,
     pub online: bool,
-    /// Valeur chargee dans TTBR0_EL1 (evite les ecritures inutiles).
+    /// TTBR0_EL1 value loaded (avoids redundant writes).
     pub cur_ttbr: u64,
-    /// Fin du quantum en cours (0 : pas de concurrent, pas de quantum).
+    /// Running quantum end (0: no contender, no quantum).
     pub slice_end: u64,
-    /// Echeance programmee dans le timer (`u64::MAX` : timer arrete).
+    /// Deadline in the timer (`u64::MAX`: timer stopped).
     pub timer_cval: u64,
-    /// Debut de l'intervalle en cours de decompte.
+    /// Start of the interval being accounted.
     pub acct_start: u64,
     pub rq: RunQueue,
     pub stats: CpuStats,
-    /// Mode idle-poll : le coeur scrute ce drapeau au lieu de dormir.
+    /// Idle-poll mode: the core polls this flag instead of sleeping.
     pub polling: AtomicBool,
     pub wake: AtomicBool,
 }
@@ -102,7 +100,7 @@ impl PerCpu {
 
 static mut PERCPU: [PerCpu; NR_CPUS] = [const { PerCpu::new() }; NR_CPUS];
 
-/// Coeur courant, sans lire MPIDR ni indexer : un `mrs` suffit.
+/// Current core, without reading MPIDR or indexing: one `mrs` is enough.
 #[inline(always)]
 pub fn this() -> &'static mut PerCpu {
     let p = sysreg_read!("tpidr_el1") as *mut PerCpu;
@@ -114,7 +112,7 @@ pub fn get(id: usize) -> &'static mut PerCpu {
     unsafe { &mut (*core::ptr::addr_of_mut!(PERCPU))[id] }
 }
 
-/// Initialise les donnees du coeur courant et publie leur adresse.
+/// Init the current core's data and publish its address.
 pub fn init(id: usize, kstack_top: u64, kernel_ttbr: u64) {
     let c = get(id);
     c.id = id;

@@ -1,37 +1,31 @@
-//! Espaces d'adressage utilisateur.
-//!
-//! Chaque processus a sa propre table de niveau 1. Ses 8 premieres entrees sont
-//! celles du noyau (vue identite de la memoire, marquees globales et reservees a
-//! EL1) : elles pointent vers les memes tables de niveau 2, partagees par tous.
-//! Le reste appartient au processus, avec des entrees non globales etiquetees
-//! par son ASID. Changer de processus revient a ecrire TTBR0_EL1 : aucune purge
-//! de TLB, les traductions des differents processus y cohabitent.
+//! Per-process L1 tables sharing kernel entries; ASID-tagged, no flush.
+//! W^X is the caller's job; TLB flushes stay with the caller.
 
 use nxk_abi::err::{EEXIST, ENOMEM};
 use nxk_abi::prot;
 
 use crate::arch::mmu::{
-    attr, AF, ATTR_DEVICE_NGNRE, ATTR_NORMAL_NC, ATTR_NORMAL_WB, ENTRIES, KERNEL_L1_ENTRIES, PXN, SH_INNER,
-    TABLE, UXN, VALID,
+    attr, AF, ATTR_DEVICE_NGNRE, ATTR_NORMAL_NC, ATTR_NORMAL_WB, ENTRIES, KERNEL_L1_ENTRIES, PXN,
+    SH_INNER, TABLE, UXN, VALID,
 };
 use crate::mm::pmm;
 
 const NG: u64 = 1 << 11;
 const AP_RW_ALL: u64 = 0b01 << 6;
 const AP_RO_ALL: u64 = 0b11 << 6;
-/// Bit logiciel (ignore par le materiel) : page possedee par le processus,
-/// rendue a l'allocateur quand l'espace d'adressage disparait.
+/// Software bit (hardware-ignored): process-owned page, returned to the
+/// allocator when the address space dies.
 pub const SW_OWNED: u64 = 1 << 55;
-/// Bit logiciel d'une entree invalide : page reservee, allouee au premier
-/// acces. Le materiel ignore tous les bits d'une entree dont VALID vaut 0.
+/// Software bit of an invalid entry: reserved page, allocated on first
+/// touch. Hardware ignores all bits of an entry with VALID clear.
 pub const SW_LAZY: u64 = 1 << 56;
-/// Entree rendue inaccessible par `mem_protect` (droits nuls) : VALID a 0,
-/// mais l'adresse physique et les attributs restent, le contenu est garde.
+/// Entry made inaccessible by `mem_protect` (no rights): VALID clear, but
+/// physical address and attributes kept, contents preserved.
 pub const SW_NOACCESS: u64 = 1 << 57;
-/// Page d'un objet de memoire partagee : jamais liberee par une projection.
+/// Shared-object page: never freed by a mapping.
 pub const SW_SHM: u64 = 1 << 58;
 const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-/// Champs de droits d'une entree : AP[2:1], PXN, UXN.
+/// Rights fields of an entry: AP[2:1], PXN, UXN.
 const PERM_MASK: u64 = (0b11 << 6) | PXN | UXN;
 
 type Table = [u64; ENTRIES];
@@ -41,43 +35,47 @@ fn table(pa: u64) -> &'static mut Table {
     unsafe { &mut *(pa as *mut Table) }
 }
 
-/// Attributs d'une page utilisateur. W^X est garanti par l'appelant.
+/// User page attributes. W^X is the caller's job.
 pub fn user_flags(p: u64) -> u64 {
     VALID | TABLE | AF | SH_INNER | attr(ATTR_NORMAL_WB) | NG | perm_bits(p)
 }
 
-/// Page utilisateur non cachee (Normal-NC), pour les tampons DMA.
+/// Uncached user page (Normal-NC), for DMA buffers.
 pub fn user_flags_nc(p: u64) -> u64 {
     VALID | TABLE | AF | SH_INNER | attr(ATTR_NORMAL_NC) | NG | perm_bits(p)
 }
 
 fn perm_bits(p: u64) -> u64 {
     let mut f = PXN;
-    f |= if p & prot::WRITE != 0 { AP_RW_ALL } else { AP_RO_ALL };
+    f |= if p & prot::WRITE != 0 {
+        AP_RW_ALL
+    } else {
+        AP_RO_ALL
+    };
     if p & prot::EXEC == 0 {
         f |= UXN;
     }
     f
 }
 
-/// Entree de registres de peripherique ?
+/// Device-register entry?
 pub fn is_device(pte: u64) -> bool {
     pte & VALID != 0 && (pte >> 2) & 7 == ATTR_DEVICE_NGNRE
 }
 
-/// Page physique possedee par le processus derriere cette entree (a rendre
-/// a l'allocateur quand elle disparait).
+/// Process-owned physical page behind this entry (to hand back when it goes
+/// away).
 pub fn owned_pa(pte: u64) -> Option<u64> {
     let present = pte & VALID != 0 || (pte & SW_NOACCESS != 0 && pte & SW_LAZY == 0);
     (present && pte & SW_OWNED != 0).then_some(pte & ADDR_MASK)
 }
 
-/// Attributs d'une page de registres de peripherique.
+/// Device-register page attributes.
 pub fn device_flags() -> u64 {
     VALID | TABLE | AF | attr(ATTR_DEVICE_NGNRE) | NG | AP_RW_ALL | PXN | UXN
 }
 
-/// Nouvelle table de niveau 1, deja pourvue des entrees du noyau.
+/// New L1 table, prefilled with the kernel entries.
 pub fn create() -> Option<u64> {
     let l1 = pmm::alloc_zeroed(0)?;
     let boot = table(crate::arch::mmu::boot_l1());
@@ -106,16 +104,16 @@ fn next_level(entry: &mut u64, create: bool) -> Option<u64> {
     Some(t)
 }
 
-/// Entree de niveau 3 couvrant `va`, en creant les tables intermediaires.
+/// L3 entry covering `va`, creating intermediate tables.
 fn leaf(l1: u64, va: u64, create: bool) -> Option<&'static mut u64> {
     let (i1, i2, i3) = indices(va);
-    debug_assert!(i1 >= KERNEL_L1_ENTRIES, "adresse dans la zone du noyau");
+    debug_assert!(i1 >= KERNEL_L1_ENTRIES, "address in the kernel area");
     let l2 = next_level(&mut table(l1)[i1], create)?;
     let l3 = next_level(&mut table(l2)[i2], create)?;
     Some(&mut table(l3)[i3])
 }
 
-/// Projette une page. Echoue si l'adresse est deja occupee.
+/// Map a page. Fails if the address is taken.
 pub fn map(l1: u64, va: u64, pa: u64, flags: u64) -> Result<(), i64> {
     let e = leaf(l1, va, true).ok_or(-ENOMEM)?;
     if *e & (VALID | SW_LAZY | SW_NOACCESS) != 0 {
@@ -125,7 +123,7 @@ pub fn map(l1: u64, va: u64, pa: u64, flags: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// Reserve une page sans l'allouer : la premiere faute la peuplera.
+/// Reserve a page without allocating: first fault populates it.
 pub fn reserve(l1: u64, va: u64, flags: u64) -> Result<(), i64> {
     let e = leaf(l1, va, true).ok_or(-ENOMEM)?;
     if *e & (VALID | SW_LAZY | SW_NOACCESS) != 0 {
@@ -135,8 +133,8 @@ pub fn reserve(l1: u64, va: u64, flags: u64) -> Result<(), i64> {
     Ok(())
 }
 
-/// Peuple une page reservee (faute de traduction sur `va`). Rend vrai si la
-/// faute est resolue ; faux si l'adresse n'etait pas reservee.
+/// Populate a reserved page (translation fault on `va`). True if the fault
+/// is resolved; false if the address was not reserved.
 pub fn populate(l1: u64, va: u64) -> Result<bool, i64> {
     let e = match leaf(l1, va, false) {
         Some(e) => e,
@@ -147,26 +145,27 @@ pub fn populate(l1: u64, va: u64) -> Result<bool, i64> {
     }
     let pa = pmm::alloc_zeroed(0).ok_or(-ENOMEM)?;
     if *e & UXN == 0 {
-        // Page executable : aucune instruction perimee de ce cadre physique
-        // ne doit rester dans le cache d'instructions.
+        // Executable page: no stale instruction of this frame may linger in
+        // the instruction cache.
         sync_icache(pa, 4096);
     }
-    // L'entree etait invalide : rien a purger en TLB, une barriere suffit.
+    // The entry was invalid: nothing to flush, one barrier is enough.
     *e = (*e & !SW_LAZY) | pa | VALID;
     publish();
     Ok(true)
 }
 
-/// Entree existante (projetee, reservee ou inaccessible) pour `va`.
+/// Existing entry (mapped, reserved or no-access) for `va`.
 pub fn is_mapped(l1: u64, va: u64) -> bool {
     lookup(l1, va) & (VALID | SW_LAZY | SW_NOACCESS) != 0
 }
 
-/// Change les droits d'une page deja projetee ou reservee. `p` = 0 : aucun
-/// acces, contenu conserve. Rend l'ancienne entree (0 si rien n'etait la).
-/// La TLB n'est pas purgee : a l'appelant (une purge par page ou par ASID).
+/// Change page rights (`p` = 0 keeps contents, drops access).
+/// Returns old entry; caller flushes TLB (per page or per ASID).
 pub fn protect(l1: u64, va: u64, p: u64) -> u64 {
-    let Some(e) = leaf(l1, va, false) else { return 0 };
+    let Some(e) = leaf(l1, va, false) else {
+        return 0;
+    };
     let old = *e;
     if old & (VALID | SW_LAZY | SW_NOACCESS) == 0 {
         return 0;
@@ -178,13 +177,13 @@ pub fn protect(l1: u64, va: u64, p: u64) -> u64 {
         new |= VALID;
     }
     if new & VALID != 0 && old & UXN != 0 && new & UXN == 0 {
-        sync_icache(new & ADDR_MASK, 4096); // devient executable
+        sync_icache(new & ADDR_MASK, 4096);
     }
     *e = new;
     old
 }
 
-/// Purge la traduction d'une page de l'espace `asid` sur tous les coeurs.
+/// Flush one page translation of `asid` space on all cores.
 pub fn flush_page(asid: u16, va: u64) {
     let arg = ((asid as u64) << 48) | ((va >> 12) & 0xFFF_FFFF_FFFF);
     unsafe {
@@ -192,20 +191,20 @@ pub fn flush_page(asid: u16, va: u64) {
     };
 }
 
-/// Rend visibles au parcours materiel les ecritures de tables precedentes.
+/// Make earlier table writes visible to the hardware walker.
 #[inline]
 pub fn publish() {
     unsafe { core::arch::asm!("dsb ishst", options(nostack)) };
 }
 
-/// Retire une page ; renvoie l'ancienne entree. La TLB est purgee sur tous les
-/// coeurs par une seule instruction diffusee (pas d'IPI necessaire).
+/// Unmap a page; return the old entry. The TLB flushes on all cores via one
+/// broadcast instruction (no IPI needed).
 pub fn unmap(l1: u64, asid: u16, va: u64) -> Option<u64> {
     let e = leaf(l1, va, false)?;
     let old = *e;
     if old & VALID == 0 {
         if old & (SW_LAZY | SW_NOACCESS) != 0 {
-            *e = 0; // entree invalide : rien a purger en TLB
+            *e = 0;
             return Some(old);
         }
         return None;
@@ -218,7 +217,7 @@ pub fn unmap(l1: u64, asid: u16, va: u64) -> Option<u64> {
     Some(old)
 }
 
-/// Entree courante pour `va` (0 si absente).
+/// Current entry for `va` (0 if missing).
 pub fn lookup(l1: u64, va: u64) -> u64 {
     leaf(l1, va, false).map(|e| *e).unwrap_or(0)
 }
@@ -227,7 +226,7 @@ pub fn pte_addr(pte: u64) -> u64 {
     pte & ADDR_MASK
 }
 
-/// Libere les pages possedees et toutes les tables, puis purge l'ASID.
+/// Free owned pages and all tables, then flush the ASID.
 pub fn destroy(l1: u64, asid: u16) -> u64 {
     let mut freed = 0;
     for i1 in KERNEL_L1_ENTRIES..ENTRIES {
@@ -264,8 +263,8 @@ pub fn flush_asid(asid: u16) {
     };
 }
 
-/// Rend du code fraichement ecrit executable : nettoie le cache de donnees
-/// jusqu'au point d'unification puis invalide le cache d'instructions.
+/// Make freshly written code executable: clean the data cache to the point
+/// of unification then invalidate the instruction cache.
 pub fn sync_icache(pa: u64, len: u64) {
     let ctr: u64;
     unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };

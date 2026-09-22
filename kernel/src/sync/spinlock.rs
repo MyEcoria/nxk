@@ -1,6 +1,4 @@
-//! Verrou a ticket : equitable et sans famine, contrairement a un simple
-//! `compare_exchange` en boucle. `wfe`/`sev` evitent de bruler du courant et
-//! du temps CPU pendant l'attente, ce qui compte aussi en emulation TCG.
+//! Fair starvation-free ticket lock; `wfe`/`sev` while waiting.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -8,7 +6,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::arch;
 
-#[repr(C, align(64))] // une ligne de cache A57 : pas de faux partage
+#[repr(C, align(64))]
 pub struct SpinLock<T> {
     next: AtomicU32,
     owner: AtomicU32,
@@ -36,8 +34,8 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
-    /// Prise sans garde, pour les verrous relaches sur un autre chemin
-    /// d'execution que celui qui les a pris (verrou global du noyau).
+    /// Raw take, for locks released on another path than the taker (kernel
+    /// global lock).
     #[inline]
     pub fn raw_lock(&self) {
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
@@ -52,15 +50,15 @@ impl<T> SpinLock<T> {
         arch::sev();
     }
 
-    /// Acces sans verrou, quand aucun acces concurrent n'est possible
-    /// (demarrage mono-coeur, MMU coupee : voir `console`).
+    /// Lock-free access, when no concurrent access is possible (single-core
+    /// boot, MMU off: see `console`).
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_unlocked(&self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
 
-    /// Verrouille en masquant les interruptions : indispensable des qu'un
-    /// gestionnaire d'interruption peut prendre le meme verrou.
+    /// Lock with interrupts masked: required once an interrupt handler may
+    /// take the same lock.
     #[inline]
     pub fn lock_irqsafe(&self) -> IrqGuard<'_, T> {
         let flags = arch::irq_save();
@@ -99,9 +97,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     }
 }
 
-/// Garde combinee : relache le verrou **puis** restaure les interruptions.
-/// L'ordre importe : reactiver les IRQ avant de rendre le verrou ouvrirait une
-/// fenetre d'interblocage si le gestionnaire prend le meme verrou.
+/// Unlock-then-restore-IRQ guard: order avoids handler deadlock.
 pub struct IrqGuard<'a, T> {
     lock: &'a SpinLock<T>,
     flags: u64,

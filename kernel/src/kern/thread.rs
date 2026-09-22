@@ -1,19 +1,15 @@
-//! Threads : blocs de controle (TCB).
-//!
-//! Le noyau n'a pas de pile par thread. A l'entree depuis EL0, l'assembleur
-//! range les registres utilisateur directement dans le `Frame` du TCB courant ;
-//! a la sortie, il recharge ceux du thread choisi. Changer de thread ne coute
-//! donc qu'un changement d'indice, plus TTBR0 si le processus change.
+//! Thread TCBs: no per-thread stack; asm lands directly in Frame.
+//! Reply tokens expire with the call; FP state is lazy (see `arch::fpu`).
 
 use crate::kern::bkl::BklCell;
 use crate::kern::objtab::Table;
 
 pub const NIL: u16 = u16::MAX;
 pub const NR_PRIO: usize = 32;
-/// Affinite libre : le noyau choisit (et peut changer) le coeur.
+/// Free affinity: the kernel picks (and may change) the core.
 pub const ANY_CPU: u8 = 0xFF;
 
-/// Registres utilisateur. Disposition figee : l'assembleur ecrit ces offsets.
+/// User registers. Frozen layout: asm writes these offsets.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Frame {
@@ -28,7 +24,7 @@ pub struct Frame {
 pub const FRAME_SIZE: usize = 288;
 const _: () = assert!(core::mem::size_of::<Frame>() == FRAME_SIZE);
 
-/// Etat FP/SIMD, sauvegarde paresseusement (voir `arch::fpu`).
+/// FP/SIMD state, saved lazily (see `arch::fpu`).
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct FpState {
@@ -43,79 +39,79 @@ pub enum State {
     Free = 0,
     Ready,
     Running,
-    /// Emetteur en file sur un point de rendez-vous.
+    /// Sender queued on a rendezvous point.
     BlockedSend,
-    /// Recepteur en attente sur un point de rendez-vous.
+    /// Receiver waiting on a rendezvous point.
     BlockedRecv,
-    /// Client ayant envoye un `call`, en attente de la reponse.
+    /// Client after `call`, waiting for the reply.
     BlockedReply,
     BlockedNotify,
-    /// Attend la fin d'un processus.
+    /// Waits for a process to exit.
     BlockedWait,
-    /// Attend sur un futex (cle : adresse physique).
+    /// Waits on a futex (key: physical address).
     BlockedFutex,
     Sleeping,
-    /// Arrete (debogage) en attendant un debogueur.
+    /// Stopped (debugging), waiting for a debugger.
     Stopped,
-    /// Mort, mais en cours d'execution sur un autre coeur : ce coeur le liberera.
+    /// Dead but running on another core: that core frees it.
     Zombie,
 }
 
 #[repr(C, align(64))]
 pub struct Tcb {
-    pub frame: Frame, // @0 : impose par l'assembleur
+    pub frame: Frame,
     pub fp: FpState,
     pub state: State,
     pub prio: u8,
     pub home: u8,
-    /// Present dans une file d'execution.
+    /// In a run queue.
     pub queued: bool,
-    /// Present dans la file d'echeances de son coeur.
+    /// In its core's deadline queue.
     pub timed: bool,
-    /// Coeur impose, ou `ANY_CPU`.
+    /// Pinned core, or `ANY_CPU`.
     pub affinity: u8,
     pub gen: u16,
-    /// Chainage intrusif : un thread n'est jamais dans deux files a la fois.
+    /// Intrusive link: a thread is never in two queues at once.
     pub next: u16,
     pub proc_idx: u16,
     pub utcb_slot: u16,
-    /// Client dont on doit porter la reponse (serveur).
+    /// Client to reply to (server).
     pub reply_to: u16,
-    /// Processus serveur dont on attend la reponse (client).
+    /// Server process awaited for a reply (client).
     pub reply_from: u16,
-    /// Objet sur lequel le thread est bloque (endpoint, notification, processus).
+    /// Object the thread parks on (endpoint, notification, process).
     pub blocked_on: u16,
     pub bound_notif: u16,
-    /// Thread suivant du meme processus.
+    /// Next thread of the same process.
     pub proc_next: u16,
-    /// Serveur qui detient notre reponse (appel en cours).
+    /// Server holding our reply (call in flight).
     pub reply_holder: u16,
-    /// File d'echeances du coeur (doublement chainee, triee par `wake_at`).
+    /// Core deadline queue (doubly linked, sorted by `wake_at`).
     pub tq_next: u16,
     pub tq_prev: u16,
-    /// File des migrations en attente sur l'ancien coeur.
+    /// Pending migrations on the old core.
     pub mig_next: u16,
     pub send_is_call: bool,
-    /// Present dans la file de migrations d'un coeur.
+    /// In a core's migration queue.
     pub mig_queued: bool,
-    /// Evenement de debogage en cours : le message au debogueur vient des
-    /// champs `fault_*` et sa reponse ne touche pas aux registres.
+    /// Ongoing debugger event: the debugger message comes from the
+    /// `fault_*` fields and its reply leaves registers alone.
     pub in_fault: bool,
     pub fault_kind: u8,
-    /// Arret demande par le debogueur, pris a la prochaine sortie du noyau.
+    /// Debugger-requested stop, taken at the next kernel exit.
     pub stop_request: bool,
-    /// Executer une seule instruction, puis evenement STEP.
+    /// Run one instruction, then a STEP event.
     pub single_step: bool,
     pub tid: u32,
-    /// Numero d'appel : un jeton de reponse ne vaut que pour l'appel en cours.
+    /// Call number: a reply token is only good for the current call.
     pub call_seq: u32,
     pub send_badge: u64,
     pub utcb_va: u64,
     pub utcb_pa: u64,
-    /// Echeance absolue (compteur) d'un sommeil ou d'une attente bornee.
+    /// Absolute deadline (counter) of a sleep or bounded wait.
     pub wake_at: u64,
     pub futex_key: u64,
-    /// Temps processeur consomme (unites du compteur).
+    /// CPU time used (counter units).
     pub cpu_time: u64,
     pub fault_esr: u64,
     pub fault_far: u64,
@@ -123,7 +119,7 @@ pub struct Tcb {
 
 impl Tcb {
     fn reset(&mut self, gen: u16) {
-        // Tout a zero (registres, etat FP), puis les champs non nuls.
+        // All zero (registers, FP state), then the non-zero fields.
         unsafe { core::ptr::write_bytes(self as *mut Tcb, 0, 1) };
         self.gen = gen;
         self.next = NIL;
@@ -159,7 +155,7 @@ pub fn get(i: u16) -> &'static mut Tcb {
     TCBS.get().get(i)
 }
 
-/// Borne d'iteration sur tous les TCB crees.
+/// Iteration bound over all created TCBs.
 #[inline]
 pub fn capacity() -> usize {
     TCBS.get().capacity()
@@ -167,7 +163,7 @@ pub fn capacity() -> usize {
 
 pub fn init() {}
 
-/// Reserve un TCB libre, remis a zero.
+/// Take a free TCB, zeroed.
 pub fn alloc() -> Option<u16> {
     let i = TCBS.get().alloc()?;
     let t = get(i);
@@ -187,9 +183,7 @@ pub fn free(i: u16) {
     TCBS.get().free(i);
 }
 
-/// Jeton de reponse : designe un appel precis d'un client precis. Il perd sa
-/// valeur des que le client disparait ou que cet appel se termine (reponse,
-/// delai echu) : une reponse tardive ne peut pas atteindre l'appel suivant.
+/// Reply token for one call; expires with the call so late replies miss.
 #[inline]
 pub fn token(i: u16) -> u64 {
     let t = get(i);
@@ -203,10 +197,11 @@ pub fn from_token(tok: u64) -> Option<u16> {
         return None;
     }
     let t = get(i as u16);
-    (t.gen == tok as u16 && t.call_seq == (tok >> 32) as u32 && t.state != State::Free).then_some(i as u16)
+    (t.gen == tok as u16 && t.call_seq == (tok >> 32) as u32 && t.state != State::Free)
+        .then_some(i as u16)
 }
 
-/// File FIFO intrusive de threads.
+/// Intrusive FIFO of threads.
 #[derive(Clone, Copy)]
 pub struct Queue {
     pub head: u16,
@@ -215,7 +210,10 @@ pub struct Queue {
 
 impl Queue {
     pub const fn new() -> Self {
-        Self { head: NIL, tail: NIL }
+        Self {
+            head: NIL,
+            tail: NIL,
+        }
     }
 
     #[inline]
@@ -248,7 +246,7 @@ impl Queue {
         Some(i)
     }
 
-    /// Retire le premier element satisfaisant `pred`.
+    /// Remove the first element matching `pred`.
     pub fn take(&mut self, mut pred: impl FnMut(u16) -> bool) -> Option<u16> {
         let mut prev = NIL;
         let mut cur = self.head;

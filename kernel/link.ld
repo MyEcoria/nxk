@@ -1,11 +1,10 @@
-/* nxk - image chargee en DRAM Tegra X1 (0x80000000).
-   Sections alignees sur 4 KiB pour pouvoir leur donner des droits distincts
-   dans les tables de pages (RX / RO / RW-NX). */
+/* nxk - image loaded in Tegra X1 DRAM (0x80000000).
+   Sections aligned to 4 KiB for distinct page rights (RX / RO / RW-NX). */
 
 ENTRY(_start)
 
 KERNEL_BASE  = 0x80000000;
-STACK_SIZE   = 0x4000;      /* 16 KiB par coeur : chemins noyau courts */
+STACK_SIZE   = 0x4000;      /* 16 KiB per core: short kernel paths */
 NR_CPUS      = 4;
 
 SECTIONS
@@ -45,7 +44,7 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Piles noyau : une par coeur, alignees sur une page. */
+    /* Kernel stacks: one per core, page-aligned. */
     .stacks (NOLOAD) : ALIGN(4096) {
         __stacks_start = .;
         . += STACK_SIZE * NR_CPUS;

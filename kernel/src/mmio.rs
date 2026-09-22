@@ -1,8 +1,4 @@
-//! Acces MMIO volatils.
-//!
-//! Toutes les lectures/ecritures de registres passent par ici : le compilateur
-//! ne doit ni les reordonner ni les elider. Les barrieres explicites restent a
-//! la charge de l'appelant (`dsb`/`isb` dans `arch::barrier`).
+//! Volatile MMIO: never reorder/elide; barriers stay with the caller.
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -24,7 +20,7 @@ pub unsafe fn modify32(addr: usize, clear: u32, set: u32) {
     }
 }
 
-/// Bloc de registres 32 bits a espacement configurable (`shift` = log2 du pas).
+/// 32-bit register block with configurable spacing (`shift` = log2 stride).
 #[derive(Clone, Copy)]
 pub struct RegBlock {
     base: usize,

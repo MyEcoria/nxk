@@ -1,17 +1,11 @@
-//! Notifications : un mot de 64 bits de signaux asynchrones.
-//!
-//! `signal` fait un OU dans le mot et reveille l'attente eventuelle ; `wait`
-//! rend et remet a zero les bits en attente. Les interruptions materielles sont
-//! livrees ainsi aux pilotes. Liee a un thread, une notification le fait aussi
-//! sortir d'un `recv` : un serveur attend requetes et interruptions en un seul
-//! appel, sans second thread.
+//! 64-bit async notification words; bound waits break out of `recv`.
 
 use nxk_abi::err::{EBUSY, EPIPE, ETIMEDOUT};
 
 use crate::kern::bkl::BklCell;
 use crate::kern::objtab::Table;
-use crate::kern::thread::{self, State, NIL};
 use crate::kern::sched::Timeout;
+use crate::kern::thread::{self, State, NIL};
 use crate::kern::{ipc, irq, sched};
 
 pub struct Notification {
@@ -81,9 +75,8 @@ pub fn decref(i: u16) {
     }
 }
 
-/// Revocation : nouvelle generation ; l'attente en cours echoue, la liaison
-/// a un thread et le routage d'interruptions (etablis par d'anciennes
-/// capacites) sont defaits.
+/// Revocation: new generation; the in-flight wait fails, the thread binding
+/// and interrupt routing (from old caps) are torn down.
 pub fn revoke(i: u16) -> u16 {
     let x = n(i);
     x.gen = x.gen.wrapping_add(1);
@@ -99,7 +92,7 @@ pub fn revoke(i: u16) -> u16 {
     n(i).gen
 }
 
-/// Signale des bits (aussi appele depuis le gestionnaire d'interruptions).
+/// Signal bits (also called from the interrupt handler).
 pub fn signal(i: u16, bits: u64) {
     let x = n(i);
     x.bits |= bits;
@@ -113,7 +106,7 @@ pub fn signal(i: u16, bits: u64) {
         let b = x.bound;
         let t = thread::get(b);
         if t.state == State::BlockedRecv {
-            // Le thread lie attend une requete : on l'en fait sortir.
+            // Bound thread waits for a request: break it out.
             ipc::remove_waiter(t.blocked_on, b);
             t.blocked_on = NIL;
             t.frame.x[0] = 0;
@@ -126,7 +119,7 @@ pub fn signal(i: u16, bits: u64) {
     }
 }
 
-/// Rend les bits en attente, ou bloque le thread.
+/// Return pending bits, or park the thread.
 pub fn wait(ti: u16, i: u16, tmo: Timeout) -> Result<Option<u64>, i64> {
     let x = n(i);
     if x.bits != 0 {

@@ -1,9 +1,4 @@
-//! PSCI : services d'alimentation d'un moniteur securise (ATF, exosphere...).
-//!
-//! Quand nxk est lance en EL2 ou EL1 par un moniteur, les registres de
-//! gestion d'alimentation (PMC, CAR) peuvent lui etre interdits : il demande
-//! alors au moniteur, par `smc`, d'allumer un coeur ou d'arreter la machine.
-//! Lance directement en EL3 (sans moniteur), il pilote le materiel lui-meme.
+//! PSCI power services via `smc` when started under a monitor.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,8 +27,8 @@ fn smc(fid: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     r
 }
 
-/// A appeler seulement si un moniteur est present (demarrage hors EL3) :
-/// un `smc` sans EL3 serait une instruction indefinie. Rend la version.
+/// Call only with a monitor present (non-EL3 boot): `smc` without EL3 is an
+/// undefined instruction. Returns the version.
 pub fn probe() -> Option<(u16, u16)> {
     let v = smc(VERSION, 0, 0, 0);
     if v as i64 <= 0 || v >> 32 != 0 {
@@ -47,7 +42,7 @@ pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
 
-/// Allume le coeur `mpidr`, qui demarrera a l'adresse physique `entry`.
+/// Power on core `mpidr`, starting at physical address `entry`.
 pub fn cpu_on(mpidr: u64, entry: u64) -> i64 {
     smc(CPU_ON_64, mpidr, entry, 0) as i64
 }

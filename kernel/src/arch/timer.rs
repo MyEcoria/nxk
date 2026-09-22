@@ -1,27 +1,19 @@
-//! Timer generique ARM : base de temps et echeances, sans tic periodique.
-//!
-//! Chaque coeur programme son timer physique EL1 en valeur absolue
-//! (`CNTP_CVAL_EL0`) sur la plus proche de ses echeances : fin du quantum en
-//! cours (seulement si un thread de meme priorite attend) et premier dormeur
-//! ou attente bornee. Sans rien de tout cela, le timer est arrete : un coeur
-//! au repos ne se reveille que pour une interruption utile, et un thread seul
-//! sur son coeur n'est jamais interrompu pour rien.
-//!
-//! Precision : celle du compteur (52 ns a 19,2 MHz), pas celle d'un tic.
+//! ARM generic timer: deadlines only, no periodic tick.
+//! Counter precision (52 ns at 19.2 MHz), not a tick.
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::arch::{self, gic};
 use crate::kern::percpu::{self, PerCpu};
-use crate::kern::thread::{self, NIL};
 use crate::kern::sched;
+use crate::kern::thread::{self, NIL};
 use crate::{sysreg_read, sysreg_write};
 
 const CNTP_CTL_ENABLE: u64 = 1 << 0;
 
 static FREQ_HZ: AtomicU64 = AtomicU64::new(0);
-/// Heure murale = temps monotone + decalage (ns), regle par le service
-/// d'horloge a partir de la RTC.
+/// Wall time = monotonic time + offset (ns), set by the clock service
+/// from the RTC.
 static REALTIME_OFFSET: AtomicI64 = AtomicI64::new(0);
 
 #[inline(always)]
@@ -55,7 +47,10 @@ pub fn realtime_ns() -> u64 {
 }
 
 pub fn set_realtime(ns: u64) {
-    REALTIME_OFFSET.store((ns as i64).wrapping_sub(monotonic_ns() as i64), Ordering::Relaxed);
+    REALTIME_OFFSET.store(
+        (ns as i64).wrapping_sub(monotonic_ns() as i64),
+        Ordering::Relaxed,
+    );
 }
 
 pub fn delay_us(us: u64) {
@@ -65,14 +60,14 @@ pub fn delay_us(us: u64) {
     }
 }
 
-/// Frequence du compteur, fixee une fois au demarrage.
+/// Counter frequency, set once at boot.
 pub fn init_global() {
     let freq = sysreg_read!("cntfrq_el0");
     let freq = if freq == 0 { 19_200_000 } else { freq };
     FREQ_HZ.store(freq, Ordering::Relaxed);
 }
 
-/// Prepare le timer du coeur courant (arrete tant qu'aucune echeance).
+/// Set up the current core's timer (stopped until a deadline exists).
 pub fn init_cpu() {
     sysreg_write!("cntp_ctl_el0", 0);
     percpu::this().timer_cval = u64::MAX;
@@ -81,7 +76,7 @@ pub fn init_cpu() {
     arch::isb();
 }
 
-/// Programme la plus proche echeance du coeur courant, ou arrete le timer.
+/// Program the current core's nearest deadline, or stop the timer.
 pub fn reprogram(c: &mut PerCpu) {
     c.timer_dirty = false;
     let mut d = u64::MAX;
@@ -94,12 +89,10 @@ pub fn reprogram(c: &mut PerCpu) {
     if d == c.timer_cval {
         return;
     }
-    crate::trace!("[s{}] timer {} (tete {})", c.id, d, c.tmo_head);
+    crate::trace!("[s{}] timer {} (head {})", c.id, d, c.tmo_head);
     c.timer_cval = d;
-    // Sortie du timer d'abord ramenee a 0 : une echeance deja depassee
-    // produira ainsi un front montant. Si le GIC traite la ligne sur front
-    // (l'emulateur configure ainsi tous les PPI), une echeance atteinte
-    // pendant le traitement de la precedente serait sinon perdue.
+    // Drive output to 0 first for a rising edge; an edge-triggered GIC
+    // (all PPIs under the emulator) could otherwise lose one.
     sysreg_write!("cntp_ctl_el0", 0);
     if d != u64::MAX {
         arch::isb();
@@ -108,7 +101,7 @@ pub fn reprogram(c: &mut PerCpu) {
     }
 }
 
-/// Interruption du timer : fin de quantum et/ou echeances atteintes.
+/// Timer interrupt: quantum end and/or reached deadlines.
 pub fn on_irq() {
     let c = percpu::this();
     let now = counter();
@@ -119,8 +112,7 @@ pub fn on_irq() {
         c.need_resched = true;
     }
     sched::expire(now);
-    // L'echeance atteinte maintient la ligne active : il faut en changer
-    // avant de rendre la main.
+    // A reached deadline keeps the line asserted: change it before returning.
     c.timer_cval = 0;
     reprogram(c);
 }

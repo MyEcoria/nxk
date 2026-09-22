@@ -1,8 +1,4 @@
-//! Image de demarrage : les programmes du systeme, embarques dans le noyau.
-//!
-//! Format (voir `nxk_abi::bootfs`) : en-tete, table d'entrees (nom, position,
-//! taille), puis les fichiers. L'image est alignee sur une page pour pouvoir
-//! etre projetee telle quelle, en lecture seule, dans le premier processus.
+//! Boot image embedded in the kernel, mapped read-only into init.
 
 use nxk_abi::bootfs::{Entry, Header, MAGIC, NAME_LEN};
 

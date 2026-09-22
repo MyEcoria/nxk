@@ -1,13 +1,5 @@
-//! Lecture minimale d'un arbre de peripheriques (FDT).
-//!
-//! Lance par un moniteur securise ou un chargeur standard (ATF, U-Boot), nxk
-//! recoit dans x0 l'adresse d'un DTB, selon le protocole de demarrage arm64.
-//! Il n'en retient que la memoire : la taille de la DRAM (`/memory`) et les
-//! zones a ne jamais toucher (`/memreserve/` et les noeuds de
-//! `/reserved-memory`, ou vit par exemple le moniteur). Tout le reste de
-//! l'arbre concerne les pilotes, en espace utilisateur.
-//!
-//! Lu MMU coupee, avant toute allocation : le DTB n'est jamais ecrase.
+//! Minimal FDT reader: DRAM size and reserved regions only.
+//! Read with MMU off; the DTB is never overwritten.
 
 const MAGIC: u32 = 0xD00D_FEED;
 const BEGIN_NODE: u32 = 1;
@@ -19,11 +11,11 @@ const END: u32 = 9;
 pub const MAX_RESERVED: usize = 8;
 
 pub struct Info {
-    /// Plage de DRAM annoncee par `/memory` (base, taille).
+    /// DRAM range advertised by `/memory` (base, size).
     pub memory: Option<(u64, u64)>,
     pub reserved: [(u64, u64); MAX_RESERVED],
     pub nreserved: usize,
-    /// Le DTB lui-meme (a ne pas ecraser tant qu'il sert).
+    /// The DTB itself (must not be overwritten while in use).
     pub blob: (u64, u64),
 }
 
@@ -43,7 +35,7 @@ fn cstr(p: u64, max: u64) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(p as *const u8, n as usize) }
 }
 
-/// Lit une cellule d'adresse ou de taille (1 ou 2 mots de 32 bits).
+/// Read one address/size cell (1 or 2 32-bit words).
 fn cells(p: u64, n: u32) -> u64 {
     if n == 2 {
         be64(p)
@@ -52,7 +44,7 @@ fn cells(p: u64, n: u32) -> u64 {
     }
 }
 
-/// Analyse le DTB a `addr` s'il est plausible (entierement dans `dram`).
+/// Parse the DTB at `addr` if plausible (fully inside `dram`).
 pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
     if addr == 0 || addr % 8 != 0 || addr < dram.0 || addr + 40 > dram.1 || be32(addr) != MAGIC {
         return None;
@@ -68,7 +60,12 @@ pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
     if off_struct + size_struct > total || off_strings > total || off_rsv + 16 > total {
         return None;
     }
-    let mut info = Info { memory: None, reserved: [(0, 0); MAX_RESERVED], nreserved: 0, blob: (addr, total) };
+    let mut info = Info {
+        memory: None,
+        reserved: [(0, 0); MAX_RESERVED],
+        nreserved: 0,
+        blob: (addr, total),
+    };
     let add = |info: &mut Info, b: u64, s: u64| {
         if s != 0 && info.nreserved < MAX_RESERVED {
             info.reserved[info.nreserved] = (b, s);
@@ -76,7 +73,7 @@ pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
         }
     };
 
-    // Bloc /memreserve/ : paires (adresse, taille) jusqu'a (0, 0).
+    // /memreserve/ block: (address, size) pairs up to (0, 0).
     let mut p = addr + off_rsv;
     while p + 16 <= addr + total {
         let (b, s) = (be64(p), be64(p + 8));
@@ -87,13 +84,13 @@ pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
         p += 16;
     }
 
-    // Structure : on suit la profondeur et les #address-cells/#size-cells.
+    // Structure: track depth and #address-cells/#size-cells.
     let strings = addr + off_strings;
     let end = addr + off_struct + size_struct;
     let mut p = addr + off_struct;
     let mut depth = 0usize;
-    // `acells[k]`/`scells[k]` : format des `reg` des noeuds de profondeur k,
-    // fixe par leur parent (defaut 2/1 selon la specification devicetree).
+    // `acells[k]`/`scells[k]`: `reg` format of depth-k nodes, set by their
+    // parent (default 2/1 per the devicetree spec).
     let mut acells = [2u32; 9];
     let mut scells = [1u32; 9];
     let mut in_reserved = false;
@@ -135,7 +132,7 @@ pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
                 let name = cstr(strings + nameoff, total - off_strings - nameoff);
                 let d = depth.min(7);
                 match name {
-                    // Valeurs pour les enfants de ce noeud.
+                    // Values for this node's children.
                     b"#address-cells" if len == 4 => acells[d + 1] = be32(val),
                     b"#size-cells" if len == 4 => scells[d + 1] = be32(val),
                     b"reg" => {

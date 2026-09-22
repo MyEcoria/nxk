@@ -1,20 +1,5 @@
-//! Ordonnanceur evenementiel, sans tic periodique.
-//!
-//! Chaque entree dans le noyau se termine par `exit_to_user`, qui choisit le
-//! thread a reprendre sur ce coeur et recharge ses registres depuis son TCB.
-//! Bloquer un thread ne demande donc aucun changement de pile : il suffit de
-//! changer son etat, le coeur repart simplement avec quelqu'un d'autre.
-//!
-//! Selection en O(1) : un bitmap de 32 priorites (0 = la plus haute), une file
-//! FIFO par niveau. Un quantum n'est arme que si un thread de meme priorite
-//! attend sur le coeur ; sinon le thread courant n'est jamais interrompu.
-//!
-//! Chaque thread a un coeur d'attache, seul a l'executer : la gestion
-//! paresseuse du FP reste exacte avec un proprietaire par coeur. Un thread
-//! change de coeur quand on lui impose une affinite, quand il se reveille
-//! alors qu'un autre coeur est libre, ou quand un coeur surcharge en cede un a
-//! un coeur au repos. Une migration est toujours faite par l'ancien coeur, le
-//! seul a pouvoir sauver l'etat FP qu'il detient peut-etre encore.
+//! Event-driven scheduler: 32-priority bitmap, per-core run queues.
+//! No tick; migration always runs on the old core (lazy FP).
 
 use core::sync::atomic::Ordering;
 
@@ -26,8 +11,8 @@ use crate::kern::thread::{self, State, ANY_CPU, NIL, NR_PRIO};
 use crate::kern::{bkl, debug, futex, ipc, notify, process};
 use crate::sysreg_write;
 
-/// Quantum : temps d'execution continu accorde avant de ceder la place a un
-/// thread pret de meme priorite.
+/// Quantum: continuous runtime granted before yielding to a ready
+/// same-priority thread.
 pub const SLICE_NS: u64 = 10_000_000;
 
 pub struct RunQueue {
@@ -123,7 +108,7 @@ impl RunQueue {
         false
     }
 
-    /// Premier thread pret sans affinite, de la priorite la plus haute.
+    /// First ready unpinned thread, highest priority first.
     fn movable(&self) -> Option<u16> {
         let mut bits = self.bitmap;
         while bits != 0 {
@@ -146,24 +131,24 @@ impl RunQueue {
     }
 }
 
-/// Envoie une IPI : le coeur cible repasse par le noyau et reevalue son choix.
+/// Send an IPI: the target core re-enters the kernel and re-picks.
 #[inline]
 pub fn kick(cpu: usize) {
     gic::send_sgi(1 << cpu, gic::SGI_RESCHEDULE);
 }
 
-/// Echeance d'une attente bornee.
+/// Deadline of a bounded wait.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Timeout {
     Never,
-    /// Deja echue : l'appel echoue au lieu de bloquer.
+    /// Already past: the call fails instead of parking.
     Now,
-    /// Valeur absolue du compteur.
+    /// Absolute counter value.
     At(u64),
 }
 
 impl Timeout {
-    /// Delai relatif en ns ; 0 = sans limite.
+    /// Relative delay in ns; 0 = unbounded.
     pub fn from_ns(ns: u64) -> Self {
         if ns == 0 {
             return Timeout::Never;
@@ -174,7 +159,7 @@ impl Timeout {
         }
     }
 
-    /// Arme l'echeance du thread qui vient de se bloquer.
+    /// Arm the deadline of the thread that just parked.
     #[inline]
     pub fn arm(self, ti: u16) {
         if let Timeout::At(d) = self {
@@ -183,7 +168,7 @@ impl Timeout {
     }
 }
 
-/// Un coeur libre : en ligne, sans thread courant ni thread pret.
+/// A free core: online, with no running or ready thread.
 fn idle_core(except: usize) -> Option<usize> {
     (0..NR_CPUS).find(|&k| {
         let c = percpu::get(k);
@@ -200,17 +185,23 @@ macro_rules! trace {
     };
 }
 
-/// Rend un thread executable sur son coeur d'attache.
+/// Make a thread runnable on its home core.
 pub fn make_ready(i: u16) {
     let t = thread::get(i);
-    trace!("[s{}] ready tid {} home {} state {:?}", percpu::this().id, t.tid, t.home, t.state);
+    trace!(
+        "[s{}] ready tid {} home {} state {:?}",
+        percpu::this().id,
+        t.tid,
+        t.home,
+        t.state
+    );
     if t.timed {
         disarm(i);
     }
     t.state = State::Ready;
 
-    // Reveil sur un coeur occupe alors qu'un autre est libre : le thread
-    // change de coeur, sauf si son etat FP vit encore dans l'ancien.
+    // Wake on a busy core while another is free: migrate the thread, unless
+    // its FP state still lives on the old one.
     let home = t.home as usize;
     let hc = percpu::get(home);
     if t.affinity == ANY_CPU
@@ -235,24 +226,24 @@ pub fn make_ready(i: u16) {
         (prio < cp, prio == cp && c.slice_end == 0)
     };
     if home == percpu::this().id {
-        // Le quantum eventuel sera arme a la sortie du noyau.
+        // Any quantum arms at kernel exit.
         if preempt {
             c.need_resched = true;
         }
     } else if preempt || slice {
-        // Un concurrent de meme priorite arrive : le coeur doit armer son
-        // quantum, il faut donc qu'il repasse par le noyau.
+        // A same-priority contender arrives: the core must arm its quantum,
+        // so it must re-enter the kernel.
         c.need_resched |= preempt;
         if cfg!(feature = "idle-poll") && c.polling.load(Ordering::Acquire) {
-            c.wake.store(true, Ordering::Release); // il scrute : pas d'IPI
+            c.wake.store(true, Ordering::Release); // it polls: no IPI
         } else {
             kick(home);
         }
     }
 }
 
-/// Commutation directe (IPC) : `i` devient le thread courant de ce coeur sans
-/// passer par la file d'execution. L'ancien courant est deja bloque.
+/// Direct switch (IPC): `i` becomes this core's current thread without
+/// going through the run queue. The old current already parks.
 #[inline]
 pub fn switch_to(i: u16) {
     let t = thread::get(i);
@@ -263,14 +254,14 @@ pub fn switch_to(i: u16) {
     percpu::this().current = i;
 }
 
-/// Abandon volontaire : cede la place aux threads de meme priorite.
+/// Voluntary yield: give way to same-priority threads.
 pub fn yield_current(_i: u16) {
     let c = percpu::this();
     c.slice_expired = true;
     c.need_resched = true;
 }
 
-/// Retire un thread de toute file ou il attend (fin de processus, delai).
+/// Remove a thread from any queue it waits on (process exit, timeout).
 pub fn detach(i: u16) {
     let t = thread::get(i);
     if t.timed {
@@ -292,7 +283,7 @@ pub fn detach(i: u16) {
     t.blocked_on = NIL;
 }
 
-/// Coeur le moins charge, avec rotation pour departager les ex aequo.
+/// Least-loaded core, with rotation to break ties.
 pub fn least_loaded() -> usize {
     static mut ROT: usize = 0;
     let start = unsafe {
@@ -316,9 +307,9 @@ pub fn least_loaded() -> usize {
     best
 }
 
-// ------------------------------------------------------------- echeances ---
+// --- deadlines ---
 
-/// Inscrit `i` dans la file d'echeances (triee) de son coeur d'attache.
+/// Insert `i` in its home core's (sorted) deadline queue.
 pub fn arm(i: u16, deadline: u64) {
     let t = thread::get(i);
     if t.timed {
@@ -328,7 +319,14 @@ pub fn arm(i: u16, deadline: u64) {
     t.timed = true;
     let home = t.home as usize;
     let c = percpu::get(home);
-    trace!("[s{}] arm tid {} home {} d {} tete {}", percpu::this().id, t.tid, home, deadline, c.tmo_head);
+    trace!(
+        "[s{}] arm tid {} home {} d {} tete {}",
+        percpu::this().id,
+        t.tid,
+        home,
+        deadline,
+        c.tmo_head
+    );
     let mut prev = NIL;
     let mut cur = c.tmo_head;
     while cur != NIL && thread::get(cur).wake_at <= deadline {
@@ -341,7 +339,7 @@ pub fn arm(i: u16, deadline: u64) {
         thread::get(cur).tq_prev = i;
     }
     if prev == NIL {
-        // Nouvelle echeance la plus proche : le timer du coeur doit suivre.
+        // New nearest deadline: the core timer must follow.
         c.tmo_head = i;
         c.timer_dirty = true;
         if home != percpu::this().id {
@@ -352,8 +350,8 @@ pub fn arm(i: u16, deadline: u64) {
     }
 }
 
-/// Retire l'echeance de `i`. Le timer peut garder l'ancienne date : il se
-/// declenchera pour rien, une fois, et sera reprogramme.
+/// Remove `i`'s deadline. The timer may keep the old date: it fires once
+/// for nothing, then reprograms.
 pub fn disarm(i: u16) {
     let t = thread::get(i);
     if !t.timed {
@@ -361,7 +359,14 @@ pub fn disarm(i: u16) {
     }
     t.timed = false;
     let c = percpu::get(t.home as usize);
-    trace!("[s{}] disarm tid {} home {} prev {} next {}", percpu::this().id, t.tid, t.home, t.tq_prev, t.tq_next);
+    trace!(
+        "[s{}] disarm tid {} home {} prev {} next {}",
+        percpu::this().id,
+        t.tid,
+        t.home,
+        t.tq_prev,
+        t.tq_next
+    );
     if t.tq_prev == NIL {
         c.tmo_head = t.tq_next;
     } else {
@@ -374,14 +379,14 @@ pub fn disarm(i: u16) {
     t.tq_prev = NIL;
 }
 
-/// Endort le thread courant jusqu'a l'echeance (valeur absolue du compteur).
+/// Sleep the current thread until the deadline (absolute counter value).
 pub fn sleep_until(i: u16, deadline: u64) {
     thread::get(i).state = State::Sleeping;
     arm(i, deadline);
 }
 
-/// Traite les echeances atteintes du coeur courant : les dormeurs repartent
-/// avec 0, les attentes bornees avec -ETIMEDOUT.
+/// Drain this core's reached deadlines: sleepers resume with 0, bounded
+/// waits with -ETIMEDOUT.
 pub fn expire(now: u64) {
     let c = percpu::this();
     while c.tmo_head != NIL {
@@ -398,9 +403,9 @@ pub fn expire(now: u64) {
     }
 }
 
-// ------------------------------------------------ priorites et migrations ---
+// --- priorities and migrations ---
 
-/// Change la priorite d'un thread, ou qu'il soit.
+/// Change a thread's priority, wherever it is.
 pub fn set_prio(i: u16, prio: u8) {
     let t = thread::get(i);
     if t.prio == prio {
@@ -414,7 +419,7 @@ pub fn set_prio(i: u16, prio: u8) {
         c.rq.push(i);
     }
     if matches!(t.state, State::Ready | State::Running) {
-        // Le coeur reevalue son choix (preemption dans un sens ou l'autre).
+        // The core re-picks (preemption either way).
         c.need_resched = true;
         if home != percpu::this().id {
             kick(home);
@@ -422,8 +427,8 @@ pub fn set_prio(i: u16, prio: u8) {
     }
 }
 
-/// Impose (ou libere) le coeur d'un thread. La migration est confiee a son
-/// coeur actuel.
+/// Pin (or release) a thread's core. Migration runs on its current core.
+///
 pub fn set_affinity(i: u16, cpu: u8) {
     let t = thread::get(i);
     t.affinity = cpu;
@@ -442,7 +447,7 @@ pub fn set_affinity(i: u16, cpu: u8) {
     }
 }
 
-/// Deplace `i`, dont le coeur courant est le coeur d'attache, vers `dst`.
+/// Move `i`, whose current core is its home, to `dst`.
 fn migrate_now(i: u16, dst: usize) {
     let c = percpu::this();
     let t = thread::get(i);
@@ -459,7 +464,7 @@ fn migrate_now(i: u16, dst: usize) {
             push_to(i, dst);
         }
         State::Running => {
-            // Thread courant de ce coeur : il repartira depuis `dst`.
+            // This core's current thread: it resumes from `dst`.
             if c.current == i {
                 c.current = NIL;
             }
@@ -468,7 +473,7 @@ fn migrate_now(i: u16, dst: usize) {
         }
         State::Free | State::Zombie => {}
         _ => {
-            // Bloque : seule son echeance est rattachee a un coeur.
+            // Parked: only its deadline attaches to a core.
             if t.timed {
                 let d = t.wake_at;
                 disarm(i);
@@ -481,7 +486,7 @@ fn migrate_now(i: u16, dst: usize) {
     }
 }
 
-/// Place un thread pret dans la file de `dst` et previent ce coeur.
+/// Push a ready thread on `dst`'s queue and notify that core.
 fn push_to(i: u16, dst: usize) {
     let t = thread::get(i);
     t.state = State::Ready;
@@ -493,8 +498,8 @@ fn push_to(i: u16, dst: usize) {
     }
 }
 
-/// Migrations demandees par d'autres coeurs, et demande de travail d'un coeur
-/// au repos.
+/// Migrations asked by other cores, and an idle core's work request.
+///
 fn run_migrations(c: &mut PerCpu) {
     while c.mig_head != NIL {
         let i = c.mig_head;
@@ -508,21 +513,25 @@ fn run_migrations(c: &mut PerCpu) {
     }
 }
 
-/// Cede un thread pret sans affinite a un coeur au repos. Vrai si fait.
-/// Seulement en surplus : ce coeur garde toujours de quoi s'occuper.
+/// Hand an unpinned ready thread to an idle core. True if done.
+/// Surplus only: this core always keeps something to run.
 fn push_to_idle(c: &mut PerCpu) -> bool {
     let running = c.current != NIL && thread::get(c.current).state == State::Running;
     if c.rq.len() + u32::from(running) < 2 {
         return false;
     }
-    let Some(dst) = idle_core(c.id) else { return false };
-    let Some(i) = c.rq.movable() else { return false };
+    let Some(dst) = idle_core(c.id) else {
+        return false;
+    };
+    let Some(i) = c.rq.movable() else {
+        return false;
+    };
     migrate_now(i, dst);
     true
 }
 
-/// Un coeur passe au repos : le plus charge des autres, s'il a un thread
-/// pret deplacable, le lui cedera a sa prochaine sortie du noyau.
+/// A core goes idle: the most loaded other core, if it holds a movable ready
+/// thread, hands it over at its next kernel exit.
 fn request_work(me: usize) {
     let mut best = None;
     let mut best_len = 0;
@@ -545,7 +554,7 @@ fn request_work(me: usize) {
     }
 }
 
-/// Un thread disparait : plus aucune trace dans les structures par coeur.
+/// A thread dies: no trace left in per-core structures.
 pub fn forget_thread(i: u16) {
     for k in 0..NR_CPUS {
         let c = percpu::get(k);
@@ -584,7 +593,7 @@ pub fn forget_thread(i: u16) {
     }
 }
 
-// ------------------------------------------------------- sortie du noyau ---
+// --- kernel exit ---
 
 fn choose(c: &mut PerCpu) -> Option<u16> {
     let cur = c.current;
@@ -602,7 +611,7 @@ fn choose(c: &mut PerCpu) -> Option<u16> {
                     c.rq.push(cur);
                 }
                 Some(p) if p == t.prio && expired => {
-                    // Concurrence : un coeur libre prend-il la releve ?
+                    // Contended: does a free core take over?
                     if push_to_idle(c) && c.rq.best_prio() != Some(t.prio) {
                         return Some(cur);
                     }
@@ -620,7 +629,7 @@ fn choose(c: &mut PerCpu) -> Option<u16> {
     c.rq.pop()
 }
 
-/// Decompte du temps : l'intervalle ecoule est impute a qui occupait le coeur.
+/// Time accounting: the elapsed slice goes to whoever owned the core.
 #[inline]
 fn account(c: &mut PerCpu, next: u16) -> u64 {
     let now = timer::counter();
@@ -643,8 +652,8 @@ extern "C" {
     fn nxk_enter_idle(kstack_top: u64) -> !;
 }
 
-/// Fin de toute entree dans le noyau : reprend le thread choisi, ou endort le
-/// coeur. Rend le verrou global juste avant de quitter EL1.
+/// End of every kernel entry: resume the chosen thread, or sleep the core.
+/// Release the global lock just before leaving EL1.
 pub fn exit_to_user() -> ! {
     let c = percpu::this();
 
@@ -655,8 +664,8 @@ pub fn exit_to_user() -> ! {
         c.push_pending = false;
         push_to_idle(c);
     }
-    // Le thread courant a pu mourir pendant ce passage (ou etre tue par un
-    // autre coeur pendant qu'il tournait ici) : c'est a ce coeur de le liberer.
+    // The current thread may have died meanwhile (or been killed by another
+    // core while running here): this core frees it.
     if c.current != NIL && thread::get(c.current).state == State::Zombie {
         let z = c.current;
         c.current = NIL;
@@ -665,8 +674,8 @@ pub fn exit_to_user() -> ! {
 
     let chosen = loop {
         let chosen = choose(c);
-        // Arret demande par un debogueur : le thread s'immobilise au lieu de
-        // repartir en EL0, et le coeur choisit a nouveau.
+        // Debugger-requested stop: the thread parks instead of returning to
+        // EL0, and the core picks again.
         match chosen {
             Some(i) if thread::get(i).stop_request => {
                 let t = thread::get(i);
@@ -680,8 +689,16 @@ pub fn exit_to_user() -> ! {
             _ => break chosen,
         }
     };
-    if chosen.map(|i| i != c.acct_thread).unwrap_or(c.acct_thread != NIL) {
-        trace!("[s{}] run {:?} (rq {})", c.id, chosen.map(|i| thread::get(i).tid), c.rq.len());
+    if chosen
+        .map(|i| i != c.acct_thread)
+        .unwrap_or(c.acct_thread != NIL)
+    {
+        trace!(
+            "[s{}] run {:?} (rq {})",
+            c.id,
+            chosen.map(|i| thread::get(i).tid),
+            c.rq.len()
+        );
     }
     match chosen {
         Some(i) => {
@@ -690,7 +707,7 @@ pub fn exit_to_user() -> ! {
             t.state = State::Running;
             c.current = i;
 
-            // Nouveau thread : decompte du temps et quantum neuf.
+            // New thread: time accounting and a fresh quantum.
             let mut now = 0;
             if c.acct_thread != i {
                 now = account(c, i);
@@ -699,7 +716,7 @@ pub fn exit_to_user() -> ! {
                     c.timer_dirty = true;
                 }
             }
-            // Quantum seulement face a un concurrent de meme priorite.
+            // Quantum only against a same-priority contender.
             if c.rq.best_prio() == Some(t.prio) {
                 if c.slice_end == 0 {
                     if now == 0 {
@@ -729,8 +746,8 @@ pub fn exit_to_user() -> ! {
                 c.last_run = i;
             }
             fpu::prepare(c, i);
-            // Pas a pas : MDSCR_EL1.SS pour ce thread seulement (pose pour
-            // un autre, il provoquerait une exception immediate).
+            // Single-step: MDSCR_EL1.SS for this thread only (set for another,
+            // it would fault at once).
             if t.single_step {
                 t.frame.spsr |= debug::SPSR_SS;
             }
@@ -757,8 +774,8 @@ pub fn exit_to_user() -> ! {
             if c.timer_dirty {
                 timer::reprogram(c);
             }
-            // Un coeur au repos ne garde aucune table de processus chargee :
-            // un processus peut mourir et ses tables etre reutilisees.
+            // An idle core keeps no process tables loaded: a process may die
+            // and its tables reused.
             let k = crate::arch::mmu::kernel_ttbr();
             if c.cur_ttbr != k {
                 sysreg_write!("ttbr0_el1", k);
@@ -773,8 +790,8 @@ pub fn exit_to_user() -> ! {
     }
 }
 
-/// Boucle de repos : le coeur dort jusqu'a une interruption. S'il y a du
-/// travail, le gestionnaire repart directement en EL0 sans revenir ici.
+/// Idle loop: the core sleeps until an interrupt. With work pending, the
+/// handler leaves straight to EL0 without coming back here.
 #[no_mangle]
 pub extern "C" fn nxk_idle_loop() -> ! {
     if cfg!(feature = "idle-poll") {
@@ -802,7 +819,7 @@ pub extern "C" fn nxk_idle_loop() -> ! {
     }
 }
 
-/// Ce coeur a-t-il un thread a reprendre ou des migrations a faire ?
+/// Does this core hold a thread to resume or migrations to run?
 pub fn has_work() -> bool {
     let c = percpu::this();
     c.rq.len() > 0 || c.mig_head != NIL

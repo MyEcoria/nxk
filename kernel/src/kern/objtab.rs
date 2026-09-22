@@ -1,18 +1,11 @@
-//! Tables d'objets noyau extensibles.
-//!
-//! Les objets (threads, processus, points de rendez-vous...) sont ranges dans
-//! des tranches allouees a la demande par l'allocateur de pages : aucune
-//! limite fixee a la compilation, et rien n'est reserve tant que le systeme
-//! n'en a pas besoin. Les emplacements libres forment une liste chainee par
-//! indice, d'ou une allocation et une liberation en O(1). L'acces par indice
-//! reste une simple indirection : tranche puis decalage.
+//! Growable object tables: O(1) alloc/free/index via chunked slices.
 
 use crate::kern::thread::NIL;
 use crate::mm::pmm;
 
-/// Taille visee d'une tranche.
+/// Target chunk size.
 const CHUNK_BYTES: usize = 16 * 1024;
-/// Indices sur 16 bits, `NIL` reserve.
+/// 16-bit indices, `NIL` reserved.
 pub const MAX_OBJECTS: usize = 0xFFFF;
 const MAX_CHUNKS: usize = 1024;
 
@@ -22,9 +15,9 @@ pub struct Table<T: 'static> {
     shift: u32,
     free_head: u16,
     live: usize,
-    /// Met un emplacement neuf dans l'etat « libre ».
+    /// Put a fresh slot in the "free" state.
     reset: fn(&mut T),
-    /// Champ de chainage de la liste libre.
+    /// Free-list link field.
     link: fn(&mut T) -> &mut u16,
 }
 
@@ -35,7 +28,7 @@ impl<T: 'static> Table<T> {
         if per == 0 {
             per = 1;
         }
-        // Plus grande puissance de 2 <= per.
+        // Largest power of 2 <= per.
         let shift = usize::BITS - 1 - per.leading_zeros();
         Self {
             chunks: [0; MAX_CHUNKS],
@@ -53,7 +46,7 @@ impl<T: 'static> Table<T> {
         1 << self.shift
     }
 
-    /// Emplacements deja crees (bornes d'iteration).
+    /// Slots created so far (iteration bound).
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         (self.nchunks << self.shift).min(MAX_OBJECTS)
@@ -84,7 +77,7 @@ impl<T: 'static> Table<T> {
         let first = self.nchunks << self.shift;
         self.chunks[self.nchunks] = pa;
         self.nchunks += 1;
-        // Enfile les nouveaux emplacements en ordre croissant.
+        // Chain new slots in increasing order.
         for k in (0..self.per_chunk()).rev() {
             let idx = first + k;
             if idx >= MAX_OBJECTS {
@@ -98,7 +91,7 @@ impl<T: 'static> Table<T> {
         true
     }
 
-    /// Reserve un emplacement ; l'objet est dans l'etat laisse par `reset`.
+    /// Take a slot; the object is in the `reset` state.
     pub fn alloc(&mut self) -> Option<u16> {
         if self.free_head == NIL && !self.grow() {
             return None;
@@ -111,7 +104,7 @@ impl<T: 'static> Table<T> {
         Some(i)
     }
 
-    /// Rend un emplacement (l'appelant a deja remis l'objet a l'etat libre).
+    /// Give a slot back (caller already reset the object to free).
     pub fn free(&mut self, i: u16) {
         let obj = self.get(i);
         *(self.link)(obj) = self.free_head;
