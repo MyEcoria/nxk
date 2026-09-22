@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::{EINVAL, ENOENT, ENOSYS, EPERM};
 use libnx::abi::proto::{console as con, pm};
-use libnx::abi::rights::{DUP, GRANT, SEND};
+use libnx::abi::rights::{DUP, GRANT, MAP, SEND};
 use libnx::abi::spawn::{self, HandleGrant};
 use libnx::abi::{layout, slots, startup};
 use libnx::bootfs::Bootfs;
@@ -23,12 +23,16 @@ const UART_A: u64 = 0x7000_6000;
 const UART_A_IRQ: u32 = 32 + 36; // SPI 36
 
 /// A driver or service started at boot, with its hardware resources.
-/// They come from `slots::DEV_BASE`: register pages first, then IRQs,
+/// They come from `slots::DEV_BASE`: register pages first, then
+/// read-only ones, then IRQs, then sysctl.
 struct Driver {
     name: &'static str,
     mmio: &'static [(u64, u64)],
+    ro_mmio: &'static [(u64, u64)],
     irqs: &'static [u32],
     sysctl: bool,
+    /// Console terminal handle in `slots::TERMINAL`.
+    terminal: bool,
     prio: u32,
 }
 
@@ -39,67 +43,97 @@ const DRIVERS: &[Driver] = &[
     Driver {
         name: "clk",
         mmio: &[(0x6000_6000, 0x1000), (0x7000_E000, 0x1000)],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: false,
+        terminal: false,
         prio: 6,
     },
     Driver {
         name: "i2c",
         mmio: &[(0x7000_C000, 0x1000), (0x7000_D000, 0x1000)],
+        ro_mmio: &[],
         // I2C1..6: SPI 38, 84, 92, 120, 53, 63.
         irqs: &[70, 116, 124, 152, 85, 95],
         sysctl: false,
+        terminal: false,
         prio: 6,
     },
     Driver {
         name: "power",
         mmio: &[],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: true,
+        terminal: false,
         prio: 8,
     },
     Driver {
         name: "sd",
         mmio: &[(0x700B_0000, 0x1000)],
+        ro_mmio: &[],
         irqs: &[46],
         sysctl: false,
+        terminal: false,
         prio: 6,
     },
     Driver {
         name: "fs",
         mmio: &[],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: false,
+        terminal: false,
         prio: 8,
     },
     Driver {
         name: "display",
         mmio: &[(0x5420_0000, 0x40000)],
+        ro_mmio: &[],
         irqs: &[105],
         sysctl: false,
+        terminal: false,
         prio: 10,
     },
     // Touchscreen (via the i2c service) and events from other drivers.
     Driver {
         name: "input",
         mmio: &[],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: false,
+        terminal: false,
         prio: 8,
     },
     Driver {
         name: "usb",
         // XUSB: xHCI host registers.
         mmio: &[(0x7009_0000, 0x4000)],
+        ro_mmio: &[],
         irqs: &[71],
         sysctl: false,
+        terminal: false,
+        prio: 6,
+    },
+    // USB-C port as a USB device (Erista OTG controller): serial console
+    // for a PC. Registers plus queue-head RAM; APB_MISC (chip revision)
+    // and fuses (PHY trims) read-only. IRQ: SPI 20.
+    Driver {
+        name: "usbcon",
+        mmio: &[(0x7D00_0000, 0x2000)],
+        ro_mmio: &[(0x7000_0000, 0x1000), (0x7000_F000, 0x1000)],
+        irqs: &[52],
+        sysctl: false,
+        terminal: true,
         prio: 6,
     },
     Driver {
         name: "net",
         mmio: &[],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: false,
+        terminal: false,
         prio: 8,
     },
 ];
@@ -112,6 +146,8 @@ struct Service {
 struct State {
     fs: Bootfs,
     console: u32,
+    /// Console handle with the terminal badge (terminal driver only).
+    terminal: u32,
     pm_app: u32,
     pm_srv: u32,
     services: Vec<Service>,
@@ -158,10 +194,12 @@ fn main() -> i32 {
     .expect("spawn console");
 
     // init keeps send rights only: the driver alone may receive,
-    // and clients learn of its death via EPIPE. A badged handle cannot
-    // be re-minted: nobody can forge the terminal badge from it.
+    // and clients learn of its death via EPIPE. Badged handles cannot
+    // be re-minted: only the terminal driver gets the terminal badge.
     let console_send =
         sys::handle_dup(ep_console, SEND | GRANT | DUP, con::BADGE_CLIENT).expect("dup console");
+    let console_term =
+        sys::handle_dup(ep_console, SEND | GRANT, con::BADGE_TERMINAL).expect("dup console");
     for h in [ep_console, uart, uart_irq, console_drv] {
         let _ = sys::handle_close(h);
     }
@@ -175,6 +213,7 @@ fn main() -> i32 {
     let mut st = State {
         fs,
         console: console_send,
+        terminal: console_term,
         pm_app,
         pm_srv,
         services: Vec::new(),
@@ -222,12 +261,28 @@ fn start_driver(st: &State, d: &Driver) -> Result<u32, i64> {
         handle: st.pm_srv,
         slot: slots::PM,
     });
+    if d.terminal {
+        grants.push(HandleGrant {
+            handle: st.terminal,
+            slot: slots::TERMINAL,
+        });
+    }
     let mut slot = slots::DEV_BASE;
     let r = (|| {
         for &(base, len) in d.mmio {
             let h = sys::mmio_derive(slots::INIT_MMIO_ROOT, base, len)?;
             owned.push(h);
             grants.push(HandleGrant { handle: h, slot });
+            slot += 1;
+        }
+        for &(base, len) in d.ro_mmio {
+            // No WRITE right: mapped read-only.
+            let h = sys::mmio_derive(slots::INIT_MMIO_ROOT, base, len)?;
+            let ro = sys::handle_dup(h, MAP | GRANT, 0);
+            let _ = sys::handle_close(h);
+            let ro = ro?;
+            owned.push(ro);
+            grants.push(HandleGrant { handle: ro, slot });
             slot += 1;
         }
         for &irq in d.irqs {

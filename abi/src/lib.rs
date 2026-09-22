@@ -464,8 +464,10 @@ pub mod slots {
     pub const DRV_SERVICE: u32 = 2;
     pub const DRV_MMIO: u32 = 3;
     pub const DRV_IRQ: u32 = 4;
-    /// Other drivers: resources from here (registers, IRQs, sysctl)
-    /// in init's driver-table order.
+    /// Terminal driver: console handle with `console::BADGE_TERMINAL`.
+    pub const TERMINAL: u32 = 6;
+    /// Other drivers: resources from here (registers, read-only
+    /// registers, IRQs, sysctl) in init's driver-table order.
     pub const DEV_BASE: u32 = 8;
 }
 
