@@ -1,16 +1,5 @@
-//! libnx : bibliotheque systeme des programmes nxk.
-//!
-//! L'equivalent de la libc : des fonctions ordinaires au-dessus des appels
-//! systeme (memoire, threads, temps) et des messages aux serveurs (console,
-//! gestionnaire de processus). Un programme se reduit a :
-//!
-//! ```ignore
-//! #![no_std]
-//! #![no_main]
-//! use libnx::println;
-//! libnx::entry!(main);
-//! fn main() -> i32 { println!("bonjour"); 0 }
-//! ```
+//! libnx: system library for nxk programs (syscalls + server IPC).
+//! See `entry!` + `println!` for a minimal program.
 
 #![no_std]
 
@@ -36,7 +25,7 @@ pub mod thread;
 pub mod time;
 pub mod tls;
 
-/// Declare la fonction principale du programme.
+/// Declare the program's main function.
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {

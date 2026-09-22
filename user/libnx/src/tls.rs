@@ -1,10 +1,5 @@
-//! Stockage local de thread (TLS) du modele AArch64 « variante 1 ».
-//!
-//! `TPIDR_EL0` designe un bloc de controle de 16 octets suivi (a l'alignement
-//! du segment PT_TLS) de la copie propre au thread du modele `.tdata`, puis
-//! de `.tbss` a zero. Le compilateur accede aux variables `#[thread_local]`
-//! d'un executable par un simple decalage depuis `TPIDR_EL0` (modele
-//! local-exec) : aucune aide du noyau, qui ne fait que sauver le registre.
+//! AArch64 variant-1 TLS via `TPIDR_EL0` (local-exec model).
+//! Block = 16-byte header plus `.tdata`/`.tbss` copy.
 
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 
@@ -38,9 +33,11 @@ fn template() -> Option<Template> {
     unsafe { *core::ptr::addr_of!(TEMPLATE) }
 }
 
-/// Lit l'en-tete PT_TLS et installe le TLS du thread principal.
+/// Read the PT_TLS header and install the main thread TLS.
 pub fn init() {
-    let Some(b) = env::startup_block() else { return };
+    let Some(b) = env::startup_block() else {
+        return;
+    };
     for k in 0..b.phnum as usize {
         let ph = unsafe { &*((b.phdr + (k * b.phent as usize) as u64) as *const Phdr) };
         if ph.ptype == PT_TLS && ph.memsz > 0 {
@@ -60,10 +57,13 @@ pub fn init() {
 
 fn layout(t: &Template) -> (usize, Layout) {
     let off = 16usize.next_multiple_of(t.align);
-    (off, Layout::from_size_align(off + t.memsz, t.align).unwrap())
+    (
+        off,
+        Layout::from_size_align(off + t.memsz, t.align).unwrap(),
+    )
 }
 
-/// Nouveau bloc TLS initialise ; rend la valeur de `TPIDR_EL0` (0 : pas de TLS).
+/// New initialized TLS block; returns the `TPIDR_EL0` value (0: no TLS).
 pub fn alloc_block() -> Option<u64> {
     let t = template()?;
     let (off, l) = layout(&t);
@@ -82,7 +82,7 @@ pub fn free_block(tp: u64) {
 }
 
 /// # Safety
-/// `tp` doit designer un bloc rendu par `alloc_block`, ou 0.
+/// `tp` must be a block from `alloc_block`, or 0.
 pub unsafe fn set_tp(tp: u64) {
     unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nomem, nostack)) };
 }

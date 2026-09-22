@@ -1,17 +1,11 @@
-//! Synchronisation en espace utilisateur.
-//!
-//! `Mutex` et `Condvar` reposent sur le futex du noyau : sans contention, tout
-//! se fait par operations atomiques, sans appel systeme ; un thread qui doit
-//! attendre dort dans le noyau au lieu de tourner. `SpinLock` reste pour les
-//! sections tres courtes (il cede le coeur si le detenteur tarde).
+//! Futex-based `Mutex`/`Condvar` (uncontended = pure atomics).
+//! `SpinLock` is for short sections only.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::sys;
-
-// ------------------------------------------------------------ SpinLock ---
 
 pub struct SpinLock<T> {
     locked: AtomicBool,
@@ -23,7 +17,10 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
     pub const fn new(v: T) -> Self {
-        Self { locked: AtomicBool::new(false), data: UnsafeCell::new(v) }
+        Self {
+            locked: AtomicBool::new(false),
+            data: UnsafeCell::new(v),
+        }
     }
 
     pub fn lock(&self) -> SpinGuard<'_, T> {
@@ -68,27 +65,29 @@ impl<T> Drop for SpinGuard<'_, T> {
     }
 }
 
-// --------------------------------------------------------------- Mutex ---
-
 const UNLOCKED: u32 = 0;
 const LOCKED: u32 = 1;
-/// Verrouille, et au moins un thread dort peut-etre dans le noyau.
+/// Locked, and at least one thread may be sleeping in the kernel.
 const CONTENDED: u32 = 2;
 
-/// Verrou a trois etats (Drepper, « Futexes are tricky ») : le deverrouillage
-/// n'appelle le noyau que si quelqu'un attend.
+/// Three-state lock (Drepper, "Futexes are tricky"): unlock only
+/// enters the kernel when someone is waiting.
 pub struct RawMutex {
     state: AtomicU32,
 }
 
 impl RawMutex {
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(UNLOCKED) }
+        Self {
+            state: AtomicU32::new(UNLOCKED),
+        }
     }
 
     #[inline]
     pub fn try_lock(&self) -> bool {
-        self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     #[inline]
@@ -100,8 +99,8 @@ impl RawMutex {
 
     #[cold]
     fn lock_contended(&self) {
-        // Courte attente active : le detenteur tourne peut-etre sur un autre
-        // coeur et va rendre le verrou tout de suite.
+        // Brief spin: the owner may be running on another core
+        // and about to release.
         for _ in 0..100 {
             if self.state.load(Ordering::Relaxed) == UNLOCKED && self.try_lock() {
                 return;
@@ -137,7 +136,10 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(v: T) -> Self {
-        Self { raw: RawMutex::new(), data: UnsafeCell::new(v) }
+        Self {
+            raw: RawMutex::new(),
+            data: UnsafeCell::new(v),
+        }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
@@ -173,21 +175,25 @@ impl<T> Drop for MutexGuard<'_, T> {
     }
 }
 
-// ------------------------------------------------------------- Condvar ---
-
-/// Variable de condition : un compteur d'evenements sur lequel on attend.
+/// Condition variable: an event counter to wait on.
 pub struct Condvar {
     seq: AtomicU32,
 }
 
 impl Condvar {
     pub const fn new() -> Self {
-        Self { seq: AtomicU32::new(0) }
+        Self {
+            seq: AtomicU32::new(0),
+        }
     }
 
-    /// Rend le verrou, attend un signal (ou `timeout_ns`, 0 = sans limite),
-    /// puis reprend le verrou. Vrai si le delai a expire.
-    pub fn wait_timeout<'a, T>(&self, g: MutexGuard<'a, T>, timeout_ns: u64) -> (MutexGuard<'a, T>, bool) {
+    /// Unlock, wait for a signal (or `timeout_ns`, 0 = no limit),
+    /// then re-lock. Returns true on timeout.
+    pub fn wait_timeout<'a, T>(
+        &self,
+        g: MutexGuard<'a, T>,
+        timeout_ns: u64,
+    ) -> (MutexGuard<'a, T>, bool) {
         let seq = self.seq.load(Ordering::Relaxed);
         let m = g.m;
         drop(g);

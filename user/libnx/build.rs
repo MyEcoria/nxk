@@ -1,5 +1,4 @@
-// Le script de link est commun a tous les programmes : sa modification doit
-// provoquer une nouvelle edition des liens.
+// The link script is shared by all programs: changing it must re-link.
 fn main() {
     println!("cargo:rerun-if-changed=../user.ld");
 }

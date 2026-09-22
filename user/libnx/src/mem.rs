@@ -1,9 +1,5 @@
-//! Memoire : projections et allocateur global (`Vec`, `String`, `Box`...).
-//!
-//! Petites tailles : classes en puissances de 2 (16 o a 2 KiB). Chaque page est
-//! decoupee entierement dans une seule classe, si bien que tout bloc est aligne
-//! sur sa taille. Les blocs liberes forment une liste par classe : allocation
-//! et liberation en O(1). Au-dela de 2 KiB, projection directe de pages.
+//! Mappings + global allocator (`Vec`/`String`/`Box`).
+//! Size classes (16 B-2 KiB) with per-class free lists.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -26,9 +22,8 @@ pub fn protect(ptr: *mut u8, len: usize, p: u64) -> Result<(), i64> {
     sys::mem_protect(ptr as u64, len as u64, p)
 }
 
-/// Memoire partagee : un objet noyau et, eventuellement, sa projection ici.
-/// Le handle peut etre transmis a un autre processus (IPC) qui la projette
-/// a son tour ; les pages vivent tant qu'un handle ou une projection existe.
+/// Shared memory: kernel object plus its mapping here, if any.
+/// Handles transfer over IPC; pages live while referenced.
 pub struct SharedMemory {
     handle: u32,
     len: usize,
@@ -36,7 +31,7 @@ pub struct SharedMemory {
 }
 
 impl SharedMemory {
-    /// Nouvel objet de `len` octets, projete en lecture/ecriture.
+    /// New `len`-byte object, mapped read/write.
     pub fn new(len: usize, flags: u64) -> Result<Self, i64> {
         let h = sys::shm_create(len as u64, flags)?;
         Self::map(h, len, prot::READ | prot::WRITE).map_err(|e| {
@@ -45,7 +40,7 @@ impl SharedMemory {
         })
     }
 
-    /// Projette un objet recu (dont on connait la taille).
+    /// Map a received object (of known size).
     pub fn map(handle: u32, len: usize, p: u64) -> Result<Self, i64> {
         let addr = sys::shm_map(handle, 0, p)?;
         Ok(Self { handle, len, addr })
@@ -67,7 +62,7 @@ impl SharedMemory {
         self.len == 0
     }
 
-    /// Adresse physique d'un octet (tampons DMA, droit DMA requis).
+    /// Physical address of one byte (DMA buffers, DMA right required).
     pub fn paddr(&self, offset: usize) -> Result<u64, i64> {
         sys::shm_paddr(self.handle, offset as u64)
     }
@@ -93,7 +88,7 @@ impl Drop for SharedMemory {
 const CLASSES: usize = 8; // 16, 32, ..., 2048
 const MIN_SHIFT: usize = 4;
 const MAX_SMALL: usize = 2048;
-const REFILL: usize = 64 * 1024; // pages demandees au noyau par lot
+const REFILL: usize = 64 * 1024; // pages requested from the kernel per batch
 
 struct State {
     free: [*mut u8; CLASSES],
@@ -110,7 +105,11 @@ pub struct Heap {
 impl Heap {
     pub const fn new() -> Self {
         Self {
-            state: Mutex::new(State { free: [ptr::null_mut(); CLASSES], page_cur: 0, page_end: 0 }),
+            state: Mutex::new(State {
+                free: [ptr::null_mut(); CLASSES],
+                page_cur: 0,
+                page_end: 0,
+            }),
         }
     }
 }
@@ -144,7 +143,7 @@ unsafe impl GlobalAlloc for Heap {
             st.free[c] = unsafe { *(head as *mut *mut u8) };
             return head;
         }
-        // Classe vide : une page neuve, decoupee entierement dans cette classe.
+        // Empty class: split one fresh page wholly into this class.
         if st.page_cur == st.page_end {
             match map(REFILL, prot::READ | prot::WRITE) {
                 Ok(p) => {

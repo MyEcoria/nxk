@@ -1,4 +1,4 @@
-//! Demarrage d'un programme et gestion des paniques.
+//! Program startup and panic handling.
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -28,8 +28,8 @@ extern "Rust" {
     fn __nx_main() -> i32;
 }
 
-/// x0 = drapeaux de demarrage, x1 = argument libre (pose par le lanceur),
-/// x2 = bloc de demarrage (arguments, environnement, en-tetes de programme).
+/// x0 = startup flags, x1 = launcher-provided argument, x2 =
+/// startup block (args, environment, program headers).
 #[no_mangle]
 extern "C" fn nx_rt_start(flags: u64, arg: u64, block: u64) -> ! {
     FLAGS.store(flags, Ordering::Relaxed);
@@ -60,6 +60,6 @@ pub fn startup_block() -> u64 {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    crate::println!("panique : {}", info);
+    crate::println!("panic: {}", info);
     sys::process_exit(101)
 }

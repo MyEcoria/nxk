@@ -1,4 +1,4 @@
-//! Processus : lancement, attente, gestionnaire de processus (init).
+//! Processes: spawning, waiting, process manager (init).
 
 use alloc::format;
 use alloc::string::String;
@@ -16,7 +16,7 @@ pub fn set_pm(h: u32) {
     PM.store(h, Ordering::Relaxed);
 }
 
-/// Handle du gestionnaire de processus (0 : aucun).
+/// Process manager handle (0: none).
 pub fn pm_handle() -> u32 {
     PM.load(Ordering::Relaxed)
 }
@@ -25,14 +25,14 @@ pub fn exit(code: i32) -> ! {
     sys::process_exit(code as i64)
 }
 
-/// Arguments et environnement, sous la forme attendue par le noyau.
+/// Args and environment, in the kernel-expected shape.
 #[derive(Clone, Default)]
 pub struct Strings {
-    /// `argc + envc` chaines terminees par NUL.
+    /// `argc + envc` NUL-terminated strings.
     pub data: Vec<u8>,
     pub argc: u32,
     pub envc: u32,
-    /// Drapeaux de lancement (`nxk_abi::spawn::SUSPENDED`).
+    /// Spawn flags (`nxk_abi::spawn::SUSPENDED`).
     pub flags: u32,
 }
 
@@ -47,22 +47,31 @@ impl Strings {
             data.extend_from_slice(e.as_bytes());
             data.push(0);
         }
-        Self { data, argc: args.len() as u32, envc: env.len() as u32, flags: 0 }
+        Self {
+            data,
+            argc: args.len() as u32,
+            envc: env.len() as u32,
+            flags: 0,
+        }
     }
 
-    /// Lancement suspendu : le programme attend un debogueur.
+    /// Suspended spawn: the program waits for a debugger.
     pub fn suspended(mut self) -> Self {
         self.flags |= nxk_abi::spawn::SUSPENDED as u32;
         self
     }
 
-    /// Premier argument (nom du programme).
+    /// First arg (program name).
     pub fn program(&self) -> &str {
-        let end = self.data.iter().position(|&c| c == 0).unwrap_or(self.data.len());
+        let end = self
+            .data
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(self.data.len());
         core::str::from_utf8(&self.data[..end]).unwrap_or("")
     }
 
-    /// Forme transportable par message : argc, envc, drapeaux, 0, chaines.
+    /// Message-carried form: argc, envc, flags, 0, strings.
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(16 + self.data.len());
         v.extend_from_slice(&self.argc.to_le_bytes());
@@ -83,13 +92,21 @@ impl Strings {
         if argc == 0 || data.iter().filter(|&&c| c == 0).count() != (argc + envc) as usize {
             return None;
         }
-        Some(Self { data, argc, envc, flags })
+        Some(Self {
+            data,
+            argc,
+            envc,
+            flags,
+        })
     }
 }
 
-/// L'environnement courant, a transmettre a un enfant.
+/// Current environment, to pass to a child.
 pub fn current_env() -> Vec<String> {
-    env::vars().into_iter().map(|(k, v)| format!("{}={}", k, v)).collect()
+    env::vars()
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect()
 }
 
 pub struct Spawn<'a> {
@@ -103,7 +120,7 @@ pub struct Spawn<'a> {
     pub strings: &'a Strings,
 }
 
-/// Lance un executable present en memoire (utilise par init).
+/// Spawn an in-memory executable (used by init).
 pub fn spawn_elf(s: &Spawn) -> Result<u32, i64> {
     let a = SpawnArgs {
         elf_ptr: s.elf.as_ptr() as u64,
@@ -125,9 +142,8 @@ pub fn spawn_elf(s: &Spawn) -> Result<u32, i64> {
     sys::process_spawn(&a)
 }
 
-/// Demande au gestionnaire de processus de lancer un programme de l'image de
-/// demarrage, avec ses arguments (le premier est son nom) et l'environnement
-/// courant ; rend le handle du processus.
+/// Ask the process manager to spawn a boot-image program with its args
+/// (first is its name) and the current environment; returns the process handle.
 pub fn spawn_args(args: &[&str]) -> Result<u32, i64> {
     spawn_with(&Strings::new(args, &current_env()))
 }
@@ -142,18 +158,16 @@ pub fn spawn_with(s: &Strings) -> Result<u32, i64> {
         return Err(-nxk_abi::err::E2BIG);
     }
     let r = ipc::call(h, &ipc::pack(pm::SPAWN, &payload))?;
-    if r.label() != 0 {
-        return Err(-(r.label() as i64));
-    }
+    ipc::checked(r)?;
     Ok(ipc::received_handle(0))
 }
 
-/// Lance un programme sans argument.
+/// Spawn a program with no args.
 pub fn spawn(name: &str) -> Result<u32, i64> {
     spawn_args(&[name])
 }
 
-/// Liste des programmes disponibles (noms separes par des espaces).
+/// Available programs (space-separated names).
 pub fn list(buf: &mut [u8]) -> usize {
     let h = PM.load(Ordering::Relaxed);
     if h == 0 {
@@ -169,18 +183,25 @@ pub fn wait(h: u32) -> i64 {
     sys::process_wait(h)
 }
 
-/// Pids des processus vivants (pas encore termines). Sert aux services a
-/// liberer les ressources d'un client disparu (un pid n'est jamais reemploye).
+/// Pids of live processes (not yet exited). Lets services free a
+/// dead client's resources (a pid is never reused).
 pub fn live_pids() -> Vec<u32> {
     use nxk_abi::info::{ProcInfo, PROCESSES, PSTATE_ALIVE};
     let mut v = alloc::vec![ProcInfo::default(); 64];
     loop {
         let bytes = unsafe {
-            core::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * core::mem::size_of::<ProcInfo>())
+            core::slice::from_raw_parts_mut(
+                v.as_mut_ptr() as *mut u8,
+                v.len() * core::mem::size_of::<ProcInfo>(),
+            )
         };
         let n = sys::sysinfo(PROCESSES, bytes).unwrap_or(0) as usize;
         if n <= v.len() {
-            return v[..n].iter().filter(|p| p.state == PSTATE_ALIVE).map(|p| p.pid).collect();
+            return v[..n]
+                .iter()
+                .filter(|p| p.state == PSTATE_ALIVE)
+                .map(|p| p.pid)
+                .collect();
         }
         v.resize(n + 16, ProcInfo::default());
     }

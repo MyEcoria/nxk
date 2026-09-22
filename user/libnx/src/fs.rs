@@ -1,8 +1,5 @@
-//! Fichiers : client du service « fs ».
-//!
-//! Les chemins relatifs partent du dossier courant (variable `PWD`, « / »
-//! par defaut). Un `File` tient sa propre position ; le service ne connait
-//! que des lectures et ecritures positionnees.
+//! File client of the "fs" service (paths from `PWD`).
+//! Position lives client-side; the service does positioned I/O.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -18,8 +15,8 @@ pub use proto::{O_CREATE, O_EXCL, O_READ, O_TRUNC, O_WRITE};
 
 static FS: AtomicU32 = AtomicU32::new(0);
 
-/// Designe le service de fichiers a utiliser (init, qui ne peut pas se
-/// chercher lui-meme dans le service de noms).
+/// Set the file service to use (for init, which cannot look
+/// itself up in the name service).
 pub fn set_handle(h: u32) {
     FS.store(h, Ordering::Relaxed);
 }
@@ -35,18 +32,18 @@ fn fs() -> Result<u32, i64> {
 }
 
 fn call(m: &Msg) -> Result<Msg, i64> {
-    let r = ipc::call(fs()?, m)?;
-    if r.label() != 0 {
-        return Err(-(r.label() as i64));
-    }
-    Ok(r)
+    ipc::call_checked(fs()?, m)
 }
 
-/// Chemin absolu normalise (« . » et « .. » resolus).
+/// Normalized absolute path ("." and ".." resolved).
 pub fn absolute(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     let cwd = env::var("PWD").unwrap_or_else(|| String::from("/"));
-    let full = if path.starts_with('/') { String::from(path) } else { alloc::format!("{}/{}", cwd, path) };
+    let full = if path.starts_with('/') {
+        String::from(path)
+    } else {
+        alloc::format!("{}/{}", cwd, path)
+    };
     for c in full.split('/') {
         match c {
             "" | "." => {}
@@ -83,7 +80,7 @@ fn kind(v: u64) -> Kind {
 pub struct Stat {
     pub size: u64,
     pub kind: Kind,
-    /// Secondes depuis 1970.
+    /// Seconds since 1970.
     pub mtime: u64,
 }
 
@@ -95,11 +92,19 @@ pub struct File {
 
 impl File {
     pub fn open(path: &str, flags: u64) -> Result<Self, i64> {
-        let m = call(&ipc::pack_at(proto::OPEN, &[flags], absolute(path).as_bytes()))?;
-        Ok(Self { fd: m.mr[0], pos: 0, size: m.mr[1] })
+        let m = call(&ipc::pack_at(
+            proto::OPEN,
+            &[flags],
+            absolute(path).as_bytes(),
+        ))?;
+        Ok(Self {
+            fd: m.mr[0],
+            pos: 0,
+            size: m.mr[1],
+        })
     }
 
-    /// Cree (ou vide) un fichier pour l'ecrire.
+    /// Create (or truncate) a file for writing.
     pub fn create(path: &str) -> Result<Self, i64> {
         Self::open(path, O_READ | O_WRITE | O_CREATE | O_TRUNC)
     }
@@ -144,7 +149,11 @@ impl File {
         let mut done = 0;
         while done < data.len() {
             let chunk = &data[done..(done + proto::MAX_IO).min(data.len())];
-            let r = call(&ipc::pack_at(proto::WRITE, &[self.fd, pos + done as u64], chunk))?;
+            let r = call(&ipc::pack_at(
+                proto::WRITE,
+                &[self.fd, pos + done as u64],
+                chunk,
+            ))?;
             if r.mr[0] as usize != chunk.len() {
                 return Err(-EIO);
             }
@@ -180,7 +189,11 @@ impl Drop for File {
 
 pub fn stat(path: &str) -> Result<Stat, i64> {
     let m = path_call(proto::STAT, path)?;
-    Ok(Stat { size: m.mr[0], kind: kind(m.mr[1]), mtime: m.mr[2] })
+    Ok(Stat {
+        size: m.mr[0],
+        kind: kind(m.mr[1]),
+        mtime: m.mr[2],
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -194,14 +207,22 @@ pub fn read_dir(path: &str) -> Result<Vec<DirEntry>, i64> {
     let mut out = Vec::new();
     let mut name = [0u8; 1024];
     loop {
-        let m = call(&ipc::pack_at(proto::READDIR, &[out.len() as u64], p.as_bytes()))?;
+        let m = call(&ipc::pack_at(
+            proto::READDIR,
+            &[out.len() as u64],
+            p.as_bytes(),
+        ))?;
         let n = ipc::unpack_at(&m, 3, &mut name);
         if n == 0 {
             return Ok(out);
         }
         out.push(DirEntry {
             name: String::from(core::str::from_utf8(&name[..n]).unwrap_or("?")),
-            stat: Stat { size: m.mr[0], kind: kind(m.mr[1]), mtime: m.mr[2] },
+            stat: Stat {
+                size: m.mr[0],
+                kind: kind(m.mr[1]),
+                mtime: m.mr[2],
+            },
         });
     }
 }
@@ -239,7 +260,7 @@ pub fn sync() -> Result<(), i64> {
     call(&Msg::new(proto::SYNC, 0, 0)).map(|_| ())
 }
 
-/// (octets libres, octets totaux).
+/// (free bytes, total bytes).
 pub fn statfs() -> Result<(u64, u64), i64> {
     let m = call(&Msg::new(proto::STATFS, 0, 0))?;
     Ok((m.mr[0], m.mr[1]))

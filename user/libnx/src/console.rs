@@ -1,7 +1,5 @@
-//! Console : sortie et lecture de lignes via le serveur console.
-//!
-//! Tant qu'aucun serveur n'est connu (ou s'il disparait), l'ecriture retombe
-//! sur l'appel systeme de debogage du noyau.
+//! Console client; falls back to the kernel debug syscall.
+//! Used before the server is known or if it dies.
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -13,7 +11,7 @@ use crate::sys;
 
 static CONSOLE: AtomicU32 = AtomicU32::new(0);
 
-/// Designe le point d'entree du serveur console (0 = aucun).
+/// Set the console server endpoint (0 = none).
 pub fn set(h: u32) {
     CONSOLE.store(h, Ordering::Relaxed);
 }
@@ -32,7 +30,7 @@ pub fn write(mut b: &[u8]) {
         let n = b.len().min(ipc::MAX_BYTES);
         let m = ipc::pack(proto::WRITE, &b[..n]);
         if ipc::call(h, &m).is_err() {
-            // Serveur disparu : on continue sur la console du noyau.
+            // Server gone: fall back to the kernel console.
             set(0);
             sys::debug_write(b);
             return;
@@ -41,7 +39,7 @@ pub fn write(mut b: &[u8]) {
     }
 }
 
-/// Lit une ligne saisie (edition et echo assures par le serveur).
+/// Read one input line (editing and echo done by the server).
 pub fn read_line(buf: &mut [u8]) -> usize {
     let h = handle();
     if h == 0 {
@@ -53,7 +51,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     }
 }
 
-/// Tampon de formatage : un message par ligne plutot qu'un par fragment.
+/// Format buffer: one message per line rather than per fragment.
 struct LineWriter {
     buf: [u8; 512],
     len: usize,
@@ -83,7 +81,10 @@ impl Write for LineWriter {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    let mut w = LineWriter { buf: [0; 512], len: 0 };
+    let mut w = LineWriter {
+        buf: [0; 512],
+        len: 0,
+    };
     let _ = w.write_fmt(args);
     w.flush();
 }

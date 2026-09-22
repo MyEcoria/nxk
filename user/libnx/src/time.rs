@@ -1,5 +1,5 @@
-//! Temps : lecture directe du compteur materiel, sans appel systeme (le noyau
-//! ouvre `CNTVCT_EL0` a EL0, comme le vDSO de Linux).
+//! Time: direct hardware counter reads, no syscall (the kernel
+//! opens `CNTVCT_EL0` to EL0, like the Linux vDSO).
 
 use core::arch::asm;
 
@@ -28,7 +28,7 @@ pub fn now_ns() -> u64 {
     ticks_to_ns(ticks())
 }
 
-/// Heure murale (ns depuis 1970, UTC), tenue par le noyau.
+/// Wall time (ns since 1970, UTC), kept by the kernel.
 pub fn realtime_ns() -> u64 {
     sys::realtime_ns()
 }

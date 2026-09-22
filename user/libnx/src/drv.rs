@@ -1,4 +1,4 @@
-//! Outils des pilotes : registres projetes, interruptions, boucle de service.
+//! Driver helpers: mapped registers, interrupts, service loop.
 
 use core::ptr::{read_volatile, write_volatile};
 
@@ -8,26 +8,30 @@ use nxk_abi::slots;
 use crate::ipc::{self, Msg, Received};
 use crate::{ns, sys};
 
-/// Capacite materielle numero `k` recue d'init.
+/// Hardware capability number `k` received from init.
 pub const fn dev_slot(k: u32) -> u32 {
     slots::DEV_BASE + k
 }
 
-/// Pages de registres d'un peripherique, projetees dans le processus.
+/// Register pages of a device, mapped into the process.
 #[derive(Clone, Copy)]
 pub struct Mmio {
     base: usize,
 }
 
 impl Mmio {
-    /// Projette `len` octets a partir de l'adresse physique `phys`.
+    /// Map `len` bytes at physical address `phys`.
     pub fn map(cap: u32, phys: u64, len: u64) -> Result<Self, i64> {
-        Ok(Self { base: sys::mmio_map(cap, phys, len)? as usize })
+        Ok(Self {
+            base: sys::mmio_map(cap, phys, len)? as usize,
+        })
     }
 
-    /// Sous-bloc a `off` octets (plusieurs controleurs dans une page).
+    /// Sub-block at `off` bytes (several controllers per page).
     pub const fn offset(self, off: usize) -> Self {
-        Self { base: self.base + off }
+        Self {
+            base: self.base + off,
+        }
     }
 
     #[inline(always)]
@@ -65,7 +69,7 @@ impl Mmio {
         self.w32(off, (self.r32(off) & !clear) | set);
     }
 
-    /// Attend que `(r32(off) & mask) == val`, au plus `timeout_us`.
+    /// Wait for `(r32(off) & mask) == val`, at most `timeout_us`.
     pub fn wait(&self, off: usize, mask: u32, val: u32, timeout_us: u64) -> bool {
         let end = crate::time::now_ns() + timeout_us * 1000;
         loop {
@@ -80,7 +84,7 @@ impl Mmio {
     }
 }
 
-/// Ligne d'interruption recue d'init, livree par une notification.
+/// Interrupt line from init, delivered via a notification.
 pub struct Irq {
     cap: u32,
     notif: u32,
@@ -93,24 +97,24 @@ impl Irq {
         Ok(Self { cap, notif })
     }
 
-    /// Notification a lier au thread de service (`notify_bind`) pour
-    /// recevoir l'interruption comme un message.
+    /// Notification to bind to the service thread (`notify_bind`)
+    /// to receive the interrupt as a message.
     pub fn notification(&self) -> u32 {
         self.notif
     }
 
-    /// Attend l'interruption (0 : sans limite) ; faux si le delai expire.
+    /// Wait for the interrupt (0: no limit); false on timeout.
     pub fn wait(&self, timeout_ns: u64) -> bool {
         sys::notify_wait_timeout(self.notif, timeout_ns).is_ok()
     }
 
-    /// Re-autorise la ligne (masquee par le noyau a chaque declenchement).
+    /// Re-arm the line (masked by the kernel on each trigger).
     pub fn ack(&self) {
         let _ = sys::irq_ack(self.cap);
     }
 }
 
-/// Cree l'endpoint d'un service et le publie sous `name`.
+/// Create a service endpoint and publish it as `name`.
 pub fn publish(name: &str) -> Result<u32, i64> {
     let ep = sys::endpoint_create()?;
     let client = sys::handle_dup(ep, SEND | GRANT | DUP, 0)?;
@@ -119,8 +123,8 @@ pub fn publish(name: &str) -> Result<u32, i64> {
     r.map(|_| ep)
 }
 
-/// Boucle de service : `f` repond a chaque requete ; `None` = reponse
-/// differee (le gestionnaire a garde `rx.token` pour `ipc::reply_to`).
+/// Service loop: `f` answers each request; `None` = deferred reply
+/// (the handler kept `rx.token` for `ipc::reply_to`).
 pub fn serve(ep: u32, mut f: impl FnMut(&Received) -> Option<Msg>) -> ! {
     let mut rx = loop {
         if let Ok(r) = ipc::recv(ep) {

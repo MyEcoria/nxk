@@ -1,4 +1,4 @@
-//! Lecture de l'image de demarrage (reservee a init, qui la recoit projetee).
+//! Boot-image reader (init only: it gets the image mapped).
 
 use nxk_abi::bootfs::{Entry, Header, MAGIC, NAME_LEN};
 
@@ -8,7 +8,7 @@ pub struct Bootfs {
 
 impl Bootfs {
     /// # Safety
-    /// `base` doit designer une image projetee de `len` octets.
+    /// `base` must name a mapped `len`-byte image.
     pub unsafe fn new(base: u64, len: u64) -> Option<Self> {
         let data = unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) };
         let fs = Self { data };
@@ -39,9 +39,12 @@ impl Bootfs {
     }
 
     pub fn find(&self, name: &str) -> Option<&'static [u8]> {
-        (0..self.count()).find(|&k| self.name(k) == name).and_then(|k| {
-            let e = self.entry(k);
-            self.data.get(e.offset as usize..(e.offset + e.size) as usize)
-        })
+        (0..self.count())
+            .find(|&k| self.name(k) == name)
+            .and_then(|k| {
+                let e = self.entry(k);
+                self.data
+                    .get(e.offset as usize..(e.offset + e.size) as usize)
+            })
     }
 }

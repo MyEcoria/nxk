@@ -1,6 +1,5 @@
-//! Service de noms : les services se publient aupres d'init, les programmes
-//! les demandent par leur nom (« fs », « net »...). La reponse porte un
-//! handle SEND vers l'endpoint du service.
+//! Name service: services publish to init, programs look them up by
+//! name. Replies carry a SEND handle to the service endpoint.
 
 use nxk_abi::proto::pm;
 
@@ -16,43 +15,36 @@ fn call_with_name(label: u32, name: &str, handle: Option<u32>) -> Result<ipc::Ms
         ipc::set_send_handle(0, ep);
         m = m.with_handles(1);
     }
-    let r = ipc::call(h, &m)?;
-    if r.label() != 0 {
-        return Err(-(r.label() as i64));
-    }
-    Ok(r)
+    ipc::call_checked(h, &m)
 }
 
-/// Publie `ep` sous `name` (reserve aux services lances par init).
+/// Publish `ep` as `name` (only for init-spawned services).
 pub fn register(name: &str, ep: u32) -> Result<(), i64> {
     call_with_name(pm::REGISTER, name, Some(ep)).map(|_| ())
 }
 
-/// Handle vers le service `name`, s'il est publie.
+/// Handle to service `name`, if published.
 pub fn lookup(name: &str) -> Result<u32, i64> {
     call_with_name(pm::LOOKUP, name, None).map(|_| ipc::received_handle(0))
 }
 
-/// Comme `lookup`, en attendant que le service soit publie.
+/// Like `lookup`, waiting until the service is published.
 pub fn wait_for(name: &str) -> Result<u32, i64> {
     call_with_name(pm::LOOKUP_WAIT, name, None).map(|_| ipc::received_handle(0))
 }
 
-/// Comme `wait_for`, au plus `timeout_ns` (-ETIMEDOUT au-dela). Une
-/// publication plus tardive ne pourra pas atteindre cet appel abandonne.
+/// Like `wait_for`, at most `timeout_ns` (-ETIMEDOUT past it). A later
+/// publication cannot reach this abandoned call.
 pub fn wait_for_timeout(name: &str, timeout_ns: u64) -> Result<u32, i64> {
     let h = process::pm_handle();
     if h == 0 {
         return Err(-nxk_abi::err::ENOSYS);
     }
     let r = ipc::call_timeout(h, &ipc::pack(pm::LOOKUP_WAIT, name.as_bytes()), timeout_ns)?;
-    if r.label() != 0 {
-        return Err(-(r.label() as i64));
-    }
-    Ok(ipc::received_handle(0))
+    ipc::checked(r).map(|_| ipc::received_handle(0))
 }
 
-/// Noms des services publies, separes par des espaces.
+/// Published service names, space-separated.
 pub fn services(buf: &mut [u8]) -> usize {
     let h = process::pm_handle();
     if h == 0 {
