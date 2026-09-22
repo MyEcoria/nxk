@@ -25,11 +25,15 @@ make -C fusee-nano  # builds ./fusee-nano/fusee-nano (17 KiB, zero deps)
 sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 ./mksd-hw.sh /mount/point  # populate the FAT32 microSD (needs it mounted)
+./mksd-hw.sh /mount/point ~/brcm  # ... plus Wi-Fi blobs -> /firmware/brcm
 ```
 
 `mksd-hw.sh` rebuilds nxk, writes `build/nxk.bin` (ELF→raw via llvm-objcopy),
 installs hekate + `hekate_ipl.ini` + `bootloader/payloads/nxk.bin` (marker)
-and the `/bin` userland on the card.
+and the `/bin` userland on the card. A second argument (or `NXK_FIRMWARE`)
+copies a directory of Wi-Fi blobs to `/firmware/brcm`, where `wlan` looks
+for `brcmfmac4356-pcie.bin` and `brcmfmac4356-pcie.txt`: proprietary files
+that are never part of the repository.
 
 ## Inject (when the Switch is plugged in)
 
