@@ -742,8 +742,20 @@ fn now() -> Instant {
 
 libnx::entry!(main);
 
+/// Interface to run on. The wired link comes first: the USB driver
+/// may still be enumerating. Failing that, wait for the Wi-Fi station,
+/// which publishes "wlan0" the moment it associates. Both waits block
+/// in the name service: an idle core stays idle.
+fn link() -> Result<u32, i64> {
+    if let Ok(h) = ns::wait_for_timeout("eth0", 3_000_000_000) {
+        return Ok(h);
+    }
+    println!("[net] no wired link, waiting for Wi-Fi");
+    ns::wait_for("wlan0")
+}
+
 fn main() -> i32 {
-    let eth = match ns::wait_for_timeout("eth0", 5_000_000_000) {
+    let eth = match link() {
         Ok(h) => h,
         Err(_) => {
             println!("[net] no network interface");
