@@ -68,6 +68,37 @@ const DRIVERS: &[Driver] = &[
         terminal: false,
         prio: 8,
     },
+    Driver {
+        name: "display",
+        mmio: &[(0x5420_0000, 0x40000)],
+        ro_mmio: &[],
+        irqs: &[105],
+        sysctl: false,
+        terminal: false,
+        prio: 10,
+    },
+    // Touchscreen (via the i2c service) and events from other drivers.
+    Driver {
+        name: "input",
+        mmio: &[],
+        ro_mmio: &[],
+        irqs: &[],
+        sysctl: false,
+        terminal: false,
+        prio: 8,
+    },
+    // Started before `sd`: a driver that stalls the APB bus must not cost
+    // us the console. Registers plus queue-head RAM; APB_MISC (chip
+    // revision) and fuses (PHY trims) read-only. IRQ: SPI 20.
+    Driver {
+        name: "usbcon",
+        mmio: &[(0x7D00_0000, 0x2000)],
+        ro_mmio: &[(0x7000_0000, 0x1000), (0x7000_F000, 0x1000)],
+        irqs: &[52],
+        sysctl: false,
+        terminal: true,
+        prio: 6,
+    },
     // SDMMC1, plus what powers the slot: APB_MISC (pad control, chip
     // revision), pinmux, GPIO (card detect/power) and PMC (I/O power).
     Driver {
@@ -95,25 +126,6 @@ const DRIVERS: &[Driver] = &[
         prio: 8,
     },
     Driver {
-        name: "display",
-        mmio: &[(0x5420_0000, 0x40000)],
-        ro_mmio: &[],
-        irqs: &[105],
-        sysctl: false,
-        terminal: false,
-        prio: 10,
-    },
-    // Touchscreen (via the i2c service) and events from other drivers.
-    Driver {
-        name: "input",
-        mmio: &[],
-        ro_mmio: &[],
-        irqs: &[],
-        sysctl: false,
-        terminal: false,
-        prio: 8,
-    },
-    Driver {
         name: "usb",
         // XUSB: xHCI host registers.
         mmio: &[(0x7009_0000, 0x4000)],
@@ -121,18 +133,6 @@ const DRIVERS: &[Driver] = &[
         irqs: &[71],
         sysctl: false,
         terminal: false,
-        prio: 6,
-    },
-    // USB-C port as a USB device (Erista OTG controller): serial console
-    // for a PC. Registers plus queue-head RAM; APB_MISC (chip revision)
-    // and fuses (PHY trims) read-only. IRQ: SPI 20.
-    Driver {
-        name: "usbcon",
-        mmio: &[(0x7D00_0000, 0x2000)],
-        ro_mmio: &[(0x7000_0000, 0x1000), (0x7000_F000, 0x1000)],
-        irqs: &[52],
-        sysctl: false,
-        terminal: true,
         prio: 6,
     },
     Driver {
