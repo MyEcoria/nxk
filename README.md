@@ -1,61 +1,61 @@
-# nxk — micro-noyau AArch64 pour Tegra X1
+# nxk — AArch64 microkernel for Tegra X1
 
-Micro-noyau écrit **entièrement en Rust**, sans système hôte, pour le SoC
-NVIDIA Tegra X1 de la Nintendo Switch (Erista et Mariko). Il tourne directement
-sur les quatre Cortex-A57, orienté serveur : pas d'interface graphique, un shell
-sur la console série.
+Microkernel written **entirely in Rust**, with no host OS, for the
+NVIDIA Tegra X1 SoC in the Nintendo Switch (Erista and Mariko). It runs
+directly on the four Cortex-A57 cores, server-oriented: no graphical
+interface, a shell over the serial console.
 
-Comme Linux, il est l'interface entre le matériel et les programmes, qui
-s'écrivent au-dessus d'appels système. Mais en vrai micro-noyau, il ne garde que
-ce qui exige le privilège EL1 : espaces d'adressage, threads, ordonnancement,
-IPC, capacités, routage des interruptions. **Les pilotes et les services
-(fichiers, réseau…) sont des programmes ordinaires en EL0**, avec pour seuls
-droits les capacités qu'on leur a confiées.
+Like Linux, it is the interface between hardware and programs, which
+are written on top of system calls. But as a true microkernel, it keeps
+only what requires EL1 privilege: address spaces, threads, scheduling,
+IPC, capabilities, interrupt routing. **Drivers and services (files,
+network…) are ordinary EL0 programs**, holding only the capabilities
+entrusted to them.
 
-Les programmes s'écrivent en **Rust ordinaire, avec la bibliothèque standard**
-(`std` est portée : cible `aarch64-unknown-nxk`). Les logiciels applicatifs
-(serveur web, SSH…) n'appartiennent pas au système : ce sont des programmes
-comme les autres.
+Programs are written in **ordinary Rust, with the standard library**
+(`std` is ported: target `aarch64-unknown-nxk`). Application software
+(web server, SSH…) does not belong to the system: it is just programs
+like any other.
 
 ```
-EL0  programmes Rust (std) · shell
-     services : fs (FAT32) · net (TCP/IP) · display · input · power
-     pilotes  : console (UART) · sd · usb (xHCI) · i2c · clk
-     init : gestionnaire de processus et service de noms
-     ─────────── std (portée) · libnx (no_std) ───────────
-     ─────────── svc #0 : 51 appels système ───────────
-EL1  nxk : mémoire · threads · ordonnanceur · IPC · capacités · IRQ · futex
+EL0  Rust programs (std) · shell
+     services: fs (FAT32) · net (TCP/IP) · display · input · power
+     drivers : console (UART) · sd · usb (xHCI) · i2c · clk
+     init: process manager and name service
+     ─────────── ported std · libnx (no_std) ───────────
+     ─────────── svc #0: 51 system calls ───────────
+EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 ```
 
-Tout a été vérifié dans l'émulateur `tegra_qemu`, **jamais sur une vraie
-Switch** (voir « Limites »).
+Everything has been verified in the `tegra_qemu` emulator, **never on a
+real Switch** (see "Limits").
 
-## Compiler, lancer, tester
+## Build, run, test
 
-Prérequis : Rust stable avec `rust-src`
-(`rustup component add rust-src` ; cibles `aarch64-unknown-none` et
-`aarch64-unknown-none-softfloat`), l'émulateur `tegra_qemu` compilé, `mkfs.fat`
-et `pyfatfs` pour l'image de carte SD.
+Prerequisites: stable Rust with `rust-src`
+(`rustup component add rust-src`; targets `aarch64-unknown-none` and
+`aarch64-unknown-none-softfloat`), the compiled `tegra_qemu` emulator,
+`mkfs.fat` and `pyfatfs` for the SD-card image.
 
 ```bash
-./tools/build.sh                  # chaîne std, programmes, image de démarrage, noyau
-./tools/mksd.py -o build/sd.img   # carte SD FAT32 (programmes dans /bin)
-./tools/run.sh                    # démarre ; shell sur le terminal (Ctrl-A X pour quitter)
-./tools/nxtest.py -c ktest -c stdtest --sd build/sd.img   # tests automatisés
+./tools/build.sh                  # std toolchain, programs, boot image, kernel
+./tools/mksd.py -o build/sd.img   # FAT32 SD card (programs in /bin)
+./tools/run.sh                    # boots; shell on the terminal (Ctrl-A X to quit)
+./tools/nxtest.py -c ktest -c stdtest --sd build/sd.img   # automated tests
 ```
 
-Options de `nxtest.py` : `--sd IMAGE` (carte SD), `--net [REDIRECTIONS]`
-(carte réseau USB, ex. `tcp::8080-:80`), `--usb-kbd` et `--keys` (clavier
-USB), `--machine tegrax1plus` (Mariko), `--monitor ELF --dtb DTB` (démarrage en
-EL2 sous un moniteur PSCI), `--screendump` (capture de l'écran).
+`nxtest.py` options: `--sd IMAGE` (SD card), `--net [REDIRECTIONS]`
+(USB network card, e.g. `tcp::8080-:80`), `--usb-kbd` and `--keys` (USB
+keyboard), `--machine tegrax1plus` (Mariko), `--monitor ELF --dtb DTB`
+(boot in EL2 under a PSCI monitor), `--screendump` (screen capture).
 
-Les dossiers de compilation vivent dans `~/.cache/nxk/` : le projet est
-synchronisé et n'a pas à transporter d'artefacts.
+Build directories live in `~/.cache/nxk/`: the project is synced and
+does not have to carry build artifacts.
 
-## Écrire un programme
+## Writing a program
 
-Un programme est une crate Rust ordinaire dans `apps/`, ajoutée à
-`apps/Cargo.toml` et à la liste `apps` de `tools/build.sh` :
+A program is an ordinary Rust crate in `apps/`, added to
+`apps/Cargo.toml` and to the `apps` list in `tools/build.sh`:
 
 ```rust
 use std::io::{Read, Write};
@@ -69,209 +69,211 @@ fn main() -> std::io::Result<()> {
         thread::spawn(move || {
             let mut req = [0u8; 1024];
             let _ = s.read(&mut req);
-            let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\nbonjour de nxk\n");
+            let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\nhello from nxk\n");
         });
     }
     Ok(())
 }
 ```
 
-`tools/mkstd.py` prépare la chaîne `nxk` : une copie de Rust stable (liens
-durs) dont la bibliothèque standard reçoit le portage de `std/library`, la
-cible `std/aarch64-unknown-nxk.json` et sa déclaration à rustup. `build.sh`
-compile ensuite `apps/` ; à la main :
+`tools/mkstd.py` prepares the `nxk` toolchain: a copy of stable Rust
+(hard links) whose standard library receives the `std/library` port,
+the `std/aarch64-unknown-nxk.json` target and its rustup declaration.
+`build.sh` then compiles `apps/`; by hand:
 
 ```bash
 cd apps && RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR=~/.cache/nxk/target-apps cargo build --release
 ```
 
-(`RUSTC_BOOTSTRAP` pour `-Z build-std`, voir `apps/.cargo/config.toml` ; ce
-dossier de compilation est celui dont `mkstd.py` invalide la `std` quand le
-portage change.) Les programmes démarrent depuis l'image de démarrage (par
-leur nom) ou depuis la carte SD (`/bin/NOM`, ou un chemin).
+(`RUSTC_BOOTSTRAP` for `-Z build-std`, see `apps/.cargo/config.toml`;
+this is the build directory whose `std` `mkstd.py` invalidates when the
+port changes.) Programs start from the boot image (by their name) or
+from the SD card (`/bin/NAME`, or a path).
 
-### Ce que fournit `std`
+### What `std` provides
 
-| Domaine | Pris en charge | Absent |
+| Area | Supported | Missing |
 |---|---|---|
-| Mémoire | `Box`, `Vec`, collections ; allocateur à 36 classes de taille (O(1), sans en-tête), grands blocs rendus au noyau, adresses réemployées | |
-| Threads | `spawn`, `scope`, noms, `join`, `park`, `sleep`, `available_parallelism`, `thread_local!` avec destructeurs ; piles gardées pour les threads suivants ; `std::os::nxk::thread` (priorité, cœur) | |
-| Synchronisation | `Mutex`, `RwLock`, `Condvar`, `Once`, `OnceLock`, `Barrier`, `mpsc` (futex du noyau) | |
-| Temps | `Instant` sans appel système, `SystemTime` (horloge temps réel) | |
-| Environnement | `args`, variables, dossier courant (`PWD`), `consts::OS = "nxk"`, `getrandom` pour `HashMap` | `current_exe` approché |
-| Fichiers | FAT32 : lecture, écriture, ajout, `seek`, dossiers, `rename`, `copy`, `remove_dir_all`, `metadata` (taille, date), `try_clone` | liens, droits, `set_times`, verrous |
-| Réseau | IPv4 : `TcpStream`, `TcpListener`, `UdpSocket`, délais, mode non bloquant, `try_clone`, résolution DNS | IPv6, `peek`, multicast, boucle locale |
-| Processus | `Command` : arguments, environnement, dossier ; `spawn`, `status`, `output`, `wait`, `try_wait`, `kill`, `id` ; tubes (`piped`, `io::pipe`, `a \| b` sans relais), `null` | redirection vers un fichier |
-| E/S standard | console ou tubes, `IsTerminal` | |
-| Paniques | message sur la sortie d'erreurs, arrêt (`panic=abort`) | déroulement, traces d'appels |
+| Memory | `Box`, `Vec`, collections; 36-size-class allocator (O(1), header-free), large blocks returned to the kernel, recycled addresses | |
+| Threads | `spawn`, `scope`, names, `join`, `park`, `sleep`, `available_parallelism`, `thread_local!` with destructors; guarded stacks for later threads; `std::os::nxk::thread` (priority, core) | |
+| Synchronization | `Mutex`, `RwLock`, `Condvar`, `Once`, `OnceLock`, `Barrier`, `mpsc` (kernel futex) | |
+| Time | `Instant` with no system call, `SystemTime` (real-time clock) | |
+| Environment | `args`, variables, current directory (`PWD`), `consts::OS = "nxk"`, `getrandom` for `HashMap` | `current_exe` approximated |
+| Files | FAT32: read, write, append, `seek`, directories, `rename`, `copy`, `remove_dir_all`, `metadata` (size, date), `try_clone` | links, permissions, `set_times`, locks |
+| Network | IPv4: `TcpStream`, `TcpListener`, `UdpSocket`, timeouts, non-blocking mode, `try_clone`, DNS resolution | IPv6, `peek`, multicast, loopback |
+| Processes | `Command`: arguments, environment, directory; `spawn`, `status`, `output`, `wait`, `try_wait`, `kill`, `id`; pipes (`piped`, `io::pipe`, `a \| b` with no relay), `null` | redirection to a file |
+| Standard I/O | console or pipes, `IsTerminal` | |
+| Panics | message on standard error, abort (`panic=abort`) | unwinding, backtraces |
 
-## Organisation
+## Layout
 
 ```
-abi/        nxk-abi : numéros d'appels, erreurs, droits, protocoles des services
-            (partagé par le noyau, libnx et std : une seule source de vérité)
-kernel/     le micro-noyau
-user/       libnx (bibliothèque système no_std), init, shell, pilotes et services
-std/        portage de la bibliothèque standard Rust, script de liaison, cible
-apps/       programmes Rust ordinaires (std) : hello-std, stdtest
-bench/      comparaison avec L4T : moniteur EL3, programme de mesure Linux, scripts
-tools/      construction, carte SD, chaîne std, lancement, tests automatisés
-refs/       hekate, Atmosphère : documentation du matériel (jamais compilés)
+abi/        nxk-abi: syscall numbers, errors, rights, service protocols
+            (shared by the kernel, libnx and std: single source of truth)
+kernel/     the microkernel
+user/       libnx (no_std system library), init, shell, drivers and services
+std/        Rust standard library port, linker script, target
+apps/       ordinary Rust (std) programs: hello-std, stdtest
+bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
+tools/      build, SD card, std toolchain, launch, automated tests
+refs/       hekate, Atmosphere: hardware documentation (never compiled)
 ```
 
-Environ 8 000 lignes de Rust pour le noyau, 7 000 pour les pilotes, services et
-libnx, 3 800 pour le portage de `std`.
+About 8,000 lines of Rust for the kernel, 7,000 for drivers, services
+and libnx, 3,800 for the `std` port.
 
-## Appels système
+## System calls
 
-Conventions de Linux arm64 : `svc #0`, numéro dans `x8`, arguments dans
-`x0`–`x5`, résultat dans `x0`, erreurs en `-errno` (valeurs Linux). Les appels
-bloquants prennent un délai (ns ; 0 = sans limite).
+Linux arm64 conventions: `svc #0`, number in `x8`, arguments in
+`x0`–`x5`, result in `x0`, errors as `-errno` (Linux values). Blocking
+calls take a timeout (ns; 0 = unbounded).
 
-| Famille | Appels |
+| Family | Calls |
 |---|---|
-| Base | `nop`, `yield`, `sleep`, `clock` (monotone, temps réel), `clock_set`, `getcpu`, `getpid`, `gettid`, `getrandom`, `debug_write`, `thread_exit`, `process_exit`, `system_power` |
-| Handles | `handle_close`, `handle_dup` (droits réduits, insigne), `handle_revoke` |
-| Mémoire | `mem_map` (à la demande ou peuplée, adresse libre ou imposée, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguë, non cachée, sous 4 GiB pour le DMA), `mmio_map`, `mmio_derive` |
-| Threads | `thread_create`, `thread_set` (priorité, cœur), `futex_wait`, `futex_wake` |
-| Processus | `process_spawn` (ELF static-PIE, arguments, environnement), `process_wait`, `process_kill` |
-| IPC | `endpoint_create` (option tube), `ipc_call`, `ipc_send`, `ipc_recv`, `ipc_reply`, `ipc_reply_recv`, `ipc_reply_to` |
+| Base | `nop`, `yield`, `sleep`, `clock` (monotonic, real-time), `clock_set`, `getcpu`, `getpid`, `gettid`, `getrandom`, `debug_write`, `thread_exit`, `process_exit`, `system_power` |
+| Handles | `handle_close`, `handle_dup` (reduced rights, badge), `handle_revoke` |
+| Memory | `mem_map` (on demand or populated, free or fixed address, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguous, uncached, below 4 GiB for DMA), `mmio_map`, `mmio_derive` |
+| Threads | `thread_create`, `thread_set` (priority, core), `futex_wait`, `futex_wake` |
+| Processes | `process_spawn` (static-PIE ELF, arguments, environment), `process_wait`, `process_kill` |
+| IPC | `endpoint_create` (pipe option), `ipc_call`, `ipc_send`, `ipc_recv`, `ipc_reply`, `ipc_reply_recv`, `ipc_reply_to` |
 | Notifications, IRQ | `notify_create`, `notify_signal`, `notify_wait`, `notify_bind`, `irq_get`, `irq_bind`, `irq_ack` |
-| Observation, débogage | `sysinfo` (processus, mémoire, cœurs), `debug_attach`, `debug_regs`, `debug_mem`, `debug_threads`, `debug_stop` |
+| Inspection, debugging | `sysinfo` (processes, memory, cores), `debug_attach`, `debug_regs`, `debug_mem`, `debug_threads`, `debug_stop` |
 
-L'heure se lit sans appel système : le noyau ouvre `CNTVCT_EL0` à EL0 (comme le
-vDSO de Linux).
+Time is read with no system call: the kernel opens `CNTVCT_EL0` to EL0
+(like the Linux vDSO).
 
-## Conception du noyau
+## Kernel design
 
-**Une pile noyau par cœur, pas par thread** (modèle de seL4). Les registres
-sont rangés directement dans le bloc de contrôle du thread ; le noyau ne bloque
-jamais au milieu d'un appel.
+**One kernel stack per core, not per thread** (seL4 model). Registers
+are stored directly in the thread control block; the kernel never blocks
+in the middle of a call.
 
-**Un verrou global**, comme seL4 en multiprocesseur : les chemins noyau durent
-quelques microsecondes. Les appels sans état partagé (`clock`, `getcpu`,
-`gettid`) passent par un chemin rapide sans verrou.
+**One global lock**, as in multiprocessor seL4: kernel paths last a few
+microseconds. Calls with no shared state (`clock`, `getcpu`, `gettid`)
+take a lock-free fast path.
 
-**Capacités** : tout objet (endpoint, thread, processus, notification,
-mémoire partagée, ligne d'interruption, plage de registres) se désigne par un
-handle portant des droits et une génération ; révocation par changement de
-génération. Tables d'objets extensibles.
+**Capabilities**: every object (endpoint, thread, process,
+notification, shared memory, interrupt line, register range) is named by
+a handle carrying rights and a generation; revocation by generation
+change. Growable object tables.
 
-**IPC synchrone** : 6 mots dans les registres, jusqu'à 4 KiB par la page de
-contrôle (UTCB) de chaque thread, jusqu'à 4 handles transmis ; le noyau fournit
-à chaque message l'insigne et le pid de l'émetteur. Client et serveur sur le
-même cœur : bascule directe sans l'ordonnanceur. Délais sur tous les appels
-bloquants. Un endpoint « tube » signale la fin du flux quand son dernier
-écrivain disparaît.
+**Synchronous IPC**: 6 words in registers, up to 4 KiB via each
+thread's control page (UTCB), up to 4 handles transferred; the kernel
+attaches the sender's badge and pid to every message. Client and server
+on the same core: direct switch with no scheduler. Timeouts on all
+blocking calls. A "pipe" endpoint signals end of stream when its last
+writer disappears.
 
-**Ordonnanceur sans tic** : 32 priorités, sélection O(1), une file par cœur ;
-le temporisateur est programmé sur la prochaine échéance (réveil, ou fin de
-quantum seulement si un thread de même priorité attend). Équilibrage vers les
-cœurs au repos, migration, affinité et priorité modifiables. Un cœur sans
-travail ne reçoit pas d'interruption périodique (les services non plus ne
-s'éveillent pas d'eux-mêmes).
+**Tickless scheduler**: 32 priorities, O(1) selection, one queue per
+core; the timer is programmed for the next deadline (wakeup, or end of
+quantum only if a thread of the same priority is waiting). Balancing
+toward idle cores, migration, adjustable affinity and priority. A core
+with no work gets no periodic interrupt (services do not wake up on
+their own either).
 
-**Mémoire** : buddy (4 KiB–4 MiB) ; pages mises à zéro par `DC ZVA` ; espaces
-d'adressage étiquetés par ASID ; pages anonymes et piles allouées au premier
-accès (y compris par plusieurs cœurs à la fois) ; W^X imposé ; ASLR
-(exécutables static-PIE relogés par le chargeur, tas, piles, registres) ; zones
-réservées (carveouts du contrôleur mémoire, `/reserved-memory` de l'arbre de
-périphériques) exclues.
+**Memory**: buddy allocator (4 KiB–4 MiB); pages zeroed with `DC ZVA`;
+ASID-tagged address spaces; on-first-access anonymous pages and stacks
+(including multi-core races); enforced W^X; ASLR (static-PIE executables
+relocated by the loader, heap, stacks, registers); reserved areas
+(memory-controller carveouts, `/reserved-memory` from the device tree)
+excluded.
 
-**Sécurité** : mitigation Spectre v2 (prédicteur invalidé au changement de
-processus), W^X, ASLR, isolation des fautes (un programme fautif est terminé,
-le reste continue).
+**Security**: Spectre v2 mitigation (predictor invalidated on process
+switch), W^X, ASLR, fault isolation (a faulty program is terminated,
+the rest keeps running).
 
-**Débogage** : un débogueur (endpoint) reçoit fautes, points d'arrêt et pas à
-pas d'un processus, lit et écrit registres et mémoire, arrête des threads.
+**Debugging**: a debugger (endpoint) receives a process's faults,
+breakpoints and single-steps, reads and writes registers and memory,
+stops threads.
 
-**Démarrage** : directement depuis le reset (EL3), ou en EL2 sous un moniteur
-PSCI (comme sur une Switch avec son firmware sécurisé) ; taille de la DRAM
-détectée ; arbre de périphériques lu s'il est fourni. Si le chargeur a laissé
-l'écran allumé (hekate), le journal du noyau y est recopié jusqu'à ce que le
-service `display` le reprenne : seule sortie visible sans adaptateur UART.
+**Boot**: directly from reset (EL3), or in EL2 under a PSCI monitor
+(as on a Switch with its secure firmware); DRAM size detected; device
+tree read when provided. If the loader left the screen on (hekate), the
+kernel log is copied there until the `display` service takes over: the
+only visible output without a UART adapter.
 
-## Services et pilotes
+## Services and drivers
 
-Tous en EL0, lancés par `init` avec leurs seules capacités.
+All in EL0, started by `init` with only their capabilities.
 
-| Service | Rôle | État |
+| Service | Role | State |
 |---|---|---|
-| `console` | UART-A, édition de ligne | émulateur |
-| `clk` | horloges et resets (CAR), état des partitions d'alimentation (PMC, en lecture) | émulateur |
-| `i2c` | six bus I2C | émulateur |
-| `power` | extinction et redémarrage (PMIC MAX77620), horloge temps réel, températures (TMP451) | émulateur |
-| `sd` | carte SD (SDHCI, ADMA2) | émulateur ; alimentation et broches du vrai lecteur non réglées |
-| `fs` | FAT32 (noms longs), cache en écriture différée avec lecture anticipée | émulateur |
-| `display` | écran (fenêtre A), terminal texte (police Terminus) | émulateur ; initialisation du panneau réel absente |
-| `input` | écran tactile (FTM3BD56), clavier USB | émulateur ; interrogé seulement quand quelqu'un lit |
-| `usb` | xHCI : clavier HID, carte réseau CDC-ECM | émulateur ; le vrai xHCI exige un firmware NVIDIA ; s'arrête si `clk` ne le dit pas alimenté |
-| `net` | TCP/IP (smoltcp) : DHCP, DNS, TCP, UDP | émulateur |
+| `console` | UART-A, line editing | emulator |
+| `clk` | clocks and resets (CAR), power-partition state (PMC, read-only) | emulator |
+| `i2c` | six I2C buses | emulator |
+| `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
+| `sd` | SD card (SDHCI, ADMA2) | emulator; real reader power and pins not set up |
+| `fs` | FAT32 (long names), write-back cache with readahead | emulator |
+| `display` | screen (window A), text terminal (Terminus font) | emulator; real panel init missing |
+| `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
+| `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
+| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
 
-Les services `fs` et `net` rattachent chaque fichier ou socket au processus
-qui l'a ouvert : un autre ne peut pas s'en servir, et ceux d'un programme
-disparu sans les fermer (plantage) sont repris.
+The `fs` and `net` services attach each open file or socket to the
+process that opened it: another process cannot use it, and the ones of a
+program that vanished without closing them (crash) are reclaimed.
 
-## Fonctionnalités
+## Features
 
-| Domaine | Fait | Reste |
+| Area | Done | Remaining |
 |---|---|---|
-| Démarrage | 4 cœurs, EL3 ou EL2 + PSCI, Erista et Mariko, détection de la DRAM | démarrage sur une vraie Switch |
-| Mémoire | à la demande, W^X, `mprotect`, mémoire partagée, tampons DMA, ASLR, zones réservées | |
-| Threads | priorités, affinité, migration, équilibrage, sans tic, futex | états de veille profonde |
-| IPC | synchrone, délais, handles, notifications, tubes, identité de l'émetteur | attente sur plusieurs objets (`poll`) |
-| Programmes | ELF static-PIE, arguments, environnement, TLS, chargement depuis la carte SD | liaison dynamique (écartée) |
-| Rust | `no_std` (libnx) et **`std`** (voir « Ce que fournit `std` ») | déroulement des paniques, traces d'appels |
-| Stockage | SD, FAT32, API fichiers | eMMC, ext4 |
-| Réseau | USB-Ethernet, TCP/IP, sockets | Wi-Fi, IPv6 |
-| Matériel | UART, I2C, PMIC, RTC, températures, écran, tactile, USB | GPU, audio, Joy-Con, boutons (GPIO), fréquences (DVFS), batterie |
-| Sécurité | capacités, révocation, Spectre v2, isolation | |
-| Outils | construction, carte SD, tests (`ktest` 27, `stdtest` 18), débogueur (gdb), comparaison avec L4T | |
+| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection | boot on a real Switch |
+| Memory | on demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas | |
+| Threads | priorities, affinity, migration, balancing, tickless, futex | deep sleep states |
+| IPC | synchronous, timeouts, handles, notifications, pipes, sender identity | wait on several objects (`poll`) |
+| Programs | static-PIE ELF, arguments, environment, TLS, load from SD card | dynamic linking (ruled out) |
+| Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
+| Storage | SD, FAT32, file API | eMMC, ext4 |
+| Network | USB-Ethernet, TCP/IP, sockets | Wi-Fi, IPv6 |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
+| Security | capabilities, revocation, Spectre v2, isolation | |
+| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18), debugger (gdb), L4T comparison | |
 
-## Limites
+## Limits
 
-- **Rien n'a tourné sur une vraie Switch.** Le vrai contrôleur USB (xHCI)
-  exige un firmware propriétaire de NVIDIA ; le lecteur SD, le réglage de
-  l'alimentation et des broches ; l'écran, l'initialisation du panneau DSI ;
-  les boutons, des GPIO que l'émulateur ne sait pas actionner.
-- GPU, audio, Wi-Fi, Joy-Con et changement de fréquence ne sont pas faits
-  (risque d'endommager le matériel pour le dernier).
-- Un tube n'a pas de tampon : l'écrivain attend qu'un lecteur prenne ses
-  données. `output()` lit les deux sorties en parallèle pour cette raison.
-- Le service `fs` refuse de supprimer un fichier encore ouvert (`EBUSY`), comme
-  Windows et non comme Unix.
+- **Nothing has run on a real Switch.** The real USB controller (xHCI)
+  needs a proprietary NVIDIA firmware; the SD reader needs power and pin
+  setup; the screen needs DSI panel init; buttons need GPIOs the
+  emulator cannot drive.
+- GPU, audio, Wi-Fi, Joy-Con and frequency scaling are not done (the
+  last one risks damaging hardware).
+- A pipe has no buffer: the writer waits until a reader takes its data.
+  `output()` reads both outputs in parallel for this reason.
+- The `fs` service refuses to delete a file that is still open
+  (`EBUSY`), like Windows rather than Unix.
 
-## Pièges propres au matériel
+## Hardware traps
 
-1. Le GIC démarre avec toutes ses lignes en Groupe 0 (monde sécurisé) : un
-   noyau en EL1 non sécurisé ne reçoit rien tant qu'on ne les bascule pas en
-   Groupe 1 depuis EL3 — rôle du moniteur sécurisé sur un vrai système.
-2. Réveiller un cœur secondaire exige, dans l'ordre : vecteur de reset dans le
-   bloc SB, partition d'alimentation au PMC, retrait des verrous de tension,
-   lignes de reset du CAR.
-3. Plusieurs registres ont une valeur de reset inconnue sur le silicium mais
-   sage sous QEMU : CNTFRQ_EL0 et CPUECTLR_EL1.SMPEN (à poser en EL3 avant
-   caches et MMU), SCTLR_EL2 et MDCR_EL2 (ce dernier peut piéger vers EL2 les
-   accès d'EL1 aux registres de débogage).
-4. MMU coupée, la mémoire est de type Device : les accès exclusifs des
-   atomiques (LDXR/STXR, pas de LSE sur A57) n'y sont pas garantis. Aucun
-   verrou avant l'activation de la MMU.
-5. hekate (entrée L4T) place sous la TZ-DRAM des carveouts du contrôleur
-   mémoire (firmware BPMP en cours d'exécution, zones du GPU interdites au
-   CPU) : ils sont exclus de la mémoire libre comme la TZ-DRAM.
-6. Lire un bloc sans horloge, en reset ou dont la partition PMC est coupée
-   bloque le bus : tout le système s'arrête quand il n'a qu'un cœur. L'émulateur
-   répond quand même. Un pilote de bloc à partition (XUSB) demande donc
-   `ENABLE` puis `STATUS` à `clk`, qui n'allume jamais une partition lui-même,
-   et ne touche à ses registres qu'avec `ST_READY` complet.
+1. The GIC starts with all its lines in Group 0 (secure world): an EL1
+   non-secure kernel receives nothing until they are switched to Group 1
+   from EL3 — the role of the secure monitor on a real system.
+2. Waking a secondary core requires, in order: reset vector in the SB
+   block, power partition at the PMC, voltage-lock removal, CAR reset
+   lines.
+3. Several registers have an unknown reset value on silicon but a sane
+   one under QEMU: CNTFRQ_EL0 and CPUECTLR_EL1.SMPEN (to set in EL3
+   before caches and MMU), SCTLR_EL2 and MDCR_EL2 (the latter can trap
+   EL1 debug-register accesses to EL2).
+4. With the MMU off, memory is Device type: exclusive accesses of
+   atomics (LDXR/STXR, no LSE on A57) are not guaranteed there. No lock
+   before the MMU is enabled.
+5. hekate (L4T entry) places memory-controller carveouts below TZ-DRAM
+   (running BPMP firmware, GPU areas forbidden to the CPU): they are
+   excluded from free memory like TZ-DRAM.
+6. Reading a block with no clock, in reset, or whose PMC partition is
+   off hangs the bus: the whole system stops when it has a single core.
+   The emulator answers anyway. A partition-gated block driver (XUSB)
+   therefore asks `clk` for `ENABLE` then `STATUS`, which never powers a
+   partition on by itself, and only touches its registers once
+   `ST_READY` is complete.
 
-## Comparaison avec L4T
+## L4T comparison
 
-Voir `bench/README.md` et `bench/RESULTS.md`. Dans l'émulateur, créer puis
-attendre un thread coûte environ 300 µs avec `std` sur nxk (226 µs avec libnx),
-contre 836 µs avec pthread sous L4T.
+See `bench/README.md` and `bench/RESULTS.md`. In the emulator, creating
+then waiting for a thread costs about 300 µs with `std` on nxk (226 µs
+with libnx), versus 836 µs with pthread on L4T.
 
-## Licences
+## Licenses
 
-La police de l'écran vient de Terminus (Dimitar Zhekov, SIL Open Font License
-1.1), convertie à la construction depuis la police console du système hôte.
+The screen font comes from Terminus (Dimitar Zhekov, SIL Open Font
+License 1.1), converted at build time from the host system console font.

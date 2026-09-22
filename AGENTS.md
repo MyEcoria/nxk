@@ -13,14 +13,17 @@ This file guides AI coding agents working on **nxk**. Follow it on every task
 - User programs are **ordinary Rust with `std`** on target
   `aarch64-unknown-nxk` (see `std/` + `tools/mkstd.py`). `user/libnx` is the
   `no_std` system library underneath `std`.
-- Everything is validated **only in the `tegra_qemu` emulator** (sibling
-  directory, QEMU fork). Never assumed to run on real hardware.
+- Validation today is in the `tegra_qemu` emulator (sibling
+  directory, QEMU fork). **Objective is real physical Switch hardware
+  (Erista / Mariko): implement for the physical Switch, not only for
+  the simulator.** New code must be hardware-compatible (datasheets,
+  `refs/`, real Tegra X1 behavior); use the emulator only as fallback
+  validation, never as an excuse for emulator-only shortcuts.
 - Syscall convention: `svc #0`, number in `x8`, args in `x0`–`x5`, result in
   `x0`, errors as `-errno` (Linux values). Single source of truth: `abi/`
   (`nxk-abi` crate shared by kernel, libnx, std).
-- Existing code and comments are mostly in **French**. Keep new comments
-  consistent with surrounding files; docs for agents and commit messages
-  may be in English.
+- Code, comments, logs and docs are in English. Keep them in English;
+  translate any French leftovers you touch.
 
 ## 2. Layout
 
@@ -112,7 +115,7 @@ Key details agents must respect:
   `/reserved-memory`.
 - Security: Spectre-v2 mitigation on process switch (default feature),
   faulty program is killed without taking down the rest.
-- `std` support matrix in `README.md` ("Ce que fournit `std`") is normative:
+- `std` support matrix in `README.md` ("What `std` provides") is normative:
   extend it rather than regress it (no unwinding / backtraces: `panic=abort`).
 - `abi/` is the single source of truth for syscall numbers and protocols.
   Never duplicate numbers in kernel/user/std.
@@ -123,9 +126,10 @@ Key details agents must respect:
 ## 5. Coding conventions
 
 - Rust edition 2021, `cargo fmt` clean, `cargo clippy` warning-free for new
-  code. Keep the existing terse, comment-in-French style; explain *why* for
-  hardware quirks (GIC Group 0→1 from EL3, secondary-core wake sequence:
-  SB reset vector → PMC power partition → voltage locks → CAR resets).
+  code. Keep terse English comments (max 2 lines per block, why-only for
+  hardware quirks such as GIC Group 0→1 from EL3 or the secondary-core
+  wake sequence: SB reset vector → PMC power partition → voltage locks
+  → CAR resets); translate any French comment you touch.
 - `no_std` in `kernel/` and `user/libnx`; ordinary `std` in `apps/` and most
   of `user/` services where already used. Do not add external crates without
   need; check `Cargo.lock` impact and offline/air-gapped builds.
@@ -144,14 +148,21 @@ Key details agents must respect:
   there.
 - `tegra_qemu/` is a large external tree: read-only by default. If a fix
   belongs there, explain why nxk side cannot fix it and keep the diff minimal.
-- Never assume real Switch hardware: emulator gaps are documented in README
-  ("Limites": xHCI firmware, SD power/pins, DSI panel init, GPIO buttons,
-  GPU/audio/Wi-Fi/Joy-Con/DVFS). Do not add shipless drivers or power-unsafe
-  clock/voltage code.
+- Target real Switch hardware: emulator gaps are documented in README
+  ("Limits": xHCI firmware, SD power/pins, DSI panel init, GPIO buttons,
+  GPU/audio/Wi-Fi/Joy-Con/DVFS). Closing these gaps to run on a physical
+  Switch is the objective — implementing real-hardware drivers, init
+  sequences, and power/clock handling is in scope. Power-unsafe
+  clock/voltage code is allowed only with explicit justification and safe
+  defaults; never add shipless drivers (every driver must target a real
+  Tegra X1 / Switch chip).
 - Do not commit `build/`, `*/target/`, `~/.cache/nxk/`, SD images, or
   `screendump` PPMs. Do not invent URLs.
 - Verify by execution (build + `nxtest.py`) rather than by reasoning. If a
-  change cannot be tested in the emulator, state what was and was not covered.
+  change targets physical Switch hardware and cannot be fully tested in
+  the emulator, state what was and was not covered and why the code is
+  still correct for real hardware (datasheet section, `refs/` reference,
+  register sequence).
 
 ## 7. Commits (mandatory)
 
