@@ -33,6 +33,12 @@ const PART_XUSBC: u32 = 1 << 22;
 /// ones the loader leaves on.
 const PART_PCIE_ID: u32 = 3;
 const PART_PCIE: u32 = 1 << PART_PCIE_ID;
+/// I/O pad deep power-down (Atmosphère tegra_pmc.hpp: code in bits 31:30).
+/// PEX bias and reference-clock pads: bits 4-6 (Linux `tegra210_io_pads`).
+const PMC_IO_DPD_REQ: usize = 0x400 + 0x1B8;
+const PMC_IO_DPD_STATUS: usize = 0x400 + 0x1BC;
+const IO_DPD_OFF: u32 = 1 << 30;
+const PEX_PADS: u32 = 0x7 << 4;
 
 /// CAR bank (L, H, U, V, W, X): state in RST_DEVICES_x and CLK_OUT_ENB_x,
 /// driven via RST_DEV_x_SET and CLK_ENB_x_SET (+ CLR).
@@ -509,6 +515,7 @@ fn pcie_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
     if r != 0 {
         return r;
     }
+    pex_pads_on(pmc);
     // Pad control block shared with XUSB: released, never re-asserted.
     car.w32(RST_DEV_W_CLR, PADCTL_RESET);
     car.w32(Y.rst_set + CLR, UPHY_PEX_RESET);
@@ -518,6 +525,21 @@ fn pcie_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
     car.w32(U.rst_set + CLR, PCIEXCLK_RESET);
     let _ = car.r32(U.rst);
     0
+}
+
+/// PEX bias and REFCLK pads out of deep power-down, as Linux's pinctrl
+/// default state for the root complex does. Only requested if needed.
+fn pex_pads_on(pmc: &Mmio) {
+    let before = pmc.r32(PMC_IO_DPD_STATUS) & PEX_PADS;
+    if before != 0 {
+        pmc.w32(PMC_IO_DPD_REQ, IO_DPD_OFF | PEX_PADS);
+        pmc.wait(PMC_IO_DPD_STATUS, PEX_PADS, 0, 250_000);
+    }
+    println!(
+        "[clk] PEX pads deep power-down {:#x} -> {:#x}",
+        before,
+        pmc.r32(PMC_IO_DPD_STATUS) & PEX_PADS
+    );
 }
 
 fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
@@ -613,8 +635,11 @@ fn main() -> i32 {
             }
             _ => EINVAL,
         };
-        let mut m = Msg::new(r as u32, 1, 0);
+        let mut m = Msg::new(r as u32, 2, 0);
         m.mr[0] = st;
+        if rx.msg.mr[0] == proto::PCIE {
+            m.mr[1] = pmc.as_ref().map_or(0, |p| p.r32(PMC_IO_DPD_STATUS)) as u64;
+        }
         Some(m)
     })
 }

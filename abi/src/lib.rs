@@ -687,8 +687,9 @@ pub mod proto {
         /// Fuse controller, STATUS only (`ST_POWERED`: fuses visible).
         /// Read fuses only at `ST_READY`.
         pub const FUSE: u64 = 23;
-        /// PCIe root complex: PCIe partition ungated, PLLE up, AFI,
-        /// PCIE and PCIEXCLK clocks out of reset.
+        /// PCIe root complex: PCIe partition ungated, PLLE up, PEX pads
+        /// out of deep power-down, AFI, PCIE and PCIEXCLK out of reset.
+        /// STATUS reply word 1: PMC IO_DPD_STATUS (pads still powered down).
         pub const PCIE: u64 = 24;
     }
     /// I2C bus.
