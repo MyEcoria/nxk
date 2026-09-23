@@ -113,6 +113,25 @@ pub mod timeout {
     pub const POLL: u64 = 1;
 }
 
+/// Counter tick <-> ns in fixed point: one multiply per conversion, no
+/// division (`scale(v, mult) = v * mult >> 32`).
+pub mod ticks {
+    /// Multiplier from ticks to ns at counter frequency `freq` (Hz).
+    pub const fn ns_mult(freq: u64) -> u64 {
+        ((1_000_000_000u128 << 32) / if freq == 0 { 1 } else { freq } as u128) as u64
+    }
+
+    /// Multiplier from ns to ticks.
+    pub const fn tick_mult(freq: u64) -> u64 {
+        (((freq as u128) << 32) / 1_000_000_000) as u64
+    }
+
+    #[inline(always)]
+    pub const fn scale(v: u64, mult: u64) -> u64 {
+        ((v as u128 * mult as u128) >> 32) as u64
+    }
+}
+
 /// Commands for `system_power`.
 pub mod power {
     pub const OFF: u64 = 0;
@@ -498,6 +517,45 @@ pub mod user {
         pub badge: u64,
         pub token: u64,
         pub pid: u32,
+    }
+
+    /// Generic-timer counter (`CNTVCT_EL0`, opened to EL0 by the kernel).
+    #[inline(always)]
+    pub fn counter() -> u64 {
+        let v: u64;
+        unsafe {
+            asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags))
+        };
+        v
+    }
+
+    /// Counter frequency (Hz).
+    #[inline(always)]
+    pub fn counter_freq() -> u64 {
+        let v: u64;
+        unsafe { asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+
+    /// `ticks::ns_mult` of this counter (0: not computed yet).
+    static NS_MULT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// Counter ticks to ns.
+    #[inline]
+    pub fn ticks_to_ns(t: u64) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut m = NS_MULT.load(Relaxed);
+        if m == 0 {
+            m = super::ticks::ns_mult(counter_freq());
+            NS_MULT.store(m, Relaxed);
+        }
+        super::ticks::scale(t, m)
+    }
+
+    /// Monotonic time in ns since boot, with no syscall (vDSO-style).
+    #[inline]
+    pub fn monotonic_ns() -> u64 {
+        ticks_to_ns(counter())
     }
 
     /// Install thread pointer `tp` (TLS block, see `startup::Tls`).

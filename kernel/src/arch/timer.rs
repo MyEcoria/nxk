@@ -3,6 +3,8 @@
 
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use nxk_abi::ticks;
+
 use crate::arch::{self, gic};
 use crate::kern::percpu::{self, PerCpu};
 use crate::kern::sched;
@@ -12,6 +14,9 @@ use crate::{sysreg_read, sysreg_write};
 const CNTP_CTL_ENABLE: u64 = 1 << 0;
 
 static FREQ_HZ: AtomicU64 = AtomicU64::new(0);
+/// `nxk_abi::ticks` multipliers, set with the frequency.
+static NS_MULT: AtomicU64 = AtomicU64::new(0);
+static TICK_MULT: AtomicU64 = AtomicU64::new(0);
 /// Wall time = monotonic time + offset (ns), set by the clock service
 /// from the RTC.
 static REALTIME_OFFSET: AtomicI64 = AtomicI64::new(0);
@@ -26,16 +31,14 @@ pub fn freq_hz() -> u64 {
     FREQ_HZ.load(Ordering::Relaxed)
 }
 
+#[inline]
 pub fn ns_to_ticks(ns: u64) -> u64 {
-    ((ns as u128 * freq_hz() as u128) / 1_000_000_000) as u64
+    ticks::scale(ns, TICK_MULT.load(Ordering::Relaxed))
 }
 
+#[inline]
 pub fn ticks_to_ns(t: u64) -> u64 {
-    ((t as u128 * 1_000_000_000) / freq_hz().max(1) as u128) as u64
-}
-
-pub fn uptime_us() -> u64 {
-    ticks_to_ns(counter()) / 1000
+    ticks::scale(t, NS_MULT.load(Ordering::Relaxed))
 }
 
 pub fn monotonic_ns() -> u64 {
@@ -53,18 +56,13 @@ pub fn set_realtime(ns: u64) {
     );
 }
 
-pub fn delay_us(us: u64) {
-    let target = counter() + ns_to_ticks(us * 1000);
-    while counter() < target {
-        core::hint::spin_loop();
-    }
-}
-
 /// Counter frequency, set once at boot.
 pub fn init_global() {
     let freq = sysreg_read!("cntfrq_el0");
     let freq = if freq == 0 { 19_200_000 } else { freq };
     FREQ_HZ.store(freq, Ordering::Relaxed);
+    NS_MULT.store(ticks::ns_mult(freq), Ordering::Relaxed);
+    TICK_MULT.store(ticks::tick_mult(freq), Ordering::Relaxed);
 }
 
 /// Set up the current core's timer (stopped until a deadline exists).
