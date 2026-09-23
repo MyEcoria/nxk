@@ -26,9 +26,14 @@ const MON_BASE: u32 = 0xFFF0_0000; // 1 MiB TZDRAM (non-b01 Erista)
 const UART_A: usize = 0x7000_6000;
 const UART_CLK_HZ: u32 = 408_000_000;
 const CAR_BASE: usize = 0x6000_6000;
-const CAR_CLK_ENB_L_SET: usize = CAR_BASE + 0x320;
+const CAR_CLK_SOURCE_UARTA: usize = CAR_BASE + 0x178;
+const CAR_RST_DEV_L_SET: usize = CAR_BASE + 0x300;
 const CAR_RST_DEV_L_CLR: usize = CAR_BASE + 0x304;
+const CAR_CLK_ENB_L_SET: usize = CAR_BASE + 0x320;
+const CAR_CLK_ENB_L_CLR: usize = CAR_BASE + 0x324;
 const CAR_BIT_UARTA: u32 = 1 << 6;
+/// UART-A source: PLLP_OUT0 (bits 31:29 = 0), divider off (bit 24 clear).
+const UARTA_SRC_PLLP: u32 = 0;
 
 const GICD: usize = 0x5004_1000;
 const GICC: usize = 0x5004_2000;
@@ -71,7 +76,17 @@ fn rd(a: usize) -> u32 {
 
 /// UART-A at 115200 8N1; enable clock+reset via CAR first (else LSR never moves).
 fn uart_init() {
+    // The divisor assumes PLLP, but UART-A is found on a ~19.2 MHz source
+    // (5.4 kbaud). Switched under reset, as hekate's clock_enable() does.
+    wr(CAR_RST_DEV_L_SET, CAR_BIT_UARTA);
+    wr(CAR_CLK_ENB_L_CLR, CAR_BIT_UARTA);
+    wr(CAR_CLK_SOURCE_UARTA, UARTA_SRC_PLLP);
     wr(CAR_CLK_ENB_L_SET, CAR_BIT_UARTA);
+    // hekate waits 2 us here; the counter is not started yet, and 128
+    // CAR reads (bus round trips) take longer than that.
+    for _ in 0..128 {
+        rd(CAR_CLK_SOURCE_UARTA);
+    }
     wr(CAR_RST_DEV_L_CLR, CAR_BIT_UARTA);
     // 16550 indexes spaced 4 bytes apart (registers x4).
     let r = |i: usize| UART_A + i * 4;
