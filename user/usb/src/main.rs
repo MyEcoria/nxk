@@ -343,21 +343,9 @@ fn events(hc: &mut Xhci, kbd: &mut Option<Keyboard>, net: &mut Option<Net>, inpu
 /// Ask clk to enable the controller, then check it is ready
 /// (`clk::ST_READY`). Error: what is missing.
 fn controller_ready() -> Result<(), String> {
-    let c = ns::wait_for_timeout("clk", 2_000_000_000)
-        .map_err(|_| String::from("clk service unreachable"))?;
-    let ask = |label| {
-        let mut m = Msg::new(label, 1, 0);
-        m.mr[0] = clk::XUSB_HOST;
-        ipc::call(c, &m)
-    };
-    let _ = ask(clk::ENABLE);
-    let r = ask(clk::STATUS);
-    let _ = sys::handle_close(c);
-    let st = match r {
-        Ok(m) if m.label() == 0 => m.mr[0],
-        Ok(m) => return Err(alloc::format!("clk: {}", err::name(m.label() as i64))),
-        Err(e) => return Err(alloc::format!("clk: {}", err::name(e))),
-    };
+    let _ = libnx::clk::enable(clk::XUSB_HOST);
+    let (st, _) =
+        libnx::clk::status(clk::XUSB_HOST).map_err(|e| alloc::format!("clk: {}", err::name(e)))?;
     let missing: Vec<&str> = [
         (clk::ST_POWERED, "partition off"),
         (clk::ST_CLOCK, "clock off"),

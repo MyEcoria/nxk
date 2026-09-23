@@ -3,36 +3,26 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
 
-use nxk_abi::err::{EIO, ENOSYS};
+use nxk_abi::err::EIO;
 use nxk_abi::proto::fs as proto;
 
+use crate::env;
 use crate::ipc::{self, Msg};
-use crate::{env, ns};
+use crate::ns::Service;
 
 pub use proto::{O_CREATE, O_EXCL, O_READ, O_TRUNC, O_WRITE};
 
-static FS: AtomicU32 = AtomicU32::new(0);
+static FS: Service = Service::new("fs", 2_000_000_000);
 
 /// Set the file service to use (for init, which cannot look
 /// itself up in the name service).
 pub fn set_handle(h: u32) {
-    FS.store(h, Ordering::Relaxed);
-}
-
-fn fs() -> Result<u32, i64> {
-    let h = FS.load(Ordering::Relaxed);
-    if h != 0 {
-        return Ok(h);
-    }
-    let h = ns::wait_for_timeout("fs", 2_000_000_000).map_err(|_| -ENOSYS)?;
-    FS.store(h, Ordering::Relaxed);
-    Ok(h)
+    FS.set(h);
 }
 
 fn call(m: &Msg) -> Result<Msg, i64> {
-    ipc::call_checked(fs()?, m)
+    FS.call(m)
 }
 
 /// Normalized absolute path ("." and ".." resolved).

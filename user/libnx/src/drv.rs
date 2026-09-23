@@ -69,18 +69,10 @@ impl Mmio {
         self.w32(off, (self.r32(off) & !clear) | set);
     }
 
-    /// Wait for `(r32(off) & mask) == val`, at most `timeout_us`.
+    /// Wait for `(r32(off) & mask) == val`, at most `timeout_us`
+    /// (`time::poll`: long waits sleep rather than spin).
     pub fn wait(&self, off: usize, mask: u32, val: u32, timeout_us: u64) -> bool {
-        let end = crate::time::now_ns() + timeout_us * 1000;
-        loop {
-            if self.r32(off) & mask == val {
-                return true;
-            }
-            if crate::time::now_ns() > end {
-                return false;
-            }
-            core::hint::spin_loop();
-        }
+        crate::time::poll(timeout_us, || self.r32(off) & mask == val)
     }
 }
 
@@ -126,26 +118,16 @@ pub fn publish(name: &str) -> Result<u32, i64> {
 /// Service loop: `f` answers each request; `None` = deferred reply
 /// (the handler kept `rx.token` for `ipc::reply_to`).
 pub fn serve(ep: u32, mut f: impl FnMut(&Received) -> Option<Msg>) -> ! {
-    let mut rx = loop {
+    let recv = || loop {
         if let Ok(r) = ipc::recv(ep) {
             break r;
         }
     };
+    let mut rx = recv();
     loop {
-        rx = match f(&rx) {
-            Some(reply) => match ipc::reply_recv(ep, &reply) {
-                Ok(r) => r,
-                Err(_) => loop {
-                    if let Ok(r) = ipc::recv(ep) {
-                        break r;
-                    }
-                },
-            },
-            None => loop {
-                if let Ok(r) = ipc::recv(ep) {
-                    break r;
-                }
-            },
+        rx = match f(&rx).map(|reply| ipc::reply_recv(ep, &reply)) {
+            Some(Ok(r)) => r,
+            _ => recv(),
         };
     }
 }

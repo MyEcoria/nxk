@@ -924,40 +924,26 @@ fn rail(ep: u32, on: bool) -> Result<(), i64> {
 
 /// PCIEXCLK through the `clk` service: held while the AFI is programmed.
 fn pcie_link(on: bool) -> Result<(), i64> {
-    let ep = ns::wait_for_timeout("clk", 2_000_000_000)?;
-    let mut m = Msg::new(if on { clk::ENABLE } else { clk::DISABLE }, 1, 0);
-    m.mr[0] = clk::PCIE_LINK;
-    ipc::checked(ipc::call(ep, &m)?).map(|_| ())
+    if on {
+        libnx::clk::enable(clk::PCIE_LINK)
+    } else {
+        libnx::clk::disable(clk::PCIE_LINK)
+    }
 }
 
 /// `clk` STATUS of a device: its state word and extra word (0s if none).
 fn clk_status(dev: u64) -> (u64, u64) {
-    let Ok(ep) = ns::wait_for_timeout("clk", 2_000_000_000) else {
-        return (0, 0);
-    };
-    let mut m = Msg::new(clk::STATUS, 1, 0);
-    m.mr[0] = dev;
-    match ipc::call(ep, &m).and_then(ipc::checked) {
-        Ok(r) => (r.mr[0], r.mr[1]),
-        Err(_) => (0, 0),
-    }
+    libnx::clk::status(dev).unwrap_or((0, 0))
 }
 
 /// Partition, PLLE and the AFI/PCIe clocks through the `clk` service,
 /// after a full controller reset: a restart then starts as a cold boot.
 fn clock_on() -> Result<(), i64> {
-    let ep = ns::wait_for_timeout("clk", 2_000_000_000)?;
-    let mut m = Msg::new(clk::DISABLE, 1, 0);
-    m.mr[0] = clk::PCIE;
-    ipc::checked(ipc::call(ep, &m)?)?;
-    let mut m = Msg::new(clk::ENABLE, 1, 0);
-    m.mr[0] = clk::PCIE;
-    ipc::checked(ipc::call(ep, &m)?)?;
-    let mut m = Msg::new(clk::STATUS, 1, 0);
-    m.mr[0] = clk::PCIE;
-    let st = ipc::checked(ipc::call(ep, &m)?)?;
-    if st.mr[0] & clk::ST_READY != clk::ST_READY {
-        println!("[wlan] PCIe clocks not ready ({:#x})", st.mr[0]);
+    libnx::clk::disable(clk::PCIE)?;
+    libnx::clk::enable(clk::PCIE)?;
+    let (st, _) = libnx::clk::status(clk::PCIE)?;
+    if st & clk::ST_READY != clk::ST_READY {
+        println!("[wlan] PCIe clocks not ready ({:#x})", st);
         return Err(-EIO);
     }
     Ok(())

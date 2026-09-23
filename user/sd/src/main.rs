@@ -143,35 +143,37 @@ impl Card {
         self.regs.modify(SDMEMCOMPPADCTRL, PADCTRL_E_INPUT_PWRD, 0);
     }
 
-    /// Wait for one of the `mask` status bits; the IRQ wakes the thread
-    /// for transfers, else short busy wait.
+    /// Wait for one of the `mask` status bits: the IRQ wakes the thread
+    /// for transfers, commands are polled (`time::poll`).
     fn wait_int(&self, mask: u32, timeout_ms: u64) -> Result<u32, i64> {
-        let end = time::now_ns() + timeout_ms * 1_000_000;
-        loop {
-            let st = self.regs.r32(INT_STATUS);
-            if st & INT_ERROR != 0 {
-                self.report(mask, st, "error");
-                self.regs.w32(INT_STATUS, st);
-                self.reset(0x6); // CMD and DAT lines
-                return Err(-EIO);
-            }
-            if st & mask != 0 {
-                self.regs.w32(INT_STATUS, st & mask);
-                return Ok(st);
-            }
-            let now = time::now_ns();
-            if now > end {
-                self.report(mask, st, "timeout");
-                self.reset(0x6);
-                return Err(-ETIMEDOUT);
-            }
-            if mask & INT_XFER_DONE != 0 {
+        let hit = || self.regs.r32(INT_STATUS) & (mask | INT_ERROR) != 0;
+        if mask & INT_XFER_DONE != 0 {
+            let end = time::now_ns() + timeout_ms * 1_000_000;
+            while !hit() {
+                let now = time::now_ns();
+                if now > end {
+                    break;
+                }
                 self.irq.wait((end - now).max(1));
                 self.irq.ack();
-            } else {
-                core::hint::spin_loop();
             }
+        } else {
+            time::poll(timeout_ms * 1000, hit);
         }
+        let st = self.regs.r32(INT_STATUS);
+        if st & INT_ERROR != 0 {
+            self.report(mask, st, "error");
+            self.regs.w32(INT_STATUS, st);
+            self.reset(0x6); // CMD and DAT lines
+            return Err(-EIO);
+        }
+        if st & mask != 0 {
+            self.regs.w32(INT_STATUS, st & mask);
+            return Ok(st);
+        }
+        self.report(mask, st, "timeout");
+        self.reset(0x6);
+        Err(-ETIMEDOUT)
     }
 
     /// A data transfer that failed, as the controller saw it before the
@@ -388,12 +390,7 @@ fn bring_up(board: &Board) -> Result<(), i64> {
     board.power_off();
     time::sleep_ms(100);
     board.power_on()?;
-    let c = ns::wait_for_timeout("clk", 2_000_000_000)?;
-    let mut m = Msg::new(clk::ENABLE, 1, 0);
-    m.mr[0] = clk::SDMMC1;
-    let r = ipc::call(c, &m).and_then(ipc::checked);
-    let _ = sys::handle_close(c);
-    r.map(|_| ())
+    libnx::clk::enable(clk::SDMMC1)
 }
 
 fn main() -> i32 {

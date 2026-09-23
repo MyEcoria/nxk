@@ -8,6 +8,7 @@ extern crate alloc;
 pub use nxk_abi as abi;
 
 pub mod bootfs;
+pub mod clk;
 pub mod console;
 pub mod drv;
 pub mod env;

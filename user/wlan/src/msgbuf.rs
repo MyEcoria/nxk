@@ -463,13 +463,9 @@ impl Msgbuf {
         // 0 (this firmware leaves the sequence number of control
         // completions at 0): one still reading 0 waits for the next poll.
         let p = r.item(r.pos);
-        let deadline = time::now_ns() + 1_000_000;
-        while unsafe { core::ptr::read_volatile(p) } == 0 {
-            if time::now_ns() > deadline {
-                self.late += 1;
-                return Ok(None);
-            }
-            core::hint::spin_loop();
+        if !time::poll(1000, || unsafe { core::ptr::read_volatile(p) } != 0) {
+            self.late += 1;
+            return Ok(None);
         }
         let mut item = alloc::vec![0u8; r.size as usize];
         unsafe {

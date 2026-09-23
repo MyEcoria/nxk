@@ -8,7 +8,7 @@ use libnx::abi::err::{EINVAL, EIO, ETIMEDOUT};
 use libnx::abi::proto::{clk, i2c as proto};
 use libnx::drv::{self, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::{ns, println, time};
+use libnx::println;
 
 const CNFG: usize = 0x00;
 const CMD_ADDR0: usize = 0x04;
@@ -62,12 +62,8 @@ fn run(b: &Mmio, cnfg: u32) -> Result<(), i64> {
     load_cfg(b);
     b.w32(CNFG, (b.r32(CNFG) & !NORMAL_MODE_GO) | NORMAL_MODE_GO);
     // 8 bytes at 100 kHz: under a millisecond.
-    let end = time::now_ns() + 100_000_000;
-    while b.r32(STATUS) & STATUS_BUSY != 0 {
-        if time::now_ns() > end {
-            return Err(-ETIMEDOUT);
-        }
-        core::hint::spin_loop();
+    if !b.wait(STATUS, STATUS_BUSY, 0, 100_000) {
+        return Err(-ETIMEDOUT);
     }
     if b.r32(STATUS) & STATUS_NOACK != 0 {
         return Err(-EIO);
@@ -111,7 +107,6 @@ fn main() -> i32 {
         regs: pages[BUSES[k].0].offset(BUSES[k].1),
         ready: false,
     });
-    let clk = ns::wait_for("clk").ok();
     let ep = drv::publish("i2c").expect("i2c: publish");
     println!("[i2c] six I2C buses ready");
 
@@ -132,11 +127,7 @@ fn main() -> i32 {
         }
         let b = &mut buses[bus - 1];
         if !b.ready {
-            if let Some(c) = clk {
-                let mut m = Msg::new(libnx::abi::proto::clk::ENABLE, 1, 0);
-                m.mr[0] = clk::I2C1 + bus as u64 - 1;
-                let _ = ipc::call(c, &m);
-            }
+            let _ = libnx::clk::enable(clk::I2C1 + bus as u64 - 1);
             init(&b.regs);
             b.ready = true;
         }

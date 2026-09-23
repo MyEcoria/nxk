@@ -259,10 +259,7 @@ fn core_disable(bp: &Backplane, c: &Core, prereset: u32, reset: u32) {
         bp.r32(c.wrap + AI_IOCTL);
         bp.w32(c.wrap + AI_RESET_CTL, AI_RESET);
         time::sleep_us(20);
-        let t = time::now_ns() + 300_000;
-        while bp.r32(c.wrap + AI_RESET_CTL) != AI_RESET && time::now_ns() < t {
-            core::hint::spin_loop();
-        }
+        time::poll(300, || bp.r32(c.wrap + AI_RESET_CTL) == AI_RESET);
     }
     bp.w32(c.wrap + AI_IOCTL, reset | AI_IOCTL_FGC | AI_IOCTL_CLK);
     bp.r32(c.wrap + AI_IOCTL);
