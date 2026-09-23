@@ -207,6 +207,15 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
             cap::lookup(pi, a[0] as u32, Kind::SysControl, rights::CONTROL)?;
             system_power(a[1])
         }
+        sys::KLOG_READ => {
+            cap::lookup(pi, a[0] as u32, Kind::Log, 0)?;
+            klog_read(a[1], a[2])
+        }
+        sys::KLOG_BIND => {
+            cap::lookup(pi, a[0] as u32, Kind::Log, 0)?;
+            let n = cap::lookup(pi, a[1] as u32, Kind::Notification, rights::SIGNAL)?;
+            val(crate::console::bind(n.obj as u16, n.obj_gen, a[2]))
+        }
 
         sys::DEBUG_ATTACH => {
             let p = cap::lookup(pi, a[0] as u32, Kind::Process, rights::CONTROL)?;
@@ -292,6 +301,21 @@ fn debug_write(ptr: u64, len: u64) -> SysResult {
         crate::console::write_bytes(&buf[..n]);
         Ok(())
     })
+}
+
+/// Unread kernel log into the user buffer, 256 bytes at a time.
+fn klog_read(ptr: u64, len: u64) -> SysResult {
+    let mut buf = [0u8; 256];
+    let mut done = 0;
+    while done < len {
+        let n = crate::console::read(&mut buf[..(len - done).min(256) as usize]);
+        if n == 0 {
+            break;
+        }
+        uaccess::copy_to_user(ptr + done, &buf[..n])?;
+        done += n as u64;
+    }
+    val(done)
 }
 
 fn getrandom(ptr: u64, len: u64) -> SysResult {

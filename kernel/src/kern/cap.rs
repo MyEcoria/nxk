@@ -25,6 +25,8 @@ pub enum Kind {
     SysControl,
     /// Shared-memory object.
     Shm,
+    /// Kernel log reader (`klog_read`, `klog_bind`).
+    Log,
 }
 
 #[repr(C)]

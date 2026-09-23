@@ -248,6 +248,12 @@ fn start_init() {
         Cap::new(Kind::SysControl, 0, 0, rights::ALL),
     )
     .expect("init: system control");
+    cap::insert_at(
+        pi,
+        slots::INIT_KLOG as usize,
+        Cap::new(Kind::Log, 0, 0, rights::GRANT | rights::DUP),
+    )
+    .expect("init: kernel log");
 
     let args = [startup::IS_INIT, img.len() as u64, start.block];
     process::create_thread(pi, loaded.entry, start.sp, args, 8, Some(0)).expect("init: thread");

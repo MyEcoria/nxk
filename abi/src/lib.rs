@@ -84,6 +84,13 @@ pub mod sys {
     /// system_power(sysctl, cmd): `power::REBOOT` or `power::OFF`.
     /// Without a PSCI monitor, power-off goes through the PMIC.
     pub const SYSTEM_POWER: u64 = 81;
+    /// klog_read(log, buf, len): unread kernel log bytes (at most `len`),
+    /// 0 if none; never waits. Needs the `Log` capability.
+    pub const KLOG_READ: u64 = 82;
+    /// klog_bind(log, notif, bits): `notif` gets `bits` whenever the log
+    /// gains data, and the kernel stops printing to UART-A and the screen
+    /// itself. Returns the unread bytes it already printed (boot log).
+    pub const KLOG_BIND: u64 = 83;
 
     /// debug_attach(process, endpoint): faults and breakpoints of the
     /// process become messages on the endpoint (CONTROL right).
@@ -796,6 +803,8 @@ pub mod slots {
     pub const INIT_MMIO_ROOT: u32 = 2;
     /// System control: wall clock.
     pub const INIT_SYSCTL: u32 = 3;
+    /// Kernel log (`klog_read`, `klog_bind`), passed on to the console.
+    pub const INIT_KLOG: u32 = 4;
     // init-spawned applications
     /// Standard output (console, or a pipe).
     pub const CONSOLE: u32 = 2;
@@ -808,6 +817,7 @@ pub mod slots {
     pub const DRV_SERVICE: u32 = 2;
     pub const DRV_MMIO: u32 = 3;
     pub const DRV_IRQ: u32 = 4;
+    pub const DRV_KLOG: u32 = 5;
     /// Terminal driver: console handle with `console::BADGE_TERMINAL`.
     pub const TERMINAL: u32 = 6;
     /// Other drivers: resources from here (registers, read-only

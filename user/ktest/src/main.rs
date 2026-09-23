@@ -37,6 +37,7 @@ fn main() -> i32 {
     }
     let tests: &[(&str, fn() -> R)] = &[
         ("getrandom", t_random),
+        ("kernel log: private, no UART wait", t_klog),
         ("precise sleep", t_sleep),
         ("bounded notify", t_notify_timeout),
         ("bounded IPC and tokens", t_ipc_timeouts),
@@ -93,6 +94,30 @@ fn expect_err<T: core::fmt::Debug>(what: &str, r: Result<T, i64>, e: i64) -> R {
             other.map_err(err::name)
         )),
     }
+}
+
+fn t_klog() -> R {
+    // Only the console holds the log capability.
+    let mut b = [0u8; 16];
+    expect_err(
+        "klog_read without the capability",
+        sys::klog_read(libnx::abi::slots::INIT_KLOG, &mut b),
+        EBADF,
+    )?;
+    // A log line costs a copy into the kernel's ring, never a wait on
+    // the UART (87 us per byte at 115200 baud).
+    let line = b"ktest: kernel log line, no UART wait\n";
+    let t0 = time::now_ns();
+    sys::debug_write(line);
+    let dt = time::now_ns() - t0;
+    if dt > MS {
+        return Err(format!(
+            "debug_write of {} bytes took {} us",
+            line.len(),
+            dt / 1000
+        ));
+    }
+    Ok(())
 }
 
 fn t_random() -> R {
