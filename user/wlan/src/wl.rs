@@ -5,6 +5,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use libnx::abi::err::{EACCES, EINVAL, EIO, ENOENT, ETIMEDOUT};
 use libnx::abi::proto::wifi;
 use libnx::drv::Mmio;
 use libnx::time;
@@ -15,7 +16,26 @@ use crate::msgbuf::Msgbuf;
 // Commands.
 const WLC_UP: u32 = 2;
 const WLC_SET_INFRA: u32 = 20;
+const WLC_GET_CHANNEL: u32 = 29;
+const WLC_DISASSOC: u32 = 52;
 const WLC_SET_PM: u32 = 86;
+const WLC_GET_RSSI: u32 = 127;
+const WLC_SET_WSEC_PMK: u32 = 268;
+
+// Security settings (`brcmf_set_wpa_version`, `_set_wsec_mode`).
+const WPA_AUTH_PSK: u32 = 0x0004;
+const WPA2_AUTH_PSK: u32 = 0x0080;
+const TKIP_ENABLED: u32 = 0x2;
+const AES_ENABLED: u32 = 0x4;
+/// `brcmf_wsec_pmk_le.flags`: the key is the passphrase, the firmware
+/// derives the PMK itself.
+const WSEC_PASSPHRASE: u16 = 1;
+const PMK_LEN: usize = 2 + 2 + 65 + 1;
+/// 802.11i passphrase lengths.
+const PSK_MIN: usize = 8;
+const PSK_MAX: usize = 63;
+/// Reason given when leaving (802.11: station leaving).
+const REASON_LEAVING: u32 = 3;
 
 // Events (`brcmf_fweh_event_code`) and their status values.
 pub const E_SET_SSID: u32 = 0;
@@ -31,6 +51,13 @@ pub const E_PSK_SUP: u32 = 46;
 pub const E_IF: u32 = 54;
 pub const E_ESCAN_RESULT: u32 = 69;
 const STATUS_PARTIAL: u32 = 8;
+/// `E_SET_SSID` statuses (`BRCMF_E_STATUS_*`).
+const SET_SSID_FAILURES: [&str; 5] = ["", "failed", "timed out", "no such network", "aborted"];
+/// `E_PSK_SUP`: firmware supplicant keyed, or given up.
+const SUP_KEYED: u32 = 6;
+const SUP_TIMEOUT: u32 = 7;
+/// `E_LINK` flag: link up.
+const LINK_UP: u16 = 1;
 /// `event_msgs`: one bit per event code.
 const EVENT_MASK_LEN: usize = 16;
 
@@ -68,6 +95,7 @@ pub struct Dev<'a> {
 /// One firmware event.
 pub struct Event {
     pub kind: u32,
+    pub flags: u16,
     pub status: u32,
     pub reason: u32,
     pub data: Vec<u8>,
@@ -93,6 +121,7 @@ fn parse_event(f: &[u8]) -> Option<Event> {
     let len = be32(f, EVENT_MSG + 20) as usize;
     Some(Event {
         kind: be32(f, EVENT_MSG + 4),
+        flags: u16::from_be_bytes([f[EVENT_MSG + 2], f[EVENT_MSG + 3]]),
         status: be32(f, EVENT_MSG + 8),
         reason: be32(f, EVENT_MSG + 12),
         data: f[EVENT_DATA..(EVENT_DATA + len).min(f.len())].to_vec(),
@@ -272,5 +301,179 @@ impl Dev<'_> {
             "scan unfinished after {} ms",
             timeout_ns / 1_000_000
         ))
+    }
+
+    /// Join `ssid` (`brcmf_cfg80211_connect` with the firmware
+    /// supplicant): security set from what the network announced, the
+    /// passphrase handed to the firmware, then its events followed until
+    /// associated and keyed, or the reason it failed.
+    pub fn connect(
+        &mut self,
+        ssid: &[u8],
+        psk: &[u8],
+        security: u8,
+        timeout_ns: u64,
+    ) -> Result<(), (i64, String)> {
+        self.join(ssid, psk, security, timeout_ns)
+            .map_err(|(e, why)| (e, format!("{}: {}", String::from_utf8_lossy(ssid), why)))
+    }
+
+    fn join(
+        &mut self,
+        ssid: &[u8],
+        psk: &[u8],
+        security: u8,
+        timeout_ns: u64,
+    ) -> Result<(), (i64, String)> {
+        let io = |e: String| (-EIO, e);
+        let (bp, tcm) = (self.bp, self.tcm);
+        let secured = security != wifi::SEC_OPEN;
+        let (wpa_auth, wsec) = match security {
+            wifi::SEC_OPEN => (0, 0),
+            wifi::SEC_WPA => (WPA_AUTH_PSK, TKIP_ENABLED | AES_ENABLED),
+            wifi::SEC_WPA2 => (WPA2_AUTH_PSK, AES_ENABLED | TKIP_ENABLED),
+            _ => {
+                return Err((
+                    -EINVAL,
+                    String::from("only open, WPA and WPA2 personal networks"),
+                ))
+            }
+        };
+        if secured && !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
+            let why = format!(
+                "passphrase of {} characters, {} to {} needed",
+                psk.len(),
+                PSK_MIN,
+                PSK_MAX
+            );
+            return Err((-EINVAL, why));
+        }
+        self.mb
+            .set_var(bp, tcm, "wpa_auth", &wpa_auth.to_le_bytes())
+            .map_err(io)?;
+        self.mb
+            .set_var(bp, tcm, "auth", &0u32.to_le_bytes())
+            .map_err(io)?;
+        self.mb
+            .set_var(bp, tcm, "wsec", &wsec.to_le_bytes())
+            .map_err(io)?;
+        self.mb
+            .set_var(bp, tcm, "sup_wpa", &(secured as u32).to_le_bytes())
+            .map_err(io)?;
+        if secured {
+            let mut pmk = [0u8; PMK_LEN];
+            pmk[..2].copy_from_slice(&(psk.len() as u16).to_le_bytes());
+            pmk[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
+            pmk[4..4 + psk.len()].copy_from_slice(psk);
+            let r = self
+                .mb
+                .ioctl(bp, tcm, WLC_SET_WSEC_PMK, &pmk, 0)
+                .map_err(io)?;
+            if r.status != 0 {
+                return Err(io(format!(
+                    "passphrase refused by the firmware ({})",
+                    r.status
+                )));
+            }
+        }
+        // Stale events (an earlier scan) must not decide this join.
+        while self.mb.event().is_some() {}
+
+        // `brcmf_ext_join_params_le`: SSID, join scan with firmware
+        // defaults, any BSSID, no channel list.
+        let mut join = Vec::with_capacity(68);
+        join.extend_from_slice(&(ssid.len() as u32).to_le_bytes());
+        let mut name = [0u8; 32];
+        name[..ssid.len()].copy_from_slice(ssid);
+        join.extend_from_slice(&name);
+        join.extend_from_slice(&[0xFF, 0, 0, 0]);
+        for _ in 0..4 {
+            join.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        join.extend_from_slice(&[0xFF; 6]);
+        join.extend_from_slice(&[0, 0]);
+        join.extend_from_slice(&0u32.to_le_bytes());
+        self.mb.set_var(bp, tcm, "join", &join).map_err(io)?;
+
+        let deadline = time::now_ns() + timeout_ns;
+        let (mut associated, mut keyed, mut link) = (false, !secured, false);
+        while let Some(e) = self.event(deadline).map_err(io)? {
+            match e.kind {
+                E_SET_SSID if e.status == 0 => associated = true,
+                E_SET_SSID => {
+                    let why = SET_SSID_FAILURES
+                        .get(e.status as usize)
+                        .copied()
+                        .unwrap_or("failed");
+                    let errno = if e.status == 3 { -ENOENT } else { -EIO };
+                    return Err((errno, format!("join {} (status {})", why, e.status)));
+                }
+                E_PSK_SUP if e.status == SUP_KEYED => keyed = true,
+                E_PSK_SUP if e.status == SUP_TIMEOUT => {
+                    let why = String::from("key handshake timed out: wrong passphrase?");
+                    return Err((-EACCES, why));
+                }
+                E_LINK => link = e.flags & LINK_UP != 0,
+                E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => {
+                    let why = format!("sent away by the access point (reason {})", e.reason);
+                    return Err((-EACCES, why));
+                }
+                _ => {}
+            }
+            if associated && keyed && (link || secured) {
+                return Ok(());
+            }
+        }
+        let why = format!(
+            "not joined after {} ms (associated {}, keyed {}, link {})",
+            timeout_ns / 1_000_000,
+            associated,
+            keyed,
+            link
+        );
+        Err((-ETIMEDOUT, why))
+    }
+
+    /// Leave the network (`brcmf_link_down`).
+    pub fn disconnect(&mut self) -> Result<(), String> {
+        let mut scb = [0u8; 12];
+        scb[..4].copy_from_slice(&REASON_LEAVING.to_le_bytes());
+        self.mb
+            .ioctl(self.bp, self.tcm, WLC_DISASSOC, &scb, 0)
+            .map(|_| ())
+    }
+
+    /// Channel and signal (dBm) of the network in use.
+    pub fn link(&mut self) -> Result<(u32, i32), String> {
+        let (bp, tcm) = (self.bp, self.tcm);
+        let ch = self.mb.ioctl(bp, tcm, WLC_GET_CHANNEL, &[0u8; 12], 12)?;
+        let rssi = self.mb.ioctl(bp, tcm, WLC_GET_RSSI, &[0u8; 12], 12)?;
+        let channel = if ch.data.len() >= 8 {
+            le32(&ch.data, 4)
+        } else {
+            0
+        };
+        let dbm = if rssi.data.len() >= 4 {
+            le32(&rssi.data, 0) as i32
+        } else {
+            0
+        };
+        Ok((channel, dbm))
+    }
+
+    /// Events that arrived on their own; false once the link is lost.
+    pub fn housekeeping(&mut self) -> Result<bool, String> {
+        self.mb.poll(self.bp, self.tcm)?;
+        let mut up = true;
+        while let Some(f) = self.mb.event() {
+            if let Some(e) = parse_event(&f) {
+                match e.kind {
+                    E_LINK if e.flags & LINK_UP == 0 => up = false,
+                    E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => up = false,
+                    _ => {}
+                }
+            }
+        }
+        Ok(up)
     }
 }

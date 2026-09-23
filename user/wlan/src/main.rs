@@ -21,7 +21,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{self, EINVAL, EIO, ENOSYS, ETIMEDOUT};
+use libnx::abi::err::{self, EINVAL, EIO, ENOENT, ENOSYS, ETIMEDOUT};
 use libnx::abi::proto::{eth, wifi};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::drv::{self, Irq, Mmio};
@@ -35,6 +35,10 @@ const MAC: [u8; 6] = [0x02, 0x4E, 0x58, 0x4B, 0x57, 0x01];
 const MTU: u64 = 1500;
 /// Scan time when the caller asks for no particular one.
 const SCAN_TIMEOUT: u64 = 3_000_000_000;
+/// Join time likewise: scan, authentication and the key handshake.
+const CONNECT_TIMEOUT: u64 = 15_000_000_000;
+/// While joined, firmware events are looked at this often at least.
+const HOUSEKEEPING_NS: u64 = 500_000_000;
 
 /// The root complex, the chip's BAR0 and TCM, and the rings to its
 /// firmware when it runs.
@@ -43,6 +47,16 @@ struct Hw {
     bar0: Mmio,
     tcm: Mmio,
     mb: Option<msgbuf::Msgbuf>,
+    /// Networks of the last scan, with their security: a join needs it.
+    seen: Vec<(Vec<u8>, u8)>,
+    joined: Option<Joined>,
+}
+
+/// The network in use: SSID, channel, signal (-dBm).
+struct Joined {
+    ssid: Vec<u8>,
+    channel: u64,
+    signal: u64,
 }
 
 impl Hw {
@@ -58,11 +72,93 @@ impl Hw {
             tcm: &self.tcm,
         }))
     }
+
+    /// Every network in range, remembered with its security.
+    fn scan(&mut self, timeout: u64) -> Result<Vec<wl::Bss>, i64> {
+        match self.dev(|d| d.scan(timeout)) {
+            Some(Ok(found)) => {
+                self.seen = found.iter().map(|b| (b.ssid.clone(), b.security)).collect();
+                Ok(found)
+            }
+            Some(Err(e)) => {
+                println!("[wlan] scan: {}", e);
+                Err(-EIO)
+            }
+            None => Err(-ENOSYS),
+        }
+    }
+
+    /// Join by name, secured as the last scan saw it (one is run if the
+    /// network was not in it).
+    fn connect(&mut self, ssid: &[u8], psk: &[u8], timeout: u64) -> Result<(), i64> {
+        let known = |hw: &Hw| hw.seen.iter().find(|s| s.0 == ssid).map(|s| s.1);
+        let security = match known(self) {
+            Some(s) => s,
+            None => {
+                self.scan(SCAN_TIMEOUT)?;
+                known(self).ok_or(-ENOENT)?
+            }
+        };
+        self.joined = None;
+        match self.dev(|d| d.connect(ssid, psk, security, timeout)) {
+            Some(Ok(())) => {
+                println!("[wlan] joined {}", String::from_utf8_lossy(ssid));
+                self.joined = Some(Joined {
+                    ssid: ssid.to_vec(),
+                    channel: 0,
+                    signal: 0,
+                });
+                self.refresh();
+                Ok(())
+            }
+            Some(Err((e, why))) => {
+                println!("[wlan] join {}", why);
+                Err(e)
+            }
+            None => Err(-ENOSYS),
+        }
+    }
+
+    fn disconnect(&mut self) {
+        if self.joined.take().is_some() {
+            if let Some(Err(e)) = self.dev(|d| d.disconnect()) {
+                println!("[wlan] leave: {}", e);
+            }
+        }
+    }
+
+    /// Channel and signal of the network in use, fresh.
+    fn refresh(&mut self) {
+        if self.joined.is_none() {
+            return;
+        }
+        if let Some(Ok((channel, dbm))) = self.dev(|d| d.link()) {
+            if let Some(j) = self.joined.as_mut() {
+                j.channel = channel as u64;
+                j.signal = dbm.unsigned_abs() as u64;
+            }
+        }
+    }
+
+    /// Firmware events that came on their own: a lost link ends the join.
+    fn housekeeping(&mut self) {
+        if self.joined.is_none() {
+            return;
+        }
+        match self.dev(|d| d.housekeeping()) {
+            Some(Ok(false)) => {
+                println!("[wlan] link lost");
+                self.joined = None;
+            }
+            Some(Err(e)) => println!("[wlan] events: {}", e),
+            _ => {}
+        }
+    }
 }
 
 enum Backend {
-    /// Chip on the bus; with its firmware running it scans. Joins and
-    /// the frames of the link are not implemented yet.
+    /// Chip on the bus; with its firmware running it scans and joins.
+    /// The frames of the link are not carried yet.
     Chip(alloc::boxed::Box<Hw>),
     Sim(sim::Sim),
 }
@@ -70,6 +166,7 @@ enum Backend {
 impl Backend {
     fn state(&self) -> u64 {
         match self {
+            Backend::Chip(hw) if hw.joined.is_some() => wifi::ST_CONNECTED,
             Backend::Chip(hw) if hw.mb.is_some() => wifi::ST_IDLE,
             Backend::Chip(_) => wifi::ST_DOWN,
             Backend::Sim(s) if s.joined.is_some() => wifi::ST_CONNECTED,
@@ -81,14 +178,7 @@ impl Backend {
         match self {
             Backend::Sim(s) => Ok((sim::APS.len(), s.scan())),
             Backend::Chip(hw) => {
-                let mut found = match hw.dev(|d| d.scan(timeout)) {
-                    Some(Ok(b)) => b,
-                    Some(Err(e)) => {
-                        println!("[wlan] scan: {}", e);
-                        return Err(-EIO);
-                    }
-                    None => return Err(-ENOSYS),
-                };
+                let mut found = hw.scan(timeout)?;
                 found.sort_by_key(|b| core::cmp::Reverse(b.rssi));
                 let (mut n, mut out) = (0, Vec::new());
                 for b in &found {
@@ -120,7 +210,10 @@ impl Backend {
                 ),
                 None => (0, 0, &[]),
             },
-            Backend::Chip(_) => (0, 0, &[]),
+            Backend::Chip(hw) => match &hw.joined {
+                Some(j) => (j.channel, j.signal, &j.ssid),
+                None => (0, 0, &[]),
+            },
         }
     }
 }
@@ -216,7 +309,18 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
         what.push_str(&text);
         mb = m;
     }
-    Ok((Hw { rc, bar0, tcm, mb }, irq, what))
+    Ok((
+        Hw {
+            rc,
+            bar0,
+            tcm,
+            mb,
+            seen: Vec::new(),
+            joined: None,
+        },
+        irq,
+        what,
+    ))
 }
 
 /// Boot the chip's firmware from the card: how it went, for `wifi
@@ -331,10 +435,17 @@ fn main() -> i32 {
     loop {
         // Wake only for the earliest reader deadline: messages and the
         // interrupt wake us on their own.
-        let wait = match readers.iter().filter(|r| r.1 != 0).map(|r| r.1).min() {
+        let mut wait = match readers.iter().filter(|r| r.1 != 0).map(|r| r.1).min() {
             Some(d) => d.saturating_sub(time::now_ns()).max(1),
             None => 0,
         };
+        // Joined: firmware events (a lost link) are looked at regularly.
+        if let Backend::Chip(hw) = &mut backend {
+            hw.housekeeping();
+            if hw.joined.is_some() && (wait == 0 || wait > HOUSEKEEPING_NS) {
+                wait = HOUSEKEEPING_NS;
+            }
+        }
         match ipc::recv_timeout(ep, wait) {
             Ok(rx) if rx.msg.is_notify() => {
                 if let (Some(i), Backend::Chip(hw)) = (irq.as_ref(), &backend) {
@@ -396,7 +507,16 @@ fn main() -> i32 {
                                 }
                                 Err(e) => Msg::error(e),
                             },
-                            Backend::Chip(_) => Msg::error(-ENOSYS),
+                            Backend::Chip(hw) => {
+                                let t = match rx.msg.mr[0] {
+                                    0 => CONNECT_TIMEOUT,
+                                    t => t,
+                                };
+                                match hw.connect(ssid, psk, t) {
+                                    Ok(()) => Msg::new(0, 0, 0),
+                                    Err(e) => Msg::error(e),
+                                }
+                            }
                         })
                     }
                     (wifi::BADGE_CTRL, wifi::DIAG) => Some(ipc::pack(0, diag.as_bytes())),
@@ -419,12 +539,16 @@ fn main() -> i32 {
                         Some(ipc::pack(0, diag.as_bytes()))
                     }
                     (wifi::BADGE_CTRL, wifi::DISCONNECT) => {
-                        if let Backend::Sim(s) = &mut backend {
-                            s.disconnect();
+                        match &mut backend {
+                            Backend::Sim(s) => s.disconnect(),
+                            Backend::Chip(hw) => hw.disconnect(),
                         }
                         Some(Msg::new(0, 0, 0))
                     }
                     (wifi::BADGE_CTRL, wifi::STATUS) => {
+                        if let Backend::Chip(hw) = &mut backend {
+                            hw.refresh();
+                        }
                         let state = backend.state();
                         let (channel, signal, ssid) = backend.joined();
                         Some(ipc::pack_at(0, &[state, channel, signal, mac_word()], ssid))
