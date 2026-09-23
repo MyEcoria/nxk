@@ -6,7 +6,7 @@ use crate::mmio::{read32, write32};
 const GICD_BASE: usize = 0x5004_1000;
 const GICC_BASE: usize = 0x5004_2000;
 
-const GICD_CTLR: usize = GICD_BASE + 0x000;
+const GICD_CTLR: usize = GICD_BASE;
 const GICD_TYPER: usize = GICD_BASE + 0x004;
 const GICD_IGROUPR: usize = GICD_BASE + 0x080;
 const GICD_ISENABLER: usize = GICD_BASE + 0x100;
@@ -17,7 +17,7 @@ const GICD_ITARGETSR: usize = GICD_BASE + 0x800;
 const GICD_ICFGR: usize = GICD_BASE + 0xC00;
 const GICD_SGIR: usize = GICD_BASE + 0xF00;
 
-const GICC_CTLR: usize = GICC_BASE + 0x00;
+const GICC_CTLR: usize = GICC_BASE;
 const GICC_PMR: usize = GICC_BASE + 0x04;
 const GICC_BPR: usize = GICC_BASE + 0x08;
 const GICC_IAR: usize = GICC_BASE + 0x0C;

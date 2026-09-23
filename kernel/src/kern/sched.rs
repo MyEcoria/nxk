@@ -180,7 +180,7 @@ fn idle_core(except: usize) -> Option<usize> {
 macro_rules! trace {
     ($($a:tt)*) => {
         if cfg!(feature = "trace-sched") {
-            crate::kprintln!($($a)*);
+            $crate::kprintln!($($a)*);
         }
     };
 }
@@ -407,13 +407,12 @@ pub fn sleep_until(i: u16, deadline: u64) {
 /// waits with -ETIMEDOUT.
 pub fn expire(now: u64) {
     let c = percpu::this();
-    while c.tmo_head != NIL {
+    loop {
         let i = c.tmo_head;
-        let t = thread::get(i);
-        if t.wake_at > now {
+        if i == NIL || thread::get(i).wake_at > now {
             break;
         }
-        let slept = t.state == State::Sleeping;
+        let slept = thread::get(i).state == State::Sleeping;
         detach(i);
         wake(i, if slept { 0 } else { (-ETIMEDOUT) as u64 });
     }

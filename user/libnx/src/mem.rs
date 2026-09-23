@@ -34,9 +34,8 @@ impl SharedMemory {
     /// New `len`-byte object, mapped read/write.
     pub fn new(len: usize, flags: u64) -> Result<Self, i64> {
         let h = sys::shm_create(len as u64, flags)?;
-        Self::map(h, len, prot::READ | prot::WRITE).map_err(|e| {
+        Self::map(h, len, prot::READ | prot::WRITE).inspect_err(|_| {
             let _ = sys::handle_close(h);
-            e
         })
     }
 

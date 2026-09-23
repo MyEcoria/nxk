@@ -275,8 +275,8 @@ pub unsafe fn enable() {
 
     // IPS from ID_AA64MMFR0_EL1 to match the hardware.
     let pa_range = sysreg_read!("id_aa64mmfr0_el1") & 0xF;
-    let tcr: u64 = (25 << 0)        // T0SZ: 39-bit VA
-        | (0b00 << 14)              // TG0: 4 KiB granule
+    // TG0 (bits 15:14) = 0: 4 KiB granule.
+    let tcr: u64 = 25               // T0SZ: 39-bit VA
         | (0b11 << 12)              // SH0: inner-shareable
         | (0b01 << 10)              // ORGN0: WB WA
         | (0b01 << 8)               // IRGN0: WB WA

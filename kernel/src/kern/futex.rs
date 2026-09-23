@@ -17,7 +17,7 @@ fn bucket(pa: u64) -> usize {
 }
 
 fn key(uaddr: u64) -> Result<u64, i64> {
-    if uaddr % 4 != 0 {
+    if !uaddr.is_multiple_of(4) {
         return Err(-EINVAL);
     }
     uaccess::translate_populate(uaddr, false).ok_or(-EFAULT)

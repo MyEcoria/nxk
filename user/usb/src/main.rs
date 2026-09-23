@@ -481,7 +481,7 @@ fn main() -> i32 {
                     }
                     (eth::SEND, Some(n)) => {
                         let len = ipc::unpack(&r.msg, &mut buf);
-                        if len > FRAME || len < 14 {
+                        if !(14..=FRAME).contains(&len) {
                             Some(Msg::error(-EINVAL))
                         } else if n.tx_busy >= TX_BUFS {
                             Some(Msg::error(-EAGAIN))

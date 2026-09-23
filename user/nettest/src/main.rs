@@ -90,10 +90,9 @@ fn ping(h: &str, count: u32) -> Result<(), i64> {
         count,
         n,
         (count as u64 - n) * 100 / count.max(1) as u64,
-        if n > 0 {
-            format!(", average {} ms", sum / n / 1_000_000)
-        } else {
-            String::new()
+        match sum.checked_div(n) {
+            Some(avg) => format!(", average {} ms", avg / 1_000_000),
+            None => String::new(),
         }
     );
     if n == 0 {

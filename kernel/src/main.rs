@@ -122,9 +122,9 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     let (total, free, kpages) = pmm::stats();
     kprintln!(
         "[mem] {} MiB DRAM, {} MiB free (kernel and metadata: {} KiB)",
-        total * PAGE_SIZE >> 20,
-        free * PAGE_SIZE >> 20,
-        kpages * PAGE_SIZE >> 10
+        (total * PAGE_SIZE) >> 20,
+        (free * PAGE_SIZE) >> 20,
+        (kpages * PAGE_SIZE) >> 10
     );
     if let mmu::DramSource::Probed { announced_mb } = dram_src {
         kprintln!(

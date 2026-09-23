@@ -13,6 +13,9 @@ fn call(m: &Msg) -> Result<Msg, i64> {
     NET.call(m)
 }
 
+/// IPv4 address and port.
+pub type Endpoint = (u32, u16);
+
 pub const fn ipv4(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) << 24 | (b as u32) << 16 | (c as u32) << 8 | d as u32
 }
@@ -100,8 +103,8 @@ impl TcpStream {
         call(&Msg::from_words(proto::SHUTDOWN, &[self.id])).map(|_| ())
     }
 
-    /// ((local address, port), (remote address, port)).
-    pub fn addrs(&self) -> Result<((u32, u16), (u32, u16)), i64> {
+    /// (local, remote) endpoints.
+    pub fn addrs(&self) -> Result<(Endpoint, Endpoint), i64> {
         let m = call(&Msg::from_words(proto::ADDRS, &[self.id]))?;
         Ok((
             (m.mr[0] as u32, m.mr[1] as u16),

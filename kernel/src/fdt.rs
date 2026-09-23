@@ -46,11 +46,16 @@ fn cells(p: u64, n: u32) -> u64 {
 
 /// Parse the DTB at `addr` if plausible (fully inside `dram`).
 pub fn parse(addr: u64, dram: (u64, u64)) -> Option<Info> {
-    if addr == 0 || addr % 8 != 0 || addr < dram.0 || addr + 40 > dram.1 || be32(addr) != MAGIC {
+    if addr == 0
+        || !addr.is_multiple_of(8)
+        || addr < dram.0
+        || addr + 40 > dram.1
+        || be32(addr) != MAGIC
+    {
         return None;
     }
     let total = be32(addr + 4) as u64;
-    if total < 40 || total > 2 << 20 || addr + total > dram.1 {
+    if !(40..=2 << 20).contains(&total) || addr + total > dram.1 {
         return None;
     }
     let off_struct = be32(addr + 8) as u64;

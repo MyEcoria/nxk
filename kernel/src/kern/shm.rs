@@ -130,7 +130,7 @@ fn fill(
     alloc: impl Fn(usize) -> Option<u64>,
 ) -> Result<(), i64> {
     for k in 0..pages {
-        if k > 0 && k % bkl::BREATHE_PAGES == 0 {
+        if k > 0 && k.is_multiple_of(bkl::BREATHE_PAGES) {
             bkl::breathe()?;
         }
         let pa = if fl & flags::CONTIGUOUS != 0 {

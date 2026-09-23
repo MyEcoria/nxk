@@ -186,7 +186,7 @@ pub fn map_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     reserve_anon(i, va, len, prot)?;
     let mut off = 0;
     while off < len {
-        let r = if off > 0 && (off / PAGE_SIZE) % bkl::BREATHE_PAGES == 0 {
+        let r = if off > 0 && (off / PAGE_SIZE).is_multiple_of(bkl::BREATHE_PAGES) {
             bkl::breathe()
         } else {
             Ok(())
@@ -211,7 +211,7 @@ pub fn reserve_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
     let flags = vm::user_flags(prot) | vm::SW_OWNED;
     let mut off = 0;
     while off < len {
-        let r = if off > 0 && (off / PAGE_SIZE) % bkl::BREATHE_PAGES == 0 {
+        let r = if off > 0 && (off / PAGE_SIZE).is_multiple_of(bkl::BREATHE_PAGES) {
             bkl::breathe()
         } else {
             Ok(())

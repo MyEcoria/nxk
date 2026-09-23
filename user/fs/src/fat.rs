@@ -349,7 +349,7 @@ impl Volume {
     }
 
     fn is_end(v: u32) -> bool {
-        v >= 0x0FFF_FFF8 || v < 2
+        !(2..0x0FFF_FFF8).contains(&v)
     }
 
     /// New cluster, chained after `prev` (0: first of a chain).

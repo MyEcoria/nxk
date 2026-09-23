@@ -144,8 +144,7 @@ impl Pmm {
         debug_assert!(pa >= self.base && self.idx(pa) < self.nframes);
         self.free_pages += 1 << order;
         while order < MAX_ORDER - 1 {
-            let buddy =
-                self.base + (((pa - self.base) / PAGE_SIZE) as u64 ^ (1 << order)) * PAGE_SIZE;
+            let buddy = self.base + (((pa - self.base) / PAGE_SIZE) ^ (1 << order)) * PAGE_SIZE;
             if self.idx(buddy) >= self.nframes
                 || !self.is_free_head(buddy)
                 || unsafe { (*block(buddy)).order } != order as u64

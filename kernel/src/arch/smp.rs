@@ -68,10 +68,10 @@ pub fn start_secondaries(entry: usize) -> usize {
         write32(SB_AA64_RESET_HIGH, (entry >> 32) as u32);
     }
 
-    for cpu in 1..NR_CPUS {
+    for (cpu, &partition) in CPU_PARTITION.iter().enumerate().take(NR_CPUS).skip(1) {
         let expected = online_count() + 1;
 
-        pwrgate_on(CPU_PARTITION[cpu]);
+        pwrgate_on(partition);
         unsafe { write32(RST_CPUG_CMPLX_CLR, cpu_reset_mask(cpu)) };
 
         // Bounded wait: a missing core must not freeze boot.

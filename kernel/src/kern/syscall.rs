@@ -388,8 +388,8 @@ fn handle_dup(pi: u16, h: u32, mask: u16, badge: u64) -> SysResult {
 
 fn page_range_ok(va: u64, len: u64) -> bool {
     len > 0
-        && va % PAGE_SIZE == 0
-        && len % PAGE_SIZE == 0
+        && va.is_multiple_of(PAGE_SIZE)
+        && len.is_multiple_of(PAGE_SIZE)
         && va >= USER_MIN
         && va.checked_add(len).is_some_and(|e| e <= USER_MAX)
 }
@@ -529,7 +529,11 @@ fn mem_unmap(pi: u16, addr: u64, len: u64) -> SysResult {
 fn mmio_range(c: &Cap, phys: u64, len: u64) -> Result<(), i64> {
     let base = (c.obj as u64) << 12;
     let end = base + c.extra;
-    if len == 0 || phys % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || phys < base || phys + len > end
+    if len == 0
+        || !phys.is_multiple_of(PAGE_SIZE)
+        || !len.is_multiple_of(PAGE_SIZE)
+        || phys < base
+        || phys + len > end
     {
         return Err(-EINVAL);
     }

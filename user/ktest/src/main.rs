@@ -35,7 +35,8 @@ fn main() -> i32 {
     if args.get(1) == Some(&"--child") {
         return child(&args[2..]);
     }
-    let tests: &[(&str, fn() -> R)] = &[
+    type Test = (&'static str, fn() -> R);
+    let tests: &[Test] = &[
         ("getrandom", t_random),
         ("kernel log: private, no UART wait", t_klog),
         ("precise sleep", t_sleep),
