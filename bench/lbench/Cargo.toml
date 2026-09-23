@@ -2,7 +2,7 @@
 name = "lbench"
 version = "0.1.0"
 edition = "2021"
-description = "Mesures cote Linux (noyau L4T), /init statique sans libc"
+description = "Linux-side measurements (L4T kernel), static libc-less /init"
 
 [profile.release]
 opt-level = 3

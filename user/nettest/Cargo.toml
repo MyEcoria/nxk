@@ -2,7 +2,7 @@
 name = "nettest"
 version = "0.1.0"
 edition = "2021"
-description = "Essais du reseau (application, hors du coeur)"
+description = "Network tests (an application, outside the core)"
 
 [dependencies]
 libnx = { path = "../libnx" }

@@ -2,7 +2,7 @@
 name = "ktest"
 version = "0.1.0"
 edition = "2021"
-description = "Tests des mecanismes du noyau nxk"
+description = "Tests of the nxk kernel mechanisms"
 
 [dependencies]
 libnx = { path = "../libnx" }
