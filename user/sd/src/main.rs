@@ -383,6 +383,10 @@ fn bring_up(board: &Board) -> Result<(), i64> {
     if !board.card_present() {
         println!("[sd] no card detected, probing anyway");
     }
+    // A card the loader left powered keeps its 1.8 V UHS signaling, which
+    // only a power cycle undoes: commands still pass, data never comes.
+    board.power_off();
+    time::sleep_ms(100);
     board.power_on()?;
     let c = ns::wait_for_timeout("clk", 2_000_000_000)?;
     let mut m = Msg::new(clk::ENABLE, 1, 0);
