@@ -271,11 +271,13 @@ program that vanished without closing them (crash) are reclaimed.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.
-- Wi-Fi reaches the chip but not the air: `wlan` powers the module
-  (PMIC LDO1, WIFI_EN on PH0, WIFI_RST on PH1), brings the PCIe root
-  complex up, trains the link and reads the BCM4356 chip identity, but
-  the firmware upload and Broadcom's ring protocol are not written yet,
-  so no frame moves. Its firmware and calibration data are proprietary
+- Wi-Fi does not reach the air: `wlan` powers the module (PMIC LDO1,
+  WIFI_EN on PH0, WIFI_RST on PH1), sets the PEX and module pads as
+  Horizon does, brings the PCIe root complex up, then should train the
+  link and read the BCM4356 chip identity. On hardware the link has not
+  trained yet (`hwboot/README.md`, runs 5 and 6), and the firmware
+  upload and Broadcom's ring protocol are not written, so no frame
+  moves. Its firmware and calibration data are proprietary
   and never in the repository: they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
   ignores it), then copied to the card by `tools/mksd.py --firmware DIR`

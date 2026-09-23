@@ -253,8 +253,20 @@ The last `usbcon:` line locates a failure:
    about 5 KB of shell output). An emulator console slowed to that rate
    reproduces the same message. Fixed since: nxk-bl31 and the kernel
    select PLLP for UART-A (hekate's `clock_enable_uart`), `wlan` waits
-   5 s and `wifi retry` reruns the bring-up without a reboot. Not
-   re-run on hardware yet.
+   5 s and `wifi retry` reruns the bring-up without a reboot.
+6. 23/09/2026, Erista, commit `795fce0`: UART-A at full speed
+   (`console`: 247 ms of CPU after 44 s, against 3.8 s after 97 s),
+   and `wlan` past the rail, the clocks and the root ports, stopping at
+   `no link on either port`: `RP_VEND_XP` 0x19800000 on both ports
+   (data link down), UPHY lane mux 0x817fc0fe (lane 0 x1, 1-4 x4, 5-6
+   USB3). The PEX pads (PERST#, CLKREQ#, WAKE#) and the module GPIO
+   pads were left as the boot chain set them, PARK bit included, which
+   Horizon clears on every pad (Atmosphère `pinmux_platform_pads.cpp`)
+   and hekate before driving a GPIO. Fixed since: `wlan` applies
+   Horizon's Icosa values to those seven pads, lifts PERST# 100 ms after
+   the module powers up, and a failed link reports pads, PH pins and
+   port registers in `wifi status`. The BAR window also grew to 8 MiB
+   for the chip's 4 MiB BAR2. Not re-run on hardware yet.
 
 ## Hardware test (once the SD card is back in the PC)
 
