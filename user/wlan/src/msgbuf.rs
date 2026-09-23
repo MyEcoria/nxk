@@ -20,6 +20,7 @@ use crate::fw::Up;
 const SHARED_DMA_INDEX: u32 = 0x1_0000;
 const SHARED_MAX_RXBUFPOST: u32 = 34;
 const SHARED_RX_DATAOFFSET: u32 = 36;
+const SHARED_DTOH_MB_DATA: u32 = 44;
 const SHARED_RING_INFO: u32 = 48;
 const SHARED_SCRATCH_LEN: u32 = 52;
 const SHARED_SCRATCH_ADDR: u32 = 56;
@@ -57,12 +58,22 @@ const FLOW_ITEM_SIZE: u16 = 48;
 const FLOW_TIMEOUT_MS: u64 = 1000;
 
 // PCIe2 core mailbox (core rev < 64).
+const PCIE2_MAILBOXINT: u32 = 0x48;
+const PCIE2_MAILBOXMASK: u32 = 0x4C;
 const PCIE2_H2D_MAILBOX_0: u32 = 0x140;
+/// Interrupt causes: function 0 mailbox data, D2H doorbells (the
+/// firmware wrote completions).
+const MB_INT_FN0: u32 = 0x0300;
+const MB_INT_D2H_DB: u32 = 0x00FF_0000;
+// Mailbox data from the firmware (`BRCMF_D2H_DEV_*`).
+pub const D2H_DS_ENTER_REQ: u32 = 0x2;
+pub const D2H_FWHALT: u32 = 0x1000_0000;
 
 // Message types.
 const MSG_FLOW_RING_CREATE: u8 = 0x3;
 const MSG_FLOW_RING_CREATE_CMPLT: u8 = 0x4;
 const MSG_IOCTLPTR_REQ: u8 = 0x9;
+const MSG_IOCTLPTR_REQ_ACK: u8 = 0xA;
 const MSG_IOCTLRESP_BUF_POST: u8 = 0xB;
 const MSG_IOCTL_CMPLT: u8 = 0xC;
 const MSG_EVENT_BUF_POST: u8 = 0xD;
@@ -81,8 +92,6 @@ const IOCTL_MAX: usize = 1518;
 const IOCTL_TIMEOUT_MS: u64 = 2000;
 /// Events kept for a reader; older ones are dropped past this.
 const EVENTS_MAX: usize = 256;
-/// D2H completions carry a modulo-253 sequence number (flag 0x20000).
-const EPOCH_MODULO: u32 = 253;
 /// Data buffers (`BRCMF_MSGBUF_MAX_PKT_SIZE`): frames received, frames
 /// to send. Enough for key handshakes and light traffic.
 const PKT_LEN: usize = 2048;
@@ -128,8 +137,6 @@ struct Ring {
     r_idx: u32,
     /// Host side: next item to write (H2D) or to read (D2H).
     pos: u16,
-    /// Expected D2H sequence number, once the first one is seen.
-    epoch: Option<u32>,
 }
 
 impl Ring {
@@ -205,9 +212,15 @@ pub struct Msgbuf {
     /// Ethernet header of the last one received: for `wifi status`.
     count: [u32; 3],
     last_rx: [u8; 14],
+    /// D2H items announced but not landed yet when first looked at.
+    late: u32,
+    /// Other control completions: count, and the last one.
+    other: (u32, [u8; 24]),
     reply: Option<Reply>,
     /// The firmware console, for `console_tail`.
     pub console: u32,
+    /// Mailbox data word from the firmware, in TCM.
+    dtoh_mb: u32,
 }
 
 /// Outcome of an ioctl: firmware status and the bytes it returned.
@@ -263,7 +276,6 @@ impl Msgbuf {
                 w_idx: w,
                 r_idx: r,
                 pos: 0,
-                epoch: None,
             });
         }
         // Flow ring: host memory now, created in the firmware on demand.
@@ -275,7 +287,6 @@ impl Msgbuf {
             w_idx: h2d_w,
             r_idx: h2d_r,
             pos: 0,
-            epoch: None,
         });
         for (addr_off, len_off, len) in [
             (SHARED_SCRATCH_ADDR, SHARED_SCRATCH_LEN, SCRATCH_LEN),
@@ -326,8 +337,11 @@ impl Msgbuf {
             flow_pa,
             count: [0; 3],
             last_rx: [0; 14],
+            late: 0,
+            other: (0, [0; 24]),
             reply: None,
             console: up.console,
+            dtoh_mb: t(up.shared + SHARED_DTOH_MB_DATA),
         };
         for id in 0..2 * CTL_BUFS {
             m.post_ctl(bp, tcm, id as u32)?;
@@ -365,6 +379,38 @@ impl Msgbuf {
         bp.w32(self.pcie2.base + PCIE2_H2D_MAILBOX_0, 1);
     }
 
+    /// Chip interrupts on (`brcmf_pcie_intr_enable`): completions and
+    /// mailbox data raise INTx.
+    pub fn irq_enable(&self, bp: &Backplane) {
+        bp.w32(
+            self.pcie2.base + PCIE2_MAILBOXMASK,
+            MB_INT_D2H_DB | MB_INT_FN0,
+        );
+    }
+
+    /// What an interrupt was for (`brcmf_pcie_isr_thread`): its causes,
+    /// cleared so INTx drops before the line is re-armed, and the mailbox
+    /// data that came with it, taken.
+    pub fn irq_take(&self, bp: &Backplane, tcm: &Mmio) -> (u32, u32) {
+        let status = bp.r32(self.pcie2.base + PCIE2_MAILBOXINT);
+        if status != 0 {
+            bp.w32(self.pcie2.base + PCIE2_MAILBOXINT, status);
+        }
+        let mut data = 0;
+        if status & MB_INT_FN0 != 0 {
+            data = tcm.r32(self.dtoh_mb as usize);
+            if data != 0 {
+                tcm.w32(self.dtoh_mb as usize, 0);
+            }
+        }
+        (status, data)
+    }
+
+    /// The chip still answers: its mailbox register does not read all ones.
+    pub fn alive(&self, bp: &Backplane) -> bool {
+        bp.r32(self.pcie2.base + PCIE2_MAILBOXINT) != u32::MAX
+    }
+
     /// Hand control buffer `id` back to the firmware, for an ioctl
     /// response (ids 0..8) or an event (8..16).
     fn post_ctl(&mut self, bp: &Backplane, tcm: &Mmio, id: u32) -> Result<(), String> {
@@ -398,8 +444,7 @@ impl Msgbuf {
         Ok(())
     }
 
-    /// Next D2H item of `ring`, if the firmware wrote one; its sequence
-    /// number is checked so a half-transferred item is never read.
+    /// Next D2H item of `ring`, if the firmware wrote one and it landed.
     fn next(&mut self, tcm: &Mmio, ring: usize) -> Result<Option<Vec<u8>>, String> {
         let r = &mut self.rings[ring];
         let write = tcm.r16(r.w_idx as usize);
@@ -413,18 +458,24 @@ impl Msgbuf {
                 ring, write, r.items
             ));
         }
+        // The index can be seen before the item lands, right after the
+        // interrupt. Items are cleared once read and no message has type
+        // 0 (this firmware leaves the sequence number of control
+        // completions at 0): one still reading 0 waits for the next poll.
         let p = r.item(r.pos);
-        if let Some(want) = r.epoch {
-            let deadline = time::now_ns() + 1_000_000;
-            while unsafe { core::ptr::read_volatile(p.add(3)) } as u32 != want
-                && time::now_ns() < deadline
-            {
-                core::hint::spin_loop();
+        let deadline = time::now_ns() + 1_000_000;
+        while unsafe { core::ptr::read_volatile(p) } == 0 {
+            if time::now_ns() > deadline {
+                self.late += 1;
+                return Ok(None);
             }
+            core::hint::spin_loop();
         }
         let mut item = alloc::vec![0u8; r.size as usize];
-        unsafe { core::ptr::copy_nonoverlapping(p, item.as_mut_ptr(), item.len()) };
-        r.epoch = Some((item[3] as u32 + 1) % EPOCH_MODULO);
+        unsafe {
+            core::ptr::copy_nonoverlapping(p, item.as_mut_ptr(), item.len());
+            core::ptr::write_bytes(p, 0, item.len());
+        }
         r.pos = (r.pos + 1) % r.items;
         tcm.w16(r.r_idx as usize, r.pos);
         Ok(Some(item))
@@ -476,8 +527,14 @@ impl Msgbuf {
                         status => Flow::Refused(status),
                     };
                 }
-                // Acks, and status messages this driver has no use for.
-                _ => {}
+                MSG_IOCTLPTR_REQ_ACK => {}
+                // Status messages: the firmware reports ring and general
+                // errors there, kept for `wifi status`.
+                t => {
+                    let _ = t;
+                    self.other.0 += 1;
+                    self.other.1.copy_from_slice(&item[..24]);
+                }
             }
         }
         // `brcmf_msgbuf_process_rx_complete`: the frame starts at its
@@ -532,7 +589,7 @@ impl Msgbuf {
             )
         };
         format!(
-            "rx {} (last {:02x?}), tx {} sent {}, flow {}; rings rxpost {} rx {} txdone {} flow {}",
+            "rx {} (last {:02x?}), tx {} sent {}, flow {}, late items {}, other control messages {} (last {:02x?}); rings rxpost {} rx {} txdone {} flow {}; next unread rx {:02x?} txdone {:02x?}",
             self.count[0],
             self.last_rx,
             self.count[1],
@@ -543,11 +600,29 @@ impl Msgbuf {
                 Flow::Open => "open",
                 Flow::Refused(_) => "refused",
             },
+            self.late,
+            self.other.0,
+            self.other.1,
             idx(RXPOST_SUBMIT),
             idx(RX_COMPLETE),
             idx(TX_COMPLETE),
-            idx(FLOW)
+            idx(FLOW),
+            self.peek(RX_COMPLETE),
+            self.peek(TX_COMPLETE)
         )
+    }
+
+    /// Raw bytes of the next unread item of a D2H ring, and of the one
+    /// after: what a stalled ring is stuck on.
+    fn peek(&self, ring: usize) -> [Vec<u8>; 2] {
+        let r = &self.rings[ring];
+        let read = |k: u16| {
+            let p = r.item(k % r.items);
+            let mut v = alloc::vec![0u8; r.size as usize];
+            unsafe { core::ptr::copy_nonoverlapping(p, v.as_mut_ptr(), v.len()) };
+            v
+        };
+        [read(r.pos), read(r.pos + 1)]
     }
 
     /// Oldest frame received and not read yet.

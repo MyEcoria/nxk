@@ -3,6 +3,7 @@
 //! and `drivers/phy/tegra/xusb-tegra210.c` (T210 data), clocks and the
 //! power partition through the `clk` service.
 
+use alloc::format;
 use alloc::string::String;
 use core::fmt::Write;
 
@@ -162,6 +163,11 @@ const PCIE_LANES: usize = 5;
 const VENDOR_NVIDIA: u16 = 0x10DE;
 const CFG_VENDOR: usize = 0x00;
 const CFG_COMMAND: usize = 0x04;
+/// Capability list: its head, the PCI Express capability and, in it,
+/// link control (low half) and status (high half).
+const CFG_CAP_PTR: usize = 0x34;
+const CAP_ID_EXP: u32 = 0x10;
+const CAP_EXP_LINK_CTL: usize = 0x10;
 const CFG_COMMAND_IO: u32 = 1 << 0;
 const CFG_COMMAND_MEMORY: u32 = 1 << 1;
 const CFG_COMMAND_MASTER: u32 = 1 << 2;
@@ -614,6 +620,57 @@ impl Pcie {
         if self.cfg_read(1, 0, off) != v {
             self.cfg_write(1, 0, off, v);
         }
+    }
+
+    /// The endpoint's link as it stands, for `wifi status`: root port
+    /// link control/status (ASPM bits, DL active), its data link, the
+    /// port's REFCLK/CLKREQ control, the UPHY PLL, then the endpoint's
+    /// command/status and link control/status (found by its capability
+    /// list), unless `ep` is false: an endpoint gone from the bus is
+    /// left alone.
+    pub fn link_state(&self, port: usize, ep: bool) -> String {
+        let rp = self.port(port);
+        let head = format!(
+            "RP link {:#010x}, VEND_XP {:#010x}, PEX_CTRL {:#x}, UPHY PLL {:#010x}",
+            rp.r32(RP_LINK_CONTROL_STATUS),
+            rp.r32(RP_VEND_XP),
+            self.afi().r32(AFI_PEX_CTRL[port]),
+            self.padctl.r32(PADCTL_UPHY_PLL_P0_CTL1)
+        );
+        if !ep {
+            // Config space still answers over a live link: after a reset
+            // of its own the chip shows cleared BARs and command.
+            return format!(
+                "{}; EP config id {:#010x}, command {:#010x}, BAR0 {:#010x}, BAR2 {:#010x}",
+                head,
+                self.cfg_read(1, 0, CFG_VENDOR),
+                self.cfg_read(1, 0, CFG_COMMAND),
+                self.cfg_read(1, 0, CFG_BAR0),
+                self.cfg_read(1, 0, CFG_BAR0 + 8)
+            );
+        }
+        let ep_link = {
+            let mut at = self.cfg_read(1, 0, CFG_CAP_PTR) as usize & 0xFC;
+            let mut found = None;
+            for _ in 0..16 {
+                if !(0x40..=0xFC).contains(&at) {
+                    break;
+                }
+                let head = self.cfg_read(1, 0, at);
+                if head & 0xFF == CAP_ID_EXP {
+                    found = Some(self.cfg_read(1, 0, at + CAP_EXP_LINK_CTL));
+                    break;
+                }
+                at = (head >> 8) as usize & 0xFC;
+            }
+            found.map_or(String::from("?"), |v| format!("{:#010x}", v))
+        };
+        format!(
+            "{}; EP command {:#010x}, link {}",
+            head,
+            self.cfg_read(1, 0, CFG_COMMAND),
+            ep_link
+        )
     }
 
     /// Latched AFI error code and the address it hit, left in place: why

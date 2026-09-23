@@ -596,6 +596,11 @@ impl Dev<'_> {
         self.mb.set_var(self.bp, self.tcm, "wsec_key", &k)
     }
 
+    /// The chip still answers on the bus (a register read not all ones).
+    pub fn alive(&self) -> bool {
+        self.mb.alive(self.bp)
+    }
+
     /// A frame from `wlan0` onto the air: `EAGAIN` while every TX buffer
     /// is in flight, for the sender to retry.
     pub fn send(&mut self, frame: &[u8]) -> Result<(), i64> {

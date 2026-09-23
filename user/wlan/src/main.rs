@@ -39,11 +39,14 @@ const MTU: u64 = 1500;
 const SCAN_TIMEOUT: u64 = 3_000_000_000;
 /// Join time likewise: scan, authentication and the key handshake.
 const CONNECT_TIMEOUT: u64 = 15_000_000_000;
-/// While joined, the rings are polled this often: received frames and
-/// firmware events have no interrupt yet.
-const POLL_NS: u64 = 2_000_000;
+/// While joined, the rings are also polled this often: the chip's
+/// interrupt drives them, this is the safety net should one be missed.
+const POLL_NS: u64 = 500_000_000;
 /// Frames received and not read by `net` yet; older ones are dropped.
 const RX_QUEUE: usize = 256;
+/// While joined, the firmware console is saved this often: once the
+/// chip is gone, it is what it said last.
+const CONSOLE_SAVE_NS: u64 = 2_000_000_000;
 
 /// The root complex, the chip's BAR0 and TCM, and the rings to its
 /// firmware when it runs.
@@ -57,6 +60,19 @@ struct Hw {
     joined: Option<Joined>,
     /// Frames for `wlan0` readers, oldest first.
     rx: VecDeque<Vec<u8>>,
+    /// Chip interrupts taken, deep sleep requests among them, the last
+    /// mailbox data, and PCIe errors (count, last AFI code): counted,
+    /// not printed, since a failing chip raises them in bursts.
+    irqs: u64,
+    deep_sleeps: u64,
+    mb_data: u32,
+    afi_errors: (u64, u32),
+    /// The chip reads all ones: gone from the bus, its line left masked.
+    gone: bool,
+    /// Root port the chip sits behind.
+    port: usize,
+    /// The firmware console as last saved, and when.
+    console: (String, u64),
 }
 
 /// The network in use: SSID, channel, signal (-dBm), and on a WPA2
@@ -160,6 +176,14 @@ impl Hw {
         let Some(mut j) = self.joined.take() else {
             return;
         };
+        let now = time::now_ns();
+        if let Some(m) = self
+            .mb
+            .as_ref()
+            .filter(|_| now > self.console.1 + CONSOLE_SAVE_NS)
+        {
+            self.console = (fw::console_tail(&self.tcm, m.console, 600), now);
+        }
         let mut rx = core::mem::take(&mut self.rx);
         let r = self.dev(|d| d.housekeeping(j.sup.as_mut(), &mut rx));
         while rx.len() > RX_QUEUE {
@@ -171,10 +195,54 @@ impl Hw {
                 println!("[wlan] link lost");
                 return;
             }
-            Some(Err(e)) => println!("[wlan] events: {}", e),
+            // Ring errors mean a chip that stopped answering.
+            Some(Err(e)) => {
+                println!("[wlan] link lost: {}", e);
+                self.gone |= self.dev(|d| !d.alive()).unwrap_or(false);
+                return;
+            }
             _ => {}
         }
         self.joined = Some(j);
+    }
+
+    /// The chip's interrupt (`brcmf_pcie_isr_thread`): causes cleared so
+    /// INTx drops before the line is re-armed, mailbox data answered;
+    /// the rings are drained by the housekeeping that follows. False when
+    /// the line must stay masked: a chip gone from the bus holds it up.
+    fn interrupt(&mut self) -> bool {
+        if self.gone {
+            return false;
+        }
+        let rc = &self.rc;
+        let window = |a| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, a);
+        let bp = chip::Backplane::new(&self.bar0, &window);
+        let Some(mb) = self.mb.as_mut() else {
+            return true;
+        };
+        let (status, data) = mb.irq_take(&bp, &self.tcm);
+        if status == u32::MAX {
+            println!("[wlan] chip unreachable (reads all ones), its interrupt masked");
+            self.gone = true;
+            self.joined = None;
+            return false;
+        }
+        if status != 0 {
+            self.irqs += 1;
+        }
+        if data != 0 {
+            self.mb_data = data;
+        }
+        // Deep sleep requests are counted, not granted (Linux acks them):
+        // the ring indices live in the chip's RAM, which a sleeping chip
+        // may not serve. None seen so far.
+        if data & msgbuf::D2H_DS_ENTER_REQ != 0 {
+            self.deep_sleeps += 1;
+        }
+        if data & msgbuf::D2H_FWHALT != 0 && self.joined.take().is_some() {
+            println!("[wlan] firmware halted");
+        }
+        true
     }
 
     /// A frame from `wlan0`; dropped while not joined, as a cable would.
@@ -348,6 +416,13 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             seen: Vec::new(),
             joined: None,
             rx: VecDeque::new(),
+            irqs: 0,
+            deep_sleeps: 0,
+            mb_data: 0,
+            afi_errors: (0, 0),
+            gone: false,
+            port: ep.port,
+            console: (String::new(), 0),
         },
         irq,
         what,
@@ -438,6 +513,7 @@ fn control(
         Ok(()) => String::from("radio up"),
         Err(e) => format!("radio setup: {}", e),
     };
+    m.irq_enable(bp);
     println!("[wlan] {}", radio);
     (format!("firmware {}, {}", ver, radio), Some(m))
 }
@@ -486,7 +562,8 @@ fn main() -> i32 {
             Some(d) => d.saturating_sub(time::now_ns()).max(1),
             None => 0,
         };
-        // Joined: the rings are polled, frames go to waiting readers.
+        // Joined: the rings are drained (after an interrupt, or by the
+        // safety-net poll), frames go to waiting readers.
         if let Backend::Chip(hw) = &mut backend {
             hw.housekeeping();
             while !readers.is_empty() {
@@ -500,15 +577,17 @@ fn main() -> i32 {
         }
         match ipc::recv_timeout(ep, wait) {
             Ok(rx) if rx.msg.is_notify() => {
-                if let (Some(i), Backend::Chip(hw)) = (irq.as_ref(), &backend) {
+                if let (Some(i), Backend::Chip(hw)) = (irq.as_ref(), &mut backend) {
                     let code = hw.rc.interrupt();
                     if code != 0
                         && code != pcie::AFI_INTR_LEGACY
                         && !pcie::AFI_INTR_BENIGN.contains(&code)
                     {
-                        println!("[wlan] PCIe error, AFI code {}", code);
+                        hw.afi_errors = (hw.afi_errors.0 + 1, code);
                     }
-                    i.ack();
+                    if hw.interrupt() {
+                        i.ack();
+                    }
                 }
             }
             Ok(rx) => {
@@ -582,10 +661,25 @@ fn main() -> i32 {
                         // The firmware's console as it is now: joins and
                         // failures show there first.
                         let live = match &backend {
+                            Backend::Chip(hw) if hw.gone => format!(
+                                "; chip unreachable, interrupts {}, PCIe errors {} (last AFI code {}); link: {}; console before the loss: {}",
+                                hw.irqs,
+                                hw.afi_errors.0,
+                                hw.afi_errors.1,
+                                hw.rc.link_state(hw.port, false),
+                                hw.console.0
+                            ),
                             Backend::Chip(hw) => match &hw.mb {
                                 Some(m) => format!(
-                                    "; data: {}; console now: {}",
+                                    "; data: {}, interrupts {} (deep sleep asked {}, mailbox data {:#x}), PCIe errors {} (last AFI code {}){}; link: {}; console now: {}",
                                     m.stats(&hw.tcm),
+                                    hw.irqs,
+                                    hw.deep_sleeps,
+                                    hw.mb_data,
+                                    hw.afi_errors.0,
+                                    hw.afi_errors.1,
+                                    "",
+                                    hw.rc.link_state(hw.port, true),
                                     fw::console_tail(&hw.tcm, m.console, 600)
                                 ),
                                 None => String::new(),
