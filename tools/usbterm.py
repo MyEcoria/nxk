@@ -8,17 +8,21 @@ back. Standard library only.
     usbterm.py                       # physical Switch: /dev/ttyACM* found by ID
     usbterm.py --dev /dev/ttyACM1    # explicit serial device
     usbterm.py -c "ps" -c "mem"      # type commands, print until the prompt
+    usbterm.py --put LOCAL:/bin/x    # copy a file to the card (shell `recv`)
+    usbterm.py --reload wlan -c "wifi status"   # new driver build, restarted
     usbterm.py --emu /tmp/usb.sock   # tegra_qemu: act as the PC's USB host
 
 Interactive mode: Ctrl-] quits. In the emulator, QEMU needs
 `-chardev socket,id=usbotg,path=SOCK,server=on,wait=off`; this script then
 plays the host side of the bus (enumeration, bulk transfers).
 """
-import argparse, glob, os, select, socket, struct, sys, termios, time, tty
+import argparse, base64, glob, io, os, select, socket, struct, sys, termios, time, tty, zlib
 
 VID, PID = 0x1209, 0x0001
 PROMPT = b"nxk> "
 QUIT = 0x1D  # Ctrl-]
+# base64 characters per typed line: the console keeps at most 1000.
+PUT_LINE = 512
 
 
 class Stall(Exception):
@@ -233,13 +237,40 @@ def drain(link, quiet=0.3, limit=5.0):
         pass
 
 
-def run(link, cmds, timeout, out=sys.stdout):
+def put(link, local, remote, timeout):
+    """File to the Switch's card through the shell's `recv`: base64 lines,
+    each one echoed before the next (flow control), CRC-32 checked there."""
+    data = open(local, "rb").read()
+    enc = base64.b64encode(data)
+    quiet = io.StringIO()
+    link.write(f"recv {remote} {len(data)} {zlib.crc32(data):08x}\r".encode())
+    seen, ok = read_until(link, b"\n", timeout, quiet)
+    t0 = time.time()
+    for i in range(0, len(enc), PUT_LINE):
+        if not ok:
+            break
+        link.write(enc[i:i + PUT_LINE] + b"\r")
+        buf, ok = read_until(link, b"\n", timeout, quiet)
+        seen += buf
+    if ok and PROMPT not in seen:
+        buf, ok = read_until(link, PROMPT, timeout, quiet)
+        seen += buf
+    verdict = [l for l in seen.decode("utf-8", "replace").splitlines() if "recv:" in l]
+    print(f"[usbterm] {local} -> {remote}: {len(data)} bytes in "
+          f"{time.time() - t0:.1f} s; {verdict[-1] if verdict else 'no answer'}")
+    return ok and bool(verdict) and f"recv: {remote} (" in verdict[-1]
+
+
+def run(link, cmds, timeout, out=sys.stdout, puts=()):
     """Type each command, print its output up to the next prompt."""
     drain(link)
     link.write(b"\r")
     if not read_until(link, PROMPT, timeout, out)[1]:
         print("\n[usbterm] no nxk prompt", file=sys.stderr)
         return False
+    for local, remote in puts:
+        if not put(link, local, remote, timeout):
+            return False
     for c in cmds:
         link.write(c.encode() + b"\r")
         if not read_until(link, PROMPT, timeout, out)[1]:
@@ -279,7 +310,16 @@ def main():
     ap.add_argument("--emu", metavar="SOCKET", help="tegra_qemu 'usbotg' chardev socket")
     ap.add_argument("-c", "--cmd", action="append", default=[], help="command to type (repeatable)")
     ap.add_argument("--timeout", type=float, default=30, help="per-command timeout (s)")
+    ap.add_argument("--put", action="append", default=[], metavar="LOCAL:REMOTE",
+                    help="copy a file to the Switch's card first (repeatable)")
+    ap.add_argument("--reload", action="append", default=[], metavar="DRIVER",
+                    help="put the built DRIVER in /bin and restart it (./tools/build.sh first)")
     a = ap.parse_args()
+    puts = [tuple(p.rsplit(":", 1)) for p in a.put]
+    cache = os.environ.get("NXK_CACHE", os.path.expanduser("~/.cache/nxk"))
+    for d in a.reload:
+        puts.append((os.path.join(cache, "target-user/aarch64-unknown-none/release", d), f"/bin/{d}"))
+    cmds = [f"restart {d}" for d in a.reload] + a.cmd
     try:
         if a.emu:
             link = EmuHost(a.emu, timeout=a.timeout)
@@ -295,9 +335,9 @@ def main():
     except (OSError, ConnectionError, TimeoutError, Stall) as e:
         sys.exit(f"[usbterm] {e}")
     try:
-        if a.cmd:
+        if cmds or puts:
             print(f"[usbterm] {link.name}", file=sys.stderr)
-            sys.exit(0 if run(link, a.cmd, a.timeout) else 1)
+            sys.exit(0 if run(link, cmds, a.timeout, puts=puts) else 1)
         interactive(link)
     except (ConnectionError, TimeoutError, Stall) as e:
         sys.exit(f"\n[usbterm] {e}")

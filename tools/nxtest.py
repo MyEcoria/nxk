@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--keys", default=None, help="keys sent to the USB keyboard (sendkey) after the 1st command")
     ap.add_argument("--usb-cmd", action="append", default=[],
                     help="command typed on the USB-C console (usbcon), the script acting as the PC")
+    ap.add_argument("--usb-put", action="append", default=[], metavar="LOCAL:REMOTE",
+                    help="file copied to the SD card over the USB-C console, before --usb-cmd")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
@@ -133,7 +135,8 @@ def main():
     ] + (["-drive", f"if=sd,index=0,format=raw,file={a.sd}"] if a.sd else []) \
       + (["-global", "driver=tegra.xusb,property=slots,value=8"] if a.usb_kbd or a.net is not None else []) \
       + (["-device", "usb-kbd,bus=usb-bus.2"] if a.usb_kbd else []) \
-      + (["-chardev", f"socket,id=usbotg,path={usb},server=on,wait=off"] if a.usb_cmd else []) \
+      + (["-chardev", f"socket,id=usbotg,path={usb},server=on,wait=off"]
+         if a.usb_cmd or a.usb_put else []) \
       + (["-netdev", "user,id=n0" + "".join(f",hostfwd={f}" for f in a.net.split()), "-device", "usb-net,netdev=n0,bus=usb-bus.2"]
          if a.net is not None else []) \
       + os.environ.get("NXTEST_QEMU_ARGS", "").split()
@@ -172,7 +175,7 @@ def main():
                 ok = False
                 break
         print()
-        if ok and a.usb_cmd:
+        if ok and (a.usb_cmd or a.usb_put):
             sys.path.insert(0, HERE)
             sys.dont_write_bytecode = True
             import usbterm
@@ -183,7 +186,8 @@ def main():
             try:
                 link = usbterm.EmuHost(usb, timeout=a.timeout)
                 print(f"[nxtest] {link.name}")
-                if not usbterm.run(link, a.usb_cmd, a.timeout):
+                puts = [tuple(p.rsplit(":", 1)) for p in a.usb_put]
+                if not usbterm.run(link, a.usb_cmd, a.timeout, puts=puts):
                     dump_cpus(mon, a.kernel)
                     ok = False
                 link.close()
