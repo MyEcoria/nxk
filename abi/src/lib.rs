@@ -648,6 +648,11 @@ pub mod proto {
         pub const LOOKUP_WAIT: u32 = 5;
         /// Published services, space-separated names.
         pub const SERVICES: u32 = 6;
+        /// Replace a boot driver with a program from the filesystem, with
+        /// the same hardware grants: bytes = driver name, space, path. The
+        /// old instance is killed and its services unpublished. Only from
+        /// the shell init started (console user): a development path.
+        pub const RESTART: u32 = 7;
         /// Badges of the manager endpoint: applications, services.
         pub const BADGE_APP: u64 = 1;
         pub const BADGE_SERVICE: u64 = 2;

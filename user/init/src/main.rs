@@ -171,6 +171,8 @@ const DRIVERS: &[Driver] = &[
 struct Service {
     name: String,
     handle: u32,
+    /// Process that published it: its names go when it is replaced.
+    owner: u32,
 }
 
 struct State {
@@ -183,6 +185,10 @@ struct State {
     services: Vec<Service>,
     /// Lookups waiting for a publication: (name, reply token).
     waiting: Vec<(String, u64)>,
+    /// Running boot drivers: name and process handle (for `RESTART`).
+    drivers: Vec<(&'static str, u32)>,
+    /// The console shell, the one caller allowed to replace a driver.
+    shell_pid: u32,
 }
 
 libnx::entry!(main);
@@ -248,16 +254,16 @@ fn main() -> i32 {
         pm_srv,
         services: Vec::new(),
         waiting: Vec::new(),
+        drivers: Vec::new(),
+        shell_pid: 0,
     };
 
     for d in DRIVERS {
-        if st.fs.find(d.name).is_none() {
+        let Some(elf) = st.fs.find(d.name) else {
             continue;
-        }
-        match start_driver(&st, d) {
-            Ok(h) => {
-                let _ = sys::handle_close(h);
-            }
+        };
+        match start_driver(&st, d, elf) {
+            Ok(h) => st.drivers.push((d.name, h)),
             Err(e) => println!(
                 "[init] {}: failed to start ({})",
                 d.name,
@@ -272,6 +278,7 @@ fn main() -> i32 {
     );
     match launch(&st, &shell, pm_app, &Stdio::CONSOLE) {
         Ok(h) => {
+            st.shell_pid = sys::getpid(h).unwrap_or(0);
             let _ = sys::handle_close(h);
         }
         Err(e) => println!("[init] shell: error {}", libnx::abi::err::name(e)),
@@ -280,7 +287,7 @@ fn main() -> i32 {
 }
 
 /// Start a driver with its hardware capabilities.
-fn start_driver(st: &State, d: &Driver) -> Result<u32, i64> {
+fn start_driver(st: &State, d: &Driver, elf: &[u8]) -> Result<u32, i64> {
     let mut grants = Vec::new();
     let mut owned = Vec::new();
     grants.push(HandleGrant {
@@ -328,7 +335,7 @@ fn start_driver(st: &State, d: &Driver) -> Result<u32, i64> {
             });
         }
         process::spawn_elf(&Spawn {
-            elf: st.fs.find(d.name).ok_or(-ENOENT)?,
+            elf,
             name: d.name,
             grants: &grants,
             arg0: startup::HAS_CONSOLE | startup::HAS_PM | startup::IS_DRIVER,
@@ -343,6 +350,36 @@ fn start_driver(st: &State, d: &Driver) -> Result<u32, i64> {
         let _ = sys::handle_close(h);
     }
     r
+}
+
+/// `RESTART`: a boot driver replaced by a program from the filesystem,
+/// same grants. The file is read first, so a bad path leaves the old
+/// instance running; its names are dropped so the new one can publish.
+fn restart(st: &mut State, name: &str, path: &str) -> Result<(), i64> {
+    let d = DRIVERS.iter().find(|d| d.name == name).ok_or(-ENOENT)?;
+    if !path.starts_with('/') {
+        return Err(-EINVAL);
+    }
+    let elf = load(st, path)?;
+    if let Some(k) = st.drivers.iter().position(|(n, _)| *n == name) {
+        let (_, h) = st.drivers.swap_remove(k);
+        let pid = sys::getpid(h).unwrap_or(0);
+        let _ = sys::process_kill(h);
+        // Its capabilities (IRQ line included) are gone once it is reaped.
+        let _ = sys::process_wait_timeout(h, 2_000_000_000);
+        let _ = sys::handle_close(h);
+        st.services.retain(|s| {
+            let keep = s.owner != pid;
+            if !keep {
+                let _ = sys::handle_close(s.handle);
+            }
+            keep
+        });
+    }
+    let h = start_driver(st, d, &elf)?;
+    st.drivers.push((d.name, h));
+    println!("[init] {} restarted from {}", name, path);
+    Ok(())
 }
 
 /// Program executable: boot image, otherwise filesystem
@@ -539,7 +576,11 @@ fn serve(st: &mut State, ep: u32) -> ! {
                             k += 1;
                         }
                     }
-                    st.services.push(Service { name, handle: h });
+                    st.services.push(Service {
+                        name,
+                        handle: h,
+                        owner: rx.pid,
+                    });
                     Msg::new(0, 0, 0)
                 }
             }
@@ -571,6 +612,18 @@ fn serve(st: &mut State, ep: u32) -> ! {
                     names.extend_from_slice(s.name.as_bytes());
                 }
                 ipc::pack(0, &names)
+            }
+            pm::RESTART if rx.pid != st.shell_pid || st.shell_pid == 0 => Msg::error(-EPERM),
+            pm::RESTART => {
+                let n = ipc::unpack(&rx.msg, &mut buf);
+                let req = core::str::from_utf8(&buf[..n]).unwrap_or("");
+                match req.split_once(' ') {
+                    Some((name, path)) => match restart(st, name, path) {
+                        Ok(()) => Msg::new(0, 0, 0),
+                        Err(e) => Msg::error(e),
+                    },
+                    None => Msg::error(-EINVAL),
+                }
             }
             _ => Msg::error(-ENOSYS),
         };

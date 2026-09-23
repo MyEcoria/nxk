@@ -213,6 +213,11 @@ pub fn process_wait_timeout(h: u32, timeout_ns: u64) -> Result<i64> {
     }
 }
 
+/// Id of the process a handle names (0: the caller).
+pub fn getpid(h: u32) -> Result<u32> {
+    check(unsafe { syscall1(GETPID, h as u64) }).map(|v| v as u32)
+}
+
 pub fn process_kill(h: u32) -> Result<()> {
     check(unsafe { syscall1(PROCESS_KILL, h as u64) }).map(|_| ())
 }
