@@ -11,15 +11,17 @@ extern crate alloc;
 
 mod chip;
 mod fw;
+mod msgbuf;
 mod pcie;
 mod sim;
+mod wl;
 
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{self, EINVAL, ENOSYS, ETIMEDOUT};
+use libnx::abi::err::{self, EINVAL, EIO, ENOSYS, ETIMEDOUT};
 use libnx::abi::proto::{eth, wifi};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::drv::{self, Irq, Mmio};
@@ -34,33 +36,76 @@ const MTU: u64 = 1500;
 /// Scan time when the caller asks for no particular one.
 const SCAN_TIMEOUT: u64 = 3_000_000_000;
 
-/// The root complex, kept for the interrupts it reports. The chip
-/// behind it is identified at startup and logged.
+/// The root complex, the chip's BAR0 and TCM, and the rings to its
+/// firmware when it runs.
 struct Hw {
     rc: pcie::Pcie,
+    bar0: Mmio,
+    tcm: Mmio,
+    mb: Option<msgbuf::Msgbuf>,
+}
+
+impl Hw {
+    /// A firmware call, with the backplane view it goes through.
+    fn dev<R>(&mut self, f: impl FnOnce(&mut wl::Dev) -> R) -> Option<R> {
+        let rc = &self.rc;
+        let window = |a| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, a);
+        let bp = chip::Backplane::new(&self.bar0, &window);
+        let mb = self.mb.as_mut()?;
+        Some(f(&mut wl::Dev {
+            mb,
+            bp: &bp,
+            tcm: &self.tcm,
+        }))
+    }
 }
 
 enum Backend {
-    /// Chip identified on the bus. Its firmware and the ring protocol
-    /// that carries frames are not implemented yet: the link stays
-    /// down, only STATUS answers.
-    Chip(Hw),
+    /// Chip on the bus; with its firmware running it scans. Joins and
+    /// the frames of the link are not implemented yet.
+    Chip(alloc::boxed::Box<Hw>),
     Sim(sim::Sim),
 }
 
 impl Backend {
     fn state(&self) -> u64 {
         match self {
+            Backend::Chip(hw) if hw.mb.is_some() => wifi::ST_IDLE,
             Backend::Chip(_) => wifi::ST_DOWN,
             Backend::Sim(s) if s.joined.is_some() => wifi::ST_CONNECTED,
             Backend::Sim(_) => wifi::ST_IDLE,
         }
     }
 
-    fn scan(&self, _timeout: u64) -> Result<(usize, Vec<u8>), i64> {
+    fn scan(&mut self, timeout: u64) -> Result<(usize, Vec<u8>), i64> {
         match self {
             Backend::Sim(s) => Ok((sim::APS.len(), s.scan())),
-            Backend::Chip(_) => Err(-ENOSYS),
+            Backend::Chip(hw) => {
+                let mut found = match hw.dev(|d| d.scan(timeout)) {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => {
+                        println!("[wlan] scan: {}", e);
+                        return Err(-EIO);
+                    }
+                    None => return Err(-ENOSYS),
+                };
+                found.sort_by_key(|b| core::cmp::Reverse(b.rssi));
+                let (mut n, mut out) = (0, Vec::new());
+                for b in &found {
+                    // One reply: what does not fit is the weakest.
+                    if out.len() + wifi::RECORD + b.ssid.len() > ipc::MAX_BYTES - 16 {
+                        break;
+                    }
+                    out.push(b.ssid.len() as u8);
+                    out.push(b.channel);
+                    out.push(b.security);
+                    out.push(b.rssi.unsigned_abs().min(255) as u8);
+                    out.extend_from_slice(&b.bssid);
+                    out.extend_from_slice(&b.ssid);
+                    n += 1;
+                }
+                Ok((n, out))
+            }
         }
     }
 
@@ -158,18 +203,25 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             "{} [chip ID read all ones: AFI error {} at {:#x}, BAR0 {:#x}]",
             what, code, addr, ep.bars[0]
         );
-    } else if !c.firmware {
-        what.push_str(", firmware missing");
-    } else {
-        let tcm = map(5, ep.bars[2], chip::BAR2_LEN)?;
-        what.push_str(&firmware(&bp, &tcm));
     }
-    what.push_str(", no data path yet");
-    Ok((Hw { rc }, irq, what))
+    let tcm = match ep.bars[2] {
+        0 => bar0,
+        a => map(5, a, chip::BAR2_LEN)?,
+    };
+    let mut mb = None;
+    if c.id != 0xFFFF && !c.firmware {
+        what.push_str(", firmware missing");
+    } else if c.id != 0xFFFF {
+        let (text, m) = firmware(&bp, &tcm);
+        what.push_str(&text);
+        mb = m;
+    }
+    Ok((Hw { rc, bar0, tcm, mb }, irq, what))
 }
 
-/// Boot the chip's firmware from the card; how it went, for `wifi status`.
-fn firmware(bp: &chip::Backplane, tcm: &Mmio) -> String {
+/// Boot the chip's firmware from the card: how it went, for `wifi
+/// status`, and the rings to it when it runs.
+fn firmware(bp: &chip::Backplane, tcm: &Mmio) -> (String, Option<msgbuf::Msgbuf>) {
     let cores = chip::cores(bp);
     let ids: Vec<String> = cores
         .iter()
@@ -178,7 +230,9 @@ fn firmware(bp: &chip::Backplane, tcm: &Mmio) -> String {
     println!("[wlan] {} cores: {}", cores.len(), ids.join(" "));
     let (image, text) = match (fs::read(chip::FW_PATH), fs::read(chip::NVRAM_PATH)) {
         (Ok(i), Ok(t)) => (i, t),
-        (Err(e), _) | (_, Err(e)) => return format!(", firmware unreadable ({})", err::name(e)),
+        (Err(e), _) | (_, Err(e)) => {
+            return (format!(", firmware unreadable ({})", err::name(e)), None)
+        }
     };
     let t0 = time::now_ns();
     match fw::boot(bp, tcm, &cores, &image, &fw::nvram(&text)) {
@@ -188,27 +242,68 @@ fn firmware(bp: &chip::Backplane, tcm: &Mmio) -> String {
                 "[wlan] firmware up in {} ms, shared area {:#x}",
                 ms, up.shared
             );
-            format!(
-                ", firmware up in {} ms (shared {:#x}, v{}, flags {:#x}); console: {}",
+            let (talk, mb) = match chip::find(&cores, chip::CORE_PCIE2) {
+                Some(pcie2) => control(bp, tcm, pcie2, &up),
+                None => (String::from("no PCIe2 core"), None),
+            };
+            let text = format!(
+                ", firmware up in {} ms (shared v{}, flags {:#x}); {}; console: {}",
                 ms,
-                up.shared,
                 up.flags & 0xFF,
                 up.flags,
-                fw::console_tail(tcm, up.console, 300)
-            )
+                talk,
+                fw::console_tail(tcm, up.console, 200)
+            );
+            (text, mb)
         }
         Err(e) => {
             println!("[wlan] firmware boot failed: {}", e);
-            format!(", firmware boot failed: {} [cores {}]", e, ids.join(" "))
+            let text = format!(", firmware boot failed: {} [cores {}]", e, ids.join(" "));
+            (text, None)
         }
     }
+}
+
+/// Rings up, the firmware's version, then the radio set up for scans.
+fn control(
+    bp: &chip::Backplane,
+    tcm: &Mmio,
+    pcie2: chip::Core,
+    up: &fw::Up,
+) -> (String, Option<msgbuf::Msgbuf>) {
+    let mut m = match msgbuf::Msgbuf::attach(bp, tcm, pcie2, up) {
+        Ok(m) => m,
+        Err(e) => return (format!("rings: {}", e), None),
+    };
+    let ver = match m.get_var(bp, tcm, "ver", 256) {
+        Ok(v) => {
+            let end = v
+                .iter()
+                .position(|&c| c == 0 || c == b'\n')
+                .unwrap_or(v.len());
+            String::from_utf8_lossy(&v[..end]).into_owned()
+        }
+        Err(e) => return (format!("ioctl ver: {}", e), None),
+    };
+    println!("[wlan] firmware: {}", ver);
+    let mut dev = wl::Dev {
+        mb: &mut m,
+        bp,
+        tcm,
+    };
+    let radio = match dev.init(&MAC) {
+        Ok(()) => String::from("radio up"),
+        Err(e) => format!("radio setup: {}", e),
+    };
+    println!("[wlan] {}", radio);
+    (format!("firmware {}, {}", ver, radio), Some(m))
 }
 
 libnx::entry!(main);
 
 fn main() -> i32 {
     let (mut backend, mut irq, mut diag) = match hardware() {
-        Ok((hw, irq, what)) => (Backend::Chip(hw), Some(irq), what),
+        Ok((hw, irq, what)) => (Backend::Chip(alloc::boxed::Box::new(hw)), Some(irq), what),
         Err(why) => {
             println!("[wlan] simulated adapter, {}", why);
             (
@@ -313,7 +408,7 @@ fn main() -> i32 {
                             match hardware() {
                                 Ok((hw, i, what)) => {
                                     let _ = sys::notify_bind(i.notification());
-                                    backend = Backend::Chip(hw);
+                                    backend = Backend::Chip(alloc::boxed::Box::new(hw));
                                     irq = Some(i);
                                     diag = what;
                                 }
