@@ -49,6 +49,9 @@ const AFI_INTR_CODE: usize = 0xB8;
 const AFI_INTR_CODE_MASK: u32 = 0xF;
 /// Legacy INTx from the endpoint: the interrupt the driver waits for.
 pub const AFI_INTR_LEGACY: u32 = 6;
+/// Master abort and presence sense: expected while the module resets
+/// (Linux logs them at debug level only).
+pub const AFI_INTR_BENIGN: [u32; 2] = [4, 10];
 const AFI_SM_INTR_ENABLE: usize = 0xC4;
 const AFI_AFI_INTR_ENABLE: usize = 0xC8;
 /// Error reporting: slave, decode, target, write and FPCI decode errors,

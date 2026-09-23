@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod chip;
+mod fw;
 mod pcie;
 mod sim;
 
@@ -23,7 +24,7 @@ use libnx::abi::proto::{eth, wifi};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::{ns, println, sys, time};
+use libnx::{fs, ns, println, sys, time};
 
 /// Station address while the real one is out of reach: the console
 /// keeps it in CAL0 on the eMMC, which nxk cannot read yet. Locally
@@ -132,7 +133,9 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
         ));
     }
     let bar0 = map(5, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
-    let c = chip::identify(&bar0, &|addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr));
+    let window = |addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr);
+    let bp = chip::Backplane::new(&bar0, &window);
+    let c = chip::identify(&bp);
     println!(
         "[wlan] BCM{:x} revision {}, firmware {}",
         c.id,
@@ -147,22 +150,58 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
     }
     // Errors reported by the AFI are worth seeing during bring-up.
     let irq = Irq::new(drv::dev_slot(7)).map_err(|e| format!("interrupt ({})", err::name(e)))?;
-    let mut what = format!(
-        "BCM{:x} rev {} on PCIe port {}, firmware {}, no data path yet",
-        c.id,
-        c.rev,
-        ep.port,
-        if c.firmware { "present" } else { "missing" }
-    );
-    // All ones: the read never reached the chip. The AFI says why.
+    let mut what = format!("BCM{:x} rev {} on PCIe port {}", c.id, c.rev, ep.port);
     if c.id == 0xFFFF {
+        // All ones: the read never reached the chip. The AFI says why.
         let (code, addr) = rc.afi_error();
         what = format!(
             "{} [chip ID read all ones: AFI error {} at {:#x}, BAR0 {:#x}]",
             what, code, addr, ep.bars[0]
         );
+    } else if !c.firmware {
+        what.push_str(", firmware missing");
+    } else {
+        let tcm = map(5, ep.bars[2], chip::BAR2_LEN)?;
+        what.push_str(&firmware(&bp, &tcm));
     }
+    what.push_str(", no data path yet");
     Ok((Hw { rc }, irq, what))
+}
+
+/// Boot the chip's firmware from the card; how it went, for `wifi status`.
+fn firmware(bp: &chip::Backplane, tcm: &Mmio) -> String {
+    let cores = chip::cores(bp);
+    let ids: Vec<String> = cores
+        .iter()
+        .map(|c| format!("{:x}/{}", c.id, c.rev))
+        .collect();
+    println!("[wlan] {} cores: {}", cores.len(), ids.join(" "));
+    let (image, text) = match (fs::read(chip::FW_PATH), fs::read(chip::NVRAM_PATH)) {
+        (Ok(i), Ok(t)) => (i, t),
+        (Err(e), _) | (_, Err(e)) => return format!(", firmware unreadable ({})", err::name(e)),
+    };
+    let t0 = time::now_ns();
+    match fw::boot(bp, tcm, &cores, &image, &fw::nvram(&text)) {
+        Ok(up) => {
+            let ms = (time::now_ns() - t0) / 1_000_000;
+            println!(
+                "[wlan] firmware up in {} ms, shared area {:#x}",
+                ms, up.shared
+            );
+            format!(
+                ", firmware up in {} ms (shared {:#x}, v{}, flags {:#x}); console: {}",
+                ms,
+                up.shared,
+                up.flags & 0xFF,
+                up.flags,
+                fw::console_tail(tcm, up.console, 300)
+            )
+        }
+        Err(e) => {
+            println!("[wlan] firmware boot failed: {}", e);
+            format!(", firmware boot failed: {} [cores {}]", e, ids.join(" "))
+        }
+    }
 }
 
 libnx::entry!(main);
@@ -205,7 +244,10 @@ fn main() -> i32 {
             Ok(rx) if rx.msg.is_notify() => {
                 if let (Some(i), Backend::Chip(hw)) = (irq.as_ref(), &backend) {
                     let code = hw.rc.interrupt();
-                    if code != 0 && code != pcie::AFI_INTR_LEGACY {
+                    if code != 0
+                        && code != pcie::AFI_INTR_LEGACY
+                        && !pcie::AFI_INTR_BENIGN.contains(&code)
+                    {
                         println!("[wlan] PCIe error, AFI code {}", code);
                     }
                     i.ack();
