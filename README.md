@@ -283,7 +283,8 @@ program that vanished without closing them (crash) are reclaimed.
   runs 5 to 12). Commands, scans (`wifi scan`) and joins (the
   firmware's own WPA2 supplicant) go through Broadcom's msgbuf rings;
   the data rings that carry frames are not written yet. Its firmware
-  and calibration data are proprietary and never in the repository: they are extracted from the console's own
+  and calibration data are proprietary and never in the repository:
+  they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
   ignores it), then copied to the card by `tools/mksd.py --firmware DIR`
   or `hwboot/mksd-hw.sh MOUNT DIR`, which put them in `/firmware/brcm`.
