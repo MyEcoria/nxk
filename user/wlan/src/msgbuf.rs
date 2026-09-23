@@ -87,7 +87,7 @@ const EPOCH_MODULO: u32 = 253;
 /// to send. Enough for key handshakes and light traffic.
 const PKT_LEN: usize = 2048;
 const RX_BUFS: usize = 64;
-const TX_BUFS: usize = 8;
+const TX_BUFS: usize = 32;
 const ETH_HLEN: usize = 14;
 /// TX post flags: an Ethernet frame, priority 0 (best effort).
 const PKT_FRAME_802_3: u8 = 0x01;
@@ -588,6 +588,11 @@ impl Msgbuf {
         self.commit(bp, tcm, FLOW);
         self.count[1] += 1;
         Ok(id)
+    }
+
+    /// A TX buffer is free for `send`.
+    pub fn tx_free(&self) -> bool {
+        self.tx.iter().any(|b| !b.busy)
     }
 
     /// Firmware status of send `id`, once it finished.

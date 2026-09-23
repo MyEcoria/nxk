@@ -39,8 +39,11 @@ const MTU: u64 = 1500;
 const SCAN_TIMEOUT: u64 = 3_000_000_000;
 /// Join time likewise: scan, authentication and the key handshake.
 const CONNECT_TIMEOUT: u64 = 15_000_000_000;
-/// While joined, firmware events are looked at this often at least.
-const HOUSEKEEPING_NS: u64 = 500_000_000;
+/// While joined, the rings are polled this often: received frames and
+/// firmware events have no interrupt yet.
+const POLL_NS: u64 = 2_000_000;
+/// Frames received and not read by `net` yet; older ones are dropped.
+const RX_QUEUE: usize = 256;
 
 /// The root complex, the chip's BAR0 and TCM, and the rings to its
 /// firmware when it runs.
@@ -52,6 +55,8 @@ struct Hw {
     /// Networks of the last scan: a join needs their security.
     seen: Vec<wl::Bss>,
     joined: Option<Joined>,
+    /// Frames for `wlan0` readers, oldest first.
+    rx: VecDeque<Vec<u8>>,
 }
 
 /// The network in use: SSID, channel, signal (-dBm), and on a WPA2
@@ -149,12 +154,19 @@ impl Hw {
     }
 
     /// Firmware events and frames that came on their own: rekeys are
-    /// answered, a lost link ends the join.
+    /// answered, data frames queued for `wlan0`, a lost link ends the
+    /// join.
     fn housekeeping(&mut self) {
         let Some(mut j) = self.joined.take() else {
             return;
         };
-        match self.dev(|d| d.housekeeping(j.sup.as_mut())) {
+        let mut rx = core::mem::take(&mut self.rx);
+        let r = self.dev(|d| d.housekeeping(j.sup.as_mut(), &mut rx));
+        while rx.len() > RX_QUEUE {
+            rx.pop_front();
+        }
+        self.rx = rx;
+        match r {
             Some(Ok(false)) => {
                 println!("[wlan] link lost");
                 return;
@@ -164,11 +176,19 @@ impl Hw {
         }
         self.joined = Some(j);
     }
+
+    /// A frame from `wlan0`; dropped while not joined, as a cable would.
+    fn send(&mut self, frame: &[u8]) -> Result<(), i64> {
+        if self.joined.is_none() {
+            return Ok(());
+        }
+        self.dev(|d| d.send(frame)).unwrap_or(Err(-ENOSYS))
+    }
 }
 
 enum Backend {
-    /// Chip on the bus; with its firmware running it scans and joins
-    /// (open and WPA2). The frames of the link are not carried yet.
+    /// Chip on the bus; with its firmware running it scans, joins (open
+    /// and WPA2) and carries the frames of `wlan0`.
     Chip(alloc::boxed::Box<Hw>),
     Sim(sim::Sim),
 }
@@ -327,6 +347,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             mb,
             seen: Vec::new(),
             joined: None,
+            rx: VecDeque::new(),
         },
         irq,
         what,
@@ -442,6 +463,14 @@ fn main() -> i32 {
     // before that, and `net` waits for the name rather than polling a
     // link that would answer nothing.
     let mut link_up = false;
+    let publish_link = |link_up: &mut bool| {
+        if !*link_up {
+            match publish(ep, "wlan0", wifi::BADGE_LINK) {
+                Ok(()) => *link_up = true,
+                Err(e) => println!("[wlan] cannot publish the link ({})", err::name(e)),
+            }
+        }
+    };
     if let Some(i) = irq.as_ref() {
         let _ = sys::notify_bind(i.notification());
     }
@@ -457,11 +486,16 @@ fn main() -> i32 {
             Some(d) => d.saturating_sub(time::now_ns()).max(1),
             None => 0,
         };
-        // Joined: firmware events (a lost link) are looked at regularly.
+        // Joined: the rings are polled, frames go to waiting readers.
         if let Backend::Chip(hw) = &mut backend {
             hw.housekeeping();
-            if hw.joined.is_some() && (wait == 0 || wait > HOUSEKEEPING_NS) {
-                wait = HOUSEKEEPING_NS;
+            while !readers.is_empty() {
+                let Some(f) = hw.rx.pop_front() else { break };
+                let (token, _) = readers.pop_front().unwrap();
+                let _ = ipc::reply_to(token, &ipc::pack(0, &f));
+            }
+            if hw.joined.is_some() && (wait == 0 || wait > POLL_NS) {
+                wait = POLL_NS;
             }
         }
         match ipc::recv_timeout(ep, wait) {
@@ -485,8 +519,20 @@ fn main() -> i32 {
                         m.mr[1] = MTU;
                         Some(m)
                     }
-                    // Simulated link: frames are accepted and dropped.
-                    (wifi::BADGE_LINK, eth::SEND) => Some(Msg::new(0, 0, 0)),
+                    (wifi::BADGE_LINK, eth::SEND) => {
+                        let n = ipc::unpack(&rx.msg, &mut buf);
+                        Some(match &mut backend {
+                            // Simulated link: frames are accepted and dropped.
+                            Backend::Sim(_) => Msg::new(0, 0, 0),
+                            Backend::Chip(_) if !(14..=14 + MTU as usize).contains(&n) => {
+                                Msg::error(-EINVAL)
+                            }
+                            Backend::Chip(hw) => match hw.send(&buf[..n]) {
+                                Ok(()) => Msg::new(0, 0, 0),
+                                Err(e) => Msg::error(e),
+                            },
+                        })
+                    }
                     (wifi::BADGE_LINK, eth::RECV) => {
                         let t = rx.msg.mr[0];
                         readers.push_back((rx.token, if t == 0 { 0 } else { time::now_ns() + t }));
@@ -512,15 +558,7 @@ fn main() -> i32 {
                         Some(match &mut backend {
                             Backend::Sim(s) => match s.connect(ssid, psk) {
                                 Ok(()) => {
-                                    if !link_up {
-                                        match publish(ep, "wlan0", wifi::BADGE_LINK) {
-                                            Ok(()) => link_up = true,
-                                            Err(e) => println!(
-                                                "[wlan] cannot publish the link ({})",
-                                                err::name(e)
-                                            ),
-                                        }
-                                    }
+                                    publish_link(&mut link_up);
                                     Msg::new(0, 0, 0)
                                 }
                                 Err(e) => Msg::error(e),
@@ -531,7 +569,10 @@ fn main() -> i32 {
                                     t => t,
                                 };
                                 match hw.connect(ssid, psk, t) {
-                                    Ok(()) => Msg::new(0, 0, 0),
+                                    Ok(()) => {
+                                        publish_link(&mut link_up);
+                                        Msg::new(0, 0, 0)
+                                    }
                                     Err(e) => Msg::error(e),
                                 }
                             }

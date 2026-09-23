@@ -2,11 +2,12 @@
 //! `fweh.c`, `cfg80211.c`): radio setup, events, scans, joins with our
 //! own WPA2 supplicant (`wpa`) and the keys it derives.
 
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EACCES, EINVAL, EIO, ENOENT, EOPNOTSUPP, ETIMEDOUT};
+use libnx::abi::err::{EACCES, EAGAIN, EINVAL, EIO, ENOENT, EOPNOTSUPP, ETIMEDOUT};
 use libnx::abi::proto::wifi;
 use libnx::drv::Mmio;
 use libnx::{println, sys, time};
@@ -595,6 +596,21 @@ impl Dev<'_> {
         self.mb.set_var(self.bp, self.tcm, "wsec_key", &k)
     }
 
+    /// A frame from `wlan0` onto the air: `EAGAIN` while every TX buffer
+    /// is in flight, for the sender to retry.
+    pub fn send(&mut self, frame: &[u8]) -> Result<(), i64> {
+        let (bp, tcm) = (self.bp, self.tcm);
+        let failed = |e: String| {
+            println!("[wlan] send: {}", e);
+            -EIO
+        };
+        self.mb.poll(bp, tcm).map_err(failed)?;
+        if !self.mb.tx_free() {
+            return Err(-EAGAIN);
+        }
+        self.mb.send(bp, tcm, frame).map(|_| ()).map_err(failed)
+    }
+
     /// Leave the network (`brcmf_link_down`).
     pub fn disconnect(&mut self) -> Result<(), String> {
         let mut scb = [0u8; 12];
@@ -623,9 +639,13 @@ impl Dev<'_> {
     }
 
     /// Events and frames that arrived on their own: key handshakes (group
-    /// rekeys) answered, the other frames dropped until `wlan0` carries
-    /// them. False once the link is lost.
-    pub fn housekeeping(&mut self, mut sup: Option<&mut Supplicant>) -> Result<bool, String> {
+    /// rekeys) answered, the other frames queued on `rx` for `wlan0`.
+    /// False once the link is lost.
+    pub fn housekeeping(
+        &mut self,
+        mut sup: Option<&mut Supplicant>,
+        rx: &mut VecDeque<Vec<u8>>,
+    ) -> Result<bool, String> {
         self.mb.poll(self.bp, self.tcm)?;
         let mut up = true;
         let mut eapol = Vec::new();
@@ -642,6 +662,8 @@ impl Dev<'_> {
         while let Some(f) = self.mb.frame() {
             if wpa::is_eapol(&f) {
                 eapol.push(f);
+            } else {
+                rx.push_back(f);
             }
         }
         for f in eapol {
