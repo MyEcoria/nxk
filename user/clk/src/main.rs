@@ -542,6 +542,29 @@ fn pex_pads_on(pmc: &Mmio) {
     );
 }
 
+/// `PCIE_LINK`: the PCIEXCLK reset alone. Linux `tegra_pcie_pm_resume`
+/// programs the AFI (crossbar, port enables) with it held, then releases
+/// it before enabling the ports. Only once the root complex is up.
+fn pcie_link(car: &Mmio, pmc: Option<&Mmio>, label: u32) -> (i64, u64) {
+    let ready = table(proto::PCIE).is_some_and(|d| status(car, pmc, &d) == proto::ST_READY);
+    match label {
+        proto::ENABLE | proto::DISABLE if !ready => (EIO, 0),
+        proto::ENABLE => {
+            car.w32(U.rst_set + CLR, PCIEXCLK_RESET);
+            let _ = car.r32(U.rst);
+            (0, 0)
+        }
+        proto::DISABLE => {
+            car.w32(U.rst_set, PCIEXCLK_RESET);
+            let _ = car.r32(U.rst);
+            (0, 0)
+        }
+        proto::STATUS if car.r32(U.rst) & PCIEXCLK_RESET == 0 => (0, proto::ST_OUT_OF_RESET),
+        proto::STATUS => (0, 0),
+        _ => (EINVAL, 0),
+    }
+}
+
 fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
     if d.needs == Needs::Pcie {
         if status(car, pmc, d) == proto::ST_READY {
@@ -622,6 +645,12 @@ fn main() -> i32 {
     let ep = drv::publish("clk").expect("clk: publish");
     println!("[clk] clock service ready");
     drv::serve(ep, |rx| {
+        if rx.msg.mr[0] == proto::PCIE_LINK {
+            let (r, st) = pcie_link(&car, pmc.as_ref(), rx.msg.label());
+            let mut m = Msg::new(r as u32, 1, 0);
+            m.mr[0] = st;
+            return Some(m);
+        }
         let mut st = 0;
         let r = match (rx.msg.label(), table(rx.msg.mr[0])) {
             (proto::ENABLE, Some(d)) => enable(&car, pmc.as_ref(), &d),

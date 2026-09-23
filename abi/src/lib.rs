@@ -691,6 +691,9 @@ pub mod proto {
         /// out of deep power-down, AFI, PCIE and PCIEXCLK out of reset.
         /// STATUS reply word 1: PMC IO_DPD_STATUS (pads still powered down).
         pub const PCIE: u64 = 24;
+        /// PCIEXCLK reset alone, once `PCIE` is ready: DISABLE holds the
+        /// link logic while the AFI is programmed, ENABLE releases it.
+        pub const PCIE_LINK: u64 = 25;
     }
     /// I2C bus.
     pub mod i2c {
