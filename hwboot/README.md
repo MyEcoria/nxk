@@ -365,6 +365,29 @@ seconds (each 512-character line is echoed back before the next).
     221 ms). Data frames arrive on the RX completion ring (only EAPOL
     comes as events). With the rings polled every 2 ms while joined,
     `wlan` used 99 ms of CPU in 10 s idle.
+16. 23/09/2026, Erista, `wlan` over USB-C: **chip interrupts**. The
+    PCIe2 mailbox raises INTx, on the AFI's line (SPI 98) `wlan` already
+    held; the rings are drained on it, a 500 ms poll as a safety net.
+    Idle while joined `wlan` now uses no measurable CPU (99 ms per 10 s
+    with the 2 ms poll); an HTTP GET takes 160 to 270 ms, 60 in a row
+    and 10 idle minutes went fine. Two driver bugs showed up and are
+    fixed. Reading right after the interrupt caught completions before
+    their DMA landed: the reader expected sequence numbers this firmware
+    leaves at 0 on control completions, so items are now cleared once
+    read and one still reading type 0 waits. And `wifi status` on a chip
+    that had stopped answering read its whole 64 KiB console a byte at a
+    time, each read stalling about 0.65 ms: `wlan` spent 42.9 s of CPU
+    there, then died (the "43 s of CPU" of commit `e5f7c9e`). It now
+    reads the last 600 bytes, and nothing once the chip is gone.
+    Still open: in about half the runs with `net` attached, the chip
+    stopped answering one to a few minutes after the join, with the link
+    still up at the root port (DL active), no mailbox data, no deep sleep
+    request and no AFI error: the chip itself resets or hangs. Once the
+    completion rings stalled instead (transmit completions at 110 of
+    142, receive at 131 of 140), with 16 control messages of an unknown
+    type (0x1D) and a received frame read 16 bytes late, as if the chip's
+    DMA writes landed 16 bytes low. `wifi status` now shows the link, the
+    chip's config space once it is gone, and the next unread items.
 
 ## Hardware test (once the SD card is back in the PC)
 

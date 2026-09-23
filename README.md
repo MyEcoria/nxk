@@ -236,7 +236,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the rings are polled every 2 ms while joined (no chip interrupt yet). WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the chip sometimes stops answering a few minutes after a join (hardware run 16, cause unknown): `wlan` reports it in `wifi status` and `restart wlan` brings it back. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -288,8 +288,11 @@ program that vanished without closing them (crash) are reclaimed.
   the replies leave on the TX flow ring, and the keys go back with
   `wsec_key`. Their known-answer and handshake tests run on the PC:
   `rustc --edition 2021 --test user/wlan/hosttest.rs -o T && ./T`.
-  Data frames use the RX and TX rings; with no chip interrupt yet they
-  are polled every 2 ms while joined (about 1% of a core). Its firmware
+  Data frames use the RX and TX rings, drained on the chip's interrupt
+  (a 500 ms poll stays as a safety net). The chip still stops answering
+  at times, a few minutes after a join (`wifi status`: `chip
+  unreachable`, with the link and the chip's config space as they are
+  then); `restart wlan` brings it back. Its firmware
   and calibration data are proprietary and never in the repository:
   they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
