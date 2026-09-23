@@ -327,8 +327,15 @@ seconds (each 512-character line is echoed back before the next).
     ...); the console's own firmware, copied into the TCM with its
     NVRAM, publishes its shared area (version 5, flags 0x20005) 200 ms
     after the ARM is released, and its console reads `wl0: Broadcom
-    BCM4356 802.11 Wireless Controller 7.35.252.108`. Next: the msgbuf
-    rings and the first commands.
+    BCM4356 802.11 Wireless Controller 7.35.252.108`.
+12. 23/09/2026, Erista, `wlan` over USB-C: **`wifi scan` lists the
+    networks around** (about 40, 2.4 and 5 GHz, signal, security and
+    BSSID). The msgbuf rings work first time: five common rings in
+    uncached DMA memory, indices in the TCM, doorbell through the PCIe2
+    mailbox, completions polled with their sequence numbers checked.
+    The firmware answers `ver` (`version 7.35.252.108`, built 29 Aug
+    2021) and `cur_etheraddr` (00:90:4c:1a:a0:01, Broadcom's
+    placeholder: nxk sets its own address), then scans with `escan`.
 
 ## Hardware test (once the SD card is back in the PC)
 
