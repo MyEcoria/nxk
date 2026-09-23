@@ -233,7 +233,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification; publishes the link as `wlan0` once associated and its control as `wifi` | firmware upload and the ring protocol that carries frames are missing: the chip is found, the link stays down. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification; publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | firmware upload and the ring protocol that carries frames are missing: the chip is found, the link stays down. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a

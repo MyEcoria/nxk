@@ -242,6 +242,19 @@ The last `usbcon:` line locates a failure:
    GPIO registers (0x80+) did not take, hekate's read-modify-write on
    the plain ones does, and `sd` touching SDMMC1 before its clock was
    enabled stalled the APB bus, which killed `usbcon` with it.
+5. 23/09/2026, Erista, commit `54686c7`, firmware on the card: Wi-Fi
+   stopped at its first step, `wifi status` reading
+   `PCIe rail (PMIC LDO1): ETIMEDOUT`. `power` and I2C were fine
+   (`temp`, `date`); `wlan` had given up its 2 s wait for `power`.
+   Cause: UART-A drained 1.81 ms per byte (~5.4 kbaud, a ~19.2 MHz
+   clock under a divisor computed for PLLP), and every service's log
+   line waits for `console` to push it out, so the boot log alone
+   delayed `power` past 2 s (`console` spent 8.8 s of CPU printing
+   about 5 KB of shell output). An emulator console slowed to that rate
+   reproduces the same message. Fixed since: nxk-bl31 and the kernel
+   select PLLP for UART-A (hekate's `clock_enable_uart`), `wlan` waits
+   5 s and `wifi retry` reruns the bring-up without a reboot. Not
+   re-run on hardware yet.
 
 ## Hardware test (once the SD card is back in the PC)
 
