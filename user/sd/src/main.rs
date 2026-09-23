@@ -10,12 +10,12 @@ mod board;
 
 use libnx::abi::err::{EINVAL, EIO, ETIMEDOUT};
 use libnx::abi::prot;
-use libnx::abi::proto::{blk, clk, display};
+use libnx::abi::proto::{blk, clk};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
-use libnx::{ns, println, sys, time};
+use libnx::{println, sys, time};
 
 use board::Board;
 
@@ -365,20 +365,6 @@ fn map(slot: u32, phys: u64) -> Mmio {
     Mmio::map(drv::dev_slot(slot), phys, 0x1000).expect("sd: registers")
 }
 
-/// Console line, mirrored to the screen: on a Switch without UART it is
-/// the only output until `usbcon` has a PC attached.
-fn status(screen: Option<u32>, text: &str) {
-    println!("[sd] {}", text);
-    if let Some(h) = screen {
-        let mut b = [0u8; 96];
-        let n = text.len().min(b.len() - 5);
-        b[..4].copy_from_slice(b"sd: ");
-        b[4..4 + n].copy_from_slice(&text.as_bytes()[..n]);
-        b[4 + n] = b'\n';
-        let _ = ipc::call(h, &ipc::pack(display::WRITE, &b[..5 + n]));
-    }
-}
-
 /// Slot power then controller clock. Card detect only reports: a card
 /// that answers beats a detect line read wrong.
 fn bring_up(board: &Board) -> Result<(), i64> {
@@ -395,7 +381,6 @@ fn bring_up(board: &Board) -> Result<(), i64> {
 
 fn main() -> i32 {
     let regs = map(0, SDMMC1);
-    let screen = ns::wait_for_timeout("display", 5_000_000_000).ok();
     let board = Board::new(
         map(1, board::APB_MISC),
         map(2, board::PINMUX),
@@ -426,17 +411,8 @@ fn main() -> i32 {
         card.init(&board)
     });
     if let Err(e) = r {
-        let mut msg = [0u8; 48];
-        let name = libnx::abi::err::name(e);
-        let head = b"no usable card (";
-        msg[..head.len()].copy_from_slice(head);
-        let n = name.len().min(msg.len() - head.len() - 1);
-        msg[head.len()..head.len() + n].copy_from_slice(&name.as_bytes()[..n]);
-        msg[head.len() + n] = b')';
-        status(
-            screen,
-            core::str::from_utf8(&msg[..head.len() + n + 1]).unwrap_or("no usable card"),
-        );
+        let why = alloc::format!("no usable card ({})", libnx::abi::err::name(e));
+        drv::report("sd", &why);
         if clocked {
             card.stop();
         }

@@ -6,7 +6,25 @@ use nxk_abi::rights::{DUP, GRANT, SEND};
 use nxk_abi::slots;
 
 use crate::ipc::{self, Msg, Received};
+use crate::ns::Service;
 use crate::{ns, sys};
+
+/// Found on first use: the screen may still be starting.
+static DISPLAY: Service = Service::new("display", 5_000_000_000);
+
+/// Text for the bottom lines of the screen (`display` WRITE).
+pub fn screen(text: &str) -> Result<(), i64> {
+    DISPLAY
+        .call(&ipc::pack(nxk_abi::proto::display::WRITE, text.as_bytes()))
+        .map(|_| ())
+}
+
+/// A driver failure: `[who] text` on the console, `who: text` on the
+/// screen, a Switch's only output without a PC attached.
+pub fn report(who: &str, text: &str) {
+    crate::println!("[{}] {}", who, text);
+    let _ = screen(&alloc::format!("{}: {}\n", who, text));
+}
 
 /// Hardware capability number `k` received from init.
 pub const fn dev_slot(k: u32) -> u32 {

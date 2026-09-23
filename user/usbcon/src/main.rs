@@ -12,12 +12,12 @@ extern crate alloc;
 mod udc;
 
 use libnx::abi::err::EINVAL;
-use libnx::abi::proto::{clk, console as con, display, usbcon as proto};
+use libnx::abi::proto::{clk, console as con, usbcon as proto};
 use libnx::abi::rights::{GRANT, SIGNAL};
 use libnx::abi::slots;
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::{ns, println, sys};
+use libnx::{println, sys};
 
 use udc::{bit, Dir, EpType, Udc};
 
@@ -121,7 +121,6 @@ struct Stats {
 struct Dev {
     udc: Udc,
     term: u32,
-    screen: Option<u32>,
     /// Terminal open on the host (configured, DTR up): output flows.
     online: bool,
     /// Last byte of a transfer that was a whole number of packets, sent
@@ -140,19 +139,10 @@ struct Dev {
 }
 
 impl Dev {
-    /// Fatal status: on the console and on the screen (the only output
-    /// of a Switch without UART). Connection changes only log: the home
-    /// screen shows them as statistics.
+    /// Fatal status: on the console and the screen. Connection changes
+    /// only log: the home screen shows them as statistics.
     fn fatal(&self, text: &str) {
-        println!("[usbcon] {}", text);
-        if let Some(h) = self.screen {
-            let mut b = [0u8; 96];
-            let n = text.len().min(b.len() - 9);
-            b[..8].copy_from_slice(b"usbcon: ");
-            b[8..8 + n].copy_from_slice(&text.as_bytes()[..n]);
-            b[8 + n] = b'\n';
-            let _ = ipc::call(h, &ipc::pack(display::WRITE, &b[..9 + n]));
-        }
+        drv::report("usbcon", text);
     }
 
     fn max_packet(&self) -> usize {
@@ -442,16 +432,12 @@ libnx::entry!(main);
 fn main() -> i32 {
     // Resources: registers, APB_MISC, fuses, IRQ (init's order).
     let misc = Mmio::map(drv::dev_slot(1), APB_MISC, 0x1000).expect("usbcon: APB_MISC");
-    // `display` publishes after its panel setup, and usbcon now starts
-    // before it finishes: without this wait the screen gets no status.
-    let screen = ns::wait_for_timeout("display", 5_000_000_000).ok();
     let mut dev = Dev {
         udc: {
             let regs = Mmio::map(drv::dev_slot(0), USB_BASE, 0x2000).expect("usbcon: registers");
             Udc::new(regs).expect("usbcon: DMA memory")
         },
         term: slots::TERMINAL,
-        screen,
         online: false,
         carry: None,
         stats: Stats::default(),

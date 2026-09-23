@@ -565,14 +565,9 @@ fn power_cmd(label: u32) {
 }
 
 fn fbecho(text: &str) {
-    let Some(h) = service("display") else { return };
-    let mut t = alloc::string::String::from(text);
-    t.push('\n');
-    let _ = ipc::call(
-        h,
-        &ipc::pack(libnx::abi::proto::display::WRITE, t.as_bytes()),
-    );
-    let _ = sys::handle_close(h);
+    if let Err(e) = libnx::drv::screen(&alloc::format!("{}\n", text)) {
+        println!("fbecho: {}", err::name(e));
+    }
 }
 
 fn events(n: u32) {
