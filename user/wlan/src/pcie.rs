@@ -606,9 +606,14 @@ impl Pcie {
     }
 
     /// Configuration write to the endpoint (bus 1, device 0): the
-    /// driver moves its BAR0 backplane window this way.
+    /// driver moves its BAR0 backplane window this way. Read back, and
+    /// rewritten once if it did not take (`brcmf_pcie_select_core`): a
+    /// posted BAR write may overtake this non-posted one otherwise.
     pub fn ep_cfg_write(&self, off: usize, v: u32) {
         self.cfg_write(1, 0, off, v);
+        if self.cfg_read(1, 0, off) != v {
+            self.cfg_write(1, 0, off, v);
+        }
     }
 
     /// Latched AFI error code and the address it hit, left in place: why
