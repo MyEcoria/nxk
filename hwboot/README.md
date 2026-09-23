@@ -266,7 +266,20 @@ The last `usbcon:` line locates a failure:
    Horizon's Icosa values to those seven pads, lifts PERST# 100 ms after
    the module powers up, and a failed link reports pads, PH pins and
    port registers in `wifi status`. The BAR window also grew to 8 MiB
-   for the chip's 4 MiB BAR2. Not re-run on hardware yet.
+   for the chip's 4 MiB BAR2.
+7. 23/09/2026, Erista, commit `6144ac3`: the readback confirmed run 6.
+   WIFI_EN/RST were `0x74` (parked, tristated: no earlier build ever
+   drove them) and the PEX pads `0x460`/`0x470` (parked); all now as
+   Horizon sets them, PH0/PH1 driven high, PERST# released and REFCLK
+   on (`AFI_PEX_CTRL` 0x1b), UPHY PLL locked. Still no link on either
+   port. Next suspects, all from Linux's T210 sequence and changed
+   since: PCIEXCLK was released before the AFI crossbar and port
+   enables were programmed (now held across them via `clk`
+   `PCIE_LINK`), the UPHY AUX mux clamps in `ELPG_PROGRAM1` were never
+   released, and the PEX bias/REFCLK pads may sit in PMC deep
+   power-down (`clk` lifts it). The report adds `ELPG_PROGRAM1`, the
+   lane power registers, `IO_DPD_STATUS` and PCIEXCLK. Not re-run on
+   hardware yet.
 
 ## Hardware test (once the SD card is back in the PC)
 

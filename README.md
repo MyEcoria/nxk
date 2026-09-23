@@ -275,7 +275,7 @@ program that vanished without closing them (crash) are reclaimed.
   WIFI_EN on PH0, WIFI_RST on PH1), sets the PEX and module pads as
   Horizon does, brings the PCIe root complex up, then should train the
   link and read the BCM4356 chip identity. On hardware the link has not
-  trained yet (`hwboot/README.md`, runs 5 and 6), and the firmware
+  trained yet (`hwboot/README.md`, runs 5 to 7), and the firmware
   upload and Broadcom's ring protocol are not written, so no frame
   moves. Its firmware and calibration data are proprietary
   and never in the repository: they are extracted from the console's own
