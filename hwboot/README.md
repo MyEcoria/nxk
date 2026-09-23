@@ -321,6 +321,14 @@ seconds (each 512-character line is echoed back before the next).
     UPHY PLL, which still read locked, did. Each start now resets the
     root complex through `clk` and calibrates the PLL from scratch;
     repeated restarts identify the BCM4356 every time.
+11. 23/09/2026, Erista, commit `8f18e6e` plus `wlan` over USB-C:
+    **the Wi-Fi firmware runs**. The enumeration ROM lists 9 cores
+    (ChipCommon rev 47, 802.11 rev 48, ARM CR4 rev 6, PCIe2 rev 11,
+    ...); the console's own firmware, copied into the TCM with its
+    NVRAM, publishes its shared area (version 5, flags 0x20005) 200 ms
+    after the ARM is released, and its console reads `wl0: Broadcom
+    BCM4356 802.11 Wireless Controller 7.35.252.108`. Next: the msgbuf
+    rings and the first commands.
 
 ## Hardware test (once the SD card is back in the PC)
 
