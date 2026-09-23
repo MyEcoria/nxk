@@ -137,16 +137,15 @@ const DRIVERS: &[Driver] = &[
     },
     // Wi-Fi: PCIe root complex (ports, PADS, AFI), the 4 KiB
     // configuration window, the pad control block holding the UPHY
-    // lanes, APB_MISC / pinmux / GPIO for the module's enable and reset
-    // pins, then the two downstream windows the endpoint's BARs land
-    // in. IRQ: SPI 98 (AFI, legacy INTx included).
+    // lanes, pinmux / GPIO for the PEX and module pads, then the two
+    // downstream windows the endpoint's BARs land in. IRQ: SPI 98 (AFI,
+    // legacy INTx included).
     Driver {
         name: "wlan",
         mmio: &[
             (0x0100_0000, 0x4000),
             (0x0200_0000, 0x1000),
             (0x7009_F000, 0x1000),
-            (0x7000_0000, 0x1000),
             (0x7000_3000, 0x1000),
             (0x6000_D000, 0x1000),
             (0x1300_0000, 0x80_0000),

@@ -102,19 +102,21 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
     let regs = map(0, pcie::PCIE_BLOCK, pcie::PCIE_BLOCK_LEN)?;
     let cfg = map(1, pcie::CFG_WINDOW, pcie::CFG_WINDOW_LEN)?;
     let padctl = map(2, pcie::PADCTL, 0x1000)?;
-    let misc = map(3, pcie::APB_MISC, 0x1000)?;
-    let pinmux = map(4, pcie::PINMUX, 0x1000)?;
-    let gpio = map(5, pcie::GPIO, 0x1000)?;
-    let rc = pcie::Pcie::new(regs, cfg, padctl, misc, pinmux, gpio);
+    let pinmux = map(3, pcie::PINMUX, 0x1000)?;
+    let gpio = map(4, pcie::GPIO, 0x1000)?;
+    let rc = pcie::Pcie::new(regs, cfg, padctl, pinmux, gpio);
 
     let ep = match rc.bring_up() {
         Ok(ep) => ep,
         Err(f) => {
             rc.module_off();
-            let why = match f.value {
+            let mut why = match f.value {
                 Some(v) => format!("{}: {} (read {:#010x})", f.step, err::name(f.err), v),
                 None => format!("{}: {}", f.step, err::name(f.err)),
             };
+            if !f.detail.is_empty() {
+                why = format!("{} [{}]", why, f.detail);
+            }
             println!("[wlan] no PCIe device, {}", why);
             return Err(why);
         }
@@ -129,7 +131,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             ep.vendor, ep.device
         ));
     }
-    let bar0 = map(6, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
+    let bar0 = map(5, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
     let c = chip::identify(&bar0, &|addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr));
     println!(
         "[wlan] BCM{:x} revision {}, firmware {}",
@@ -144,7 +146,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
         );
     }
     // Errors reported by the AFI are worth seeing during bring-up.
-    let irq = Irq::new(drv::dev_slot(8)).map_err(|e| format!("interrupt ({})", err::name(e)))?;
+    let irq = Irq::new(drv::dev_slot(7)).map_err(|e| format!("interrupt ({})", err::name(e)))?;
     let what = format!(
         "BCM{:x} rev {} on PCIe port {}, firmware {}, no data path yet",
         c.id,

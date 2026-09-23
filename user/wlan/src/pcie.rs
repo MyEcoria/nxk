@@ -3,6 +3,9 @@
 //! and `drivers/phy/tegra/xusb-tegra210.c` (T210 data), clocks and the
 //! power partition through the `clk` service.
 
+use alloc::string::String;
+use core::fmt::Write;
+
 use libnx::abi::err::{EIO, ENODEV, ENXIO, ETIMEDOUT};
 use libnx::abi::proto::{clk, power};
 use libnx::drv::Mmio;
@@ -158,22 +161,42 @@ const CFG_PRIMARY_BUS: usize = 0x18;
 /// Module control pins (Switch): WIFI_EN on PH0, WIFI_RST on PH1
 /// (hekate `PINMUX_AUX_WIFI_EN`/`_RST`, Switch device tree `wifi_en_ph0`
 /// and `wifi_rst_ph1`).
-pub const APB_MISC: u64 = 0x7000_0000;
 pub const PINMUX: u64 = 0x7000_3000;
 pub const GPIO: u64 = 0x6000_D000;
-const PIN_WIFI_EN: usize = 0x1B4;
-const PIN_WIFI_RST: usize = 0x1B8;
-const GP_WIFI_EN_CFGPADCTRL: usize = 0xB64;
-const GP_WIFI_RST_CFGPADCTRL: usize = 0xB68;
-const PINMUX_TRISTATE: u32 = 1 << 4;
-/// Function 1 of both pins: plain GPIO output.
-const PINMUX_FUNC_RSVD1: u32 = 1;
 const PORT_H: usize = 7;
 const PIN_EN: u32 = 1 << 0;
 const PIN_RST: u32 = 1 << 1;
 const GPIO_CNF: usize = 0x00;
 const GPIO_OE: usize = 0x10;
 const GPIO_OUT: usize = 0x20;
+const GPIO_IN: usize = 0x30;
+
+// Pinmux pad fields.
+const PINMUX_PM: u32 = 0x3;
+const PINMUX_PUPD: u32 = 0x3 << 2;
+const PINMUX_TRISTATE: u32 = 1 << 4;
+const PINMUX_PARK: u32 = 1 << 5;
+const PINMUX_E_INPUT: u32 = 1 << 6;
+const PINMUX_E_IO_HV: u32 = 1 << 10;
+const PINMUX_E_OD: u32 = 1 << 11;
+const PAD_OUT_CLEAR: u32 =
+    PINMUX_PM | PINMUX_TRISTATE | PINMUX_PARK | PINMUX_E_INPUT | PINMUX_E_OD | PINMUX_E_IO_HV;
+const PAD_IN_CLEAR: u32 = PINMUX_PM | PINMUX_PUPD | PINMUX_PARK | PINMUX_E_OD | PINMUX_E_IO_HV;
+const PAD_IN: u32 = PINMUX_TRISTATE | PINMUX_E_INPUT;
+/// Pads as Horizon sets them on Icosa (Atmosphère
+/// `pinmux_initial_pad_config_icosa.inc`): (offset, clear, set). Function
+/// 0 everywhere: PE0/PE1 on the PEX pads, GPIO-owned on the module pins.
+/// Its pinmux driver also clears PARK on every pad: a parked pad does not
+/// follow its function or GPIO (hekate's `usbd.c` does the same).
+const PADS: [(usize, u32, u32); 7] = [
+    (0x038, PAD_OUT_CLEAR, 0),     // PEX_L0_RST_N: PERST# of port 0
+    (0x03C, PAD_IN_CLEAR, PAD_IN), // PEX_L0_CLKREQ_N: gates REFCLK
+    (0x040, PAD_IN_CLEAR, PAD_IN), // PEX_WAKE_N
+    (0x044, PAD_OUT_CLEAR, 0),     // PEX_L1_RST_N: PERST# of port 1
+    (0x048, PAD_IN_CLEAR, PAD_IN), // PEX_L1_CLKREQ_N
+    (0x1B4, PAD_OUT_CLEAR, 0),     // WIFI_EN (PH0)
+    (0x1B8, PAD_OUT_CLEAR, 0),     // WIFI_RST (PH1)
+];
 
 /// Where bring-up stopped, with the value that said so: the only way
 /// to tell a dead rail from an untrained link without a UART.
@@ -183,6 +206,8 @@ pub struct Fail {
     /// Register that decided it, when one did: 0 and 0xFFFFFFFF are both
     /// meaningful (nothing there vs a bus error), hence the option.
     pub value: Option<u32>,
+    /// Register readback for the steps a single value cannot explain.
+    pub detail: String,
 }
 
 impl Fail {
@@ -191,6 +216,7 @@ impl Fail {
             step,
             err,
             value: None,
+            detail: String::new(),
         }
     }
 
@@ -199,6 +225,7 @@ impl Fail {
             step,
             err,
             value: Some(value),
+            detail: String::new(),
         }
     }
 }
@@ -216,18 +243,16 @@ pub struct Pcie {
     regs: Mmio,
     cfg: Mmio,
     padctl: Mmio,
-    misc: Mmio,
     pinmux: Mmio,
     gpio: Mmio,
 }
 
 impl Pcie {
-    pub fn new(regs: Mmio, cfg: Mmio, padctl: Mmio, misc: Mmio, pinmux: Mmio, gpio: Mmio) -> Self {
+    pub fn new(regs: Mmio, cfg: Mmio, padctl: Mmio, pinmux: Mmio, gpio: Mmio) -> Self {
         Self {
             regs,
             cfg,
             padctl,
-            misc,
             pinmux,
             gpio,
         }
@@ -247,16 +272,21 @@ impl Pcie {
         let _ = self.gpio.r32(reg + off);
     }
 
+    /// PEX and module pads to Horizon's settings; returns what they held
+    /// before, for the report if the link does not come up.
+    fn pads(&self) -> [u32; PADS.len()] {
+        let mut before = [0; PADS.len()];
+        for (k, &(off, clear, set)) in PADS.iter().enumerate() {
+            before[k] = self.pinmux.r32(off);
+            self.pinmux.w32(off, (before[k] & !clear) | set);
+        }
+        let _ = self.pinmux.r32(PADS[0].0);
+        before
+    }
+
     /// Wi-Fi module out of reset: pins as GPIO outputs, enable high,
     /// reset released after it. The chip needs the rail before this.
     fn module_on(&self) {
-        self.misc.w32(GP_WIFI_EN_CFGPADCTRL, 0);
-        self.misc.w32(GP_WIFI_RST_CFGPADCTRL, 0);
-        for pin in [PIN_WIFI_EN, PIN_WIFI_RST] {
-            let v = self.pinmux.r32(pin);
-            self.pinmux
-                .w32(pin, (v & !(PINMUX_TRISTATE | 3)) | PINMUX_FUNC_RSVD1);
-        }
         let both = PIN_EN | PIN_RST;
         self.gpio_set(GPIO_CNF, both, both);
         self.gpio_set(GPIO_OUT, both, 0);
@@ -266,7 +296,8 @@ impl Pcie {
         // Datasheet-style power-on: enable settles before reset lifts.
         time::sleep_ms(5);
         self.gpio_set(GPIO_OUT, PIN_RST, PIN_RST);
-        time::sleep_ms(10);
+        // PCIe T_PVPERL: power stable 100 ms before PERST# lifts.
+        time::sleep_ms(100);
     }
 
     /// Module pins back down, in reverse order.
@@ -569,6 +600,7 @@ impl Pcie {
         if id as u16 != VENDOR_NVIDIA {
             return Err(Fail::read("no NVIDIA root port", -ENODEV, id));
         }
+        let before = self.pads();
         self.module_on();
         self.uphy_pll()
             .map_err(|e| Fail::new("UPHY PLL of the PCIe lanes", e))?;
@@ -589,15 +621,52 @@ impl Pcie {
             );
         }
         let port = found.ok_or_else(|| {
-            Fail::read(
+            let mut f = Fail::read(
                 "no link on either port",
                 -ENODEV,
                 self.port(0).r32(RP_VEND_XP),
-            )
+            );
+            f.detail = self.link_report(&before);
+            f
         })?;
         println!("[wlan] PCIe port {}: link up", port);
         self.enumerate(port)
             .map_err(|e| Fail::new("endpoint behind the port", e))
+    }
+
+    /// Why no link came up, as far as registers tell: each pad before and
+    /// after `pads`, the module pins as driven and as read back, then per
+    /// port its PERST#/REFCLK control, link status and data-link state.
+    fn link_report(&self, before: &[u32; PADS.len()]) -> String {
+        let mut s = String::from("pads");
+        for (k, &(off, ..)) in PADS.iter().enumerate() {
+            let _ = write!(s, " {:x}>{:x}", before[k], self.pinmux.r32(off));
+        }
+        let h = (PORT_H >> 2) * 0x100 + (PORT_H & 3) * 4;
+        let _ = write!(
+            s,
+            "; PH out {:x} in {:x}",
+            self.gpio.r32(GPIO_OUT + h),
+            self.gpio.r32(GPIO_IN + h)
+        );
+        let afi = self.afi();
+        for (i, &ctrl) in AFI_PEX_CTRL.iter().enumerate() {
+            let rp = self.port(i);
+            let _ = write!(
+                s,
+                "; port {} ctrl {:x} link {:x} xp {:x}",
+                i,
+                afi.r32(ctrl),
+                rp.r32(RP_LINK_CONTROL_STATUS),
+                rp.r32(RP_VEND_XP)
+            );
+        }
+        let _ = write!(
+            s,
+            "; UPHY PLL {:x}",
+            self.padctl.r32(PADCTL_UPHY_PLL_P0_CTL1)
+        );
+        s
     }
 
     /// One endpoint behind the port: bus numbers, BARs placed in our
