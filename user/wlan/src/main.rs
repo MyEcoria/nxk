@@ -10,11 +10,13 @@
 extern crate alloc;
 
 mod chip;
+mod crypto;
 mod fw;
 mod msgbuf;
 mod pcie;
 mod sim;
 mod wl;
+mod wpa;
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -47,16 +49,18 @@ struct Hw {
     bar0: Mmio,
     tcm: Mmio,
     mb: Option<msgbuf::Msgbuf>,
-    /// Networks of the last scan, with their security: a join needs it.
-    seen: Vec<(Vec<u8>, u8)>,
+    /// Networks of the last scan: a join needs their security.
+    seen: Vec<wl::Bss>,
     joined: Option<Joined>,
 }
 
-/// The network in use: SSID, channel, signal (-dBm).
+/// The network in use: SSID, channel, signal (-dBm), and on a WPA2
+/// network the supplicant that answers its rekeys.
 struct Joined {
     ssid: Vec<u8>,
     channel: u64,
     signal: u64,
+    sup: Option<wpa::Supplicant>,
 }
 
 impl Hw {
@@ -77,7 +81,7 @@ impl Hw {
     fn scan(&mut self, timeout: u64) -> Result<Vec<wl::Bss>, i64> {
         match self.dev(|d| d.scan(timeout)) {
             Some(Ok(found)) => {
-                self.seen = found.iter().map(|b| (b.ssid.clone(), b.security)).collect();
+                self.seen = found.clone();
                 Ok(found)
             }
             Some(Err(e)) => {
@@ -91,22 +95,26 @@ impl Hw {
     /// Join by name, secured as the last scan saw it (one is run if the
     /// network was not in it).
     fn connect(&mut self, ssid: &[u8], psk: &[u8], timeout: u64) -> Result<(), i64> {
-        let known = |hw: &Hw| hw.seen.iter().find(|s| s.0 == ssid).map(|s| s.1);
-        let security = match known(self) {
-            Some(s) => s,
+        let known = |hw: &Hw| {
+            let b = hw.seen.iter().find(|b| b.ssid == ssid)?;
+            Some((b.security, b.rsn.clone()))
+        };
+        let (security, rsn) = match known(self) {
+            Some(k) => k,
             None => {
                 self.scan(SCAN_TIMEOUT)?;
                 known(self).ok_or(-ENOENT)?
             }
         };
         self.joined = None;
-        match self.dev(|d| d.connect(ssid, psk, security, timeout)) {
-            Some(Ok(())) => {
+        match self.dev(|d| d.connect(ssid, psk, (security, &rsn), &MAC, timeout)) {
+            Some(Ok(sup)) => {
                 println!("[wlan] joined {}", String::from_utf8_lossy(ssid));
                 self.joined = Some(Joined {
                     ssid: ssid.to_vec(),
                     channel: 0,
                     signal: 0,
+                    sup,
                 });
                 self.refresh();
                 Ok(())
@@ -140,25 +148,27 @@ impl Hw {
         }
     }
 
-    /// Firmware events that came on their own: a lost link ends the join.
+    /// Firmware events and frames that came on their own: rekeys are
+    /// answered, a lost link ends the join.
     fn housekeeping(&mut self) {
-        if self.joined.is_none() {
+        let Some(mut j) = self.joined.take() else {
             return;
-        }
-        match self.dev(|d| d.housekeeping()) {
+        };
+        match self.dev(|d| d.housekeeping(j.sup.as_mut())) {
             Some(Ok(false)) => {
                 println!("[wlan] link lost");
-                self.joined = None;
+                return;
             }
             Some(Err(e)) => println!("[wlan] events: {}", e),
             _ => {}
         }
+        self.joined = Some(j);
     }
 }
 
 enum Backend {
-    /// Chip on the bus; with its firmware running it scans and joins.
-    /// The frames of the link are not carried yet.
+    /// Chip on the bus; with its firmware running it scans and joins
+    /// (open and WPA2). The frames of the link are not carried yet.
     Chip(alloc::boxed::Box<Hw>),
     Sim(sim::Sim),
 }
@@ -533,7 +543,8 @@ fn main() -> i32 {
                         let live = match &backend {
                             Backend::Chip(hw) => match &hw.mb {
                                 Some(m) => format!(
-                                    "; console now: {}",
+                                    "; data: {}; console now: {}",
+                                    m.stats(&hw.tcm),
                                     fw::console_tail(&hw.tcm, m.console, 600)
                                 ),
                                 None => String::new(),

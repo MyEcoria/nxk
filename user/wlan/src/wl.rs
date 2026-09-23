@@ -1,5 +1,6 @@
 //! Firmware interface of the FullMAC chip (Linux `brcmfmac`: `fwil.c`,
-//! `fweh.c`, `cfg80211.c`): radio setup, events, scans.
+//! `fweh.c`, `cfg80211.c`): radio setup, events, scans, joins with our
+//! own WPA2 supplicant (`wpa`) and the keys it derives.
 
 use alloc::format;
 use alloc::string::String;
@@ -8,10 +9,12 @@ use alloc::vec::Vec;
 use libnx::abi::err::{EACCES, EINVAL, EIO, ENOENT, EOPNOTSUPP, ETIMEDOUT};
 use libnx::abi::proto::wifi;
 use libnx::drv::Mmio;
-use libnx::time;
+use libnx::{println, sys, time};
 
 use crate::chip::Backplane;
+use crate::crypto;
 use crate::msgbuf::Msgbuf;
+use crate::wpa::{self, Supplicant};
 
 // Commands.
 const WLC_UP: u32 = 2;
@@ -20,22 +23,30 @@ const WLC_GET_CHANNEL: u32 = 29;
 const WLC_DISASSOC: u32 = 52;
 const WLC_SET_PM: u32 = 86;
 const WLC_GET_RSSI: u32 = 127;
-const WLC_SET_WSEC_PMK: u32 = 268;
 
 // Security settings (`brcmf_set_wpa_version`, `_set_wsec_mode`).
-const WPA_AUTH_PSK: u32 = 0x0004;
 const WPA2_AUTH_PSK: u32 = 0x0080;
-const TKIP_ENABLED: u32 = 0x2;
 const AES_ENABLED: u32 = 0x4;
-/// `brcmf_wsec_pmk_le.flags`: the key is the passphrase, the firmware
-/// derives the PMK itself.
-const WSEC_PASSPHRASE: u16 = 1;
-const PMK_LEN: usize = 2 + 2 + 65 + 1;
 /// 802.11i passphrase lengths.
 const PSK_MIN: usize = 8;
 const PSK_MAX: usize = 63;
-/// `cap` token of the firmware supplicant (brcmfmac `BRCMF_FEAT_FWSUP`).
-const CAP_FWSUP: &[u8] = b"idsup";
+
+// `wsec_key` (`brcmf_wsec_key_le`, not packed: 164 bytes).
+const KEY_SIZE: usize = 164;
+const KEY_LEN: usize = 4;
+const KEY_DATA: usize = 8;
+const KEY_ALGO: usize = 112;
+const KEY_FLAGS: usize = 116;
+const KEY_IV_INIT: usize = 132;
+const KEY_RXIV: usize = 140;
+const KEY_EA: usize = 156;
+const CRYPTO_ALGO_AES_CCM: u32 = 4;
+/// Key flag of a group key (`BRCMF_PRIMARY_KEY`).
+const PRIMARY_KEY: u32 = 1 << 1;
+/// Room for the association request's elements (`WL_ASSOC_INFO_MAX`).
+const ASSOC_INFO_MAX: usize = 512;
+/// A handshake frame has left once the firmware reports it sent.
+const TX_TIMEOUT_NS: u64 = 1_000_000_000;
 /// Reason given when leaving (802.11: station leaving).
 const REASON_LEAVING: u32 = 3;
 
@@ -49,15 +60,14 @@ pub const E_ASSOC: u32 = 7;
 pub const E_DISASSOC: u32 = 11;
 pub const E_DISASSOC_IND: u32 = 12;
 pub const E_LINK: u32 = 16;
-pub const E_PSK_SUP: u32 = 46;
+/// An EAPOL frame received: how this firmware hands 802.1X to the host,
+/// rather than on the data rings as Linux's firmware does.
+pub const E_EAPOL_MSG: u32 = 25;
 pub const E_IF: u32 = 54;
 pub const E_ESCAN_RESULT: u32 = 69;
 const STATUS_PARTIAL: u32 = 8;
 /// `E_SET_SSID` statuses (`BRCMF_E_STATUS_*`).
 const SET_SSID_FAILURES: [&str; 5] = ["", "failed", "timed out", "no such network", "aborted"];
-/// `E_PSK_SUP`: firmware supplicant keyed, or given up.
-const SUP_KEYED: u32 = 6;
-const SUP_TIMEOUT: u32 = 7;
 /// `E_LINK` flag: link up.
 const LINK_UP: u16 = 1;
 /// `event_msgs`: one bit per event code.
@@ -86,6 +96,7 @@ const BSS_CTL_CH: usize = 88;
 const BSS_IE_OFFSET: usize = 116;
 const BSS_IE_LENGTH: usize = 120;
 const CAP_PRIVACY: u16 = 1 << 4;
+const EID_RSN: u8 = 48;
 
 /// Chip, backplane and TCM together: what every firmware call needs.
 pub struct Dev<'a> {
@@ -100,6 +111,8 @@ pub struct Event {
     pub flags: u16,
     pub status: u32,
     pub reason: u32,
+    /// The station it concerns (for `E_EAPOL_MSG`, the sender).
+    pub addr: [u8; 6],
     pub data: Vec<u8>,
 }
 
@@ -121,16 +134,31 @@ fn parse_event(f: &[u8]) -> Option<Event> {
         return None;
     }
     let len = be32(f, EVENT_MSG + 20) as usize;
+    let mut addr = [0u8; 6];
+    addr.copy_from_slice(&f[EVENT_MSG + 24..EVENT_MSG + 30]);
     Some(Event {
         kind: be32(f, EVENT_MSG + 4),
         flags: u16::from_be_bytes([f[EVENT_MSG + 2], f[EVENT_MSG + 3]]),
         status: be32(f, EVENT_MSG + 8),
         reason: be32(f, EVENT_MSG + 12),
+        addr,
         data: f[EVENT_DATA..(EVENT_DATA + len).min(f.len())].to_vec(),
     })
 }
 
+/// An `E_EAPOL_MSG` event (the EAPOL PDU alone) as the Ethernet frame
+/// the supplicant takes: sender, ethertype, then the PDU.
+fn eapol_frame(e: &Event) -> Vec<u8> {
+    let mut f = Vec::with_capacity(14 + e.data.len());
+    f.extend_from_slice(&[0; 6]);
+    f.extend_from_slice(&e.addr);
+    f.extend_from_slice(&wpa::ETH_P_PAE.to_be_bytes());
+    f.extend_from_slice(&e.data);
+    f
+}
+
 /// A network seen by a scan.
+#[derive(Clone)]
 pub struct Bss {
     pub bssid: [u8; 6],
     pub ssid: Vec<u8>,
@@ -138,6 +166,8 @@ pub struct Bss {
     pub security: u8,
     /// Signal in dBm (negative).
     pub rssi: i16,
+    /// Its RSN element, empty without one.
+    pub rsn: Vec<u8>,
 }
 
 /// Security from the information elements: RSN (WPA2, or WPA3 when SAE
@@ -208,6 +238,7 @@ fn parse_bss(data: &[u8], out: &mut Vec<Bss>) {
             channel,
             security: security(le16(b, BSS_CAPABILITY), ies),
             rssi: le16(b, BSS_RSSI) as i16,
+            rsn: wpa::element(ies, EID_RSN).map_or(Vec::new(), <[u8]>::to_vec),
         };
         // Several results per network: keep the strongest.
         match out.iter_mut().find(|o| o.bssid == bss.bssid) {
@@ -237,7 +268,7 @@ impl Dev<'_> {
             E_DISASSOC,
             E_DISASSOC_IND,
             E_LINK,
-            E_PSK_SUP,
+            E_EAPOL_MSG,
             E_IF,
             E_ESCAN_RESULT,
         ] {
@@ -305,18 +336,19 @@ impl Dev<'_> {
         ))
     }
 
-    /// Join `ssid` (`brcmf_cfg80211_connect` with the firmware
-    /// supplicant): security set from what the network announced, the
-    /// passphrase handed to the firmware, then its events followed until
-    /// associated and keyed, or the reason it failed.
+    /// Join `ssid` (`brcmf_cfg80211_connect`): security set from what
+    /// the network announced, then its events and key handshake followed
+    /// until associated, linked and keyed, or the reason it failed. A
+    /// WPA2 join returns the supplicant, which answers later rekeys.
     pub fn connect(
         &mut self,
         ssid: &[u8],
         psk: &[u8],
-        security: u8,
+        ap: (u8, &[u8]),
+        mac: &[u8; 6],
         timeout_ns: u64,
-    ) -> Result<(), (i64, String)> {
-        self.join(ssid, psk, security, timeout_ns)
+    ) -> Result<Option<Supplicant>, (i64, String)> {
+        self.join(ssid, psk, ap, mac, timeout_ns)
             .map_err(|(e, why)| (e, format!("{}: {}", String::from_utf8_lossy(ssid), why)))
     }
 
@@ -324,36 +356,44 @@ impl Dev<'_> {
         &mut self,
         ssid: &[u8],
         psk: &[u8],
-        security: u8,
+        (security, rsn): (u8, &[u8]),
+        mac: &[u8; 6],
         timeout_ns: u64,
-    ) -> Result<(), (i64, String)> {
+    ) -> Result<Option<Supplicant>, (i64, String)> {
         let io = |e: String| (-EIO, e);
         let (bp, tcm) = (self.bp, self.tcm);
-        let secured = security != wifi::SEC_OPEN;
         let (wpa_auth, wsec) = match security {
             wifi::SEC_OPEN => (0, 0),
-            wifi::SEC_WPA => (WPA_AUTH_PSK, TKIP_ENABLED | AES_ENABLED),
-            wifi::SEC_WPA2 => (WPA2_AUTH_PSK, AES_ENABLED | TKIP_ENABLED),
+            wifi::SEC_WPA2 => (WPA2_AUTH_PSK, AES_ENABLED),
+            wifi::SEC_WPA => {
+                let why = String::from("WPA (TKIP) networks are not supported, WPA2 only");
+                return Err((-EOPNOTSUPP, why));
+            }
             _ => {
-                return Err((
-                    -EINVAL,
-                    String::from("only open, WPA and WPA2 personal networks"),
-                ))
+                let why = String::from("only open and WPA2 personal networks");
+                return Err((-EINVAL, why));
             }
         };
-        if secured && !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
-            let why = format!(
-                "passphrase of {} characters, {} to {} needed",
-                psk.len(),
-                PSK_MIN,
-                PSK_MAX
-            );
-            return Err((-EINVAL, why));
+        let mut sup = None;
+        if security == wifi::SEC_WPA2 {
+            if !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
+                let why = format!(
+                    "passphrase of {} characters, {} to {} needed",
+                    psk.len(),
+                    PSK_MIN,
+                    PSK_MAX
+                );
+                return Err((-EINVAL, why));
+            }
+            wpa::check_rsn(rsn).map_err(|why| (-EOPNOTSUPP, String::from(why)))?;
+            let pmk = crypto::psk(psk, ssid);
+            sup = Some(Supplicant::new(pmk, *mac, sys::getrandom));
         }
-        // The console's firmware has no supplicant: Horizon runs its own.
-        if secured && !self.has_cap(CAP_FWSUP).map_err(io)? {
-            let why = String::from("WPA/WPA2 need a host supplicant, this firmware has none");
-            return Err((-EOPNOTSUPP, why));
+        // Our RSN element for the association request, none for an open
+        // network (brcmfmac `wpaie`); the firmware may build its own.
+        let ie: &[u8] = if sup.is_some() { &wpa::RSN_IE } else { &[] };
+        if let Err(e) = self.mb.set_var(bp, tcm, "wpaie", ie) {
+            println!("[wlan] {}", e);
         }
         self.mb
             .set_var(bp, tcm, "wpa_auth", &wpa_auth.to_le_bytes())
@@ -364,29 +404,11 @@ impl Dev<'_> {
         self.mb
             .set_var(bp, tcm, "wsec", &wsec.to_le_bytes())
             .map_err(io)?;
-        // Only the firmware supplicant knows `sup_wpa` (brcmfmac sets it with
-        // FWSUP alone): without one, even 0 is refused.
-        if secured {
-            self.mb
-                .set_var(bp, tcm, "sup_wpa", &1u32.to_le_bytes())
-                .map_err(io)?;
-            let mut pmk = [0u8; PMK_LEN];
-            pmk[..2].copy_from_slice(&(psk.len() as u16).to_le_bytes());
-            pmk[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
-            pmk[4..4 + psk.len()].copy_from_slice(psk);
-            let r = self
-                .mb
-                .ioctl(bp, tcm, WLC_SET_WSEC_PMK, &pmk, 0)
-                .map_err(io)?;
-            if r.status != 0 {
-                return Err(io(format!(
-                    "passphrase refused by the firmware ({})",
-                    r.status
-                )));
-            }
-        }
-        // Stale events (an earlier scan) must not decide this join.
+        // Stale events and frames (an earlier scan or join) must not
+        // decide this one.
+        self.mb.poll(bp, tcm).map_err(io)?;
         while self.mb.event().is_some() {}
+        while self.mb.frame().is_some() {}
 
         // `brcmf_ext_join_params_le`: SSID, join scan with firmware
         // defaults, any BSSID, no channel list.
@@ -405,48 +427,172 @@ impl Dev<'_> {
         self.mb.set_var(bp, tcm, "join", &join).map_err(io)?;
 
         let deadline = time::now_ns() + timeout_ns;
-        let (mut associated, mut keyed, mut link) = (false, !secured, false);
-        while let Some(e) = self.event(deadline).map_err(io)? {
-            match e.kind {
-                E_SET_SSID if e.status == 0 => associated = true,
-                E_SET_SSID => {
-                    let why = SET_SSID_FAILURES
-                        .get(e.status as usize)
-                        .copied()
-                        .unwrap_or("failed");
-                    let errno = if e.status == 3 { -ENOENT } else { -EIO };
-                    return Err((errno, format!("join {} (status {})", why, e.status)));
+        let (mut associated, mut link, mut keyed) = (false, false, sup.is_none());
+        let mut ie_read = false;
+        loop {
+            self.mb.poll(bp, tcm).map_err(io)?;
+            let mut eapol = Vec::new();
+            while let Some(f) = self.mb.event() {
+                let Some(e) = parse_event(&f) else { continue };
+                match e.kind {
+                    E_SET_SSID if e.status == 0 => associated = true,
+                    E_SET_SSID => {
+                        let why = SET_SSID_FAILURES
+                            .get(e.status as usize)
+                            .copied()
+                            .unwrap_or("failed");
+                        let errno = if e.status == 3 { -ENOENT } else { -EIO };
+                        return Err((errno, format!("join {} (status {})", why, e.status)));
+                    }
+                    E_LINK => link = e.flags & LINK_UP != 0,
+                    E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => {
+                        let why = if sup.as_ref().is_some_and(|s| s.unconfirmed()) {
+                            format!(
+                                "key handshake refused, wrong passphrase? (reason {})",
+                                e.reason
+                            )
+                        } else {
+                            format!("sent away by the access point (reason {})", e.reason)
+                        };
+                        return Err((-EACCES, why));
+                    }
+                    E_EAPOL_MSG => eapol.push(eapol_frame(&e)),
+                    _ => {}
                 }
-                E_PSK_SUP if e.status == SUP_KEYED => keyed = true,
-                E_PSK_SUP if e.status == SUP_TIMEOUT => {
-                    let why = String::from("key handshake timed out: wrong passphrase?");
-                    return Err((-EACCES, why));
-                }
-                E_LINK => link = e.flags & LINK_UP != 0,
-                E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => {
-                    let why = format!("sent away by the access point (reason {})", e.reason);
-                    return Err((-EACCES, why));
-                }
-                _ => {}
             }
-            if associated && keyed && (link || secured) {
-                return Ok(());
+            while let Some(f) = self.mb.frame() {
+                if wpa::is_eapol(&f) {
+                    eapol.push(f);
+                }
             }
+            for f in eapol {
+                let Some(s) = sup.as_mut() else { continue };
+                // Message 2 repeats the RSN element the association
+                // request carried: the firmware's, if it built one.
+                if !ie_read {
+                    ie_read = true;
+                    if let Some(ie) = self.assoc_rsn() {
+                        if ie != wpa::RSN_IE {
+                            println!("[wlan] association RSN element {:02x?}", ie);
+                        }
+                        s.set_ie(&ie);
+                    }
+                }
+                match s.receive(&f) {
+                    Ok(step) => keyed |= self.apply(s, step).map_err(io)?,
+                    Err(why) => println!("[wlan] EAPOL-Key frame dropped: {}", why),
+                }
+            }
+            if associated && link && keyed {
+                return Ok(sup);
+            }
+            if time::now_ns() > deadline {
+                let handshake = match &sup {
+                    Some(s) if s.unconfirmed() => ", no message 3: wrong passphrase?",
+                    Some(s) if s.aa().is_none() => ", no key handshake started",
+                    _ => "",
+                };
+                let why = format!(
+                    "not joined after {} ms (associated {}, link {}, keyed {}{})",
+                    timeout_ns / 1_000_000,
+                    associated,
+                    link,
+                    keyed,
+                    handshake
+                );
+                return Err((-ETIMEDOUT, why));
+            }
+            time::sleep_ms(2);
         }
-        let why = format!(
-            "not joined after {} ms (associated {}, keyed {}, link {})",
-            timeout_ns / 1_000_000,
-            associated,
-            keyed,
-            link
-        );
-        Err((-ETIMEDOUT, why))
     }
 
-    /// Whether the firmware's `cap` list names `feature` (`brcmf_feat_attach`).
-    fn has_cap(&mut self, feature: &[u8]) -> Result<bool, String> {
-        let caps = self.mb.get_var(self.bp, self.tcm, "cap", 512)?;
-        Ok(caps.split(|&c| c == b' ' || c == 0).any(|w| w == feature))
+    /// Our RSN element as the association request carried it
+    /// (`brcmf_get_assoc_ies`), when the firmware tells.
+    fn assoc_rsn(&mut self) -> Option<Vec<u8>> {
+        let (bp, tcm) = (self.bp, self.tcm);
+        let info = self
+            .mb
+            .get_var(bp, tcm, "assoc_info", ASSOC_INFO_MAX)
+            .ok()?;
+        let len = le32(info.get(..4)?, 0) as usize;
+        let ies = self
+            .mb
+            .get_var(bp, tcm, "assoc_req_ies", ASSOC_INFO_MAX)
+            .ok()?;
+        wpa::element(&ies[..len.min(ies.len())], EID_RSN).map(<[u8]>::to_vec)
+    }
+
+    /// A handshake step carried out: the reply on the air before its
+    /// keys are in (`brcmf_netdev_wait_pend8021x`), so message 4 leaves
+    /// in the clear. True once a group key is installed.
+    fn apply(&mut self, s: &Supplicant, step: wpa::Step) -> Result<bool, String> {
+        if let Some(reply) = &step.reply {
+            let id = self.mb.send(self.bp, self.tcm, reply)?;
+            if step.ptk.is_some() || step.gtk.is_some() {
+                self.wait_sent(id)?;
+            }
+        }
+        if let Some(tk) = step.ptk {
+            let aa = s
+                .aa()
+                .ok_or_else(|| String::from("pairwise key without a peer"))?;
+            self.add_key(0, &tk, Some(&aa), None)?;
+        }
+        match step.gtk {
+            Some(g) => {
+                self.add_key(g.index as u32, &g.key, None, Some(&g.rsc))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn wait_sent(&mut self, id: u32) -> Result<(), String> {
+        let deadline = time::now_ns() + TX_TIMEOUT_NS;
+        loop {
+            if let Some(status) = self.mb.sent(id) {
+                if status != 0 {
+                    println!("[wlan] handshake frame sent with status {}", status);
+                }
+                return Ok(());
+            }
+            if time::now_ns() > deadline {
+                return Err(format!(
+                    "handshake frame not sent after {} ms",
+                    TX_TIMEOUT_NS / 1_000_000
+                ));
+            }
+            time::sleep_us(200);
+            self.mb.poll(self.bp, self.tcm)?;
+        }
+    }
+
+    /// A CCMP key to the firmware (`brcmf_cfg80211_add_key`): pairwise
+    /// for the access point, or a group key by index with its receive
+    /// counter.
+    fn add_key(
+        &mut self,
+        index: u32,
+        key: &[u8; 16],
+        peer: Option<&[u8; 6]>,
+        rsc: Option<&[u8; 6]>,
+    ) -> Result<(), String> {
+        let mut k = [0u8; KEY_SIZE];
+        k[..4].copy_from_slice(&index.to_le_bytes());
+        k[KEY_LEN..KEY_LEN + 4].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        k[KEY_DATA..KEY_DATA + key.len()].copy_from_slice(key);
+        k[KEY_ALGO..KEY_ALGO + 4].copy_from_slice(&CRYPTO_ALGO_AES_CCM.to_le_bytes());
+        match peer {
+            Some(ea) => k[KEY_EA..KEY_EA + 6].copy_from_slice(ea),
+            None => k[KEY_FLAGS..KEY_FLAGS + 4].copy_from_slice(&PRIMARY_KEY.to_le_bytes()),
+        }
+        if let Some(pn) = rsc {
+            // Receive IV: bits 16-47 of the packet number, then 0-15.
+            k[KEY_RXIV..KEY_RXIV + 4].copy_from_slice(&pn[2..6]);
+            k[KEY_RXIV + 4..KEY_RXIV + 6].copy_from_slice(&pn[..2]);
+            k[KEY_IV_INIT] = 1;
+        }
+        self.mb.set_var(self.bp, self.tcm, "wsec_key", &k)
     }
 
     /// Leave the network (`brcmf_link_down`).
@@ -476,17 +622,39 @@ impl Dev<'_> {
         Ok((channel, dbm))
     }
 
-    /// Events that arrived on their own; false once the link is lost.
-    pub fn housekeeping(&mut self) -> Result<bool, String> {
+    /// Events and frames that arrived on their own: key handshakes (group
+    /// rekeys) answered, the other frames dropped until `wlan0` carries
+    /// them. False once the link is lost.
+    pub fn housekeeping(&mut self, mut sup: Option<&mut Supplicant>) -> Result<bool, String> {
         self.mb.poll(self.bp, self.tcm)?;
         let mut up = true;
+        let mut eapol = Vec::new();
         while let Some(f) = self.mb.event() {
             if let Some(e) = parse_event(&f) {
                 match e.kind {
                     E_LINK if e.flags & LINK_UP == 0 => up = false,
                     E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => up = false,
+                    E_EAPOL_MSG => eapol.push(eapol_frame(&e)),
                     _ => {}
                 }
+            }
+        }
+        while let Some(f) = self.mb.frame() {
+            if wpa::is_eapol(&f) {
+                eapol.push(f);
+            }
+        }
+        for f in eapol {
+            let Some(s) = sup.as_deref_mut() else {
+                continue;
+            };
+            match s.receive(&f) {
+                Ok(step) => {
+                    if self.apply(s, step)? {
+                        println!("[wlan] group key renewed");
+                    }
+                }
+                Err(why) => println!("[wlan] EAPOL-Key frame dropped: {}", why),
             }
         }
         Ok(up)

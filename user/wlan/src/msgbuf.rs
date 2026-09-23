@@ -1,6 +1,7 @@
 //! Broadcom msgbuf protocol over PCIe (Linux `brcmfmac`: `pcie.c`,
 //! `commonring.c`, `msgbuf.c`): rings in host memory, their indices in
-//! the chip's RAM, doorbells through the PCIe2 core's mailbox.
+//! the chip's RAM, doorbells through the PCIe2 core's mailbox. Control
+//! (ioctls, events) and data: received frames, and one TX flow ring.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -17,6 +18,7 @@ use crate::fw::Up;
 
 // Shared area fields (offsets from its base).
 const SHARED_DMA_INDEX: u32 = 0x1_0000;
+const SHARED_MAX_RXBUFPOST: u32 = 34;
 const SHARED_RX_DATAOFFSET: u32 = 36;
 const SHARED_RING_INFO: u32 = 48;
 const SHARED_SCRATCH_LEN: u32 = 52;
@@ -41,18 +43,34 @@ const RING_BASE_ADDR: u32 = 8;
 /// Common rings: two host-to-dongle, three back. Shared version 5 has
 /// the pre-v7 completion sizes.
 const CONTROL_SUBMIT: usize = 0;
+const RXPOST_SUBMIT: usize = 1;
 const CONTROL_COMPLETE: usize = 2;
+const TX_COMPLETE: usize = 3;
+const RX_COMPLETE: usize = 4;
 const RINGS: [(u16, u16); 5] = [(64, 40), (512, 32), (64, 24), (1024, 16), (512, 32)];
+/// The TX flow ring, after the common ones: its indices follow theirs
+/// in TCM, its id follows the two H2D ones (`_FLOWRING_IDSTART`).
+const FLOW: usize = 5;
+const FLOW_RING_ID: u16 = 2;
+const FLOW_ITEMS: u16 = 512;
+const FLOW_ITEM_SIZE: u16 = 48;
+const FLOW_TIMEOUT_MS: u64 = 1000;
 
 // PCIe2 core mailbox (core rev < 64).
 const PCIE2_H2D_MAILBOX_0: u32 = 0x140;
 
 // Message types.
+const MSG_FLOW_RING_CREATE: u8 = 0x3;
+const MSG_FLOW_RING_CREATE_CMPLT: u8 = 0x4;
 const MSG_IOCTLPTR_REQ: u8 = 0x9;
 const MSG_IOCTLRESP_BUF_POST: u8 = 0xB;
 const MSG_IOCTL_CMPLT: u8 = 0xC;
 const MSG_EVENT_BUF_POST: u8 = 0xD;
 const MSG_WL_EVENT: u8 = 0xE;
+const MSG_TX_POST: u8 = 0xF;
+const MSG_TX_STATUS: u8 = 0x10;
+const MSG_RXBUF_POST: u8 = 0x11;
+const MSG_RX_CMPLT: u8 = 0x12;
 /// Request id of the one ioctl in flight (`BRCMF_IOCTL_REQ_PKTID`).
 const IOCTL_REQ_PKTID: u32 = 0xFFFE;
 /// Control buffers: responses, then events (`BRCMF_MSGBUF_MAX_*_POST`).
@@ -65,6 +83,18 @@ const IOCTL_TIMEOUT_MS: u64 = 2000;
 const EVENTS_MAX: usize = 256;
 /// D2H completions carry a modulo-253 sequence number (flag 0x20000).
 const EPOCH_MODULO: u32 = 253;
+/// Data buffers (`BRCMF_MSGBUF_MAX_PKT_SIZE`): frames received, frames
+/// to send. Enough for key handshakes and light traffic.
+const PKT_LEN: usize = 2048;
+const RX_BUFS: usize = 64;
+const TX_BUFS: usize = 8;
+const ETH_HLEN: usize = 14;
+/// TX post flags: an Ethernet frame, priority 0 (best effort).
+const PKT_FRAME_802_3: u8 = 0x01;
+/// Frames kept for a reader; older ones are dropped past this.
+const FRAMES_MAX: usize = 64;
+/// Host memory for rings and buffers.
+const DMA_LEN: usize = 512 * 1024;
 
 pub const WLC_GET_VAR: u32 = 262;
 pub const WLC_SET_VAR: u32 = 263;
@@ -133,8 +163,27 @@ fn get32(p: *const u8, off: usize) -> u32 {
     u32::from_le_bytes(b)
 }
 
+/// State of the TX flow ring, created on the first frame sent.
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    Closed,
+    Pending,
+    Open,
+    Refused(u16),
+}
+
+/// A frame buffer the firmware reads for a send.
+struct TxBuf {
+    va: *mut u8,
+    pa: u32,
+    busy: bool,
+    /// Firmware status of its last send.
+    status: u16,
+}
+
 pub struct Msgbuf {
     _dma: Dma,
+    /// The five common rings, then the TX flow ring.
     rings: Vec<Ring>,
     pcie2: Core,
     ioctl_buf: (*mut u8, u32),
@@ -145,6 +194,17 @@ pub struct Msgbuf {
     rx_dataoffset: u32,
     /// Firmware event frames (Ethernet, Broadcom ethertype), oldest first.
     events: VecDeque<Vec<u8>>,
+    /// Receive buffers by request id.
+    rx: Vec<(*mut u8, u32)>,
+    /// Frames received (Ethernet), oldest first.
+    frames: VecDeque<Vec<u8>>,
+    tx: Vec<TxBuf>,
+    flow: Flow,
+    flow_pa: u32,
+    /// Frames received and sent (posted, then completed), and the
+    /// Ethernet header of the last one received: for `wifi status`.
+    count: [u32; 3],
+    last_rx: [u8; 14],
     reply: Option<Reply>,
     /// The firmware console, for `console_tail`.
     pub console: u32,
@@ -168,7 +228,7 @@ impl Msgbuf {
             ));
         }
         let t = |a: u32| tcm.r32(a as usize);
-        let shm = SharedMemory::new(256 * 1024, CONTIGUOUS | UNCACHED | DMA32)
+        let shm = SharedMemory::new(DMA_LEN, CONTIGUOUS | UNCACHED | DMA32)
             .map_err(|e| format!("DMA memory ({})", libnx::abi::err::name(e)))?;
         let pa = shm
             .paddr(0)
@@ -206,6 +266,17 @@ impl Msgbuf {
                 epoch: None,
             });
         }
+        // Flow ring: host memory now, created in the firmware on demand.
+        let (va, flow_pa) = dma.alloc(FLOW_ITEMS as usize * FLOW_ITEM_SIZE as usize, 8)?;
+        rings.push(Ring {
+            va,
+            items: FLOW_ITEMS,
+            size: FLOW_ITEM_SIZE,
+            w_idx: h2d_w,
+            r_idx: h2d_r,
+            pos: 0,
+            epoch: None,
+        });
         for (addr_off, len_off, len) in [
             (SHARED_SCRATCH_ADDR, SHARED_SCRATCH_LEN, SCRATCH_LEN),
             (SHARED_RINGUPD_ADDR, SHARED_RINGUPD_LEN, RINGUPD_LEN),
@@ -220,6 +291,25 @@ impl Msgbuf {
         for _ in 0..2 * CTL_BUFS {
             ctl.push(dma.alloc(CTL_BUF_LEN, 64)?);
         }
+        // As many receive buffers as the firmware takes, up to ours.
+        let max_rx = match tcm.r16((up.shared + SHARED_MAX_RXBUFPOST) as usize) {
+            0 => RX_BUFS,
+            n => RX_BUFS.min(n as usize),
+        };
+        let mut rx = Vec::new();
+        for _ in 0..max_rx {
+            rx.push(dma.alloc(PKT_LEN, 64)?);
+        }
+        let mut tx = Vec::new();
+        for _ in 0..TX_BUFS {
+            let (va, pa) = dma.alloc(PKT_LEN, 64)?;
+            tx.push(TxBuf {
+                va,
+                pa,
+                busy: false,
+                status: 0,
+            });
+        }
         let mut m = Msgbuf {
             _dma: dma,
             rings,
@@ -229,11 +319,21 @@ impl Msgbuf {
             trans_id: 0,
             rx_dataoffset: t(up.shared + SHARED_RX_DATAOFFSET),
             events: VecDeque::new(),
+            rx,
+            frames: VecDeque::new(),
+            tx,
+            flow: Flow::Closed,
+            flow_pa,
+            count: [0; 3],
+            last_rx: [0; 14],
             reply: None,
             console: up.console,
         };
         for id in 0..2 * CTL_BUFS {
             m.post_ctl(bp, tcm, id as u32)?;
+        }
+        for id in 0..m.rx.len() {
+            m.post_rx(bp, tcm, id as u32)?;
         }
         Ok(m)
     }
@@ -281,6 +381,20 @@ impl Msgbuf {
         put32(p, 16, pa);
         put32(p, 20, 0);
         self.commit(bp, tcm, CONTROL_SUBMIT);
+        Ok(())
+    }
+
+    /// Hand receive buffer `id` to the firmware
+    /// (`brcmf_msgbuf_rxbuf_data_post`).
+    fn post_rx(&mut self, bp: &Backplane, tcm: &Mmio, id: u32) -> Result<(), String> {
+        let p = self.reserve(tcm, RXPOST_SUBMIT)?;
+        let (_, pa) = self.rx[id as usize];
+        unsafe { *p = MSG_RXBUF_POST };
+        put32(p, 4, id);
+        put16(p, 10, PKT_LEN as u16);
+        put32(p, 24, pa);
+        put32(p, 28, 0);
+        self.commit(bp, tcm, RXPOST_SUBMIT);
         Ok(())
     }
 
@@ -334,8 +448,9 @@ impl Msgbuf {
         Ok(out)
     }
 
-    /// Drain the control completion ring: ioctl answers are kept for
-    /// `ioctl`, event frames queued for `event`.
+    /// Drain the completion rings: ioctl answers are kept for `ioctl`,
+    /// event frames queued for `event`, received frames for `frame`,
+    /// finished sends noted for `sent`.
     pub fn poll(&mut self, bp: &Backplane, tcm: &Mmio) -> Result<(), String> {
         while let Some(item) = self.next(tcm, CONTROL_COMPLETE)? {
             let id = get32(item.as_ptr(), 4);
@@ -355,11 +470,166 @@ impl Msgbuf {
                     }
                     self.events.push_back(frame);
                 }
+                MSG_FLOW_RING_CREATE_CMPLT => {
+                    self.flow = match get16(item.as_ptr(), 8) {
+                        0 => Flow::Open,
+                        status => Flow::Refused(status),
+                    };
+                }
                 // Acks, and status messages this driver has no use for.
                 _ => {}
             }
         }
+        // `brcmf_msgbuf_process_rx_complete`: the frame starts at its
+        // offset, or at the firmware's default one.
+        while let Some(item) = self.next(tcm, RX_COMPLETE)? {
+            let id = get32(item.as_ptr(), 4) as usize;
+            if item[0] != MSG_RX_CMPLT || id >= self.rx.len() {
+                continue;
+            }
+            let len = get16(item.as_ptr(), 14) as usize;
+            let off = match get16(item.as_ptr(), 16) {
+                0 => self.rx_dataoffset as usize,
+                o => o as usize,
+            };
+            let (va, _) = self.rx[id];
+            let n = len.min(PKT_LEN.saturating_sub(off));
+            let mut frame = alloc::vec![0u8; n];
+            unsafe { core::ptr::copy_nonoverlapping(va.add(off), frame.as_mut_ptr(), n) };
+            self.post_rx(bp, tcm, id as u32)?;
+            self.count[0] += 1;
+            let h = n.min(self.last_rx.len());
+            self.last_rx[..h].copy_from_slice(&frame[..h]);
+            if self.frames.len() == FRAMES_MAX {
+                self.frames.pop_front();
+            }
+            self.frames.push_back(frame);
+        }
+        while let Some(item) = self.next(tcm, TX_COMPLETE)? {
+            let id = get32(item.as_ptr(), 4) as usize;
+            if item[0] != MSG_TX_STATUS {
+                continue;
+            }
+            if let Some(b) = id.checked_sub(1).and_then(|k| self.tx.get_mut(k)) {
+                b.busy = false;
+                b.status = get16(item.as_ptr(), 8);
+                self.count[2] += 1;
+            }
+        }
         Ok(())
+    }
+
+    /// The data path at a glance: frame counts, the last header seen,
+    /// then the write/read indices of the RX post, RX and TX completion
+    /// and flow rings.
+    pub fn stats(&self, tcm: &Mmio) -> String {
+        let idx = |k: usize| {
+            let r = &self.rings[k];
+            format!(
+                "{}/{}",
+                tcm.r16(r.w_idx as usize),
+                tcm.r16(r.r_idx as usize)
+            )
+        };
+        format!(
+            "rx {} (last {:02x?}), tx {} sent {}, flow {}; rings rxpost {} rx {} txdone {} flow {}",
+            self.count[0],
+            self.last_rx,
+            self.count[1],
+            self.count[2],
+            match self.flow {
+                Flow::Closed => "closed",
+                Flow::Pending => "pending",
+                Flow::Open => "open",
+                Flow::Refused(_) => "refused",
+            },
+            idx(RXPOST_SUBMIT),
+            idx(RX_COMPLETE),
+            idx(TX_COMPLETE),
+            idx(FLOW)
+        )
+    }
+
+    /// Oldest frame received and not read yet.
+    pub fn frame(&mut self) -> Option<Vec<u8>> {
+        self.frames.pop_front()
+    }
+
+    /// Send an Ethernet frame (`brcmf_msgbuf_txflow`): its header in the
+    /// ring item, its payload read from our buffer. Returns the request
+    /// id `sent` answers for.
+    pub fn send(&mut self, bp: &Backplane, tcm: &Mmio, frame: &[u8]) -> Result<u32, String> {
+        if frame.len() < ETH_HLEN || frame.len() > PKT_LEN {
+            return Err(format!("frame of {} bytes", frame.len()));
+        }
+        self.open_flow(bp, tcm, frame)?;
+        self.poll(bp, tcm)?;
+        let slot = self
+            .tx
+            .iter()
+            .position(|b| !b.busy)
+            .ok_or_else(|| String::from("every TX buffer in flight"))?;
+        let p = self.reserve(tcm, FLOW)?;
+        let b = &mut self.tx[slot];
+        unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), b.va, frame.len()) };
+        b.busy = true;
+        let pa = b.pa;
+        let id = slot as u32 + 1;
+        unsafe {
+            *p = MSG_TX_POST;
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), p.add(8), ETH_HLEN);
+            *p.add(22) = PKT_FRAME_802_3;
+            *p.add(23) = 1; // one segment
+        }
+        put32(p, 4, id);
+        put32(p, 32, pa + ETH_HLEN as u32);
+        put32(p, 36, 0);
+        put16(p, 42, (frame.len() - ETH_HLEN) as u16);
+        self.commit(bp, tcm, FLOW);
+        self.count[1] += 1;
+        Ok(id)
+    }
+
+    /// Firmware status of send `id`, once it finished.
+    pub fn sent(&self, id: u32) -> Option<u16> {
+        let b = self.tx.get((id as usize).checked_sub(1)?)?;
+        (!b.busy).then_some(b.status)
+    }
+
+    /// The TX flow ring, created in the firmware for the first frame
+    /// (`brcmf_msgbuf_flowring_create_worker`); a station keeps one.
+    fn open_flow(&mut self, bp: &Backplane, tcm: &Mmio, frame: &[u8]) -> Result<(), String> {
+        if self.flow == Flow::Open {
+            return Ok(());
+        }
+        let p = self.reserve(tcm, CONTROL_SUBMIT)?;
+        unsafe {
+            *p = MSG_FLOW_RING_CREATE;
+            // Destination, then source: the frame's own addresses.
+            core::ptr::copy_nonoverlapping(frame.as_ptr(), p.add(8), 12);
+        }
+        put16(p, 22, FLOW_RING_ID);
+        put16(p, 28, FLOW_ITEMS);
+        put16(p, 30, FLOW_ITEM_SIZE);
+        put32(p, 32, self.flow_pa);
+        put32(p, 36, 0);
+        self.flow = Flow::Pending;
+        self.commit(bp, tcm, CONTROL_SUBMIT);
+        let deadline = time::now_ns() + FLOW_TIMEOUT_MS * 1_000_000;
+        while self.flow == Flow::Pending && time::now_ns() < deadline {
+            time::sleep_us(200);
+            self.poll(bp, tcm)?;
+        }
+        match self.flow {
+            Flow::Open => Ok(()),
+            f => {
+                self.flow = Flow::Closed;
+                Err(match f {
+                    Flow::Refused(status) => format!("TX flow ring refused (status {})", status),
+                    _ => format!("TX flow ring not created in {} ms", FLOW_TIMEOUT_MS),
+                })
+            }
+        }
     }
 
     /// Oldest firmware event frame not read yet.
