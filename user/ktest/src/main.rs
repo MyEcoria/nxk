@@ -53,6 +53,7 @@ fn main() -> i32 {
         ("load balancing", t_balance),
         ("tickless idle cores", t_tickless),
         ("mem_protect", t_protect),
+        ("long zeroing lets other cores in", t_breathe),
         ("concurrent first touch, fixed mapping", t_first_touch),
         ("pipe: end of stream, write with no reader", t_pipe),
         ("shared memory", t_shm),
@@ -511,6 +512,55 @@ fn t_priority() -> R {
         return Err(format!(
             "max lateness of high-priority thread: {} us",
             w / 1000
+        ));
+    }
+    Ok(())
+}
+
+fn t_breathe() -> R {
+    // 64 MiB populated then unmapped on core 1 while core 2 makes locked
+    // syscalls: the kernel lets its global lock go during long work.
+    let probe = |phase: &AtomicU32, worst: &[AtomicU64; 2]| {
+        while phase.load(Ordering::Relaxed) < 3 {
+            let t0 = time::now_ns();
+            let _ = sys::getpid(0);
+            let dt = time::now_ns() - t0;
+            match phase.load(Ordering::Relaxed) {
+                1 => worst[0].fetch_max(dt, Ordering::Relaxed),
+                2 => worst[1].fetch_max(dt, Ordering::Relaxed),
+                _ => 0,
+            };
+        }
+    };
+    let phase = Arc::new(AtomicU32::new(0));
+    let worst = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let (p2, w2) = (phase.clone(), worst.clone());
+    let prober = thread::spawn_on(Some(2), 0, move || probe(&p2, &w2))
+        .map_err(|e| format!("thread {}", e))?;
+    let p3 = phase.clone();
+    let filler = thread::spawn_on(Some(1), 0, move || {
+        let len = 64 << 20;
+        time::sleep_ms(5);
+        p3.store(1, Ordering::Relaxed);
+        let a = sys::mem_map(0, len, READ | WRITE | libnx::abi::prot::POPULATE);
+        p3.store(2, Ordering::Relaxed);
+        let _ = a.and_then(|a| sys::mem_unmap(a, len));
+        p3.store(3, Ordering::Relaxed);
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    filler.join();
+    prober.join();
+    // One batch of zeroing, not the whole 64 MiB (the emulator zeroes
+    // 64 pages in a few ms; before, a core stalled 245 ms on the unmap).
+    let w = [
+        worst[0].load(Ordering::Relaxed),
+        worst[1].load(Ordering::Relaxed),
+    ];
+    if w[0] > 20 * MS || w[1] > 20 * MS {
+        return Err(format!(
+            "a syscall waited {} us during the populate, {} us during the unmap",
+            w[0] / 1000,
+            w[1] / 1000
         ));
     }
     Ok(())

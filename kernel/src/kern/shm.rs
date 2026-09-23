@@ -5,7 +5,7 @@ use nxk_abi::err::{EACCES, EINVAL, ENOMEM};
 use nxk_abi::layout::PAGE_SIZE;
 use nxk_abi::{prot, shm as flags};
 
-use crate::kern::bkl::BklCell;
+use crate::kern::bkl::{self, BklCell};
 use crate::kern::objtab::Table;
 use crate::kern::process;
 use crate::kern::thread::NIL;
@@ -77,11 +77,12 @@ pub fn create(len: u64, fl: u64) -> Result<(u16, u16), i64> {
         return Err(-EINVAL);
     }
     let pages = pmm::align_up(len, PAGE_SIZE) / PAGE_SIZE;
-    let page = |order: usize| {
+    // Not zeroed here: `fill` does it, letting other cores in.
+    let alloc = |order: usize| {
         if fl & flags::DMA32 != 0 {
-            pmm::alloc_zeroed_below(order, 1 << 32)
+            pmm::alloc_below(order, 1 << 32)
         } else {
-            pmm::alloc_zeroed(order)
+            pmm::alloc(order)
         }
     };
     let (base, order) = if fl & flags::CONTIGUOUS != 0 {
@@ -89,27 +90,20 @@ pub fn create(len: u64, fl: u64) -> Result<(u16, u16), i64> {
         if order >= pmm::MAX_ORDER {
             return Err(-EINVAL);
         }
-        (page(order).ok_or(-ENOMEM)?, order)
+        (alloc(order).ok_or(-ENOMEM)?, order)
     } else {
         if pages > MAX_PAGES {
             return Err(-EINVAL);
         }
+        // Page array: every entry is written by `fill`.
         let order = pmm::order_for(pages * 8);
-        let arr = pmm::alloc_zeroed(order).ok_or(-ENOMEM)?;
-        for k in 0..pages {
-            match page(0) {
-                Some(pa) => unsafe { *(arr as *mut u64).add(k as usize) = pa },
-                None => {
-                    for j in 0..k {
-                        pmm::free(unsafe { *(arr as *const u64).add(j as usize) }, 0);
-                    }
-                    pmm::free(arr, order);
-                    return Err(-ENOMEM);
-                }
-            }
-        }
-        (arr, order)
+        (pmm::alloc(order).ok_or(-ENOMEM)?, order)
     };
+    let mut ready = 0;
+    if let Err(e) = fill(base, fl, pages, &mut ready, alloc) {
+        release_pages(base, order, fl, ready as u32);
+        return Err(e);
+    }
     let Some(i) = SHMS.get().alloc() else {
         release_pages(base, order, fl, pages as u32);
         return Err(-ENOMEM);
@@ -121,12 +115,38 @@ pub fn create(len: u64, fl: u64) -> Result<(u16, u16), i64> {
     x.order = order as u8;
     x.flags = fl;
     x.base = base;
-    if fl & flags::UNCACHED != 0 {
-        for k in 0..pages as u32 {
-            clean_inval(page_pa(i, k), PAGE_SIZE);
+    Ok((i, x.gen))
+}
+
+/// Zero the object's pages (allocating them one by one if not
+/// contiguous), cleaned to memory if uncached. The global lock is let
+/// go every `BREATHE_PAGES`: nothing else sees the object yet.
+/// `ready`: pages allocated so far (non-contiguous).
+fn fill(
+    base: u64,
+    fl: u64,
+    pages: u64,
+    ready: &mut u64,
+    alloc: impl Fn(usize) -> Option<u64>,
+) -> Result<(), i64> {
+    for k in 0..pages {
+        if k > 0 && k % bkl::BREATHE_PAGES == 0 {
+            bkl::breathe()?;
+        }
+        let pa = if fl & flags::CONTIGUOUS != 0 {
+            base + k * PAGE_SIZE
+        } else {
+            let pa = alloc(0).ok_or(-ENOMEM)?;
+            unsafe { *(base as *mut u64).add(k as usize) = pa };
+            *ready = k + 1;
+            pa
+        };
+        pmm::zero(pa, PAGE_SIZE);
+        if fl & flags::UNCACHED != 0 {
+            clean_inval(pa, PAGE_SIZE);
         }
     }
-    Ok((i, x.gen))
+    Ok(())
 }
 
 fn release_pages(base: u64, order: usize, fl: u64, pages: u32) {

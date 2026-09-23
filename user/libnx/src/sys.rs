@@ -223,8 +223,15 @@ pub fn sysinfo(kind: u64, buf: &mut [u8]) -> Result<u64> {
 
 /// Unread kernel log bytes into `buf` (`Log` capability); 0: none.
 pub fn klog_read(log: u32, buf: &mut [u8]) -> Result<usize> {
-    check(unsafe { syscall3(KLOG_READ, log as u64, buf.as_mut_ptr() as u64, buf.len() as u64) })
-        .map(|n| n as usize)
+    check(unsafe {
+        syscall3(
+            KLOG_READ,
+            log as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    })
+    .map(|n| n as usize)
 }
 
 /// Become the kernel log's drain: `notif` gets `bits` on new data.

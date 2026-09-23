@@ -428,20 +428,16 @@ fn mem_map(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
     check_prot_mask(p, prot::POPULATE)?;
     check_no_wx(p)?;
     let va = place(pi, addr, len)?;
-    // Fixed address: the range must be free, else failure (and its cleanup)
-    // would touch already-mapped pages.
+    // Fixed address: the range must be free.
     let l1 = process::get(pi).l1;
     if addr != 0 && (0..len / PAGE_SIZE).any(|k| vm::is_mapped(l1, addr + k * PAGE_SIZE)) {
         return Err(-EEXIST);
     }
-    let r = if p & prot::POPULATE != 0 {
-        process::map_anon(pi, va, len, (p & !prot::POPULATE) | prot::READ)
+    // Both undo their own work on failure.
+    if p & prot::POPULATE != 0 {
+        process::map_anon(pi, va, len, (p & !prot::POPULATE) | prot::READ)?;
     } else {
-        process::reserve_anon(pi, va, len, p | prot::READ)
-    };
-    if let Err(e) = r {
-        process::unmap(pi, va, len);
-        return Err(e);
+        process::reserve_anon(pi, va, len, p | prot::READ)?;
     }
     val(va)
 }

@@ -201,21 +201,28 @@ pub fn publish() {
 /// Unmap a page; return the old entry. The TLB flushes on all cores via one
 /// broadcast instruction (no IPI needed).
 pub fn unmap(l1: u64, asid: u16, va: u64) -> Option<u64> {
+    let old = clear(l1, va)?;
+    if old & VALID != 0 {
+        flush_page(asid, va);
+    }
+    Some(old)
+}
+
+/// Remove the entry at `va` (mapped or reserved) with no TLB
+/// maintenance: the caller flushes before reusing what it pointed to.
+pub fn clear(l1: u64, va: u64) -> Option<u64> {
     let e = leaf(l1, va, false)?;
     let old = *e;
-    if old & VALID == 0 {
-        if old & (SW_LAZY | SW_NOACCESS) != 0 {
-            *e = 0;
-            return Some(old);
-        }
+    if old & (VALID | SW_LAZY | SW_NOACCESS) == 0 {
         return None;
     }
     *e = 0;
-    let arg = ((asid as u64) << 48) | ((va >> 12) & 0xFFF_FFFF_FFFF);
-    unsafe {
-        core::arch::asm!("dsb ishst", "tlbi vae1is, {}", "dsb ish", "isb", in(reg) arg, options(nostack))
-    };
     Some(old)
+}
+
+/// Was this entry live (possibly cached in a TLB)?
+pub fn is_valid(pte: u64) -> bool {
+    pte & VALID != 0
 }
 
 /// Current entry for `va` (0 if missing).

@@ -238,11 +238,9 @@ pub fn free(pa: u64, order: usize) {
     PMM.get().free(pa, order)
 }
 
-/// Block fully below `limit` (32-bit DMA buffers), zeroed.
-pub fn alloc_zeroed_below(order: usize, limit: u64) -> Option<u64> {
-    let pa = PMM.get().alloc_below(order, limit)?;
-    zero(pa, PAGE_SIZE << order);
-    Some(pa)
+/// Block fully below `limit` (32-bit DMA buffers), not zeroed.
+pub fn alloc_below(order: usize, limit: u64) -> Option<u64> {
+    PMM.get().alloc_below(order, limit)
 }
 
 /// Zeroed page, ready to hand to a process.

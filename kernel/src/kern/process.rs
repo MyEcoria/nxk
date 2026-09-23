@@ -4,7 +4,7 @@ use nxk_abi::err::{EINVAL, ENOMEM, ESRCH, ETIMEDOUT};
 use nxk_abi::layout::{MAX_THREADS_PER_PROCESS, PAGE_SIZE, UTCB_BASE};
 use nxk_abi::prot;
 
-use crate::kern::bkl::BklCell;
+use crate::kern::bkl::{self, BklCell};
 use crate::kern::objtab::Table;
 use crate::kern::sched::Timeout;
 use crate::kern::thread::{self, Queue, State, NIL};
@@ -178,31 +178,48 @@ pub fn create(name: &[u8], parent: u16) -> Result<u16, i64> {
     Ok(i)
 }
 
-/// Map fresh (zeroed) pages owned by the process.
+/// Map fresh (zeroed) pages owned by the process: the range is taken
+/// first, then filled letting other cores take the global lock every
+/// `BREATHE_PAGES` (a page unmapped meanwhile is skipped). On failure
+/// nothing stays mapped.
 pub fn map_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
-    let p = get(i);
-    let flags = vm::user_flags(prot) | vm::SW_OWNED;
+    reserve_anon(i, va, len, prot)?;
     let mut off = 0;
     while off < len {
-        let pa = pmm::alloc_zeroed(0).ok_or(-ENOMEM)?;
-        if let Err(e) = vm::map(p.l1, va + off, pa, flags) {
-            pmm::free(pa, 0);
-            return Err(e);
+        let r = if off > 0 && (off / PAGE_SIZE) % bkl::BREATHE_PAGES == 0 {
+            bkl::breathe()
+        } else {
+            Ok(())
+        };
+        match r.and_then(|()| vm::populate(get(i).l1, va + off)) {
+            Ok(true) => get(i).pages += 1,
+            Ok(false) => {}
+            Err(e) => {
+                unmap(i, va, len);
+                return Err(e);
+            }
         }
-        p.pages += 1;
         off += PAGE_SIZE;
     }
-    vm::publish();
     Ok(())
 }
 
-/// Reserve anonymous pages allocated on first touch (like `mmap`).
+/// Reserve anonymous pages allocated on first touch (like `mmap`),
+/// letting other cores in every `BREATHE_PAGES`. On failure nothing
+/// stays reserved.
 pub fn reserve_anon(i: u16, va: u64, len: u64, prot: u64) -> Result<(), i64> {
-    let p = get(i);
     let flags = vm::user_flags(prot) | vm::SW_OWNED;
     let mut off = 0;
     while off < len {
-        vm::reserve(p.l1, va + off, flags)?;
+        let r = if off > 0 && (off / PAGE_SIZE) % bkl::BREATHE_PAGES == 0 {
+            bkl::breathe()
+        } else {
+            Ok(())
+        };
+        if let Err(e) = r.and_then(|()| vm::reserve(get(i).l1, va + off, flags)) {
+            unmap(i, va, off);
+            return Err(e);
+        }
         off += PAGE_SIZE;
     }
     Ok(())
@@ -233,20 +250,50 @@ pub fn populate(i: u16, va: u64) -> bool {
 }
 
 /// Remove and free pages (only owned pages return to the allocator; device
-/// registers and shared memory stay).
+/// registers and shared memory stay). By batches of `BREATHE_PAGES`:
+/// entries cleared, one TLB flush, then what they held is released and
+/// other cores may take the global lock.
 pub fn unmap(i: u16, va: u64, len: u64) {
-    let p = get(i);
-    let mut off = 0;
-    while off < len {
-        if let Some(old) = vm::unmap(p.l1, p.asid, va + off) {
-            if let Some(pa) = vm::owned_pa(old) {
-                pmm::free(pa, 0);
-                p.pages -= 1;
-            } else if old & vm::SW_SHM != 0 {
-                shm::page_unmapped(i, va + off);
+    const BATCH: usize = bkl::BREATHE_PAGES as usize;
+    let pages = len / PAGE_SIZE;
+    let mut k = 0;
+    while k < pages {
+        // Killed meanwhile: the rest goes with the address space.
+        if k > 0 && bkl::breathe().is_err() {
+            return;
+        }
+        let p = get(i);
+        let n = (pages - k).min(BATCH as u64);
+        let mut cleared = [(0u64, 0u64); BATCH];
+        let mut nc = 0;
+        let mut live = 0;
+        for j in 0..n {
+            let a = va + (k + j) * PAGE_SIZE;
+            if let Some(old) = vm::clear(p.l1, a) {
+                live += vm::is_valid(old) as usize;
+                cleared[nc] = (a, old);
+                nc += 1;
             }
         }
-        off += PAGE_SIZE;
+        // No core may still reach a page when it is freed.
+        if live > 8 {
+            vm::flush_asid(p.asid);
+        } else {
+            for &(a, old) in &cleared[..nc] {
+                if vm::is_valid(old) {
+                    vm::flush_page(p.asid, a);
+                }
+            }
+        }
+        for &(a, old) in &cleared[..nc] {
+            if let Some(pa) = vm::owned_pa(old) {
+                pmm::free(pa, 0);
+                get(i).pages -= 1;
+            } else if old & vm::SW_SHM != 0 {
+                shm::page_unmapped(i, a);
+            }
+        }
+        k += n;
     }
 }
 
