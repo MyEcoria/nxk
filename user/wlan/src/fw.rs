@@ -161,8 +161,10 @@ pub fn console_tail(tcm: &Mmio, console: u32, max: usize) -> String {
             buf, size, write
         );
     }
+    // Only the newest `max` bytes: the whole buffer is 64 KiB of MMIO.
+    let n = (max as u32).min(size);
     let mut text = Vec::new();
-    for k in 0..size {
+    for k in size - n..size {
         let c = tcm.r8((buf + (write + k) % size) as usize);
         match c {
             b'\n' => text.extend_from_slice(b" | "),
