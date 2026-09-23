@@ -357,6 +357,14 @@ seconds (each 512-character line is echoed back before the next).
     the pairwise and group keys go in with `wsec_key`. A boot-image
     `wlan` idle about 3 minutes had lost the chip again (`ring 2 write
     index 0xffff`); a restart brought it back.
+15. 23/09/2026, Erista, `wlan` over USB-C: **traffic over Wi-Fi**.
+    `wlan0` published once joined; `net`, waiting since boot for a link,
+    took it and got `10.133.165.75/24` by DHCP from the phone hotspot
+    (gateway and DNS `10.133.165.217`). `nettest resolve example.com`
+    and `nettest get example.com 80 /` worked (HTTP 200, 829 bytes in
+    221 ms). Data frames arrive on the RX completion ring (only EAPOL
+    comes as events). With the rings polled every 2 ms while joined,
+    `wlan` used 99 ms of CPU in 10 s idle.
 
 ## Hardware test (once the SD card is back in the PC)
 

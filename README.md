@@ -236,7 +236,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | `wlan0` is not published yet: frames reach the rings but carry no traffic for `net`. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the rings are polled every 2 ms while joined (no chip interrupt yet). WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -253,7 +253,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Programs | static-PIE ELF, arguments, environment, TLS, load from SD card | dynamic linking (ruled out) |
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
-| Network | USB-Ethernet, TCP/IP, sockets, Wi-Fi control (`wifi`: scans, open and WPA2 joins) and PCIe root complex | Wi-Fi traffic (`wlan0`), IPv6 |
+| Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
 | Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB host, USB device (serial console) | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 27, `stdtest` 18, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
@@ -274,7 +274,7 @@ program that vanished without closing them (crash) are reclaimed.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.
-- Wi-Fi carries no traffic yet: `wlan` powers the module (PMIC LDO1,
+- Wi-Fi: `wlan` powers the module (PMIC LDO1,
   WIFI_EN on PH0, WIFI_RST on PH1), sets the PEX and module pads as
   Horizon does, brings the PCIe root complex up, then should train the
   link, read the BCM4356 chip identity and boot the console's own
@@ -287,7 +287,9 @@ program that vanished without closing them (crash) are reclaimed.
   this firmware reports received EAPOL frames as `E_EAPOL_MSG` events,
   the replies leave on the TX flow ring, and the keys go back with
   `wsec_key`. Their known-answer and handshake tests run on the PC:
-  `rustc --edition 2021 --test user/wlan/hosttest.rs -o T && ./T`. Its firmware
+  `rustc --edition 2021 --test user/wlan/hosttest.rs -o T && ./T`.
+  Data frames use the RX and TX rings; with no chip interrupt yet they
+  are polled every 2 ms while joined (about 1% of a core). Its firmware
   and calibration data are proprietary and never in the repository:
   they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
