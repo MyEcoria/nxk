@@ -60,7 +60,10 @@ Prerequisites: stable Rust with `rust-src`
 keyboard), `--machine tegrax1plus` (Mariko), `--monitor ELF --dtb DTB`
 (boot in EL2 under a PSCI monitor), `--screendump` (screen capture),
 `--usb-cmd CMD` (CMD typed on the USB-C console, the script acting as
-the PC).
+the PC), `--usb-put LOCAL:REMOTE` (file copied to the SD card over that
+console first). On a real Switch, `tools/usbterm.py --reload DRIVER`
+replaces a running boot driver by a new build without touching the SD
+card (`hwboot/README.md`, "Driver updates over USB-C").
 
 `--usb-cmd` needs the USB device mode of the OTG controller in
 `tegra_qemu`, which upstream lacks:

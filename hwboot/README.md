@@ -208,6 +208,25 @@ The last `usbcon:` line locates a failure:
 - `fuses unreadable: PHY left without its trims`: hekate did not leave
   the fuses readable; high speed may then fail.
 
+## Driver updates over USB-C (no SD swap)
+
+A boot driver can be replaced while nxk runs, with the same hardware
+grants, from a build on the PC:
+
+```bash
+./tools/build.sh
+./tools/usbterm.py --reload wlan -c "wifi status"
+```
+
+`--reload wlan` copies `~/.cache/nxk/target-user/.../wlan` to
+`/bin/wlan` on the card (`--put LOCAL:REMOTE` for any file: the shell's
+`recv` takes base64 lines, checks the CRC-32 and writes the file), then
+types `restart wlan`: init kills the running instance, unpublishes its
+services and starts the file with the driver's grants. Only the console
+shell may ask for it. The kernel, init, the shell and the boot image
+still need `mksd-hw.sh` and a reboot. A 50 KB driver takes a few
+seconds (each 512-character line is echoed back before the next).
+
 ## Hardware runs
 
 1. 22/09/2026, Erista, before the screen console: stage 1 with nothing

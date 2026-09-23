@@ -96,8 +96,13 @@ Key details agents must respect:
   `-c` commands, exits 1 on timeout. Useful flags: `--sd`, `--machine
   tegrax1plus` (Mariko), `--monitor ELF --dtb DTB` (EL2 under PSCI monitor),
   `--net [hostfwd...]`, `--usb-kbd --keys`, `--usb-cmd CMD` (typed on the
-  USB-C console, the script as the PC), `--screendump out.ppm`,
-  `--timeout SECS`. Extra QEMU args via `NXTEST_QEMU_ARGS`.
+  USB-C console, the script as the PC), `--usb-put LOCAL:REMOTE`,
+  `--screendump out.ppm`, `--timeout SECS`. Extra QEMU args via
+  `NXTEST_QEMU_ARGS`.
+- On a connected Switch, iterate on a boot driver without an SD swap:
+  `./tools/build.sh && ./tools/usbterm.py --reload DRIVER -c "..."`
+  (init's `RESTART`, see `hwboot/README.md`). Kernel, init, shell and
+  boot-path changes still need `hwboot/mksd-hw.sh` and a reboot.
 - **Strict rule: after any kernel / libnx / service / std / app change, run
   `./tools/build.sh` then `./tools/nxtest.py -c ktest -c stdtest --sd
   build/sd.img` (add relevant `-c` commands, e.g. `-c bench`,
