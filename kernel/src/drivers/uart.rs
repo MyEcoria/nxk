@@ -30,9 +30,12 @@ const UART_CLK_HZ: u32 = 408_000_000;
 
 // CAR: UART-A clock + reset (CLK_OUT_ENB_L / RST_DEVICES_L, bit 6).
 const CAR_BASE: usize = 0x6000_6000;
+const CLK_SOURCE_UARTA: usize = CAR_BASE + 0x178;
 const CLK_ENB_L_SET: usize = CAR_BASE + 0x320;
 const RST_DEV_L_CLR: usize = CAR_BASE + 0x304;
 const CAR_BIT_UARTA: u32 = 1 << 6;
+// PLLP_OUT0 source (bits 31:29 = 0), divider off (bit 24 clear).
+const UARTA_SRC_PLLP: u32 = 0;
 
 #[derive(Clone, Copy)]
 pub struct Uart {
@@ -49,7 +52,9 @@ impl Uart {
     /// Set up 8N1 at the requested baud, FIFOs on.
     pub fn init(&self, baud: u32) {
         unsafe {
-            // Clock then out of reset (no-op under the emulator, right on SoC).
+            // PLLP source (the boot chain leaves ~19.2 MHz: 5.4 kbaud), clock,
+            // then out of reset. No-op under the emulator, right on SoC.
+            write32(CLK_SOURCE_UARTA, UARTA_SRC_PLLP);
             write32(CLK_ENB_L_SET, CAR_BIT_UARTA);
             write32(RST_DEV_L_CLR, CAR_BIT_UARTA);
 
