@@ -337,13 +337,14 @@ impl Pcie {
         before
     }
 
-    /// UPHY PLL of the PCIe bricks (`tegra210_pex_uphy_enable`).
-    /// Already locked (loader, or XUSB SuperSpeed): left alone.
+    /// UPHY PLL of the PCIe bricks (`tegra210_pex_uphy_enable`), always
+    /// calibrated from scratch: after a driver restart it still reads
+    /// locked, yet the link only trains again once it is redone.
     fn uphy_pll(&self) -> Result<(), i64> {
         let p = &self.padctl;
-        if p.r32(PADCTL_UPHY_PLL_P0_CTL1) & PLL_CTL1_LOCKDET != 0 {
-            return Ok(());
-        }
+        p.modify(PADCTL_UPHY_PLL_P0_CTL1, 0, PLL_CTL1_PWR_OVRD);
+        p.modify(PADCTL_UPHY_PLL_P0_CTL1, PLL_CTL1_ENABLE, PLL_CTL1_IDDQ);
+        time::sleep_us(20);
         p.modify(
             PADCTL_UPHY_PLL_P0_CTL2,
             PLL_CTL2_CAL_CTRL_MASK,
@@ -675,7 +676,6 @@ impl Pcie {
         })?;
         println!("[wlan] PCIe port {}: link up", port);
         self.enumerate(port)
-            .map_err(|e| Fail::new("endpoint behind the port", e))
     }
 
     /// Why no link came up, as far as registers tell: each pad before and
@@ -734,7 +734,7 @@ impl Pcie {
 
     /// One endpoint behind the port: bus numbers, BARs placed in our
     /// windows, memory and bus mastering on.
-    fn enumerate(&self, port: usize) -> Result<Endpoint, i64> {
+    fn enumerate(&self, port: usize) -> Result<Endpoint, Fail> {
         let dev = port as u8 + 1;
         // Root port as a bridge: bus 0 upstream, bus 1 below it.
         let secondary = 1u32;
@@ -771,7 +771,7 @@ impl Pcie {
         );
         let id = self.cfg_read(1, 0, CFG_VENDOR);
         if id == 0xFFFF_FFFF || id == 0 {
-            return Err(-ENXIO);
+            return Err(Fail::read("endpoint behind the port", -ENXIO, id));
         }
         let mut ep = Endpoint {
             port,
@@ -809,7 +809,7 @@ impl Pcie {
             };
             if addr + size > end {
                 println!("[wlan] BAR{}: {} bytes do not fit", i, size);
-                return Err(-EIO);
+                return Err(Fail::new("endpoint BAR placement", -EIO));
             }
             self.cfg_write(1, 0, off, addr as u32);
             if is_64 {
@@ -878,9 +878,13 @@ fn clk_status(dev: u64) -> (u64, u64) {
     }
 }
 
-/// Partition, PLLE and the AFI/PCIe clocks through the `clk` service.
+/// Partition, PLLE and the AFI/PCIe clocks through the `clk` service,
+/// after a full controller reset: a restart then starts as a cold boot.
 fn clock_on() -> Result<(), i64> {
     let ep = ns::wait_for_timeout("clk", 2_000_000_000)?;
+    let mut m = Msg::new(clk::DISABLE, 1, 0);
+    m.mr[0] = clk::PCIE;
+    ipc::checked(ipc::call(ep, &m)?)?;
     let mut m = Msg::new(clk::ENABLE, 1, 0);
     m.mr[0] = clk::PCIE;
     ipc::checked(ipc::call(ep, &m)?)?;
