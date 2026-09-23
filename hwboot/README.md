@@ -336,6 +336,14 @@ seconds (each 512-character line is echoed back before the next).
     The firmware answers `ver` (`version 7.35.252.108`, built 29 Aug
     2021) and `cur_etheraddr` (00:90:4c:1a:a0:01, Broadcom's
     placeholder: nxk sets its own address), then scans with `escan`.
+13. 23/09/2026, Erista, `wlan` over USB-C: **first join**, to an open
+    phone hotspot (`wifi connect nxk-test`: `state connected`, channel 6,
+    -33 dBm; disconnect and rejoin work too). The same hotspot on WPA2
+    failed at once, `sup_wpa: firmware error -23` (`BCME_UNSUPPORTED`):
+    the firmware's `cap` list has no `idsup`, so it has no supplicant
+    of its own, and even `sup_wpa 0` is refused. `wlan` now leaves
+    `sup_wpa` alone on open networks and refuses WPA/WPA2 with
+    `EOPNOTSUPP` until a host supplicant exists.
 
 ## Hardware test (once the SD card is back in the PC)
 

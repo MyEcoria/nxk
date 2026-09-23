@@ -236,7 +236,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control rings, scans, joins (WPA/WPA2 personal, the firmware's own supplicant); publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the data rings that carry frames are missing: scans and joins work, `wlan0` is not published yet. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control rings, scans, joins of open networks; publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the data rings that carry frames are missing: scans and open joins work, `wlan0` is not published yet. WPA/WPA2 joins need a host supplicant: the console's firmware has none (no `idsup`), so `wifi connect` refuses them with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -280,9 +280,11 @@ program that vanished without closing them (crash) are reclaimed.
   link, read the BCM4356 chip identity and boot the console's own
   firmware in it: on an Erista, `wifi status` reports `BCM4356 rev 3 on
   PCIe port 1, firmware up` with the firmware's console (`hwboot/README.md`,
-  runs 5 to 12). Commands, scans (`wifi scan`) and joins (the
-  firmware's own WPA2 supplicant) go through Broadcom's msgbuf rings;
-  the data rings that carry frames are not written yet. Its firmware
+  runs 5 to 13). Commands, scans (`wifi scan`) and joins of open
+  networks go through Broadcom's msgbuf rings; the data rings that carry
+  frames are not written yet. WPA/WPA2 joins are refused: the console's
+  firmware has no supplicant (Horizon runs its own), and the handshake
+  needs those data rings. Its firmware
   and calibration data are proprietary and never in the repository:
   they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
