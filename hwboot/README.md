@@ -344,6 +344,19 @@ seconds (each 512-character line is echoed back before the next).
     of its own, and even `sup_wpa 0` is refused. `wlan` now leaves
     `sup_wpa` alone on open networks and refuses WPA/WPA2 with
     `EOPNOTSUPP` until a host supplicant exists.
+14. 23/09/2026, Erista, `wlan` over USB-C: **first WPA2 join**, to the
+    same phone hotspot on WPA2-Personal (`wifi connect nxk-test
+    PASSPHRASE`: `state connected`, channel 7, -33 dBm, still up after
+    30 s; a wrong passphrase ends in `key handshake refused` and
+    `EACCES`). `wlan` now runs the 4-way handshake itself. The data
+    rings came first (64 RX buffers taken, `rxpost 64/64`), yet no frame
+    ever completed on them: logging every firmware event showed the
+    access point's message 1 arriving as `E_EAPOL_MSG` (event 25, the
+    99-byte EAPOL PDU, sender in the event header). Replies leave on the
+    TX flow ring (created on the first frame, 2 sent, 2 completed), then
+    the pairwise and group keys go in with `wsec_key`. A boot-image
+    `wlan` idle about 3 minutes had lost the chip again (`ring 2 write
+    index 0xffff`); a restart brought it back.
 
 ## Hardware test (once the SD card is back in the PC)
 

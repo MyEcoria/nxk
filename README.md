@@ -236,7 +236,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control rings, scans, joins of open networks; publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the data rings that carry frames are missing: scans and open joins work, `wlan0` is not published yet. WPA/WPA2 joins need a host supplicant: the console's firmware has none (no `idsup`), so `wifi connect` refuses them with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | `wlan0` is not published yet: frames reach the rings but carry no traffic for `net`. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -253,10 +253,10 @@ program that vanished without closing them (crash) are reclaimed.
 | Programs | static-PIE ELF, arguments, environment, TLS, load from SD card | dynamic linking (ruled out) |
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
-| Network | USB-Ethernet, TCP/IP, sockets, Wi-Fi control (`wifi`) and PCIe root complex | BCM4356 firmware and data path, IPv6 |
+| Network | USB-Ethernet, TCP/IP, sockets, Wi-Fi control (`wifi`: scans, open and WPA2 joins) and PCIe root complex | Wi-Fi traffic (`wlan0`), IPv6 |
 | Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB host, USB device (serial console) | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
-| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18), debugger (gdb), L4T comparison, USB-C terminal | |
+| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
 ## Limits
 
@@ -280,11 +280,14 @@ program that vanished without closing them (crash) are reclaimed.
   link, read the BCM4356 chip identity and boot the console's own
   firmware in it: on an Erista, `wifi status` reports `BCM4356 rev 3 on
   PCIe port 1, firmware up` with the firmware's console (`hwboot/README.md`,
-  runs 5 to 13). Commands, scans (`wifi scan`) and joins of open
-  networks go through Broadcom's msgbuf rings; the data rings that carry
-  frames are not written yet. WPA/WPA2 joins are refused: the console's
-  firmware has no supplicant (Horizon runs its own), and the handshake
-  needs those data rings. Its firmware
+  runs 5 to 14). Commands, scans (`wifi scan`) and joins go through
+  Broadcom's msgbuf rings. The console's firmware has no supplicant
+  (Horizon runs its own), so `wlan` has one for WPA2-Personal (`wpa.rs`,
+  with SHA-1, PBKDF2, the 802.11 PRF and AES key unwrap in `crypto.rs`):
+  this firmware reports received EAPOL frames as `E_EAPOL_MSG` events,
+  the replies leave on the TX flow ring, and the keys go back with
+  `wsec_key`. Their known-answer and handshake tests run on the PC:
+  `rustc --edition 2021 --test user/wlan/hosttest.rs -o T && ./T`. Its firmware
   and calibration data are proprietary and never in the repository:
   they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
