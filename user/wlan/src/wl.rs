@@ -5,7 +5,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EACCES, EINVAL, EIO, ENOENT, ETIMEDOUT};
+use libnx::abi::err::{EACCES, EINVAL, EIO, ENOENT, EOPNOTSUPP, ETIMEDOUT};
 use libnx::abi::proto::wifi;
 use libnx::drv::Mmio;
 use libnx::time;
@@ -34,6 +34,8 @@ const PMK_LEN: usize = 2 + 2 + 65 + 1;
 /// 802.11i passphrase lengths.
 const PSK_MIN: usize = 8;
 const PSK_MAX: usize = 63;
+/// `cap` token of the firmware supplicant (brcmfmac `BRCMF_FEAT_FWSUP`).
+const CAP_FWSUP: &[u8] = b"idsup";
 /// Reason given when leaving (802.11: station leaving).
 const REASON_LEAVING: u32 = 3;
 
@@ -348,6 +350,11 @@ impl Dev<'_> {
             );
             return Err((-EINVAL, why));
         }
+        // The console's firmware has no supplicant: Horizon runs its own.
+        if secured && !self.has_cap(CAP_FWSUP).map_err(io)? {
+            let why = String::from("WPA/WPA2 need a host supplicant, this firmware has none");
+            return Err((-EOPNOTSUPP, why));
+        }
         self.mb
             .set_var(bp, tcm, "wpa_auth", &wpa_auth.to_le_bytes())
             .map_err(io)?;
@@ -357,10 +364,12 @@ impl Dev<'_> {
         self.mb
             .set_var(bp, tcm, "wsec", &wsec.to_le_bytes())
             .map_err(io)?;
-        self.mb
-            .set_var(bp, tcm, "sup_wpa", &(secured as u32).to_le_bytes())
-            .map_err(io)?;
+        // Only the firmware supplicant knows `sup_wpa` (brcmfmac sets it with
+        // FWSUP alone): without one, even 0 is refused.
         if secured {
+            self.mb
+                .set_var(bp, tcm, "sup_wpa", &1u32.to_le_bytes())
+                .map_err(io)?;
             let mut pmk = [0u8; PMK_LEN];
             pmk[..2].copy_from_slice(&(psk.len() as u16).to_le_bytes());
             pmk[2..4].copy_from_slice(&WSEC_PASSPHRASE.to_le_bytes());
@@ -432,6 +441,12 @@ impl Dev<'_> {
             link
         );
         Err((-ETIMEDOUT, why))
+    }
+
+    /// Whether the firmware's `cap` list names `feature` (`brcmf_feat_attach`).
+    fn has_cap(&mut self, feature: &[u8]) -> Result<bool, String> {
+        let caps = self.mb.get_var(self.bp, self.tcm, "cap", 512)?;
+        Ok(caps.split(|&c| c == b' ' || c == 0).any(|w| w == feature))
     }
 
     /// Leave the network (`brcmf_link_down`).
