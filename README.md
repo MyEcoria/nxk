@@ -236,7 +236,7 @@ All in EL0, started by `init` with only their capabilities.
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP | emulator |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control rings, scans; publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | joining a network and the data rings that carry frames are missing: scans work, the link stays down. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control rings, scans, joins (WPA/WPA2 personal, the firmware's own supplicant); publishes the link as `wlan0` once associated and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the data rings that carry frames are missing: scans and joins work, `wlan0` is not published yet. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -274,15 +274,16 @@ program that vanished without closing them (crash) are reclaimed.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.
-- Wi-Fi does not reach the air: `wlan` powers the module (PMIC LDO1,
+- Wi-Fi carries no traffic yet: `wlan` powers the module (PMIC LDO1,
   WIFI_EN on PH0, WIFI_RST on PH1), sets the PEX and module pads as
   Horizon does, brings the PCIe root complex up, then should train the
   link, read the BCM4356 chip identity and boot the console's own
   firmware in it: on an Erista, `wifi status` reports `BCM4356 rev 3 on
   PCIe port 1, firmware up` with the firmware's console (`hwboot/README.md`,
-  runs 5 to 11). Broadcom's ring protocol is not written yet, so no
-  frame moves. Its firmware and calibration data are proprietary
-  and never in the repository: they are extracted from the console's own
+  runs 5 to 12). Commands, scans (`wifi scan`) and joins (the
+  firmware's own WPA2 supplicant) go through Broadcom's msgbuf rings;
+  the data rings that carry frames are not written yet. Its firmware
+  and calibration data are proprietary and never in the repository: they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
   ignores it), then copied to the card by `tools/mksd.py --firmware DIR`
   or `hwboot/mksd-hw.sh MOUNT DIR`, which put them in `/firmware/brcm`.
