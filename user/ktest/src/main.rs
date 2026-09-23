@@ -167,51 +167,78 @@ fn t_ipc_timeouts() -> R {
 
     // Server holding the request without replying: the client gives up, and
     // neither the implicit reply nor the stale token may reach it later.
+    // Stages: 1 server about to recv, 2 request held, 3 client gave up.
+    const LONG: u64 = 2000 * MS;
     let stage = Arc::new(AtomicU32::new(0));
     let report = Arc::new(AtomicU64::new(0));
     let (st, rp) = (stage.clone(), report.clone());
     let server = thread::spawn(move || {
-        let rx = match ipc::recv(ep) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        st.store(1, Ordering::Release);
-        while st.load(Ordering::Acquire) != 2 {
-            time::sleep_ms(1);
-        }
-        let late = ipc::reply(&Msg::new(7, 0, 0));
-        let rx2 = match ipc::recv(ep) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let stale = ipc::reply_to(rx.token, &Msg::new(8, 0, 0));
-        let good = ipc::reply_to(rx2.token, &Msg::new(9, 0, 0));
         let code = |r: Result<(), i64>| match r {
             Ok(()) => 0u64,
             Err(e) => (-e) as u64,
         };
+        // Report word: step << 48; steps 1-2 = that recv failed (errno below).
+        st.store(1, Ordering::Release);
+        let rx = match ipc::recv_timeout(ep, LONG) {
+            Ok(r) => r,
+            Err(e) => return rp.store(1 << 48 | code(Err(e)), Ordering::Release),
+        };
+        st.store(2, Ordering::Release);
+        while st.load(Ordering::Acquire) != 3 {
+            time::sleep_ms(1);
+        }
+        let late = ipc::reply(&Msg::new(7, 0, 0));
+        let rx2 = match ipc::recv_timeout(ep, LONG) {
+            Ok(r) => r,
+            Err(e) => return rp.store(2 << 48 | code(Err(e)), Ordering::Release),
+        };
+        let stale = ipc::reply_to(rx.token, &Msg::new(8, 0, 0));
+        let good = ipc::reply_to(rx2.token, &Msg::new(9, 0, 0));
         rp.store(
-            code(late) | code(stale) << 16 | code(good) << 32 | 1 << 48,
+            code(late) | code(stale) << 16 | code(good) << 32 | 3 << 48,
             Ordering::Release,
         );
     })
     .map_err(|e| format!("thread {}", e))?;
 
-    let t0 = time::now_ns();
-    let first = ipc::call_timeout(ep, &Msg::new(1, 0, 0), 5 * MS);
-    let dt = time::now_ns() - t0;
-    stage.store(2, Ordering::Release);
-    let second = ipc::call(ep, &Msg::new(2, 0, 0));
+    // A call that times out before the server sits in recv proves nothing:
+    // retry until the server reports holding one of them.
+    let start = time::now_ns();
+    let gave_up = loop {
+        match stage.load(Ordering::Acquire) {
+            0 => time::sleep_ms(1),
+            1 => {
+                let t0 = time::now_ns();
+                let r = ipc::call_timeout(ep, &Msg::new(1, 0, 0), 5 * MS);
+                let dt = time::now_ns() - t0;
+                if let Err(e) =
+                    expect_err("5 ms call with no reply", r.map(|m| m.label()), ETIMEDOUT)
+                {
+                    break Err(e);
+                }
+                if dt < 5 * MS {
+                    break Err(format!("call gave up too early ({} us)", dt / 1000));
+                }
+            }
+            _ => break Ok(()),
+        }
+        if time::now_ns() - start > LONG {
+            break Err("server never took a request".into());
+        }
+    };
+    stage.store(3, Ordering::Release);
+    let second = ipc::call_timeout(ep, &Msg::new(2, 0, 0), LONG);
     server.join();
     let _ = sys::handle_close(ep);
 
-    expect_err(
-        "5 ms call with no reply",
-        first.map(|m| m.label()),
-        ETIMEDOUT,
-    )?;
-    if dt < 5 * MS {
-        return Err(format!("call gave up too early ({} us)", dt / 1000));
+    gave_up?;
+    let r = report.load(Ordering::Acquire);
+    if r >> 48 != 3 {
+        return Err(format!(
+            "server recv #{}: {}",
+            r >> 48,
+            err::name((r & 0xFFFF) as i64)
+        ));
     }
     match second {
         Ok(m) if m.label() == 9 => {}
