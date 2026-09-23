@@ -144,6 +144,15 @@ const PLL_CTL8_RCAL_OVRD: u32 = 1 << 15;
 const PLL_CTL8_RCAL_DONE: u32 = 1 << 31;
 /// Seven UPHY lanes; PCIe owns the ones XUSB does not.
 const UPHY_LANES: u32 = 7;
+/// UPHY AUX mux clamps, set out of reset (Linux `tegra210_xusb_padctl_enable`
+/// releases them in this order; hekate zeroes the register for XUSB).
+const PADCTL_ELPG_PROGRAM1: usize = 0x024;
+const ELPG_AUX_MUX_LP0: [u32; 3] = [1 << 29, 1 << 30, 1 << 31];
+/// Per-lane UPHY power control (`UPHY_MISC_PAD_Px_CTL2`), reported only.
+const PADCTL_UPHY_MISC_PAD_CTL2: usize = 0x464;
+const UPHY_MISC_PAD_STRIDE: usize = 0x40;
+/// Lanes 0-4: the x1 and x4 PCIe functions of the lane mux.
+const PCIE_LANES: usize = 5;
 
 // PCI configuration space.
 /// The root ports are NVIDIA bridges.
@@ -305,6 +314,17 @@ impl Pcie {
         self.gpio_set(GPIO_OUT, PIN_RST, 0);
         time::sleep_ms(1);
         self.gpio_set(GPIO_OUT, PIN_EN, 0);
+    }
+
+    /// UPHY AUX mux clamps off, one step at a time; returns the register
+    /// as found, for the report.
+    fn padctl_enable(&self) -> u32 {
+        let before = self.padctl.r32(PADCTL_ELPG_PROGRAM1);
+        for bit in ELPG_AUX_MUX_LP0 {
+            self.padctl.modify(PADCTL_ELPG_PROGRAM1, bit, 0);
+            time::sleep_us(200);
+        }
+        before
     }
 
     /// UPHY PLL of the PCIe bricks (`tegra210_pex_uphy_enable`).
@@ -602,10 +622,14 @@ impl Pcie {
         }
         let before = self.pads();
         self.module_on();
+        let elpg = self.padctl_enable();
         self.uphy_pll()
             .map_err(|e| Fail::new("UPHY PLL of the PCIe lanes", e))?;
         self.uphy_lanes();
+        // Crossbar and port enables are taken when PCIEXCLK leaves reset.
+        pcie_link(false).map_err(|e| Fail::new("PCIe link logic reset (PCIEXCLK)", e))?;
         self.controller();
+        pcie_link(true).map_err(|e| Fail::new("PCIe link logic release (PCIEXCLK)", e))?;
 
         let mut found = None;
         for i in 0..PORT_REGS.len() {
@@ -626,7 +650,7 @@ impl Pcie {
                 -ENODEV,
                 self.port(0).r32(RP_VEND_XP),
             );
-            f.detail = self.link_report(&before);
+            f.detail = self.link_report(&before, elpg);
             f
         })?;
         println!("[wlan] PCIe port {}: link up", port);
@@ -635,9 +659,10 @@ impl Pcie {
     }
 
     /// Why no link came up, as far as registers tell: each pad before and
-    /// after `pads`, the module pins as driven and as read back, then per
-    /// port its PERST#/REFCLK control, link status and data-link state.
-    fn link_report(&self, before: &[u32; PADS.len()]) -> String {
+    /// after `pads`, the module pins as driven and as read back, per port
+    /// its PERST#/REFCLK control, link status and data-link state, then
+    /// the UPHY side and what `clk` holds (pad power-down, PCIEXCLK).
+    fn link_report(&self, before: &[u32; PADS.len()], elpg: u32) -> String {
         let mut s = String::from("pads");
         for (k, &(off, ..)) in PADS.iter().enumerate() {
             let _ = write!(s, " {:x}>{:x}", before[k], self.pinmux.r32(off));
@@ -663,8 +688,26 @@ impl Pcie {
         }
         let _ = write!(
             s,
-            "; UPHY PLL {:x}",
-            self.padctl.r32(PADCTL_UPHY_PLL_P0_CTL1)
+            "; UPHY PLL {:x}; ELPG1 {:x}>{:x}; lane CTL2",
+            self.padctl.r32(PADCTL_UPHY_PLL_P0_CTL1),
+            elpg,
+            self.padctl.r32(PADCTL_ELPG_PROGRAM1)
+        );
+        for k in 0..PCIE_LANES {
+            let off = PADCTL_UPHY_MISC_PAD_CTL2 + k * UPHY_MISC_PAD_STRIDE;
+            let _ = write!(s, " {:x}", self.padctl.r32(off));
+        }
+        let (_, dpd) = clk_status(clk::PCIE);
+        let (link, _) = clk_status(clk::PCIE_LINK);
+        let _ = write!(
+            s,
+            "; IO DPD {:x}; PCIEXCLK {}",
+            dpd,
+            if link & clk::ST_OUT_OF_RESET != 0 {
+                "released"
+            } else {
+                "held"
+            }
         );
         s
     }
@@ -760,6 +803,27 @@ fn rail(ep: u32, on: bool) -> Result<(), i64> {
     let mut m = Msg::new(power::PCIE_POWER, 1, 0);
     m.mr[0] = on as u64;
     ipc::checked(ipc::call(ep, &m)?).map(|_| ())
+}
+
+/// PCIEXCLK through the `clk` service: held while the AFI is programmed.
+fn pcie_link(on: bool) -> Result<(), i64> {
+    let ep = ns::wait_for_timeout("clk", 2_000_000_000)?;
+    let mut m = Msg::new(if on { clk::ENABLE } else { clk::DISABLE }, 1, 0);
+    m.mr[0] = clk::PCIE_LINK;
+    ipc::checked(ipc::call(ep, &m)?).map(|_| ())
+}
+
+/// `clk` STATUS of a device: its state word and extra word (0s if none).
+fn clk_status(dev: u64) -> (u64, u64) {
+    let Ok(ep) = ns::wait_for_timeout("clk", 2_000_000_000) else {
+        return (0, 0);
+    };
+    let mut m = Msg::new(clk::STATUS, 1, 0);
+    m.mr[0] = dev;
+    match ipc::call(ep, &m).and_then(ipc::checked) {
+        Ok(r) => (r.mr[0], r.mr[1]),
+        Err(_) => (0, 0),
+    }
 }
 
 /// Partition, PLLE and the AFI/PCIe clocks through the `clk` service.
