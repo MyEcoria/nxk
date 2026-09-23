@@ -390,6 +390,14 @@ fn control(
         Err(e) => return (format!("ioctl ver: {}", e), None),
     };
     println!("[wlan] firmware: {}", ver);
+    // Features the firmware offers (brcmfmac `brcmf_feat_attach`).
+    if let Ok(c) = m.get_var(bp, tcm, "cap", 512) {
+        let end = c.iter().position(|&x| x == 0).unwrap_or(c.len());
+        println!(
+            "[wlan] firmware features: {}",
+            String::from_utf8_lossy(&c[..end])
+        );
+    }
     let mut dev = wl::Dev {
         mb: &mut m,
         bp,
