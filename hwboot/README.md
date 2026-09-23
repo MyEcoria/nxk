@@ -312,6 +312,15 @@ seconds (each 512-character line is echoed back before the next).
    whole bring-up works on silicon: PMIC rail, module pins, PCIe link,
    bridge windows, backplane reads through BAR0. What remains is the
    data path: firmware download and Broadcom's msgbuf rings.
+10. 23/09/2026, Erista, commit `263ea9d`: driver updates over USB-C
+    work (`usbterm.py --reload wlan`: upload, CRC check and restart in
+    7 s). They showed that only the first bring-up after power-on
+    worked: a restarted `wlan` saw a stale link whose config reads
+    returned all ones, or, with the root complex reset, no link at all.
+    Holding the module off longer changed nothing; recalibrating the
+    UPHY PLL, which still read locked, did. Each start now resets the
+    root complex through `clk` and calibrates the PLL from scratch;
+    repeated restarts identify the BCM4356 every time.
 
 ## Hardware test (once the SD card is back in the PC)
 
