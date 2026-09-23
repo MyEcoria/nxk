@@ -278,8 +278,15 @@ The last `usbcon:` line locates a failure:
    `PCIE_LINK`), the UPHY AUX mux clamps in `ELPG_PROGRAM1` were never
    released, and the PEX bias/REFCLK pads may sit in PMC deep
    power-down (`clk` lifts it). The report adds `ELPG_PROGRAM1`, the
-   lane power registers, `IO_DPD_STATUS` and PCIEXCLK. Not re-run on
-   hardware yet.
+   lane power registers, `IO_DPD_STATUS` and PCIEXCLK.
+8. 23/09/2026, Erista, commit `68d5c34`: **PCIe link up on port 1**
+   (lane 0, the x1 port) and a Broadcom endpoint behind it: `wifi
+   status` reads `adapter BCMffff rev 15 on PCIe port 1`. Config reads
+   reach the chip, memory reads through BAR0 come back all ones: the
+   root port had bus numbers but no memory window and no memory
+   decoding, so it forwarded nothing. Fixed since (`pci_setup_bridge`
+   equivalent); an all-ones chip ID now also reports the AFI error
+   code and address. Not re-run on hardware yet.
 
 ## Hardware test (once the SD card is back in the PC)
 
