@@ -11,6 +11,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use libnx::abi::err::{
     EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETUNREACH, ENOENT, ENOTCONN,
@@ -38,6 +39,19 @@ const PONGS_MAX: usize = 64;
 const UDP_BUF: usize = 64 * 1024;
 /// Data bytes per reply message.
 const MAX_IO: usize = 3 * 1024;
+/// Largest frame (Ethernet MTU with header).
+const FRAME: usize = 1514;
+
+/// Traffic counters (`proto::STATS`): frames and bytes each way.
+static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static TX_FRAMES: AtomicU64 = AtomicU64::new(0);
+static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn count(frames: &AtomicU64, bytes: &AtomicU64, n: usize) {
+    frames.fetch_add(1, Ordering::Relaxed);
+    bytes.fetch_add(n as u64, Ordering::Relaxed);
+}
 
 // ------------------------------------------------------------ interface ---
 
@@ -57,11 +71,12 @@ impl RxToken for Rx {
 
 impl TxToken for Tx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut b = vec![0u8; len];
-        let r = f(&mut b);
+        let mut b = [0u8; FRAME];
+        let r = f(&mut b[..len]);
+        count(&TX_FRAMES, &TX_BYTES, len);
         // Driver TX ring full: let what is there drain.
         for _ in 0..100 {
-            match ipc::call(self.0, &ipc::pack(eth::SEND, &b)) {
+            match ipc::call(self.0, &ipc::pack(eth::SEND, &b[..len])) {
                 Ok(m) if m.label() == EAGAIN as u32 => time::sleep_us(100),
                 _ => break,
             }
@@ -82,6 +97,7 @@ impl Device for Dev {
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx)> {
         let f = self.rx.lock().pop_front()?;
+        count(&RX_FRAMES, &RX_BYTES, f.len());
         Some((Rx(f), Tx(self.eth)))
     }
 
@@ -92,7 +108,7 @@ impl Device for Dev {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut c = DeviceCapabilities::default();
         c.medium = Medium::Ethernet;
-        c.max_transmission_unit = 1514;
+        c.max_transmission_unit = FRAME;
         c
     }
 }
@@ -140,12 +156,6 @@ fn deadline(timeout: u64) -> u64 {
     }
 }
 
-fn words(w: &[u64]) -> Msg {
-    let mut m = Msg::new(0, w.len(), 0);
-    m.mr[..w.len()].copy_from_slice(w);
-    m
-}
-
 struct Net {
     iface: Interface,
     dev: Dev,
@@ -173,6 +183,8 @@ struct Net {
     ident: u16,
     seq: u16,
     pongs: VecDeque<(u32, u16, u64)>,
+    /// Interface in use (`proto::LINK_*`).
+    link: u64,
 }
 
 impl Net {
@@ -362,7 +374,10 @@ impl Net {
                     let _ = self.sockets.get_mut::<tcp::Socket>(h).listen(port);
                     pool.push(h);
                 }
-                Ok(words(&[self.insert(Sock::Listener { port, pool }, pid)]))
+                Ok(Msg::from_words(
+                    0,
+                    &[self.insert(Sock::Listener { port, pool }, pid)],
+                ))
             }
             proto::TCP_ACCEPT => {
                 if !matches!(self.sock(m.mr[0]), Ok(Sock::Listener { .. })) {
@@ -439,7 +454,10 @@ impl Net {
                     self.sockets.remove(h);
                     return Some(Err(-EADDRINUSE));
                 }
-                Ok(words(&[self.insert(Sock::Udp(h), pid), port as u64]))
+                Ok(Msg::from_words(
+                    0,
+                    &[self.insert(Sock::Udp(h), pid), port as u64],
+                ))
             }
             proto::SEND_TO => {
                 let (id, addr, port) = (
@@ -457,7 +475,7 @@ impl Net {
                             .get_mut::<udp::Socket>(h)
                             .send_slice(&buf[..n], ep)
                         {
-                            Ok(()) => Ok(words(&[n as u64])),
+                            Ok(()) => Ok(Msg::from_words(0, &[n as u64])),
                             Err(_) => Err(-EAGAIN),
                         }
                     }
@@ -483,7 +501,7 @@ impl Net {
                 let name = String::from(core::str::from_utf8(&buf[..n]).unwrap_or(""));
                 // Literal address: no query.
                 if let Some(a) = parse_ipv4(&name) {
-                    return Some(Ok(words(&[u32::from(a) as u64])));
+                    return Some(Ok(Msg::from_words(0, &[u32::from(a) as u64])));
                 }
                 if self.dns_server.is_none() {
                     return Some(Err(-ENETUNREACH));
@@ -542,19 +560,37 @@ impl Net {
                     .unwrap_or((0, 0));
                 let g = self.gateway.map(|g| u32::from(g) as u64).unwrap_or(0);
                 let d = self.dns_server.map(|d| u32::from(d) as u64).unwrap_or(0);
-                Ok(words(&[a, p, g, d]))
+                Ok(Msg::from_words(0, &[a, p, g, d]))
+            }
+            proto::STATS => {
+                let open = self.table.iter().filter(|s| s.is_some()).count();
+                let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+                Ok(Msg::from_words(
+                    0,
+                    &[
+                        n(&RX_FRAMES),
+                        n(&RX_BYTES),
+                        n(&TX_FRAMES),
+                        n(&TX_BYTES),
+                        open as u64,
+                        self.link,
+                    ],
+                ))
             }
             proto::ADDRS => match self.tcp_handle(m.mr[0]) {
                 Ok(h) => {
                     let s = self.sockets.get::<tcp::Socket>(h);
                     let l = s.local_endpoint();
                     let r = s.remote_endpoint();
-                    Ok(words(&[
-                        l.map(|e| word(e.addr)).unwrap_or(0),
-                        l.map(|e| e.port as u64).unwrap_or(0),
-                        r.map(|e| word(e.addr)).unwrap_or(0),
-                        r.map(|e| e.port as u64).unwrap_or(0),
-                    ]))
+                    Ok(Msg::from_words(
+                        0,
+                        &[
+                            l.map(|e| word(e.addr)).unwrap_or(0),
+                            l.map(|e| e.port as u64).unwrap_or(0),
+                            r.map(|e| word(e.addr)).unwrap_or(0),
+                            r.map(|e| e.port as u64).unwrap_or(0),
+                        ],
+                    ))
                 }
                 Err(e) => Err(e),
             },
@@ -570,7 +606,7 @@ impl Net {
                 let h = self.tcp_handle(*sock as u64).ok()?;
                 let st = self.sockets.get::<tcp::Socket>(h).state();
                 match st {
-                    tcp::State::Established => Some(Ok(words(&[*sock as u64]))),
+                    tcp::State::Established => Some(Ok(Msg::from_words(0, &[*sock as u64]))),
                     tcp::State::Closed => {
                         let _ = self.close(*sock as u64);
                         Some(Err(-ECONNREFUSED))
@@ -610,11 +646,14 @@ impl Net {
                         let r = self.sockets.get::<tcp::Socket>(h).remote_endpoint();
                         let owner = self.owners[*listener - 1];
                         let sid = self.insert(Sock::Tcp(h), owner);
-                        Some(Ok(words(&[
-                            sid,
-                            r.map(|e| word(e.addr)).unwrap_or(0),
-                            r.map(|e| e.port as u64).unwrap_or(0),
-                        ])))
+                        Some(Ok(Msg::from_words(
+                            0,
+                            &[
+                                sid,
+                                r.map(|e| word(e.addr)).unwrap_or(0),
+                                r.map(|e| e.port as u64).unwrap_or(0),
+                            ],
+                        )))
                     }
                     None if expired => Some(Err(-ETIMEDOUT)),
                     None => None,
@@ -657,7 +696,7 @@ impl Net {
                 }
                 if s.can_send() {
                     return Some(match s.send_slice(data) {
-                        Ok(n) => Ok(words(&[n as u64])),
+                        Ok(n) => Ok(Msg::from_words(0, &[n as u64])),
                         Err(_) => Err(-EPIPE),
                     });
                 }
@@ -695,7 +734,7 @@ impl Net {
                     .get_query_result(*query)
                 {
                     Ok(addrs) => Some(match addrs.first() {
-                        Some(&a) => Ok(words(&[word(a)])),
+                        Some(&a) => Ok(Msg::from_words(0, &[word(a)])),
                         None => Err(-ENOENT),
                     }),
                     Err(dns::GetQueryResultError::Pending) if expired => {
@@ -712,7 +751,7 @@ impl Net {
                 match self.pongs.iter().position(|p| p.0 == *addr && p.1 == *seq) {
                     Some(k) => {
                         let (_, _, at) = self.pongs.remove(k)?;
-                        Some(Ok(words(&[at.saturating_sub(*sent)])))
+                        Some(Ok(Msg::from_words(0, &[at.saturating_sub(*sent)])))
                     }
                     None if expired => Some(Err(-ETIMEDOUT)),
                     None => None,
@@ -819,17 +858,17 @@ libnx::entry!(main);
 /// may still be enumerating. Failing that, wait for the Wi-Fi station,
 /// which publishes "wlan0" the moment it associates. Both waits block
 /// in the name service: an idle core stays idle.
-fn link() -> Result<u32, i64> {
+fn link() -> Result<(u32, u64), i64> {
     if let Ok(h) = ns::wait_for_timeout("eth0", 3_000_000_000) {
-        return Ok(h);
+        return Ok((h, proto::LINK_ETH0));
     }
     println!("[net] no wired link, waiting for Wi-Fi");
-    ns::wait_for("wlan0")
+    ns::wait_for("wlan0").map(|h| (h, proto::LINK_WLAN0))
 }
 
 fn main() -> i32 {
-    let eth = match link() {
-        Ok(h) => h,
+    let (eth, link) = match link() {
+        Ok(l) => l,
         Err(_) => {
             println!("[net] no network interface");
             return 0;
@@ -910,6 +949,7 @@ fn main() -> i32 {
         ident,
         seq: 0,
         pongs: VecDeque::new(),
+        link,
     };
     let ep = drv::publish("net").expect("net: publish");
     let mut buf = vec![0u8; ipc::MAX_BYTES];

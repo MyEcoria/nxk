@@ -65,10 +65,13 @@ pub fn services(buf: &mut [u8]) -> usize {
 /// service was restarted) is dropped, so the next call looks it up again.
 pub struct Service {
     name: &'static str,
-    /// How long the first lookup waits for publication (0: no limit).
+    /// How long the first lookup waits for publication (0: no limit,
+    /// `NO_WAIT`: not at all).
     wait_ns: u64,
     handle: AtomicU32,
 }
+
+const NO_WAIT: u64 = u64::MAX;
 
 impl Service {
     pub const fn new(name: &'static str, wait_ns: u64) -> Self {
@@ -77,6 +80,12 @@ impl Service {
             wait_ns,
             handle: AtomicU32::new(0),
         }
+    }
+
+    /// Looked up without waiting: calls fail with `-ENOSYS` until the
+    /// service is published.
+    pub const fn optional(name: &'static str) -> Self {
+        Self::new(name, NO_WAIT)
     }
 
     /// Use `h` rather than a lookup (init cannot look itself up).
@@ -90,7 +99,11 @@ impl Service {
         if h != 0 {
             return Ok(h);
         }
-        let h = wait_for_timeout(self.name, self.wait_ns).map_err(|_| -ENOSYS)?;
+        let h = match self.wait_ns {
+            NO_WAIT => lookup(self.name),
+            ns => wait_for_timeout(self.name, ns),
+        }
+        .map_err(|_| -ENOSYS)?;
         // Two threads may race: only one handle is kept.
         match self
             .handle

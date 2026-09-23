@@ -1325,6 +1325,11 @@ pub mod proto {
         /// words: address, timeout. One ICMP echo request. Reply: word
         /// 0 = round-trip time in ns.
         pub const PING: u32 = 15;
+        /// Reply: frames received, bytes received, frames sent, bytes
+        /// sent, open sockets, link (`LINK_*`).
+        pub const STATS: u32 = 16;
+        pub const LINK_ETH0: u64 = 1;
+        pub const LINK_WLAN0: u64 = 2;
     }
     /// Input events.
     pub mod input {
