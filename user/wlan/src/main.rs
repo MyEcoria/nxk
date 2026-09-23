@@ -43,7 +43,7 @@ const CONNECT_TIMEOUT: u64 = 15_000_000_000;
 /// interrupt drives them, this is the safety net should one be missed.
 const POLL_NS: u64 = 500_000_000;
 /// How long bring-up waits for `fs` (the card is mounted after `sd`
-/// initializes it) before looking for the firmware.
+/// initializes it) before touching the hardware.
 const FS_WAIT_NS: u64 = 30_000_000_000;
 /// Frames received and not read by `net` yet; older ones are dropped.
 const RX_QUEUE: usize = 256;
@@ -335,6 +335,9 @@ fn publish(ep: u32, name: &str, badge: u64) -> Result<(), i64> {
 /// where it stopped (reported by `wifi`, since hardware runs have no
 /// UART to read the boot log from).
 fn hardware() -> Result<(Hw, Irq, String), String> {
+    // The firmware is on the card, and the PCIe bring-up is kept off the
+    // card's own start: at boot `sd` initializes it and `fs` mounts it.
+    let _ = ns::wait_for_timeout("fs", FS_WAIT_NS);
     let map = |slot, base, len| {
         Mmio::map(drv::dev_slot(slot), base, len)
             .map_err(|e| format!("register page {} ({})", slot, err::name(e)))
@@ -374,8 +377,6 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
     let bar0 = map(5, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
     let window = |addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr);
     let bp = chip::Backplane::new(&bar0, &window);
-    // The firmware is on the card: at boot `fs` may still be mounting it.
-    let _ = ns::wait_for_timeout("fs", FS_WAIT_NS);
     let c = chip::identify(&bp);
     println!(
         "[wlan] BCM{:x} revision {}, firmware {}",
