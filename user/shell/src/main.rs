@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
-use libnx::abi::proto::power;
+use libnx::abi::proto::{pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
@@ -169,6 +169,8 @@ fn command(line: &str) {
         }
         "poweroff" => power_cmd(power::OFF),
         "reboot" => power_cmd(power::REBOOT),
+        "recv" if argv.len() == 4 => recv(argv[1], argv[2], argv[3]),
+        "restart" if argv.len() >= 2 => restart(argv[1], argv.get(2).copied()),
         "run" => run(&argv[1..]),
         _ => run(&argv), // a program name runs directly
     }
@@ -199,6 +201,93 @@ fn help() {
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
+    println!("  recv F SIZE CRC receive F as base64 lines (tools/usbterm.py --put)");
+    println!("  restart DRV [F] replace boot driver DRV by F (default /bin/DRV)");
+}
+
+/// File typed as base64 lines (`tools/usbterm.py --put`): SIZE bytes,
+/// checked against their CRC-32 (zlib's), then written. An empty line aborts.
+fn recv(path: &str, size: &str, crc: &str) {
+    let (Ok(size), Ok(crc)) = (size.parse::<usize>(), u32::from_str_radix(crc, 16)) else {
+        println!("usage: recv FILE SIZE CRC32 (hex)");
+        return;
+    };
+    let mut data = Vec::with_capacity(size);
+    let mut line = [0u8; 1024];
+    while data.len() < size {
+        let n = console::read_line(&mut line);
+        if n == 0 || !base64_decode(&line[..n], &mut data) {
+            println!("recv: aborted after {} of {} bytes", data.len(), size);
+            return;
+        }
+    }
+    if data.len() != size || crc32(&data) != crc {
+        println!(
+            "recv: {} bytes, CRC {:08x}: corrupted",
+            data.len(),
+            crc32(&data)
+        );
+        return;
+    }
+    match fs::write(path, &data) {
+        Ok(()) => println!("recv: {} ({} bytes)", path, size),
+        Err(e) => println!("recv: {}: {}", path, err::name(e)),
+    }
+}
+
+/// Standard base64 (padding allowed); false on a foreign character.
+fn base64_decode(s: &[u8], out: &mut Vec<u8>) -> bool {
+    let (mut acc, mut bits) = (0u32, 0);
+    for &c in s {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return false,
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    true
+}
+
+/// CRC-32 (IEEE 802.3, reflected), as zlib computes it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg());
+        }
+    }
+    !c
+}
+
+/// Replace a boot driver by a program on the card, same hardware
+/// grants (init's `RESTART`): the development loop for drivers.
+fn restart(name: &str, path: Option<&str>) {
+    let path = match path {
+        Some(p) => fs::absolute(p),
+        None => alloc::format!("/bin/{}", name),
+    };
+    let req = alloc::format!("{} {}", name, path);
+    let r = ipc::call(
+        process::pm_handle(),
+        &ipc::pack(pm::RESTART, req.as_bytes()),
+    )
+    .and_then(ipc::checked);
+    match r {
+        Ok(_) => println!("{} restarted from {}", name, path),
+        Err(e) => println!("restart {}: {}", name, err::name(e)),
+    }
 }
 
 fn progs() {
