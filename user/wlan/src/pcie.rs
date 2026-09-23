@@ -556,7 +556,9 @@ impl Pcie {
     /// Whole bring-up: rail, module, clocks, UPHY, AFI, link, then the
     /// endpoint behind whichever port trained.
     pub fn bring_up(&self) -> Result<Endpoint, Fail> {
-        rail(true).map_err(|e| Fail::new("PCIe rail (PMIC LDO1)", e))?;
+        let power = ns::wait_for_timeout("power", 5_000_000_000)
+            .map_err(|e| Fail::new("power service not published", e))?;
+        rail(power, true).map_err(|e| Fail::new("PCIe rail (PMIC LDO1)", e))?;
         clock_on().map_err(|e| Fail::new("PCIe clocks and PLLE", e))?;
         // The root ports identify themselves once their clock runs. No
         // NVIDIA bridge there means no root complex (emulator): stop
@@ -683,8 +685,7 @@ fn cfg_offset(bus: u8, dev: u8, where_: usize) -> usize {
 }
 
 /// PCIe/XUSB rail through the `power` service.
-fn rail(on: bool) -> Result<(), i64> {
-    let ep = ns::wait_for_timeout("power", 2_000_000_000)?;
+fn rail(ep: u32, on: bool) -> Result<(), i64> {
     let mut m = Msg::new(power::PCIE_POWER, 1, 0);
     m.mr[0] = on as u64;
     ipc::checked(ipc::call(ep, &m)?).map(|_| ())
