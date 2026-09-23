@@ -42,6 +42,9 @@ const CONNECT_TIMEOUT: u64 = 15_000_000_000;
 /// While joined, the rings are also polled this often: the chip's
 /// interrupt drives them, this is the safety net should one be missed.
 const POLL_NS: u64 = 500_000_000;
+/// How long bring-up waits for `fs` (the card is mounted after `sd`
+/// initializes it) before looking for the firmware.
+const FS_WAIT_NS: u64 = 30_000_000_000;
 /// Frames received and not read by `net` yet; older ones are dropped.
 const RX_QUEUE: usize = 256;
 /// While joined, the firmware console is saved this often: once the
@@ -371,6 +374,8 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
     let bar0 = map(5, ep.bars[0], chip::BAR0_WINDOW_LEN)?;
     let window = |addr| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, addr);
     let bp = chip::Backplane::new(&bar0, &window);
+    // The firmware is on the card: at boot `fs` may still be mounting it.
+    let _ = ns::wait_for_timeout("fs", FS_WAIT_NS);
     let c = chip::identify(&bp);
     println!(
         "[wlan] BCM{:x} revision {}, firmware {}",
