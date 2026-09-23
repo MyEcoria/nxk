@@ -373,8 +373,10 @@ fn bring_up(board: &Board) -> Result<(), i64> {
     }
     // A card the loader left powered keeps its 1.8 V UHS signaling, which
     // only a power cycle undoes: commands still pass, data never comes.
+    // 239 ms off, hekate's T210 value for the rails to discharge (100 ms
+    // failed after warm reboots).
     board.power_off();
-    time::sleep_ms(100);
+    time::sleep_ms(239);
     board.power_on()?;
     libnx::clk::enable(clk::SDMMC1)
 }
