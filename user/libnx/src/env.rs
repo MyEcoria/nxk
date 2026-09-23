@@ -4,27 +4,19 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use nxk_abi::startup::{Block, BLOCK_MAGIC};
+use nxk_abi::startup::Block;
 
 use crate::rt;
 use crate::sync::Mutex;
 
 fn block() -> Option<&'static Block> {
-    let p = rt::startup_block();
-    if p == 0 {
-        return None;
-    }
-    let b = unsafe { &*(p as *const Block) };
-    (b.magic == BLOCK_MAGIC).then_some(b)
+    Block::at(rt::startup_block())
 }
 
 /// Block strings: the `argc` args then the `envc` variables.
 fn strings() -> impl Iterator<Item = &'static str> {
     let (data, n) = match block() {
-        Some(b) => (
-            unsafe { core::slice::from_raw_parts(b.strings as *const u8, b.strings_len as usize) },
-            (b.argc + b.envc) as usize,
-        ),
+        Some(b) => (b.string_area(), (b.argc + b.envc) as usize),
         None => (&[][..], 0),
     };
     data.split(|&c| c == 0)

@@ -79,24 +79,13 @@ pub fn startup_flags() -> u64 {
 
 /// Kernel startup block, if valid.
 pub fn startup_block() -> Option<&'static abi::startup::Block> {
-    let p = BLOCK.load(Ordering::Relaxed);
-    if p == 0 {
-        return None;
-    }
-    // SAFETY: the kernel leaves the block atop the main stack,
-    // which outlives the process.
-    let b = unsafe { &*(p as *const abi::startup::Block) };
-    (b.magic == abi::startup::BLOCK_MAGIC).then_some(b)
+    abi::startup::Block::at(BLOCK.load(Ordering::Relaxed))
 }
 
 /// Startup-block strings: `argc` args then `envc` vars.
 pub fn startup_strings() -> (&'static [u8], usize, usize) {
     match startup_block() {
-        Some(b) => {
-            // SAFETY: copied by the kernel into the startup block.
-            let s = unsafe { crate::slice::from_raw_parts(b.strings as *const u8, b.strings_len as usize) };
-            (s, b.argc as usize, b.envc as usize)
-        }
+        Some(b) => (b.string_area(), b.argc as usize, b.envc as usize),
         None => (&[], 0, 0),
     }
 }

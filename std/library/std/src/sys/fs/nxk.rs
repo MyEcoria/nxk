@@ -313,7 +313,7 @@ impl File {
     }
 
     fn fstat(&self) -> io::Result<FileAttr> {
-        call(&Msg::words(proto::FSTAT, &[self.fd])).map(|m| FileAttr::from_reply(&m))
+        call(&Msg::from_words(proto::FSTAT, &[self.fd])).map(|m| FileAttr::from_reply(&m))
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
@@ -349,7 +349,7 @@ impl File {
     }
 
     pub fn truncate(&self, size: u64) -> io::Result<()> {
-        call(&Msg::words(proto::TRUNCATE, &[self.fd, size])).map(|_| ())
+        call(&Msg::from_words(proto::TRUNCATE, &[self.fd, size])).map(|_| ())
     }
 
     /// Positioned read, in `MAX_IO`-byte chunks.
@@ -357,7 +357,7 @@ impl File {
         let mut done = 0;
         while done < buf.len() {
             let len = (buf.len() - done).min(proto::MAX_IO);
-            let r = call(&Msg::words(proto::READ, &[self.fd, pos + done as u64, len as u64]))?;
+            let r = call(&Msg::from_words(proto::READ, &[self.fd, pos + done as u64, len as u64]))?;
             let n = ipc::unpack(&r, &mut buf[done..done + len]);
             done += n;
             if n < len {
@@ -445,7 +445,7 @@ impl File {
     }
 
     pub fn duplicate(&self) -> io::Result<File> {
-        call(&Msg::words(proto::DUP, &[self.fd]))?;
+        call(&Msg::from_words(proto::DUP, &[self.fd]))?;
         Ok(File { fd: self.fd, pos: self.pos.clone(), append: self.append, path: self.path.clone() })
     }
 
@@ -460,7 +460,7 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        let _ = call(&Msg::words(proto::CLOSE, &[self.fd]));
+        let _ = call(&Msg::from_words(proto::CLOSE, &[self.fd]));
     }
 }
 

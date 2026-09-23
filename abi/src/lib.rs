@@ -375,6 +375,292 @@ pub mod utcb {
     const _: () = assert!(core::mem::size_of::<Utcb>() == 4096);
 }
 
+/// EL0 side of the calling convention: raw syscalls, IPC messages and
+/// the UTCB. Shared by libnx and std (the kernel never calls these).
+pub mod user {
+    use core::arch::asm;
+
+    use super::utcb::{Utcb, MR_WORDS};
+    use super::{sys, tag};
+
+    /// # Safety
+    /// `nr` and its arguments must follow the syscall's contract.
+    #[inline(always)]
+    pub unsafe fn syscall0(nr: u64) -> i64 {
+        let r: i64;
+        unsafe { asm!("svc #0", lateout("x0") r, in("x8") nr, options(nostack)) };
+        r
+    }
+
+    /// # Safety
+    /// See `syscall0`.
+    #[inline(always)]
+    pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
+        let r: i64;
+        unsafe { asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x8") nr, options(nostack)) };
+        r
+    }
+
+    /// # Safety
+    /// See `syscall0`.
+    #[inline(always)]
+    pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
+        let r: i64;
+        unsafe {
+            asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x8") nr,
+                 options(nostack))
+        };
+        r
+    }
+
+    /// # Safety
+    /// See `syscall0`.
+    #[inline(always)]
+    pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+        let r: i64;
+        unsafe {
+            asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x2") a2,
+                 in("x8") nr, options(nostack))
+        };
+        r
+    }
+
+    /// # Safety
+    /// See `syscall0`.
+    #[inline(always)]
+    pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+        let r: i64;
+        unsafe {
+            asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x2") a2,
+                 in("x3") a3, in("x8") nr, options(nostack))
+        };
+        r
+    }
+
+    /// Message: tag plus the 6 words carried in x2-x7.
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Msg {
+        pub tag: u64,
+        pub mr: [u64; 6],
+    }
+
+    impl Msg {
+        pub const fn new(label: u32, words: usize, handles: usize) -> Self {
+            Self {
+                tag: tag::make(label, words, handles),
+                mr: [0; 6],
+            }
+        }
+
+        /// Words-only message (at most 6).
+        pub fn from_words(label: u32, w: &[u64]) -> Self {
+            let mut m = Self::new(label, w.len(), 0);
+            m.mr[..w.len()].copy_from_slice(w);
+            m
+        }
+
+        pub const fn label(&self) -> u32 {
+            tag::label(self.tag)
+        }
+
+        pub const fn words(&self) -> usize {
+            tag::words(self.tag)
+        }
+
+        pub const fn handles(&self) -> usize {
+            tag::handles(self.tag)
+        }
+
+        /// Synthetic message: the thread-bound notification fired.
+        pub const fn is_notify(&self) -> bool {
+            self.tag & tag::FLAG_NOTIFY != 0
+        }
+
+        /// Same message plus `n` handles (set via `set_send_handle`).
+        pub const fn with_handles(self, n: usize) -> Self {
+            Self {
+                tag: tag::make(self.label(), self.words(), n),
+                mr: self.mr,
+            }
+        }
+
+        /// Error reply (positive errno in the label).
+        pub const fn error(e: i64) -> Self {
+            Self::new(e.unsigned_abs() as u32, 0, 0)
+        }
+    }
+
+    /// Received message: contents, sender badge, deferred-reply token,
+    /// sender pid (set by the kernel; 0 for a notification).
+    #[derive(Clone, Copy, Default, Debug)]
+    pub struct Received {
+        pub msg: Msg,
+        pub badge: u64,
+        pub token: u64,
+        pub pid: u32,
+    }
+
+    /// Install thread pointer `tp` (TLS block, see `startup::Tls`).
+    ///
+    /// # Safety
+    /// `tp` must be this thread's initialized TLS block, or 0.
+    #[inline(always)]
+    pub unsafe fn set_tp(tp: u64) {
+        unsafe { asm!("msr tpidr_el0, {}", in(reg) tp, options(nomem, nostack, preserves_flags)) };
+    }
+
+    /// Current thread's UTCB (address in `TPIDRRO_EL0`, no syscall).
+    #[inline(always)]
+    pub fn utcb() -> *mut Utcb {
+        let p: u64;
+        unsafe {
+            asm!("mrs {}, tpidrro_el0", out(reg) p, options(nomem, nostack, preserves_flags))
+        };
+        p as *mut Utcb
+    }
+
+    /// IPC syscall `nr` on `x0`: `timeout` (ns, 0 = no limit) travels
+    /// in x9, the token comes back there. Returns x0 and the message.
+    #[inline(always)]
+    pub fn ipc(nr: u64, x0: u64, m: &Msg, timeout: u64) -> (i64, Received) {
+        let (r0, t, a, b, c, d, e, f, badge, token, pid): (
+            i64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+        );
+        unsafe {
+            asm!("svc #0",
+                inlateout("x0") x0 as i64 => r0,
+                inlateout("x1") m.tag => t,
+                inlateout("x2") m.mr[0] => a,
+                inlateout("x3") m.mr[1] => b,
+                inlateout("x4") m.mr[2] => c,
+                inlateout("x5") m.mr[3] => d,
+                inlateout("x6") m.mr[4] => e,
+                inlateout("x7") m.mr[5] => f,
+                inlateout("x8") nr => badge,
+                inlateout("x9") timeout => token,
+                lateout("x10") pid,
+                options(nostack));
+        }
+        (
+            r0,
+            Received {
+                msg: Msg {
+                    tag: t,
+                    mr: [a, b, c, d, e, f],
+                },
+                badge,
+                token,
+                pid: pid as u32,
+            },
+        )
+    }
+
+    /// `ipc` with its status checked: `Err(-errno)` from the kernel.
+    #[inline(always)]
+    pub fn ipc_checked(nr: u64, x0: u64, m: &Msg, timeout: u64) -> Result<Received, i64> {
+        match ipc(nr, x0, m, timeout) {
+            (r, _) if r < 0 => Err(r),
+            (_, rx) => Ok(rx),
+        }
+    }
+
+    /// Send a request and wait for the reply (`timeout` ns covers both,
+    /// 0 = no limit).
+    #[inline]
+    pub fn call(ep: u32, m: &Msg, timeout: u64) -> Result<Msg, i64> {
+        ipc_checked(sys::IPC_CALL, ep as u64, m, timeout).map(|r| r.msg)
+    }
+
+    /// Bytes per message: word 0 = length, bytes follow.
+    pub const MAX_BYTES: usize = (MR_WORDS - 1) * 8;
+
+    /// Word `i` of a message (registers or UTCB).
+    #[inline]
+    fn word(m: &Msg, i: usize) -> u64 {
+        if i < tag::REG_WORDS {
+            m.mr[i]
+        } else {
+            unsafe { (*utcb()).mr[i] }
+        }
+    }
+
+    #[inline]
+    fn set_word(m: &mut Msg, i: usize, v: u64) {
+        if i < tag::REG_WORDS {
+            m.mr[i] = v;
+        } else {
+            unsafe { (*utcb()).mr[i] = v };
+        }
+    }
+
+    /// Header word `i` of a received message (register or UTCB).
+    pub fn header(m: &Msg, i: usize) -> u64 {
+        word(m, i)
+    }
+
+    /// Message of `head` header words, a length word, then the bytes
+    /// (truncated to what fits). Also returns the byte count carried.
+    pub fn pack_at(label: u32, head: &[u64], data: &[u8]) -> (Msg, usize) {
+        let first = head.len();
+        let n = data.len().min((MR_WORDS - 1 - first) * 8);
+        let mut m = Msg::new(label, first + 1 + n.div_ceil(8), 0);
+        for (i, &w) in head.iter().enumerate() {
+            set_word(&mut m, i, w);
+        }
+        set_word(&mut m, first, n as u64);
+        for (i, chunk) in data[..n].chunks(8).enumerate() {
+            let mut w = [0u8; 8];
+            w[..chunk.len()].copy_from_slice(chunk);
+            set_word(&mut m, first + 1 + i, u64::from_le_bytes(w));
+        }
+        (m, n)
+    }
+
+    /// Byte count a `pack_at` message with `first` header words
+    /// advertises (no copy).
+    pub fn bytes_len(m: &Msg, first: usize) -> usize {
+        if m.words() <= first {
+            return 0;
+        }
+        (word(m, first) as usize).min((m.words() - first - 1) * 8)
+    }
+
+    /// Bytes of a `pack_at` message with `first` header words.
+    pub fn unpack_at(m: &Msg, first: usize, out: &mut [u8]) -> usize {
+        let n = bytes_len(m, first).min(out.len());
+        let mut done = 0;
+        let mut wi = first + 1;
+        while done < n {
+            let b = word(m, wi).to_le_bytes();
+            let k = (n - done).min(8);
+            out[done..done + k].copy_from_slice(&b[..k]);
+            done += k;
+            wi += 1;
+        }
+        n
+    }
+
+    /// Handle `k` received with the last message.
+    pub fn received_handle(k: usize) -> u32 {
+        unsafe { (*utcb()).handles[k] }
+    }
+
+    /// Stage handle `k` for the next message sent (GRANT right needed).
+    pub fn set_send_handle(k: usize, h: u32) {
+        unsafe { (*utcb()).handles[k] = h };
+    }
+}
+
 /// Args for `process_spawn`, passed by pointer (like `clone3`).
 pub mod spawn {
     #[repr(C)]
@@ -519,6 +805,83 @@ pub mod startup {
         pub stack_size: u64,
         /// Random seed (like AT_RANDOM).
         pub random: [u8; 16],
+    }
+
+    /// ELF program header, as copied into the block.
+    #[repr(C)]
+    struct Phdr {
+        ptype: u32,
+        pflags: u32,
+        offset: u64,
+        vaddr: u64,
+        paddr: u64,
+        filesz: u64,
+        memsz: u64,
+        align: u64,
+    }
+
+    const PT_TLS: u32 = 7;
+
+    /// PT_TLS template: AArch64 variant 1, a 16-byte header at
+    /// `TPIDR_EL0`, then `.tdata` and a zeroed `.tbss`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Tls {
+        pub image: u64,
+        pub filesz: usize,
+        pub memsz: usize,
+        pub align: usize,
+    }
+
+    impl Tls {
+        /// Data offset from `TPIDR_EL0`.
+        pub const fn data_offset(&self) -> usize {
+            16usize.next_multiple_of(self.align)
+        }
+
+        /// Bytes of one thread's block.
+        pub const fn block_size(&self) -> usize {
+            self.data_offset() + self.memsz
+        }
+    }
+
+    impl Block {
+        /// The block at `p` (x2 at process entry), if valid.
+        pub fn at(p: u64) -> Option<&'static Block> {
+            if p == 0 {
+                return None;
+            }
+            // SAFETY: the kernel leaves the block atop the main stack,
+            // which outlives the process.
+            let b = unsafe { &*(p as *const Block) };
+            (b.magic == BLOCK_MAGIC).then_some(b)
+        }
+
+        /// `argc` args then `envc` variables, each NUL-terminated.
+        pub fn string_area(&self) -> &'static [u8] {
+            // SAFETY: copied by the kernel into the block's stack area.
+            unsafe {
+                core::slice::from_raw_parts(self.strings as *const u8, self.strings_len as usize)
+            }
+        }
+
+        /// The executable's TLS template, if it has one.
+        pub fn tls(&self) -> Option<Tls> {
+            let mut t = None;
+            for k in 0..self.phnum as usize {
+                // SAFETY: `phnum` headers of `phent` bytes, copied by the kernel.
+                let ph =
+                    unsafe { &*((self.phdr + (k * self.phent as usize) as u64) as *const Phdr) };
+                if ph.ptype == PT_TLS && ph.memsz > 0 {
+                    t = Some(Tls {
+                        image: self.load_base + ph.vaddr,
+                        filesz: ph.filesz as usize,
+                        memsz: ph.memsz as usize,
+                        align: (ph.align as usize).max(16),
+                    });
+                }
+            }
+            t
+        }
     }
 }
 

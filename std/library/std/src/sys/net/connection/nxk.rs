@@ -88,7 +88,7 @@ impl TcpStream {
 
     fn connect_one(a: &SocketAddr, t: u64) -> io::Result<TcpStream> {
         let a = v4(a)?;
-        let m = call(&Msg::words(proto::TCP_CONNECT, &[u32::from(*a.ip()) as u64, a.port() as u64, t]))?;
+        let m = call(&Msg::from_words(proto::TCP_CONNECT, &[u32::from(*a.ip()) as u64, a.port() as u64, t]))?;
         Ok(TcpStream::from_id(m.mr[0]))
     }
 
@@ -129,7 +129,7 @@ impl TcpStream {
             return Ok(0);
         }
         let t = self.st.t.get(&self.st.t.read);
-        let m = call(&Msg::words(proto::RECV, &[self.id, len as u64, t])).map_err(would_block)?;
+        let m = call(&Msg::from_words(proto::RECV, &[self.id, len as u64, t])).map_err(would_block)?;
         Ok(ipc::unpack(&m, &mut buf[..len]))
     }
 
@@ -164,7 +164,7 @@ impl TcpStream {
     }
 
     fn addrs(&self) -> io::Result<Msg> {
-        call(&Msg::words(proto::ADDRS, &[self.id]))
+        call(&Msg::from_words(proto::ADDRS, &[self.id]))
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
@@ -179,12 +179,12 @@ impl TcpStream {
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match how {
             Shutdown::Read => Ok(()),
-            Shutdown::Write | Shutdown::Both => call(&Msg::words(proto::SHUTDOWN, &[self.id])).map(|_| ()),
+            Shutdown::Write | Shutdown::Both => call(&Msg::from_words(proto::SHUTDOWN, &[self.id])).map(|_| ()),
         }
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
-        call(&Msg::words(proto::DUP, &[self.id]))?;
+        call(&Msg::from_words(proto::DUP, &[self.id]))?;
         Ok(TcpStream { id: self.id, st: self.st.clone() })
     }
 
@@ -234,7 +234,7 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let _ = call(&Msg::words(proto::CLOSE, &[self.id]));
+        let _ = call(&Msg::from_words(proto::CLOSE, &[self.id]));
     }
 }
 
@@ -260,7 +260,7 @@ pub struct TcpListener {
 impl TcpListener {
     fn bind_one(a: &SocketAddr) -> io::Result<TcpListener> {
         let a = v4(a)?;
-        let listen = |port: u16| call(&Msg::words(proto::TCP_LISTEN, &[port as u64, 128]));
+        let listen = |port: u16| call(&Msg::from_words(proto::TCP_LISTEN, &[port as u64, 128]));
         let (m, port) = if a.port() != 0 {
             (listen(a.port())?, a.port())
         } else {
@@ -293,12 +293,12 @@ impl TcpListener {
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let t = if self.nonblocking.load(Ordering::Relaxed) { timeout::POLL } else { timeout::INFINITE };
-        let m = call(&Msg::words(proto::TCP_ACCEPT, &[self.id, t])).map_err(would_block)?;
+        let m = call(&Msg::from_words(proto::TCP_ACCEPT, &[self.id, t])).map_err(would_block)?;
         Ok((TcpStream::from_id(m.mr[0]), addr(m.mr[1], m.mr[2])))
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
-        call(&Msg::words(proto::DUP, &[self.id]))?;
+        call(&Msg::from_words(proto::DUP, &[self.id]))?;
         Ok(TcpListener { id: self.id, local: self.local, nonblocking: self.nonblocking.clone() })
     }
 
@@ -330,7 +330,7 @@ impl TcpListener {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        let _ = call(&Msg::words(proto::CLOSE, &[self.id]));
+        let _ = call(&Msg::from_words(proto::CLOSE, &[self.id]));
     }
 }
 
@@ -357,7 +357,7 @@ pub struct UdpSocket {
 impl UdpSocket {
     fn bind_one(a: &SocketAddr) -> io::Result<UdpSocket> {
         let a = v4(a)?;
-        let m = call(&Msg::words(proto::UDP_BIND, &[a.port() as u64]))?;
+        let m = call(&Msg::from_words(proto::UDP_BIND, &[a.port() as u64]))?;
         Ok(UdpSocket {
             id: m.mr[0],
             local: SocketAddrV4::new(*a.ip(), m.mr[1] as u16),
@@ -384,7 +384,7 @@ impl UdpSocket {
 
     pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let t = self.st.t.get(&self.st.t.read);
-        let m = call(&Msg::words(proto::RECV_FROM, &[self.id, t])).map_err(would_block)?;
+        let m = call(&Msg::from_words(proto::RECV_FROM, &[self.id, t])).map_err(would_block)?;
         let n = ipc::unpack_at(&m, 2, buf);
         Ok((n, addr(ipc::header(&m, 0), ipc::header(&m, 1))))
     }
@@ -403,7 +403,7 @@ impl UdpSocket {
     }
 
     pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        call(&Msg::words(proto::DUP, &[self.id]))?;
+        call(&Msg::from_words(proto::DUP, &[self.id]))?;
         Ok(UdpSocket { id: self.id, local: self.local, st: self.st.clone() })
     }
 
@@ -520,7 +520,7 @@ impl UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
-        let _ = call(&Msg::words(proto::CLOSE, &[self.id]));
+        let _ = call(&Msg::from_words(proto::CLOSE, &[self.id]));
     }
 }
 

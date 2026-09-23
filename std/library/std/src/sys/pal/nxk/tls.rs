@@ -6,20 +6,6 @@ use super::abi::prot;
 use super::syscall;
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const PT_TLS: u32 = 7;
-
-#[repr(C)]
-struct Phdr {
-    ptype: u32,
-    pflags: u32,
-    offset: u64,
-    vaddr: u64,
-    paddr: u64,
-    filesz: u64,
-    memsz: u64,
-    align: u64,
-}
-
 // PT_TLS template, read once at startup.
 static IMAGE: AtomicU64 = AtomicU64::new(0);
 static FILESZ: AtomicUsize = AtomicUsize::new(0);
@@ -54,16 +40,11 @@ pub unsafe fn init_block(base: *mut u8) -> u64 {
 
 /// Install the main-thread TLS from the PT_TLS header. # Safety: call once at startup, before any TLS use.
 pub unsafe fn init_main() {
-    let Some(b) = super::startup_block() else { return };
-    for k in 0..b.phnum as usize {
-        let ph = unsafe { &*((b.phdr + (k * b.phent as usize) as u64) as *const Phdr) };
-        if ph.ptype == PT_TLS && ph.memsz > 0 {
-            IMAGE.store(b.load_base + ph.vaddr, Ordering::Relaxed);
-            FILESZ.store(ph.filesz as usize, Ordering::Relaxed);
-            MEMSZ.store(ph.memsz as usize, Ordering::Relaxed);
-            ALIGN.store((ph.align as usize).max(16), Ordering::Relaxed);
-        }
-    }
+    let Some(t) = super::startup_block().and_then(|b| b.tls()) else { return };
+    IMAGE.store(t.image, Ordering::Relaxed);
+    FILESZ.store(t.filesz, Ordering::Relaxed);
+    MEMSZ.store(t.memsz, Ordering::Relaxed);
+    ALIGN.store(t.align, Ordering::Relaxed);
     let size = block_size();
     if size == 0 {
         return;
@@ -77,8 +58,4 @@ pub unsafe fn init_main() {
     unsafe { set_tp(init_block(r as *mut u8)) };
 }
 
-/// # Safety
-/// `tp` must be a block initialized by `init_block`.
-pub unsafe fn set_tp(tp: u64) {
-    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) tp, options(nomem, nostack, preserves_flags)) };
-}
+pub use super::abi::user::set_tp;

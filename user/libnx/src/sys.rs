@@ -1,10 +1,9 @@
-//! Raw syscalls (`svc #0`, number in x8).
-//! Only x0 is clobbered, so `asm!` needs no extra clobbers.
-
-use core::arch::asm;
+//! Typed syscalls over the raw stubs of `nxk_abi::user`.
+//! Errors are `Err(-errno)`.
 
 use nxk_abi::spawn::SpawnArgs;
 use nxk_abi::sys::*;
+pub use nxk_abi::user::{syscall0, syscall1, syscall2, syscall3, syscall4};
 
 pub type Result<T> = core::result::Result<T, i64>;
 
@@ -15,48 +14,6 @@ pub fn check(r: i64) -> Result<u64> {
     } else {
         Ok(r as u64)
     }
-}
-
-#[inline(always)]
-pub unsafe fn syscall0(nr: u64) -> i64 {
-    let r: i64;
-    unsafe { asm!("svc #0", lateout("x0") r, in("x8") nr, options(nostack)) };
-    r
-}
-
-#[inline(always)]
-pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
-    let r: i64;
-    unsafe { asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x8") nr, options(nostack)) };
-    r
-}
-
-#[inline(always)]
-pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
-    let r: i64;
-    unsafe {
-        asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x8") nr, options(nostack))
-    };
-    r
-}
-
-#[inline(always)]
-pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    let r: i64;
-    unsafe {
-        asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x2") a2, in("x8") nr, options(nostack))
-    };
-    r
-}
-
-#[inline(always)]
-pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let r: i64;
-    unsafe {
-        asm!("svc #0", inlateout("x0") a0 as i64 => r, in("x1") a1, in("x2") a2, in("x3") a3,
-             in("x8") nr, options(nostack))
-    };
-    r
 }
 
 #[inline(always)]
