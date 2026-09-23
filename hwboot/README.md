@@ -286,7 +286,13 @@ The last `usbcon:` line locates a failure:
    root port had bus numbers but no memory window and no memory
    decoding, so it forwarded nothing. Fixed since (`pci_setup_bridge`
    equivalent); an all-ones chip ID now also reports the AFI error
-   code and address. Not re-run on hardware yet.
+   code and address.
+9. 23/09/2026, Erista, commit `d5c821d`: **Wi-Fi chip identified**,
+   `adapter BCM4356 rev 3 on PCIe port 1, firmware present` (rev 3:
+   the A3 silicon the console's `4356a3` firmware is built for). The
+   whole bring-up works on silicon: PMIC rail, module pins, PCIe link,
+   bridge windows, backplane reads through BAR0. What remains is the
+   data path: firmware download and Broadcom's msgbuf rings.
 
 ## Hardware test (once the SD card is back in the PC)
 

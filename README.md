@@ -274,11 +274,10 @@ program that vanished without closing them (crash) are reclaimed.
 - Wi-Fi does not reach the air: `wlan` powers the module (PMIC LDO1,
   WIFI_EN on PH0, WIFI_RST on PH1), sets the PEX and module pads as
   Horizon does, brings the PCIe root complex up, then should train the
-  link and read the BCM4356 chip identity. On hardware the link trains
-  on port 1 and the endpoint answers; reading the chip itself through
-  BAR0 is not confirmed yet (`hwboot/README.md`, runs 5 to 8). The
-  firmware upload and Broadcom's ring protocol are not written, so no
-  frame moves. Its firmware and calibration data are proprietary
+  link and read the BCM4356 chip identity: on an Erista, `wifi status`
+  reports `BCM4356 rev 3 on PCIe port 1` (`hwboot/README.md`, runs 5
+  to 9). The firmware upload and Broadcom's ring protocol are not
+  written, so no frame moves. Its firmware and calibration data are proprietary
   and never in the repository: they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git
   ignores it), then copied to the card by `tools/mksd.py --firmware DIR`
