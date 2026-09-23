@@ -19,9 +19,11 @@ const AFI: usize = 0x3800;
 /// Configuration space: a single 4 KiB window the AFI retargets.
 pub const CFG_WINDOW: u64 = 0x0200_0000;
 pub const CFG_WINDOW_LEN: u64 = 0x1000;
-/// Downstream memory windows handed to the endpoint's BARs.
+/// Downstream memory windows handed to the endpoint's BARs. The
+/// BCM4356 wants 32 KiB (BAR0) plus 4 MiB aligned (BAR2, its TCM), both
+/// non-prefetchable; the root complex has 208 MiB there.
 pub const MEM_WINDOW: u64 = 0x1300_0000;
-pub const MEM_WINDOW_LEN: u64 = 0x1_0000;
+pub const MEM_WINDOW_LEN: u64 = 0x80_0000;
 pub const PREFETCH_WINDOW: u64 = 0x2000_0000;
 pub const PREFETCH_WINDOW_LEN: u64 = 0x40_0000;
 /// Pad control block: the UPHY bricks the PCIe lanes live on.
