@@ -288,7 +288,9 @@ impl Server {
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let blk = match ns::wait_for_timeout("blk:sd", 5_000_000_000) {
+    // `sd` waits for `display` and `clk` first, which the other boot
+    // drivers (PCIe bring-up) keep busy: give it time.
+    let blk = match ns::wait_for_timeout("blk:sd", 30_000_000_000) {
         Ok(h) => h,
         Err(_) => {
             println!("[fs] no SD card: no filesystem");
