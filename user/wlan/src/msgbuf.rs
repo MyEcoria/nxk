@@ -146,6 +146,8 @@ pub struct Msgbuf {
     /// Firmware event frames (Ethernet, Broadcom ethertype), oldest first.
     events: VecDeque<Vec<u8>>,
     reply: Option<Reply>,
+    /// The firmware console, for `console_tail`.
+    pub console: u32,
 }
 
 /// Outcome of an ioctl: firmware status and the bytes it returned.
@@ -228,6 +230,7 @@ impl Msgbuf {
             rx_dataoffset: t(up.shared + SHARED_RX_DATAOFFSET),
             events: VecDeque::new(),
             reply: None,
+            console: up.console,
         };
         for id in 0..2 * CTL_BUFS {
             m.post_ctl(bp, tcm, id as u32)?;
@@ -283,11 +286,18 @@ impl Msgbuf {
 
     /// Next D2H item of `ring`, if the firmware wrote one; its sequence
     /// number is checked so a half-transferred item is never read.
-    fn next(&mut self, tcm: &Mmio, ring: usize) -> Option<Vec<u8>> {
+    fn next(&mut self, tcm: &Mmio, ring: usize) -> Result<Option<Vec<u8>>, String> {
         let r = &mut self.rings[ring];
         let write = tcm.r16(r.w_idx as usize);
         if write == r.pos {
-            return None;
+            return Ok(None);
+        }
+        // A dead or sleeping chip reads all ones: never chase that index.
+        if write >= r.items {
+            return Err(format!(
+                "ring {} write index {:#x} of {} items",
+                ring, write, r.items
+            ));
         }
         let p = r.item(r.pos);
         if let Some(want) = r.epoch {
@@ -303,7 +313,7 @@ impl Msgbuf {
         r.epoch = Some((item[3] as u32 + 1) % EPOCH_MODULO);
         r.pos = (r.pos + 1) % r.items;
         tcm.w16(r.r_idx as usize, r.pos);
-        Some(item)
+        Ok(Some(item))
     }
 
     /// Contents of control buffer `id`, from where the firmware starts
@@ -327,7 +337,7 @@ impl Msgbuf {
     /// Drain the control completion ring: ioctl answers are kept for
     /// `ioctl`, event frames queued for `event`.
     pub fn poll(&mut self, bp: &Backplane, tcm: &Mmio) -> Result<(), String> {
-        while let Some(item) = self.next(tcm, CONTROL_COMPLETE) {
+        while let Some(item) = self.next(tcm, CONTROL_COMPLETE)? {
             let id = get32(item.as_ptr(), 4);
             match item[0] {
                 MSG_IOCTL_CMPLT if (id as usize) < CTL_BUFS => {

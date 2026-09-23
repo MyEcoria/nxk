@@ -519,7 +519,21 @@ fn main() -> i32 {
                             }
                         })
                     }
-                    (wifi::BADGE_CTRL, wifi::DIAG) => Some(ipc::pack(0, diag.as_bytes())),
+                    (wifi::BADGE_CTRL, wifi::DIAG) => {
+                        // The firmware's console as it is now: joins and
+                        // failures show there first.
+                        let live = match &backend {
+                            Backend::Chip(hw) => match &hw.mb {
+                                Some(m) => format!(
+                                    "; console now: {}",
+                                    fw::console_tail(&hw.tcm, m.console, 600)
+                                ),
+                                None => String::new(),
+                            },
+                            Backend::Sim(_) => String::new(),
+                        };
+                        Some(ipc::pack(0, format!("{}{}", diag, live).as_bytes()))
+                    }
                     // Bring-up again, on demand: at boot the other
                     // services are still starting, which a single log
                     // line cannot tell apart from a dead register.
