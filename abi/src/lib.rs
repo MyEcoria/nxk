@@ -806,6 +806,10 @@ pub mod proto {
         /// What the adapter is, or why there is none: a line of text
         /// naming the step that failed during bring-up. Reply: bytes.
         pub const DIAG: u32 = 5;
+        /// Run the hardware bring-up again and report what happened:
+        /// a boot-time race and a dead register read look the same in
+        /// the log, not here. Reply: bytes, like DIAG.
+        pub const RETRY: u32 = 6;
         /// No adapter: no PCIe device, or its firmware is missing.
         pub const ST_DOWN: u64 = 0;
         pub const ST_IDLE: u64 = 1;

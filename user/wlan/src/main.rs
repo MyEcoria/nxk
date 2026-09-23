@@ -158,7 +158,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let (mut backend, irq, diag) = match hardware() {
+    let (mut backend, mut irq, mut diag) = match hardware() {
         Ok((hw, irq, what)) => (Backend::Chip(hw), Some(irq), what),
         Err(why) => {
             println!("[wlan] simulated adapter, {}", why);
@@ -253,6 +253,24 @@ fn main() -> i32 {
                         })
                     }
                     (wifi::BADGE_CTRL, wifi::DIAG) => Some(ipc::pack(0, diag.as_bytes())),
+                    // Bring-up again, on demand: at boot the other
+                    // services are still starting, which a single log
+                    // line cannot tell apart from a dead register.
+                    (wifi::BADGE_CTRL, wifi::RETRY) => {
+                        if matches!(backend, Backend::Sim(_)) {
+                            match hardware() {
+                                Ok((hw, i, what)) => {
+                                    let _ = sys::notify_bind(i.notification());
+                                    backend = Backend::Chip(hw);
+                                    irq = Some(i);
+                                    diag = what;
+                                }
+                                Err(why) => diag = format!("simulated adapter, {}", why),
+                            }
+                            println!("[wlan] retry: {}", diag);
+                        }
+                        Some(ipc::pack(0, diag.as_bytes()))
+                    }
                     (wifi::BADGE_CTRL, wifi::DISCONNECT) => {
                         if let Backend::Sim(s) = &mut backend {
                             s.disconnect();

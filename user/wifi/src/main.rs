@@ -101,7 +101,12 @@ fn connect(ssid: &str, psk: &str) -> Result<(), i64> {
 
 /// One line on what the adapter is, or why there is none.
 fn diag() -> Result<(), i64> {
-    let r = call(&Msg::new(proto::DIAG, 0, 0))?;
+    text(proto::DIAG)
+}
+
+/// Reply made of bytes, printed as a line.
+fn text(label: u32) -> Result<(), i64> {
+    let r = call(&Msg::new(label, 0, 0))?;
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     let n = ipc::unpack(&r, &mut buf);
     if n > 0 {
@@ -148,9 +153,10 @@ fn main() -> i32 {
         Some("scan") => scan(),
         Some("connect") if args.len() >= 3 => connect(args[2], args.get(3).copied().unwrap_or("")),
         Some("disconnect") => call(&Msg::new(proto::DISCONNECT, 0, 0)).map(|_| ()),
+        Some("retry") => text(proto::RETRY),
         Some("status") | None => status(),
         _ => {
-            println!("usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status");
+            println!("usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status | retry");
             return 2;
         }
     };
