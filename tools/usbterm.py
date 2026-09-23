@@ -34,7 +34,8 @@ class Serial:
 
     def __init__(self, path):
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-        tty.setraw(self.fd)
+        # Raw at once, nothing flushed: echoed bytes would be typed.
+        tty.setraw(self.fd, termios.TCSANOW)
         self.name = path
 
     def read(self, timeout):

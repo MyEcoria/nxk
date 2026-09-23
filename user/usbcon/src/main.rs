@@ -17,7 +17,7 @@ use libnx::abi::rights::{GRANT, SIGNAL};
 use libnx::abi::slots;
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::{println, sys};
+use libnx::{println, sys, time};
 
 use udc::{bit, Dir, EpType, Udc};
 
@@ -32,6 +32,9 @@ const FUSE_USB_CALIB_EXT: usize = 0x800 + 0x350;
 /// Notification bits: controller interrupt, console output pending.
 const EV_IRQ: u64 = 1;
 const EV_TX: u64 = 2;
+/// Output held after the host opens the terminal: its tty echoes what
+/// arrives before it is switched to raw, and the echo would be typed.
+const HOLD_NS: u64 = 100_000_000;
 
 /// DMA block after the descriptors: control, receive, transmit buffers.
 const EP0_BUF: usize = 0x400;
@@ -121,8 +124,10 @@ struct Stats {
 struct Dev {
     udc: Udc,
     term: u32,
-    /// Terminal open on the host (configured, DTR up): output flows.
+    /// Terminal open on the host (configured, DTR up): output flows,
+    /// from `hold_until` on.
     online: bool,
+    hold_until: u64,
     /// Last byte of a transfer that was a whole number of packets, sent
     /// first in the next one.
     carry: Option<u8>,
@@ -157,6 +162,7 @@ impl Dev {
         let online = self.config != 0 && self.dtr;
         if self.online != online {
             self.online = online;
+            self.hold_until = time::now_ns() + HOLD_NS;
             println!(
                 "[usbcon] {}",
                 if online {
@@ -383,8 +389,16 @@ impl Dev {
 
     /// Next IN transfer, pulled from the console, if the endpoint is
     /// free and a terminal reads.
+    /// ns until held output may go (0: none held).
+    fn hold_left(&self) -> u64 {
+        match self.hold_until.checked_sub(time::now_ns()) {
+            Some(left) if self.online => left.max(1),
+            _ => 0,
+        }
+    }
+
     fn send(&mut self) {
-        if !self.online || self.tx_len != 0 {
+        if !self.online || self.tx_len != 0 || self.hold_left() != 0 {
             return;
         }
         let buf = self.udc.buf(TX_BUF, TX_LEN);
@@ -439,6 +453,7 @@ fn main() -> i32 {
         },
         term: slots::TERMINAL,
         online: false,
+        hold_until: 0,
         carry: None,
         stats: Stats::default(),
         hs: true,
@@ -513,18 +528,29 @@ fn main() -> i32 {
         return 0;
     }
     println!("[usbcon] USB-C console ready, waiting for a PC (tools/usbterm.py)");
-    drv::serve(ep, |rx| {
-        if rx.msg.is_notify() {
-            if rx.msg.mr[0] & EV_IRQ != 0 {
-                dev.interrupt();
-                irq.ack();
+    // Requests and events; a timeout ends the output hold.
+    let mut reply: Option<Msg> = None;
+    loop {
+        let wait = dev.hold_left();
+        let rx = match reply.take() {
+            Some(m) => ipc::reply_recv_timeout(ep, &m, wait),
+            None => ipc::recv_timeout(ep, wait),
+        };
+        match rx {
+            Ok(rx) if rx.msg.is_notify() => {
+                if rx.msg.mr[0] & EV_IRQ != 0 {
+                    dev.interrupt();
+                    irq.ack();
+                }
             }
-            dev.send();
-            return None;
+            Ok(rx) => {
+                reply = Some(match rx.msg.label() {
+                    proto::STATS => dev.stats_reply(),
+                    _ => Msg::error(-EINVAL),
+                })
+            }
+            Err(_) => {}
         }
-        Some(match rx.msg.label() {
-            proto::STATS => dev.stats_reply(),
-            _ => Msg::error(-EINVAL),
-        })
-    })
+        dev.send();
+    }
 }
