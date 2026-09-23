@@ -52,6 +52,11 @@ pub fn resolve(name: &str) -> Result<u32, i64> {
     call(&ipc::pack(proto::RESOLVE, name.as_bytes())).map(|m| m.mr[0] as u32)
 }
 
+/// Round-trip time (ns) of one ICMP echo to `addr`.
+pub fn ping(addr: u32, timeout_ns: u64) -> Result<u64, i64> {
+    call(&words(proto::PING, &[addr as u64, timeout_ns])).map(|m| m.mr[0])
+}
+
 /// Config: (address, prefix length, gateway, DNS).
 pub fn info() -> Result<(u32, u8, u32, u32), i64> {
     let m = call(&Msg::new(proto::INFO, 0, 0))?;

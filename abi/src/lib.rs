@@ -873,6 +873,9 @@ pub mod proto {
         /// words: socket. Extra reference to the same socket (same
         /// id); CLOSE only closes it at the last one.
         pub const DUP: u32 = 14;
+        /// words: address, timeout. One ICMP echo request. Reply: word
+        /// 0 = round-trip time in ns.
+        pub const PING: u32 = 15;
     }
     /// Input events.
     pub mod input {

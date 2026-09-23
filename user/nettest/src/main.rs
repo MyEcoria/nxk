@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::err;
@@ -40,8 +41,12 @@ fn main() -> i32 {
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(1),
         ),
         Some("udp") if args.len() == 5 => udp(args[2], args[3].parse().unwrap_or(7), args[4]),
+        Some("ping") if args.len() >= 3 => ping(
+            args[2],
+            args.get(3).and_then(|n| n.parse().ok()).unwrap_or(4),
+        ),
         _ => {
-            println!("usage: nettest info | resolve NAME | get HOST PORT PATH | serve PORT [N] | udp HOST PORT TEXT");
+            println!("usage: nettest info | resolve NAME | get HOST PORT PATH | serve PORT [N] | udp HOST PORT TEXT | ping HOST [COUNT]");
             return 2;
         }
     };
@@ -52,6 +57,49 @@ fn main() -> i32 {
             1
         }
     }
+}
+
+/// ICMP echoes to `h`, one a second: each reply's round trip, then a
+/// summary; an error only if none came back.
+fn ping(h: &str, count: u32) -> Result<(), i64> {
+    let addr = host(h)?;
+    println!("PING {} ({})", h, fmt_ipv4(addr));
+    let mut rtts = Vec::new();
+    for seq in 1..=count {
+        let t0 = time::now_ns();
+        match net::ping(addr, 2_000_000_000) {
+            Ok(ns) => {
+                println!(
+                    "reply from {}: seq={} time={}.{:03} ms",
+                    fmt_ipv4(addr),
+                    seq,
+                    ns / 1_000_000,
+                    ns / 1000 % 1000
+                );
+                rtts.push(ns);
+            }
+            Err(e) => println!("seq={}: {}", seq, err::name(e)),
+        }
+        if seq < count {
+            time::sleep_ms(1000u64.saturating_sub((time::now_ns() - t0) / 1_000_000));
+        }
+    }
+    let (n, sum) = (rtts.len() as u64, rtts.iter().sum::<u64>());
+    println!(
+        "{} sent, {} received, {}% loss{}",
+        count,
+        n,
+        (count as u64 - n) * 100 / count.max(1) as u64,
+        if n > 0 {
+            format!(", average {} ms", sum / n / 1_000_000)
+        } else {
+            String::new()
+        }
+    );
+    if n == 0 {
+        return Err(libnx::abi::err::ETIMEDOUT);
+    }
+    Ok(())
 }
 
 fn get(h: &str, port: u16, path: &str) -> Result<(), i64> {

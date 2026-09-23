@@ -23,14 +23,18 @@ use libnx::sync::Mutex;
 use libnx::{ns, println, sys, thread, time};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, tcp, udp};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    DnsQueryType, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
+    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
+    IpEndpoint, Ipv4Address,
 };
 
 const TCP_BUF: usize = 64 * 1024;
+/// Echo request payload, and echo replies kept for the pings waiting.
+const PING_DATA: [u8; 32] = *b"nxk ping 0123456789abcdefghijklm";
+const PONGS_MAX: usize = 64;
 const UDP_BUF: usize = 64 * 1024;
 /// Data bytes per reply message.
 const MAX_IO: usize = 3 * 1024;
@@ -108,6 +112,7 @@ enum Op {
     Send { sock: usize, data: Vec<u8> },
     RecvFrom { sock: usize },
     Resolve { query: dns::QueryHandle },
+    Ping { addr: u32, seq: u16, sent: u64 },
 }
 
 /// Pending operation: what is awaited, who to reply to, until when.
@@ -162,6 +167,12 @@ struct Net {
     dns_server: Option<Ipv4Address>,
     /// TCP sockets closed by their client, at end of connection.
     closing: Vec<SocketHandle>,
+    /// The ICMP socket (bound to `ident`), the last sequence number sent,
+    /// and echo replies received: (address, sequence, when).
+    icmp: SocketHandle,
+    ident: u16,
+    seq: u16,
+    pongs: VecDeque<(u32, u16, u64)>,
 }
 
 impl Net {
@@ -494,6 +505,36 @@ impl Net {
                     Err(_) => Err(-EINVAL),
                 }
             }
+            proto::PING => {
+                if self.addr.is_none() {
+                    return Some(Err(-ENETUNREACH));
+                }
+                let addr = m.mr[0] as u32;
+                self.seq = self.seq.wrapping_add(1);
+                let repr = Icmpv4Repr::EchoRequest {
+                    ident: self.ident,
+                    seq_no: self.seq,
+                    data: &PING_DATA,
+                };
+                let s = self.sockets.get_mut::<icmp::Socket>(self.icmp);
+                match s.send(repr.buffer_len(), IpAddress::Ipv4(ip(addr as u64))) {
+                    Ok(b) => repr.emit(
+                        &mut Icmpv4Packet::new_unchecked(b),
+                        &ChecksumCapabilities::default(),
+                    ),
+                    Err(_) => return Some(Err(-EAGAIN)),
+                }
+                self.waits.push(Wait {
+                    op: Op::Ping {
+                        addr,
+                        seq: self.seq,
+                        sent: time::now_ns(),
+                    },
+                    token,
+                    deadline: deadline(m.mr[1]),
+                });
+                return None;
+            }
             proto::INFO => {
                 let (a, p) = self
                     .addr
@@ -667,6 +708,38 @@ impl Net {
                     Err(_) => Some(Err(-ENOENT)),
                 }
             }
+            Op::Ping { addr, seq, sent } => {
+                match self.pongs.iter().position(|p| p.0 == *addr && p.1 == *seq) {
+                    Some(k) => {
+                        let (_, _, at) = self.pongs.remove(k)?;
+                        Some(Ok(words(&[at.saturating_sub(*sent)])))
+                    }
+                    None if expired => Some(Err(-ETIMEDOUT)),
+                    None => None,
+                }
+            }
+        }
+    }
+
+    /// Echo replies to our requests (our identifier), kept with the time
+    /// they came for the pings that wait on them.
+    fn icmp_events(&mut self) {
+        let s = self.sockets.get_mut::<icmp::Socket>(self.icmp);
+        while let Ok((data, from)) = s.recv() {
+            let Ok(p) = Icmpv4Packet::new_checked(data) else {
+                continue;
+            };
+            if let Ok(Icmpv4Repr::EchoReply { ident, seq_no, .. }) =
+                Icmpv4Repr::parse(&p, &ChecksumCapabilities::default())
+            {
+                if ident == self.ident {
+                    if self.pongs.len() == PONGS_MAX {
+                        self.pongs.pop_front();
+                    }
+                    self.pongs
+                        .push_back((word(from) as u32, seq_no, time::now_ns()));
+                }
+            }
         }
     }
 
@@ -809,6 +882,14 @@ fn main() -> i32 {
         &[],
         vec![None, None, None, None, None, None, None, None],
     ));
+    let mut ping = icmp::Socket::new(
+        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 2048]),
+        icmp::PacketBuffer::new(vec![icmp::PacketMetadata::EMPTY; 8], vec![0; 2048]),
+    );
+    let ident = u16::from_le_bytes([seed[2], seed[3]]);
+    ping.bind(icmp::Endpoint::Ident(ident))
+        .expect("net: ICMP socket");
+    let icmp = sockets.add(ping);
     let mut net = Net {
         iface,
         dev,
@@ -825,6 +906,10 @@ fn main() -> i32 {
         gateway: None,
         dns_server: None,
         closing: Vec::new(),
+        icmp,
+        ident,
+        seq: 0,
+        pongs: VecDeque::new(),
     };
     let ep = drv::publish("net").expect("net: publish");
     let mut buf = vec![0u8; ipc::MAX_BYTES];
@@ -832,6 +917,7 @@ fn main() -> i32 {
         let t = now();
         net.iface.poll(t, &mut net.dev, &mut net.sockets);
         net.dhcp_events();
+        net.icmp_events();
 
         // Pending operations.
         let now_ns = time::now_ns();
