@@ -41,6 +41,7 @@ const INT_STATUS: usize = 0x30;
 const INT_ENABLE: usize = 0x34;
 const INT_SIGNAL: usize = 0x38;
 const HOST_CONTROL2: usize = 0x3E;
+const ADMA_ERROR: usize = 0x54;
 const ADMA_ADDRESS: usize = 0x58;
 
 // Tegra vendor registers (hekate bdk/storage/sdmmc_t210.h).
@@ -149,6 +150,7 @@ impl Card {
         loop {
             let st = self.regs.r32(INT_STATUS);
             if st & INT_ERROR != 0 {
+                self.report(mask, st, "error");
                 self.regs.w32(INT_STATUS, st);
                 self.reset(0x6); // CMD and DAT lines
                 return Err(-EIO);
@@ -159,6 +161,7 @@ impl Card {
             }
             let now = time::now_ns();
             if now > end {
+                self.report(mask, st, "timeout");
                 self.reset(0x6);
                 return Err(-ETIMEDOUT);
             }
@@ -169,6 +172,25 @@ impl Card {
                 core::hint::spin_loop();
             }
         }
+    }
+
+    /// A data transfer that failed, as the controller saw it before the
+    /// reset: interrupt and line state, the ADMA engine's error and the
+    /// address it had reached, against our buffer's. Command-only waits
+    /// fail in normal probing and stay quiet.
+    fn report(&self, mask: u32, st: u32, what: &str) {
+        if mask & INT_XFER_DONE == 0 {
+            return;
+        }
+        println!(
+            "[sd] transfer {}: status {:#010x}, present {:#010x}, ADMA error {:#x} at {:#010x}, buffer {:#010x}",
+            what,
+            st,
+            self.regs.r32(PRESENT_STATE),
+            self.regs.r32(ADMA_ERROR),
+            self.regs.r32(ADMA_ADDRESS),
+            self.dma_pa
+        );
     }
 
     fn command(
@@ -423,14 +445,15 @@ fn main() -> i32 {
         }
     }
     println!(
-        "[sd] {} card of {} MiB ({} blocks)",
+        "[sd] {} card of {} MiB ({} blocks), DMA buffer at {:#x}",
         if card.block_addressed {
             "SDHC/SDXC"
         } else {
             "SDSC"
         },
         card.blocks / 2048,
-        card.blocks
+        card.blocks,
+        card.dma_pa
     );
     let ep = drv::publish("blk:sd").expect("sd: publish");
     let mut client: Option<SharedMemory> = None;
