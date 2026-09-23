@@ -220,6 +220,10 @@ fn main() -> i32 {
                 handle: uart_irq,
                 slot: slots::DRV_IRQ,
             },
+            HandleGrant {
+                handle: slots::INIT_KLOG,
+                slot: slots::DRV_KLOG,
+            },
         ],
         arg0: startup::IS_DRIVER,
         arg1: 0,

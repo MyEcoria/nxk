@@ -1054,9 +1054,13 @@ pub mod proto {
         /// Terminal driver only (`BADGE_TERMINAL`): typed bytes, same
         /// shape as WRITE, edited and echoed like UART input.
         pub const INPUT: u32 = 3;
-        /// Terminal driver only: next console output (echo included),
-        /// deferred until there is some. Reply shaped like WRITE.
+        /// Terminal driver only: pending console output (echo included),
+        /// at most word 0 bytes (0: as many as fit), none if caught up;
+        /// never waits. Reply shaped like WRITE.
         pub const OUTPUT: u32 = 4;
+        /// Terminal driver only: handle 0 = notification (SIGNAL) the
+        /// console signals with word 0's bits once output is pending.
+        pub const ATTACH: u32 = 5;
         /// Badge of the console handle init gives a terminal driver.
         pub const BADGE_TERMINAL: u64 = 1;
         /// Badge of all other console handles: a badged handle cannot
@@ -1217,6 +1221,20 @@ pub mod proto {
         /// Text for the on-screen terminal (see `pack`).
         pub const WRITE: u32 = 2;
         pub const FORMAT_RGBA8888: u64 = 1;
+    }
+    /// USB-C console (`usbcon`), published as "usbcon".
+    pub mod usbcon {
+        /// Reply: word 0 = state (`ST_*` bits), 1 = bytes typed on the
+        /// host, 2 = bytes sent to it, 3 = transfers received, 4 =
+        /// transfers sent, 5 = bus resets (low 32 bits) and transfer
+        /// errors (high 32).
+        pub const STATS: u32 = 1;
+        /// A host reset the bus at least once: a PC sees the Switch.
+        pub const ST_HOST: u64 = 1;
+        pub const ST_CONFIGURED: u64 = 2;
+        pub const ST_HIGH_SPEED: u64 = 4;
+        /// Terminal open on the host (configured, DTR up).
+        pub const ST_TERMINAL: u64 = 8;
     }
     /// Ethernet interface (link layer).
     pub mod eth {

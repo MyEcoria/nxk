@@ -1,6 +1,8 @@
 //! usbcon: the USB-C port as a serial console (USB CDC-ACM) for a PC.
 //! Erista's OTG controller in device mode: bytes typed on the PC go to
-//! the console as input, all console output goes back to the PC.
+//! the console as input, all console output goes back to the PC. One
+//! thread: console output is pulled only when the IN endpoint is free,
+//! so the console's ring is the only buffer.
 
 #![no_std]
 #![no_main]
@@ -9,15 +11,13 @@ extern crate alloc;
 
 mod udc;
 
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
-
-use libnx::abi::proto::{clk, console as con, display};
+use libnx::abi::err::EINVAL;
+use libnx::abi::proto::{clk, console as con, display, usbcon as proto};
+use libnx::abi::rights::{GRANT, SIGNAL};
 use libnx::abi::slots;
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::sync::{Condvar, Mutex};
-use libnx::{ns, println, sys, thread, time};
+use libnx::{ns, println, sys};
 
 use udc::{bit, Dir, EpType, Udc};
 
@@ -29,7 +29,7 @@ const FUSE_PAGE: u64 = 0x7000_F000;
 const FUSE_USB_CALIB: usize = 0x800 + 0x1F0;
 const FUSE_USB_CALIB_EXT: usize = 0x800 + 0x350;
 
-/// Notification bits: controller interrupt, console output queued.
+/// Notification bits: controller interrupt, console output pending.
 const EV_IRQ: u64 = 1;
 const EV_TX: u64 = 2;
 
@@ -40,8 +40,6 @@ const RX_BUF: usize = 0x800;
 const RX_LEN: usize = 512;
 const TX_BUF: usize = 0x1000;
 const TX_LEN: usize = 0x1000;
-/// Console output kept while no terminal reads (oldest bytes dropped).
-const TX_QUEUE: usize = 16 * 1024;
 
 /// pid.codes test IDs: private use only.
 const VID: u16 = 0x1209;
@@ -109,24 +107,27 @@ enum Ep0 {
     LineCoding,
 }
 
-/// Console output waiting for the host.
-struct Tx {
-    data: VecDeque<u8>,
-    /// Terminal open on the host (configured, DTR up): keep all output,
-    /// waiting for room, rather than drop the oldest.
-    online: bool,
-}
-
-struct Shared {
-    tx: Mutex<Tx>,
-    space: Condvar,
+/// Traffic counters (`proto::STATS`).
+#[derive(Default)]
+struct Stats {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_xfers: u64,
+    tx_xfers: u64,
+    resets: u32,
+    errors: u32,
 }
 
 struct Dev {
     udc: Udc,
-    shared: Arc<Shared>,
     term: u32,
     screen: Option<u32>,
+    /// Terminal open on the host (configured, DTR up): output flows.
+    online: bool,
+    /// Last byte of a transfer that was a whole number of packets, sent
+    /// first in the next one.
+    carry: Option<u8>,
+    stats: Stats,
     hs: bool,
     ep0: Ep0,
     config: u8,
@@ -136,14 +137,13 @@ struct Dev {
     tx_len: usize,
     /// A host reset the bus once: a PC sees the Switch.
     seen: bool,
-    /// Transfer errors reported (UEI) once.
-    error_seen: bool,
 }
 
 impl Dev {
-    /// Status line on the console and on the screen (the only output
-    /// of a Switch without UART).
-    fn status(&self, text: &str) {
+    /// Fatal status: on the console and on the screen (the only output
+    /// of a Switch without UART). Connection changes only log: the home
+    /// screen shows them as statistics.
+    fn fatal(&self, text: &str) {
         println!("[usbcon] {}", text);
         if let Some(h) = self.screen {
             let mut b = [0u8; 96];
@@ -165,17 +165,25 @@ impl Dev {
 
     fn set_online(&mut self) {
         let online = self.config != 0 && self.dtr;
-        let mut tx = self.shared.tx.lock();
-        if tx.online != online {
-            tx.online = online;
-            drop(tx);
-            self.shared.space.notify_all();
-            self.status(if online {
-                "terminal open on the host"
-            } else {
-                "terminal closed"
-            });
+        if self.online != online {
+            self.online = online;
+            println!(
+                "[usbcon] {}",
+                if online {
+                    "terminal open on the host"
+                } else {
+                    "terminal closed"
+                }
+            );
         }
+    }
+
+    fn state(&self) -> u64 {
+        let bit = |on: bool, b: u64| if on { b } else { 0 };
+        bit(self.seen, proto::ST_HOST)
+            | bit(self.config != 0, proto::ST_CONFIGURED)
+            | bit(self.hs, proto::ST_HIGH_SPEED)
+            | bit(self.online, proto::ST_TERMINAL)
     }
 
     fn interrupt(&mut self) {
@@ -183,9 +191,11 @@ impl Dev {
         if st & udc::STS_URI != 0 {
             self.bus_reset();
         }
-        if st & udc::STS_UEI != 0 && !self.error_seen {
-            self.error_seen = true;
-            self.status("USB transfer error (UEI)");
+        if st & udc::STS_UEI != 0 {
+            self.stats.errors += 1;
+            if self.stats.errors == 1 {
+                println!("[usbcon] USB transfer error (UEI)");
+            }
         }
         if st & udc::STS_PCI != 0 {
             self.hs = self.udc.high_speed();
@@ -198,7 +208,9 @@ impl Dev {
         if done & bit(1, Dir::Out) != 0 {
             self.rx_done();
         }
-        if done & bit(1, Dir::In) != 0 {
+        if done & bit(1, Dir::In) != 0 && self.tx_len != 0 {
+            self.stats.tx_bytes += self.tx_len as u64;
+            self.stats.tx_xfers += 1;
             self.tx_len = 0;
         }
         while let Some(p) = self.udc.take_setup() {
@@ -209,11 +221,12 @@ impl Dev {
     fn bus_reset(&mut self) {
         self.udc.bus_reset();
         self.ep0 = Ep0::Idle;
+        self.stats.resets += 1;
         if !self.seen {
             self.seen = true;
-            self.status("host detected (bus reset)");
+            println!("[usbcon] host detected (bus reset)");
         } else if self.config != 0 {
-            self.status("bus reset by the host");
+            println!("[usbcon] bus reset by the host");
         }
         self.config = 0;
         self.dtr = false;
@@ -225,6 +238,7 @@ impl Dev {
         self.udc
             .flush(bit(1, Dir::Out) | bit(1, Dir::In) | bit(2, Dir::In));
         self.tx_len = 0;
+        self.carry = None;
         self.config = value;
         if value != 0 {
             let mps = self.max_packet() as u32;
@@ -232,11 +246,10 @@ impl Dev {
             self.udc.enable(1, Dir::In, EpType::Bulk, mps);
             self.udc.enable(2, Dir::In, EpType::Interrupt, 16);
             self.udc.start(1, Dir::Out, RX_BUF, RX_LEN, false);
-            self.status(if self.hs {
-                "configured by the host (high speed)"
-            } else {
-                "configured by the host (full speed)"
-            });
+            println!(
+                "[usbcon] configured by the host ({} speed)",
+                if self.hs { "high" } else { "full" }
+            );
         } else {
             self.udc.disable_data_eps();
             self.dtr = false;
@@ -371,67 +384,57 @@ impl Dev {
         if self.config != 0 {
             self.udc.start(1, Dir::Out, RX_BUF, RX_LEN, false);
         }
+        self.stats.rx_bytes += n as u64;
+        self.stats.rx_xfers += 1;
         for chunk in data[..n].chunks(ipc::MAX_BYTES) {
             let _ = ipc::call(self.term, &ipc::pack(con::INPUT, chunk));
         }
     }
 
-    /// Next IN transfer from the queue, if the endpoint is free.
+    /// Next IN transfer, pulled from the console, if the endpoint is
+    /// free and a terminal reads.
     fn send(&mut self) {
-        if self.config == 0 || self.tx_len != 0 {
+        if !self.online || self.tx_len != 0 {
             return;
         }
-        let mut tx = self.shared.tx.lock();
-        let mut n = tx.data.len().min(TX_LEN);
-        if n == 0 {
-            return;
+        let buf = self.udc.buf(TX_BUF, TX_LEN);
+        let mut n = 0;
+        if let Some(b) = self.carry.take() {
+            buf[0] = b;
+            n = 1;
+        }
+        let ask = Msg::from_words(con::OUTPUT, &[(TX_LEN - n) as u64]);
+        if let Ok(m) = ipc::call(self.term, &ask) {
+            if m.label() == 0 {
+                n += ipc::unpack(&m, &mut buf[n..]);
+            }
         }
         // Never a whole number of packets: the host sees the end of
         // each transfer without a zero-length packet.
-        if n.is_multiple_of(self.max_packet()) {
+        if n > 1 && n.is_multiple_of(self.max_packet()) {
             n -= 1;
+            self.carry = Some(buf[n]);
         }
-        for (d, s) in self.udc.buf(TX_BUF, n).iter_mut().zip(tx.data.drain(..n)) {
-            *d = s;
+        if n > 0 {
+            self.udc.start(1, Dir::In, TX_BUF, n, false);
+            self.tx_len = n;
         }
-        drop(tx);
-        self.shared.space.notify_all();
-        self.udc.start(1, Dir::In, TX_BUF, n, false);
-        self.tx_len = n;
     }
-}
 
-/// Console output to the transmit queue (second thread: OUTPUT blocks).
-fn pump(term: u32, shared: Arc<Shared>, notif: u32) {
-    let mut buf = [0u8; ipc::MAX_BYTES];
-    loop {
-        let n = match ipc::call(term, &Msg::new(con::OUTPUT, 0, 0)) {
-            Ok(m) if m.label() == 0 => ipc::unpack(&m, &mut buf),
-            _ => {
-                time::sleep_ms(100);
-                continue;
-            }
-        };
-        let mut tx = shared.tx.lock();
-        while tx.online && tx.data.len() + n > TX_QUEUE {
-            tx = shared.space.wait(tx);
-        }
-        let excess = (tx.data.len() + n).saturating_sub(TX_QUEUE);
-        tx.data.drain(..excess);
-        tx.data.extend(&buf[..n]);
-        drop(tx);
-        let _ = sys::notify_signal(notif, EV_TX);
+    fn stats_reply(&self) -> Msg {
+        let s = &self.stats;
+        Msg::from_words(
+            0,
+            &[
+                self.state(),
+                s.rx_bytes,
+                s.tx_bytes,
+                s.rx_xfers,
+                s.tx_xfers,
+                s.resets as u64 | (s.errors as u64) << 32,
+            ],
+        )
     }
-}
-
-/// clk request on `dev`: its reply word, or `None` on error.
-fn clk_call(clk: u32, label: u32, dev: u64) -> Option<u64> {
-    let mut m = Msg::new(label, 1, 0);
-    m.mr[0] = dev;
-    ipc::call(clk, &m)
-        .ok()
-        .filter(|r| r.label() == 0)
-        .map(|r| r.mr[0])
 }
 
 libnx::entry!(main);
@@ -447,15 +450,11 @@ fn main() -> i32 {
             let regs = Mmio::map(drv::dev_slot(0), USB_BASE, 0x2000).expect("usbcon: registers");
             Udc::new(regs).expect("usbcon: DMA memory")
         },
-        shared: Arc::new(Shared {
-            tx: Mutex::new(Tx {
-                data: VecDeque::with_capacity(TX_QUEUE),
-                online: false,
-            }),
-            space: Condvar::new(),
-        }),
         term: slots::TERMINAL,
         screen,
+        online: false,
+        carry: None,
+        stats: Stats::default(),
         hs: true,
         ep0: Ep0::Idle,
         config: 0,
@@ -463,47 +462,41 @@ fn main() -> i32 {
         line: [0x00, 0xC2, 0x01, 0x00, 0, 0, 8], // 115200 8N1
         tx_len: 0,
         seen: false,
-        error_seen: false,
     };
     // T210B01 (Mariko) has no such controller: its OTG port is XUSB's.
     if (misc.r32(HIDREV) >> 4) & 0xF >= 2 {
-        dev.status("Mariko SoC: no USB2 OTG device controller, stopping");
+        dev.fatal("Mariko SoC: no USB2 OTG device controller, stopping");
         return 0;
     }
-    let Ok(clk) = ns::wait_for_timeout("clk", 2_000_000_000) else {
-        dev.status("clk service unreachable, stopping");
-        return 0;
-    };
-    let ready =
-        clk_call(clk, clk::ENABLE, clk::USBD).and_then(|_| clk_call(clk, clk::STATUS, clk::USBD));
-    if ready != Some(clk::ST_READY) {
-        dev.status("USB PLLs or controller clock not ready, stopping");
+    let _ = libnx::clk::enable(clk::USBD);
+    if !libnx::clk::ready(clk::USBD) {
+        dev.fatal("USB PLLs or controller clock not ready, stopping");
         return 0;
     }
     // Fuse reads hang the bus unless the fuse block is clocked.
-    let trims = match clk_call(clk, clk::STATUS, clk::FUSE) {
-        Some(clk::ST_READY) => Mmio::map(drv::dev_slot(2), FUSE_PAGE, 0x1000)
+    let trims = if libnx::clk::ready(clk::FUSE) {
+        Mmio::map(drv::dev_slot(2), FUSE_PAGE, 0x1000)
             .ok()
-            .map(|f| (f.r32(FUSE_USB_CALIB), f.r32(FUSE_USB_CALIB_EXT))),
-        _ => None,
+            .map(|f| (f.r32(FUSE_USB_CALIB), f.r32(FUSE_USB_CALIB_EXT)))
+    } else {
+        None
     };
     if trims.is_none() {
-        dev.status("fuses unreadable: PHY left without its trims");
+        dev.fatal("fuses unreadable: PHY left without its trims");
     }
     let trk = |on| {
-        clk_call(
-            clk,
-            if on { clk::ENABLE } else { clk::DISABLE },
-            clk::USB2_TRK,
-        )
-        .is_some()
+        if on {
+            libnx::clk::enable(clk::USB2_TRK).is_ok()
+        } else {
+            libnx::clk::disable(clk::USB2_TRK).is_ok()
+        }
     };
     if !dev.udc.phy_init(trims, trk) {
-        dev.status("USB2 tracking clock refused, stopping");
+        dev.fatal("USB2 tracking clock refused, stopping");
         return 0;
     }
     if !dev.udc.reset_device_mode() {
-        dev.status("controller reset timed out, stopping");
+        dev.fatal("controller reset timed out, stopping");
         return 0;
     }
     if dev.udc.endpoints() < udc::NUM_EPS as u32 {
@@ -512,24 +505,40 @@ fn main() -> i32 {
             dev.udc.endpoints()
         );
     }
+    // One notification wakes the service loop: controller interrupt and
+    // console output pending (the console signals a copy of it).
     let irq = Irq::new(drv::dev_slot(3)).expect("usbcon: IRQ");
     let notif = irq.notification();
-    let (term, shared) = (dev.term, dev.shared.clone());
-    thread::spawn(move || pump(term, shared, notif)).expect("usbcon: thread");
+    sys::notify_bind(notif).expect("usbcon: notification");
+    let signal = sys::handle_dup(notif, SIGNAL | GRANT, 0).expect("usbcon: notification");
+    ipc::set_send_handle(0, signal);
+    let attach = Msg::from_words(con::ATTACH, &[EV_TX]).with_handles(1);
+    if ipc::call_checked(dev.term, &attach).is_err() {
+        dev.fatal("console refused the terminal, stopping");
+        return 0;
+    }
+    let _ = sys::handle_close(signal);
+    let ep = drv::publish("usbcon").expect("usbcon: publish");
     if !dev
         .udc
         .attach(udc::STS_UI | udc::STS_UEI | udc::STS_PCI | udc::STS_URI)
     {
-        dev.status("controller did not start, stopping");
+        dev.fatal("controller did not start, stopping");
         return 0;
     }
-    dev.status("USB-C console ready, waiting for a PC (tools/usbterm.py)");
-    loop {
-        let ev = sys::notify_wait(notif).unwrap_or(0);
-        if ev & EV_IRQ != 0 {
-            dev.interrupt();
-            irq.ack();
+    println!("[usbcon] USB-C console ready, waiting for a PC (tools/usbterm.py)");
+    drv::serve(ep, |rx| {
+        if rx.msg.is_notify() {
+            if rx.msg.mr[0] & EV_IRQ != 0 {
+                dev.interrupt();
+                irq.ack();
+            }
+            dev.send();
+            return None;
         }
-        dev.send();
-    }
+        Some(match rx.msg.label() {
+            proto::STATS => dev.stats_reply(),
+            _ => Msg::error(-EINVAL),
+        })
+    })
 }
