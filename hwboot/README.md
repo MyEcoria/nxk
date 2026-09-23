@@ -388,6 +388,20 @@ seconds (each 512-character line is echoed back before the next).
     type (0x1D) and a received frame read 16 bytes late, as if the chip's
     DMA writes landed 16 bytes low. `wifi status` now shows the link, the
     chip's config space once it is gone, and the next unread items.
+17. 23/09/2026, Erista, boot image from `mksd-hw.sh`: **the Switch
+    pings google.com over Wi-Fi**. The first image carrying the full
+    Wi-Fi driver did not mount the card: `fs` gave up its 5 s wait for
+    `sd`, then, waiting longer, its first read timed out. `sd` now
+    reports a failed transfer: `status 0x00000000, present 0x01ab0206,
+    ADMA error 0x0 at 0x80380008, buffer 0x80380000`, a read active with
+    the data lines at 1010 and the DMA engine fine. hekate runs the card
+    in 1.8 V UHS signaling, which only a power cycle undoes; `sd`
+    assumed a card switched off and powered it up at 3.3 V, where
+    commands pass and data does not. It now powers the slot off, waits
+    100 ms, then up: the card mounts, `wlan` loads its firmware at boot
+    (after `fs`, then the PCIe bring-up), joins `nxk-test` (WPA2), `net`
+    gets `10.133.165.75/24` by DHCP and `nettest ping google.com 5`
+    (`172.217.22.46`) answers 5 of 5, 37 to 301 ms, 120 ms on average.
 
 ## Hardware test (once the SD card is back in the PC)
 

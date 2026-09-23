@@ -230,12 +230,12 @@ All in EL0, started by `init` with only their capabilities.
 | `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
-| `sd` | SD card (SDHCI, ADMA2), slot power-up (pads, GPIOs, PMC I/O power, PMIC LDO2); **Erista**: 64 GB card read and written | 3.3 V default speed only (no UHS / 1.8 V) |
+| `sd` | SD card (SDHCI, ADMA2), slot power cycle then power-up (pads, GPIOs, PMC I/O power, PMIC LDO2): a card hekate left in 1.8 V signaling starts over at 3.3 V; **Erista**: 64 GB card read and written | 3.3 V default speed only (no UHS / 1.8 V) |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
 | `display` | screen (window A), boot logo and landscape text terminal (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
-| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP, ICMP echo (`nettest ping HOST`) | emulator |
+| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP, ICMP echo (`nettest ping HOST`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
 | `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the chip sometimes stops answering a few minutes after a join (hardware run 16, cause unknown): `wlan` reports it in `wifi status` and `restart wlan` brings it back. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
