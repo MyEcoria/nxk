@@ -454,10 +454,7 @@ fn finalize(i: u16) {
     }
     // Wake those waiting for this exit.
     while let Some(w) = p.waiters.pop() {
-        let wt = thread::get(w);
-        wt.frame.x[0] = code as u64;
-        wt.blocked_on = NIL;
-        sched::make_ready(w);
+        sched::wake(w, code as u64);
     }
     p.state = PState::Zombie;
     if p.refs == 0 {

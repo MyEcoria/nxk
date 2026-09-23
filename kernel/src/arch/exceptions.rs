@@ -65,7 +65,7 @@ extern "C" fn nxk_el0_trap(_frame: u64, kind: u64) -> ! {
             match esr >> 26 {
                 0x15 => syscall::dispatch(cur),
                 0x07 => fpu::trap(cur),
-                0x01 => sched::yield_current(cur),
+                0x01 => sched::yield_current(),
                 _ => fault::user_fault(cur, esr, sysreg_read!("far_el1")),
             }
         }

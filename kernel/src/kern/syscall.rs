@@ -58,7 +58,7 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
         sys::NOP => val(0),
         sys::DEBUG_WRITE => debug_write(a[0], a[1]),
         sys::YIELD => {
-            sched::yield_current(ti);
+            sched::yield_current();
             val(0)
         }
         sys::THREAD_EXIT => thread_exit(ti, a[0] as i64, a[1] as u32, a[2]),
@@ -131,7 +131,7 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
         sys::FUTEX_WAIT => futex::wait(ti, a[0], a[1] as u32, Timeout::from_ns(a[2])),
         sys::FUTEX_WAKE => futex::wake(a[0], a[1]).map(Some),
 
-        sys::PROCESS_SPAWN => spawn(ti, pi, a[0]),
+        sys::PROCESS_SPAWN => spawn(pi, a[0]),
         sys::PROCESS_WAIT => {
             let c = cap::lookup(pi, a[0] as u32, Kind::Process, rights::WAIT)?;
             process::wait(ti, c.obj as u16, Timeout::from_ns(a[1]))
@@ -320,7 +320,6 @@ fn chunked(
 }
 
 /// Exit the current thread; an optional notification fires after EL0 exit.
-///
 fn thread_exit(ti: u16, code: i64, notif: u32, bits: u64) -> SysResult {
     if notif != 0 {
         let pi = thread::get(ti).proc_idx;
@@ -340,7 +339,7 @@ fn thread_exit(ti: u16, code: i64, notif: u32, bits: u64) -> SysResult {
 fn sleep(ti: u16, ns: u64) -> SysResult {
     let ticks = timer::ns_to_ticks(ns);
     if ticks == 0 {
-        sched::yield_current(ti);
+        sched::yield_current();
         return val(0);
     }
     sched::sleep_until(ti, timer::counter().saturating_add(ticks));
@@ -404,26 +403,13 @@ fn mem_map(pi: u16, addr: u64, len: u64, p: u64) -> SysResult {
     }
     check_prot_mask(p, prot::POPULATE)?;
     check_no_wx(p)?;
-    let proc = process::get(pi);
-    let va = if addr == 0 {
-        let va = proc.heap_next;
-        if va + len > HEAP_END {
-            return Err(-ENOMEM);
-        }
-        proc.heap_next += len + PAGE_SIZE;
-        va
-    } else {
-        if !user_range_ok(addr, len) {
-            return Err(-EINVAL);
-        }
-        // Fixed address: the range must be free, else failure (and its cleanup)
-        // would touch already-mapped pages.
-        let l1 = proc.l1;
-        if (0..len / PAGE_SIZE).any(|k| crate::mm::vm::is_mapped(l1, addr + k * PAGE_SIZE)) {
-            return Err(-EEXIST);
-        }
-        addr
-    };
+    let va = place(pi, addr, len)?;
+    // Fixed address: the range must be free, else failure (and its cleanup)
+    // would touch already-mapped pages.
+    let l1 = process::get(pi).l1;
+    if addr != 0 && (0..len / PAGE_SIZE).any(|k| vm::is_mapped(l1, addr + k * PAGE_SIZE)) {
+        return Err(-EEXIST);
+    }
     let r = if p & prot::POPULATE != 0 {
         process::map_anon(pi, va, len, (p & !prot::POPULATE) | prot::READ)
     } else {
@@ -608,7 +594,7 @@ fn thread_set(ti: u16, pi: u16, h: u32, what: u64, v: u64) -> SysResult {
     val(0)
 }
 
-fn spawn(ti: u16, pi: u16, args_ptr: u64) -> SysResult {
+fn spawn(pi: u16, args_ptr: u64) -> SysResult {
     let a: SpawnArgs = uaccess::read(args_ptr)?;
     if a.elf_len == 0 || a.elf_len > 32 << 20 || a.name_len > 15 || a.grants_len > 16 {
         return Err(-EINVAL);
@@ -647,7 +633,6 @@ fn spawn(ti: u16, pi: u16, args_ptr: u64) -> SysResult {
         return Err(e);
     }
     let gen = process::get(child).gen;
-    let _ = ti;
     let r = rights::WAIT | rights::KILL | rights::GRANT | rights::DUP | rights::CONTROL;
     cap::insert(pi, Cap::new(Kind::Process, child as u32, gen, r)).map(|h| Some(h as u64))
 }

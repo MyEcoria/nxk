@@ -25,15 +25,6 @@ impl<T> SpinLock<T> {
         }
     }
 
-    #[inline]
-    pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        while self.owner.load(Ordering::Acquire) != ticket {
-            arch::wfe();
-        }
-        SpinLockGuard { lock: self }
-    }
-
     /// Raw take, for locks released on another path than the taker (kernel
     /// global lock).
     #[inline]
@@ -62,38 +53,8 @@ impl<T> SpinLock<T> {
     #[inline]
     pub fn lock_irqsafe(&self) -> IrqGuard<'_, T> {
         let flags = arch::irq_save();
-        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        while self.owner.load(Ordering::Acquire) != ticket {
-            arch::wfe();
-        }
+        self.raw_lock();
         IrqGuard { lock: self, flags }
-    }
-}
-
-pub struct SpinLockGuard<'a, T> {
-    lock: &'a SpinLock<T>,
-}
-
-impl<T> Deref for SpinLockGuard<'_, T> {
-    type Target = T;
-    #[inline]
-    fn deref(&self) -> &T {
-        unsafe { &*self.lock.data.get() }
-    }
-}
-
-impl<T> DerefMut for SpinLockGuard<'_, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.lock.data.get() }
-    }
-}
-
-impl<T> Drop for SpinLockGuard<'_, T> {
-    #[inline]
-    fn drop(&mut self) {
-        self.lock.owner.fetch_add(1, Ordering::Release);
-        arch::sev();
     }
 }
 
@@ -121,8 +82,7 @@ impl<T> DerefMut for IrqGuard<'_, T> {
 impl<T> Drop for IrqGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.owner.fetch_add(1, Ordering::Release);
-        arch::sev();
+        self.lock.raw_unlock();
         arch::irq_restore(self.flags);
     }
 }

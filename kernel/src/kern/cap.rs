@@ -275,7 +275,3 @@ pub fn grant(from: u16, h: u32, to: u16, slot: Option<usize>) -> Result<u32, i64
         None => insert(to, c),
     }
 }
-
-pub fn count(p: u16) -> usize {
-    table(p).iter().filter(|c| c.kind != Kind::Empty).count()
-}

@@ -1,4 +1,3 @@
 pub mod spinlock;
 
-#[allow(unused_imports)]
-pub use spinlock::{IrqGuard, SpinLock, SpinLockGuard};
+pub use spinlock::SpinLock;

@@ -61,14 +61,7 @@ pub fn decref(i: u16) {
     let x = n(i);
     x.refs -= 1;
     if x.refs == 0 {
-        if x.waiter != NIL {
-            let w = core::mem::replace(&mut x.waiter, NIL);
-            thread::get(w).frame.x[0] = (-EPIPE) as u64;
-            thread::get(w).blocked_on = NIL;
-            sched::make_ready(w);
-        }
-        unbind(i);
-        irq::forget_notification(i);
+        detach_all(i);
         x.used = false;
         x.gen = x.gen.wrapping_add(1);
         NOTIFS.get().free(i);
@@ -81,15 +74,18 @@ pub fn revoke(i: u16) -> u16 {
     let x = n(i);
     x.gen = x.gen.wrapping_add(1);
     x.refs = 1;
+    detach_all(i);
+    n(i).gen
+}
+
+/// Fail the waiter, drop the thread binding and interrupt routing.
+fn detach_all(i: u16) {
+    let x = n(i);
     if x.waiter != NIL {
-        let w = core::mem::replace(&mut x.waiter, NIL);
-        thread::get(w).frame.x[0] = (-EPIPE) as u64;
-        thread::get(w).blocked_on = NIL;
-        sched::make_ready(w);
+        sched::wake(core::mem::replace(&mut x.waiter, NIL), (-EPIPE) as u64);
     }
     unbind(i);
     irq::forget_notification(i);
-    n(i).gen
 }
 
 /// Signal bits (also called from the interrupt handler).
@@ -98,10 +94,7 @@ pub fn signal(i: u16, bits: u64) {
     x.bits |= bits;
     if x.waiter != NIL {
         let w = core::mem::replace(&mut x.waiter, NIL);
-        let t = thread::get(w);
-        t.frame.x[0] = core::mem::take(&mut x.bits);
-        t.blocked_on = NIL;
-        sched::make_ready(w);
+        sched::wake(w, core::mem::take(&mut x.bits));
     } else if x.bound != NIL {
         let b = x.bound;
         let t = thread::get(b);

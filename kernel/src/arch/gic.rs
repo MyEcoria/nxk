@@ -28,7 +28,6 @@ pub const SPURIOUS: u32 = 1023;
 
 pub const IRQ_TIMER: u32 = 30;
 pub const SGI_RESCHEDULE: u32 = 0;
-pub const SGI_STOP: u32 = 1;
 
 /// Lines handled by the distributor.
 pub fn num_irqs() -> u32 {

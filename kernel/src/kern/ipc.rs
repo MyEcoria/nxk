@@ -259,6 +259,33 @@ fn timeout_of(ti: u16) -> Timeout {
     Timeout::from_ns(thread::get(ti).frame.x[9])
 }
 
+/// `ti`'s call reaches receiver `r`: message copied, `ti` now waits for
+/// `r`'s reply (its deadline, if any, also covers the reply).
+fn deliver_call(ti: u16, r: u16, badge: u64) {
+    transfer(ti, r, badge);
+    let server_proc = thread::get(r).proc_idx;
+    let t = thread::get(ti);
+    t.state = State::BlockedReply;
+    t.blocked_on = NIL;
+    t.reply_from = server_proc;
+    t.reply_holder = r;
+    t.call_seq = t.call_seq.wrapping_add(1);
+    let rt = thread::get(r);
+    rt.frame.x[9] = thread::token(ti);
+    rt.reply_to = ti;
+    rt.blocked_on = NIL;
+}
+
+/// Park `ti` in endpoint `ep_idx`'s send queue until a receiver comes.
+fn park_sender(ti: u16, ep_idx: u16, badge: u64, is_call: bool) {
+    let t = thread::get(ti);
+    t.state = State::BlockedSend;
+    t.blocked_on = ep_idx;
+    t.send_badge = badge;
+    t.send_is_call = is_call;
+    ep(ep_idx).send_q.push(ti);
+}
+
 pub fn call(ti: u16, h: u32) -> IpcResult {
     let pi = thread::get(ti).proc_idx;
     let tmo = timeout_of(ti);
@@ -276,38 +303,19 @@ pub fn call(ti: u16, h: u32) -> IpcResult {
 
     match r {
         Some(r) => {
-            transfer(ti, r, c.badge);
-            let server_proc = thread::get(r).proc_idx;
-            let t = thread::get(ti);
-            t.state = State::BlockedReply;
-            t.reply_from = server_proc;
-            t.reply_holder = r;
-            t.call_seq = t.call_seq.wrapping_add(1);
-            let rt = thread::get(r);
-            rt.frame.x[9] = thread::token(ti);
-            rt.reply_to = ti;
-            rt.blocked_on = NIL;
+            deliver_call(ti, r, c.badge);
             // A no-wait call still delivers its request to the ready server:
             // only the wait for a server is skipped, not the reply.
             if tmo != Timeout::Now {
                 tmo.arm(ti);
             }
-            if rt.home as usize == here {
-                sched::switch_to(r);
-            } else {
-                sched::make_ready(r);
-            }
+            sched::run_next(r);
         }
         None => {
             if tmo == Timeout::Now {
                 return Err(-ETIMEDOUT);
             }
-            let t = thread::get(ti);
-            t.state = State::BlockedSend;
-            t.blocked_on = c.obj as u16;
-            t.send_badge = c.badge;
-            t.send_is_call = true;
-            e.send_q.push(ti);
+            park_sender(ti, c.obj as u16, c.badge, true);
             tmo.arm(ti);
         }
     }
@@ -323,27 +331,10 @@ pub fn fault_call(ti: u16, ep_idx: u16) -> IpcResult {
     }
     match e.recv_q.pop() {
         Some(r) => {
-            transfer(ti, r, 0);
-            let server_proc = thread::get(r).proc_idx;
-            let t = thread::get(ti);
-            t.state = State::BlockedReply;
-            t.reply_from = server_proc;
-            t.reply_holder = r;
-            t.call_seq = t.call_seq.wrapping_add(1);
-            let rt = thread::get(r);
-            rt.frame.x[9] = thread::token(ti);
-            rt.reply_to = ti;
-            rt.blocked_on = NIL;
+            deliver_call(ti, r, 0);
             sched::make_ready(r);
         }
-        None => {
-            let t = thread::get(ti);
-            t.state = State::BlockedSend;
-            t.blocked_on = ep_idx;
-            t.send_badge = 0;
-            t.send_is_call = true;
-            e.send_q.push(ti);
-        }
+        None => park_sender(ti, ep_idx, 0, true),
     }
     Ok(())
 }
@@ -369,12 +360,7 @@ pub fn send(ti: u16, h: u32) -> IpcResult {
             if tmo == Timeout::Now {
                 return Err(-ETIMEDOUT);
             }
-            let t = thread::get(ti);
-            t.state = State::BlockedSend;
-            t.blocked_on = c.obj as u16;
-            t.send_badge = c.badge;
-            t.send_is_call = false;
-            e.send_q.push(ti);
+            park_sender(ti, c.obj as u16, c.badge, false);
             tmo.arm(ti);
         }
     }
@@ -397,22 +383,13 @@ fn receive(ti: u16, ep_idx: u16, tmo: Timeout) -> Result<bool, i64> {
     if let Some(s) = e.send_q.pop() {
         let st = thread::get(s);
         let badge = st.send_badge;
-        transfer(s, ti, badge);
-        let st = thread::get(s);
-        st.blocked_on = NIL;
-        let t = thread::get(ti);
         if st.send_is_call {
             // Its deadline, if any, stays armed: it also covers the reply.
-            st.state = State::BlockedReply;
-            st.reply_from = t.proc_idx;
-            st.reply_holder = ti;
-            st.call_seq = st.call_seq.wrapping_add(1);
-            t.reply_to = s;
-            t.frame.x[9] = thread::token(s);
+            deliver_call(s, ti, badge);
         } else {
-            st.frame.x[0] = 0;
-            t.reply_to = NIL;
-            sched::make_ready(s);
+            transfer(s, ti, badge);
+            thread::get(ti).reply_to = NIL;
+            sched::wake(s, 0);
         }
         return Ok(true);
     }
@@ -467,11 +444,8 @@ fn deliver_reply(ti: u16, client: u16) -> Result<bool, i64> {
     Ok(true)
 }
 
-pub fn reply(ti: u16) -> IpcResult {
-    let client = core::mem::replace(&mut thread::get(ti).reply_to, NIL);
-    if client == NIL {
-        return Err(-ESRCH);
-    }
+/// Reply to `client` and resume it; the replier continues.
+fn finish_reply(ti: u16, client: u16) -> IpcResult {
     if deliver_reply(ti, client)? {
         sched::make_ready(client);
     }
@@ -479,13 +453,15 @@ pub fn reply(ti: u16) -> IpcResult {
     Ok(())
 }
 
-pub fn reply_to(ti: u16, token: u64) -> IpcResult {
-    let client = thread::from_token(token).ok_or(-ESRCH)?;
-    if deliver_reply(ti, client)? {
-        sched::make_ready(client);
+pub fn reply(ti: u16) -> IpcResult {
+    match core::mem::replace(&mut thread::get(ti).reply_to, NIL) {
+        NIL => Err(-ESRCH),
+        client => finish_reply(ti, client),
     }
-    thread::get(ti).frame.x[0] = 0;
-    Ok(())
+}
+
+pub fn reply_to(ti: u16, token: u64) -> IpcResult {
+    finish_reply(ti, thread::from_token(token).ok_or(-ESRCH)?)
 }
 
 /// Single-call service loop: reply then wait for the next request.
@@ -507,11 +483,7 @@ pub fn reply_recv(ti: u16, h: u32) -> IpcResult {
         return got.map(|_| ());
     }
     if replied {
-        if thread::get(client).home as usize == percpu::this().id {
-            sched::switch_to(client);
-        } else {
-            sched::make_ready(client);
-        }
+        sched::run_next(client);
     }
     Ok(())
 }

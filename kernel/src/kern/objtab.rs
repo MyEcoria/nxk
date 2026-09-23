@@ -14,7 +14,6 @@ pub struct Table<T: 'static> {
     nchunks: usize,
     shift: u32,
     free_head: u16,
-    live: usize,
     /// Put a fresh slot in the "free" state.
     reset: fn(&mut T),
     /// Free-list link field.
@@ -35,7 +34,6 @@ impl<T: 'static> Table<T> {
             nchunks: 0,
             shift,
             free_head: NIL,
-            live: 0,
             reset,
             link,
         }
@@ -50,11 +48,6 @@ impl<T: 'static> Table<T> {
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         (self.nchunks << self.shift).min(MAX_OBJECTS)
-    }
-
-    #[inline(always)]
-    pub fn live(&self) -> usize {
-        self.live
     }
 
     #[inline(always)]
@@ -100,7 +93,6 @@ impl<T: 'static> Table<T> {
         let obj = self.get(i);
         self.free_head = *(self.link)(obj);
         *(self.link)(obj) = NIL;
-        self.live += 1;
         Some(i)
     }
 
@@ -109,6 +101,5 @@ impl<T: 'static> Table<T> {
         let obj = self.get(i);
         *(self.link)(obj) = self.free_head;
         self.free_head = i;
-        self.live -= 1;
     }
 }

@@ -25,7 +25,6 @@ const CPU_PARTITION: [u32; 4] = [14, 9, 10, 11];
 
 // --- CAR: CPU complex reset lines ---
 const CAR_BASE: usize = 0x6000_6000;
-const RST_CPUG_CMPLX_SET: usize = CAR_BASE + 0x450;
 const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 
 /// Reset mask for one core: CPU, DE, WD, DBG, CORE and CX.
@@ -100,9 +99,4 @@ pub fn start_secondaries_psci(entry: usize) -> usize {
         }
     }
     online_count()
-}
-
-/// Put a core back in reset (clean stop, currently unused).
-pub fn stop_core(cpu: usize) {
-    unsafe { write32(RST_CPUG_CMPLX_SET, cpu_reset_mask(cpu)) };
 }

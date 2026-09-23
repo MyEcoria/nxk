@@ -242,6 +242,24 @@ pub fn make_ready(i: u16) {
     }
 }
 
+/// Resume a parked thread with `x0` as its call's result.
+pub fn wake(i: u16, x0: u64) {
+    let t = thread::get(i);
+    t.frame.x[0] = x0;
+    t.blocked_on = NIL;
+    make_ready(i);
+}
+
+/// Resume `i` on this core at once if it lives here (IPC handoff), else
+/// through its core's run queue.
+pub fn run_next(i: u16) {
+    if thread::get(i).home as usize == percpu::this().id {
+        switch_to(i);
+    } else {
+        make_ready(i);
+    }
+}
+
 /// Direct switch (IPC): `i` becomes this core's current thread without
 /// going through the run queue. The old current already parks.
 #[inline]
@@ -255,7 +273,7 @@ pub fn switch_to(i: u16) {
 }
 
 /// Voluntary yield: give way to same-priority threads.
-pub fn yield_current(_i: u16) {
+pub fn yield_current() {
     let c = percpu::this();
     c.slice_expired = true;
     c.need_resched = true;
@@ -397,9 +415,7 @@ pub fn expire(now: u64) {
         }
         let slept = t.state == State::Sleeping;
         detach(i);
-        let t = thread::get(i);
-        t.frame.x[0] = if slept { 0 } else { (-ETIMEDOUT) as u64 };
-        make_ready(i);
+        wake(i, if slept { 0 } else { (-ETIMEDOUT) as u64 });
     }
 }
 
@@ -428,7 +444,6 @@ pub fn set_prio(i: u16, prio: u8) {
 }
 
 /// Pin (or release) a thread's core. Migration runs on its current core.
-///
 pub fn set_affinity(i: u16, cpu: u8) {
     let t = thread::get(i);
     t.affinity = cpu;
@@ -499,7 +514,6 @@ fn push_to(i: u16, dst: usize) {
 }
 
 /// Migrations asked by other cores, and an idle core's work request.
-///
 fn run_migrations(c: &mut PerCpu) {
     while c.mig_head != NIL {
         let i = c.mig_head;

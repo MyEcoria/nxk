@@ -76,18 +76,23 @@ pub fn _print(args: fmt::Arguments) {
     let _ = with(|c| c.write_fmt(args));
 }
 
-/// Emergency output: ignores the lock (panic, fatal exception).
+/// Emergency output, UART plus screen: ignores the lock and formats
+/// nothing (panic, fatal exception).
+pub fn emergency_str(s: &str) {
+    Uart::new(UART_A).write_str(s);
+    fbcon::write_str(s);
+}
+
 #[doc(hidden)]
 pub fn _print_emergency(args: fmt::Arguments) {
-    struct Emergency(Uart);
+    struct Emergency;
     impl Write for Emergency {
         fn write_str(&mut self, s: &str) -> fmt::Result {
-            self.0.write_str(s);
-            fbcon::write_str(s);
+            emergency_str(s);
             Ok(())
         }
     }
-    let _ = Emergency(Uart::new(UART_A)).write_fmt(args);
+    let _ = Emergency.write_fmt(args);
 }
 
 #[macro_export]

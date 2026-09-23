@@ -4,9 +4,6 @@
 use crate::mmio::{write32, RegBlock};
 
 pub const UART_A: usize = 0x7000_6000;
-pub const UART_B: usize = 0x7000_6040;
-pub const UART_C: usize = 0x7000_6200;
-pub const UART_D: usize = 0x7000_6300;
 
 // Registers (indices, 1 << 2 spacing)
 const RBR_THR_DLL: usize = 0;
@@ -22,8 +19,6 @@ const FCR_ENABLE: u32 = 1 << 0;
 const FCR_CLEAR_RX: u32 = 1 << 1;
 const FCR_CLEAR_TX: u32 = 1 << 2;
 const LSR_THRE: u32 = 1 << 5;
-const LSR_TMTY: u32 = 1 << 6;
-const LSR_RDR: u32 = 1 << 0;
 
 // Device reference clock on T210 (PLLP / 1).
 const UART_CLK_HZ: u32 = 408_000_000;
@@ -91,26 +86,6 @@ impl Uart {
                 self.put(b'\r');
             }
             self.put(b);
-        }
-    }
-
-    /// Wait for the shift register to fully drain.
-    pub fn flush(&self) {
-        unsafe {
-            while self.regs.read(LSR) & LSR_TMTY == 0 {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Non-blocking read.
-    pub fn try_get(&self) -> Option<u8> {
-        unsafe {
-            if self.regs.read(LSR) & LSR_RDR != 0 {
-                Some(self.regs.read(RBR_THR_DLL) as u8)
-            } else {
-                None
-            }
         }
     }
 }

@@ -217,11 +217,6 @@ impl Queue {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.head == NIL
-    }
-
-    #[inline]
     pub fn push(&mut self, i: u16) {
         get(i).next = NIL;
         if self.tail == NIL {

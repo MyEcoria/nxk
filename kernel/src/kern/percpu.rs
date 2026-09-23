@@ -123,7 +123,3 @@ pub fn init(id: usize, kstack_top: u64, kernel_ttbr: u64) {
     sysreg_write!("tpidr_el1", c as *mut PerCpu as u64);
     arch::isb();
 }
-
-pub fn online_count() -> usize {
-    (0..NR_CPUS).filter(|&i| get(i).online).count()
-}

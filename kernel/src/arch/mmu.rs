@@ -317,16 +317,3 @@ pub fn boot_l1() -> u64 {
 pub fn kernel_ttbr() -> u64 {
     boot_l1()
 }
-
-/// Flush the whole TLB on the current core.
-pub fn flush_tlb() {
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1",
-            "dsb ish",
-            "isb",
-            options(nostack)
-        )
-    };
-}

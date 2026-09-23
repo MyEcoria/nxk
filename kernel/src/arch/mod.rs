@@ -55,17 +55,6 @@ pub fn sev() {
     unsafe { asm!("sev", options(nomem, nostack)) };
 }
 
-#[inline(always)]
-pub fn nop() {
-    unsafe { asm!("nop", options(nomem, nostack)) };
-}
-
-/// Data synchronization barrier, inner-shareable domain.
-#[inline(always)]
-pub fn dsb_ish() {
-    unsafe { asm!("dsb ish", options(nostack)) };
-}
-
 /// Full data barrier (devices included).
 #[inline(always)]
 pub fn dsb_sy() {

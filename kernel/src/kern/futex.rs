@@ -4,7 +4,7 @@ use nxk_abi::err::{EAGAIN, EFAULT, EINVAL, ETIMEDOUT};
 
 use crate::kern::bkl::BklCell;
 use crate::kern::sched::{self, Timeout};
-use crate::kern::thread::{self, Queue, State, NIL};
+use crate::kern::thread::{self, Queue, State};
 use crate::mm::uaccess;
 
 const BUCKETS: usize = 256;
@@ -40,9 +40,7 @@ pub fn wait(ti: u16, uaddr: u64, val: u32, tmo: Timeout) -> Result<Option<u64>, 
     t.futex_key = pa;
     t.blocked_on = b as u16;
     TABLE.get()[b].push(ti);
-    if let Timeout::At(d) = tmo {
-        sched::arm(ti, d);
-    }
+    tmo.arm(ti);
     Ok(None)
 }
 
@@ -54,10 +52,7 @@ pub fn wake(uaddr: u64, n: u64) -> Result<u64, i64> {
     while woken < n {
         match q.take(|x| thread::get(x).futex_key == pa) {
             Some(w) => {
-                let t = thread::get(w);
-                t.frame.x[0] = 0;
-                t.blocked_on = NIL;
-                sched::make_ready(w);
+                sched::wake(w, 0);
                 woken += 1;
             }
             None => break,

@@ -4,8 +4,6 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-// Drivers expose the full register set even if the kernel uses a subset.
-#![allow(dead_code)]
 
 mod arch;
 mod boot;
@@ -289,22 +287,8 @@ fn banner(core: usize) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Raw lock-free output (UART plus screen): survives broken formatting.
-    use drivers::uart::{Uart, UART_A};
-    struct Out(Uart);
-    impl core::fmt::Write for Out {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            self.0.write_str(s);
-            fbcon::write_str(s);
-            Ok(())
-        }
-    }
-    let mut out = Out(Uart::new(UART_A));
-
-    let put_str = |s: &str| {
-        Uart::new(UART_A).write_str(s);
-        fbcon::write_str(s);
-    };
+    // Header without the formatting machinery: survives a broken `fmt`.
+    use console::emergency_str as put_str;
     let put_num = |mut n: u64| {
         let mut buf = [0u8; 20];
         let mut i = buf.len();
@@ -330,7 +314,6 @@ fn panic(info: &PanicInfo) -> ! {
         put_str("\n");
     }
     put_str("  what : ");
-    let _ = core::fmt::write(&mut out, format_args!("{}", info.message()));
-    put_str("\n");
+    console::_print_emergency(format_args!("{}\n", info.message()));
     arch::park()
 }
