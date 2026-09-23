@@ -147,13 +147,21 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
     }
     // Errors reported by the AFI are worth seeing during bring-up.
     let irq = Irq::new(drv::dev_slot(7)).map_err(|e| format!("interrupt ({})", err::name(e)))?;
-    let what = format!(
+    let mut what = format!(
         "BCM{:x} rev {} on PCIe port {}, firmware {}, no data path yet",
         c.id,
         c.rev,
         ep.port,
         if c.firmware { "present" } else { "missing" }
     );
+    // All ones: the read never reached the chip. The AFI says why.
+    if c.id == 0xFFFF {
+        let (code, addr) = rc.afi_error();
+        what = format!(
+            "{} [chip ID read all ones: AFI error {} at {:#x}, BAR0 {:#x}]",
+            what, code, addr, ep.bars[0]
+        );
+    }
     Ok((Hw { rc }, irq, what))
 }
 

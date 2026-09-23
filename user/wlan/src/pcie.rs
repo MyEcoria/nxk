@@ -166,6 +166,16 @@ const CFG_COMMAND_MASTER: u32 = 1 << 2;
 const CFG_COMMAND_INTX_OFF: u32 = 1 << 10;
 const CFG_BAR0: usize = 0x10;
 const CFG_PRIMARY_BUS: usize = 0x18;
+// Bridge (type 1) windows of a root port.
+const CFG_IO_BASE: usize = 0x1C;
+/// I/O base above I/O limit: no I/O window.
+const CFG_IO_NONE: u32 = 0xF0;
+const CFG_MEM_BASE: usize = 0x20;
+const CFG_PREF_BASE: usize = 0x24;
+const CFG_PREF_BASE_UPPER: usize = 0x28;
+const CFG_PREF_LIMIT_UPPER: usize = 0x2C;
+/// Faulting address of the error in `AFI_INTR_CODE`.
+const AFI_INTR_SIGNATURE: usize = 0xBC;
 
 /// Module control pins (Switch): WIFI_EN on PH0, WIFI_RST on PH1
 /// (hekate `PINMUX_AUX_WIFI_EN`/`_RST`, Switch device tree `wifi_en_ph0`
@@ -597,6 +607,16 @@ impl Pcie {
         self.cfg_write(1, 0, off, v);
     }
 
+    /// Latched AFI error code and the address it hit, left in place: why
+    /// an access through a window read all ones.
+    pub fn afi_error(&self) -> (u32, u32) {
+        let afi = self.afi();
+        (
+            afi.r32(AFI_INTR_CODE) & AFI_INTR_CODE_MASK,
+            afi.r32(AFI_INTR_SIGNATURE),
+        )
+    }
+
     /// Pending AFI interrupt: legacy INTx from the endpoint, or an error
     /// worth reporting. Clears the code register either way.
     pub fn interrupt(&self) -> u32 {
@@ -724,6 +744,31 @@ impl Pcie {
             CFG_PRIMARY_BUS,
             (secondary << 16) | (secondary << 8),
         );
+        // A bridge forwards memory accesses only inside its windows and
+        // with memory decoding on (Linux `pci_setup_bridge`); config
+        // accesses take another path, so the endpoint answers without it.
+        self.cfg_write(0, dev, CFG_IO_BASE, CFG_IO_NONE);
+        self.cfg_write(
+            0,
+            dev,
+            CFG_MEM_BASE,
+            bridge_window(MEM_WINDOW, MEM_WINDOW_LEN),
+        );
+        self.cfg_write(
+            0,
+            dev,
+            CFG_PREF_BASE,
+            bridge_window(PREFETCH_WINDOW, PREFETCH_WINDOW_LEN),
+        );
+        self.cfg_write(0, dev, CFG_PREF_BASE_UPPER, 0);
+        self.cfg_write(0, dev, CFG_PREF_LIMIT_UPPER, 0);
+        let cmd = self.cfg_read(0, dev, CFG_COMMAND) & 0xFFFF;
+        self.cfg_write(
+            0,
+            dev,
+            CFG_COMMAND,
+            cmd | CFG_COMMAND_MEMORY | CFG_COMMAND_MASTER,
+        );
         let id = self.cfg_read(1, 0, CFG_VENDOR);
         if id == 0xFFFF_FFFF || id == 0 {
             return Err(-ENXIO);
@@ -786,6 +831,13 @@ impl Pcie {
         );
         Ok(ep)
     }
+}
+
+/// Bridge memory window register: address bits 31:20 of base (low half)
+/// and of the last byte (high half), 1 MiB granularity.
+fn bridge_window(base: u64, len: u64) -> u32 {
+    let field = |a: u64| ((a >> 16) & 0xFFF0) as u32;
+    (field(base + len - 1) << 16) | field(base)
 }
 
 /// FPCI address of an AXI window (pci-tegra `tegra_pcie_setup_translations`).
