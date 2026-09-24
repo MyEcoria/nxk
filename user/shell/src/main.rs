@@ -1,4 +1,7 @@
-//! nxk interactive shell, over the serial console.
+//! nxk interactive shell, over the serial console. Around each prompt
+//! and command it prints the marks of shells integrated with their
+//! terminal (OSC 7 directory, OSC 133 prompt, command and status):
+//! terminals ignore them, the screen's TERMINAL page reads them.
 
 #![no_std]
 #![no_main]
@@ -7,6 +10,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
@@ -14,6 +18,13 @@ use libnx::abi::proto::{pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
+
+/// Outcome of the running command: 0, `-errno`, or a program's exit code.
+static STATUS: AtomicI64 = AtomicI64::new(0);
+
+fn fail(e: i64) {
+    STATUS.store(e, Ordering::Relaxed);
+}
 
 libnx::entry!(main);
 
@@ -23,7 +34,11 @@ fn main() -> i32 {
     println!("nxk - shell. Type 'help' for the command list.");
     let mut buf = [0u8; 256];
     loop {
-        print!("nxk> ");
+        // BEL-terminated OSC; "nxk> " stays whole for nxtest and usbterm.
+        print!(
+            "\x1b]7;file://nxk{}\x07\x1b]133;A\x07nxk> \x1b]133;B\x07",
+            fs::absolute(".")
+        );
         let n = console::read_line(&mut buf);
         if n == 0 && console::handle() == 0 {
             time::sleep_ms(1000); // no console left: avoid spinning idle
@@ -31,7 +46,13 @@ fn main() -> i32 {
         }
         let line = core::str::from_utf8(&buf[..n]).unwrap_or("").trim();
         if !line.is_empty() {
+            print!("\x1b]133;C\x07");
+            STATUS.store(0, Ordering::Relaxed);
             command(line);
+            match STATUS.load(Ordering::Relaxed) {
+                e if e < 0 => print!("\x1b]133;D;{};err={}\x07", -e, err::name(e)),
+                code => print!("\x1b]133;D;{}\x07", code),
+            }
         }
     }
 }
@@ -154,7 +175,10 @@ fn command(line: &str) {
             for a in &argv[1..] {
                 match a.split_once('=') {
                     Some((k, v)) if !k.is_empty() => env::set_var(k, v),
-                    _ => println!("export: expected NAME=value ({})", a),
+                    _ => {
+                        println!("export: expected NAME=value ({})", a);
+                        fail(-err::EINVAL);
+                    }
                 }
             }
         }
@@ -210,6 +234,7 @@ fn help() {
 fn recv(path: &str, size: &str, crc: &str) {
     let (Ok(size), Ok(crc)) = (size.parse::<usize>(), u32::from_str_radix(crc, 16)) else {
         println!("usage: recv FILE SIZE CRC32 (hex)");
+        fail(-err::EINVAL);
         return;
     };
     let mut data = Vec::with_capacity(size);
@@ -218,6 +243,7 @@ fn recv(path: &str, size: &str, crc: &str) {
         let n = console::read_line(&mut line);
         if n == 0 || !base64_decode(&line[..n], &mut data) {
             println!("recv: aborted after {} of {} bytes", data.len(), size);
+            fail(-err::EIO);
             return;
         }
     }
@@ -227,11 +253,15 @@ fn recv(path: &str, size: &str, crc: &str) {
             data.len(),
             crc32(&data)
         );
+        fail(-err::EIO);
         return;
     }
     match fs::write(path, &data) {
         Ok(()) => println!("recv: {} ({} bytes)", path, size),
-        Err(e) => println!("recv: {}: {}", path, err::name(e)),
+        Err(e) => {
+            println!("recv: {}: {}", path, err::name(e));
+            fail(e);
+        }
     }
 }
 
@@ -286,7 +316,10 @@ fn restart(name: &str, path: Option<&str>) {
     .and_then(ipc::checked);
     match r {
         Ok(_) => println!("{} restarted from {}", name, path),
-        Err(e) => println!("restart {}: {}", name, err::name(e)),
+        Err(e) => {
+            println!("restart {}: {}", name, err::name(e));
+            fail(e);
+        }
     }
 }
 
@@ -299,6 +332,7 @@ fn progs() {
 fn report<T>(what: &str, r: Result<T, i64>) {
     if let Err(e) = r {
         println!("{} : {}", what, err::name(e));
+        fail(e);
     }
 }
 
@@ -312,7 +346,10 @@ fn ls(path: &str) {
                 }
             }
         }
-        Err(e) => println!("ls {}: {}", path, err::name(e)),
+        Err(e) => {
+            println!("ls {}: {}", path, err::name(e));
+            fail(e);
+        }
     }
 }
 
@@ -320,15 +357,24 @@ fn cd(path: &str) {
     let abs = fs::absolute(path);
     match fs::stat(&abs) {
         Ok(s) if s.kind == Kind::Dir => env::set_var("PWD", &abs),
-        Ok(_) => println!("cd {}: not a directory", path),
-        Err(e) => println!("cd {}: {}", path, err::name(e)),
+        Ok(_) => {
+            println!("cd {}: not a directory", path);
+            fail(-err::ENOTDIR);
+        }
+        Err(e) => {
+            println!("cd {}: {}", path, err::name(e));
+            fail(e);
+        }
     }
 }
 
 fn cat(path: &str) {
     match fs::read(path) {
         Ok(d) => console::write(&d),
-        Err(e) => println!("cat {}: {}", path, err::name(e)),
+        Err(e) => {
+            println!("cat {}: {}", path, err::name(e));
+            fail(e);
+        }
     }
 }
 
@@ -340,6 +386,7 @@ fn echo(args: &[&str]) {
     };
     let Some(&target) = args.get(k + 1) else {
         println!("echo: missing file after {}", args[k]);
+        fail(-err::EINVAL);
         return;
     };
     let mut text = args[..k].join(" ");
@@ -374,14 +421,20 @@ fn stat(path: &str) {
                 h % 60
             );
         }
-        Err(e) => println!("stat {}: {}", path, err::name(e)),
+        Err(e) => {
+            println!("stat {}: {}", path, err::name(e));
+            fail(e);
+        }
     }
 }
 
 fn df() {
     match fs::statfs() {
         Ok((free, total)) => println!("  SD card: {} MiB free of {} MiB", free >> 20, total >> 20),
-        Err(e) => println!("df: {}", err::name(e)),
+        Err(e) => {
+            println!("df: {}", err::name(e));
+            fail(e);
+        }
     }
 }
 
@@ -399,6 +452,7 @@ fn run(argv: &[&str]) {
     }
     let Some(&name) = argv.first() else {
         println!("run: missing program name");
+        fail(-err::EINVAL);
         return;
     };
     let abs;
@@ -411,10 +465,12 @@ fn run(argv: &[&str]) {
         Ok(h) => h,
         Err(e) if e == -err::ENOENT => {
             println!("{}: unknown command or program (see 'help' and 'ls')", name);
+            fail(e);
             return;
         }
         Err(e) => {
             println!("{}: failed to start ({})", name, err::name(e));
+            fail(e);
             return;
         }
     };
@@ -422,6 +478,7 @@ fn run(argv: &[&str]) {
         println!("[{} started in background]", name);
     } else {
         let code = process::wait(h);
+        STATUS.store(code, Ordering::Relaxed);
         let ms = (time::now_ns() - t0) / 1_000_000;
         match code {
             0 => {}
@@ -528,6 +585,7 @@ fn service(name: &str) -> Option<u32> {
         Ok(h) => Some(h),
         Err(_) => {
             println!("service {} missing", name);
+            fail(-err::ENOENT);
             None
         }
     }
@@ -548,8 +606,14 @@ fn temp() {
             let (a, b) = (f(m.mr[0]), f(m.mr[1]));
             println!("chip {}.{} C, package {}.{} C", a.0, a.1, b.0, b.1);
         }
-        Ok(m) => println!("temp: error {}", err::name(-(m.label() as i64))),
-        Err(e) => println!("temp: {}", err::name(e)),
+        Ok(m) => {
+            println!("temp: error {}", err::name(-(m.label() as i64)));
+            fail(-(m.label() as i64));
+        }
+        Err(e) => {
+            println!("temp: {}", err::name(e));
+            fail(e);
+        }
     }
     let _ = sys::handle_close(h);
 }
@@ -557,8 +621,14 @@ fn temp() {
 fn power_cmd(label: u32) {
     let Some(h) = power_service() else { return };
     match ipc::call(h, &Msg::new(label, 0, 0)) {
-        Ok(m) if m.label() != 0 => println!("failed: {}", err::name(-(m.label() as i64))),
-        Err(e) => println!("failed: {}", err::name(e)),
+        Ok(m) if m.label() != 0 => {
+            println!("failed: {}", err::name(-(m.label() as i64)));
+            fail(-(m.label() as i64));
+        }
+        Err(e) => {
+            println!("failed: {}", err::name(e));
+            fail(e);
+        }
         _ => {}
     }
     let _ = sys::handle_close(h);
@@ -567,6 +637,7 @@ fn power_cmd(label: u32) {
 fn fbecho(text: &str) {
     if let Err(e) = libnx::drv::screen(&alloc::format!("{}\n", text)) {
         println!("fbecho: {}", err::name(e));
+        fail(e);
     }
 }
 
@@ -607,6 +678,7 @@ fn events(n: u32) {
             }
             Err(e) => {
                 println!("events: {}", err::name(e));
+                fail(e);
                 break;
             }
         }
