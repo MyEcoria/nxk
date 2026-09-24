@@ -1150,9 +1150,13 @@ pub mod proto {
     }
     /// I2C bus.
     pub mod i2c {
-        /// word 0 = bus (1..6) | address << 8 | read bytes << 16;
-        /// write bytes follow (see `pack`). Reply: bytes read.
+        /// word 0 = bus (1..6) | address << 8 | read bytes << 16
+        /// [| `REPEATED_START`]; write bytes follow (see `pack`).
+        /// Reply: bytes read.
         pub const TRANSFER: u32 = 1;
+        /// In word 0: the write then the read as one transaction, a
+        /// repeated start between them instead of a stop (both needed).
+        pub const REPEATED_START: u64 = 1 << 24;
         pub const fn header(bus: u64, addr: u64, read: u64) -> u64 {
             bus | addr << 8 | read << 16
         }

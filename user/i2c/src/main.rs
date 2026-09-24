@@ -1,5 +1,6 @@
 //! i2c: six Tegra X1 controllers; short transfers, init on first use.
-//! Sequence from hekate (bdk/soc/i2c.c).
+//! Sequences from hekate (bdk/soc/i2c.c): normal mode, packet mode for
+//! a write and a read joined by a repeated start.
 
 #![no_std]
 #![no_main]
@@ -8,13 +9,17 @@ use libnx::abi::err::{EINVAL, EIO, ETIMEDOUT};
 use libnx::abi::proto::{clk, i2c as proto};
 use libnx::drv::{self, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::println;
+use libnx::{println, time};
 
 const CNFG: usize = 0x00;
 const CMD_ADDR0: usize = 0x04;
 const CMD_DATA1: usize = 0x0C;
 const CMD_DATA2: usize = 0x10;
 const STATUS: usize = 0x1C;
+const TX_FIFO: usize = 0x50;
+const RX_FIFO: usize = 0x54;
+const FIFO_CONTROL: usize = 0x5C;
+const FIFO_STATUS: usize = 0x60;
 const INT_STATUS: usize = 0x68;
 const CLK_DIVISOR: usize = 0x6C;
 const BUS_CLEAR_CONFIG: usize = 0x84;
@@ -23,10 +28,23 @@ const CONFIG_LOAD: usize = 0x8C;
 
 const CMD1_READ: u32 = 1 << 6;
 const NORMAL_MODE_GO: u32 = 1 << 9;
+const PACKET_MODE_GO: u32 = 1 << 10;
 const NEW_MASTER_FSM: u32 = 1 << 11;
 const DEBOUNCE_CNT_4T: u32 = 2 << 12;
 const STATUS_NOACK: u32 = 0xF;
 const STATUS_BUSY: u32 = 1 << 8;
+const RX_FIFO_FLUSH: u32 = 1 << 0;
+const TX_FIFO_FLUSH: u32 = 1 << 1;
+const RX_FIFO_FULL_CNT: u32 = 0xF;
+const TX_FIFO_EMPTY_CNT: u32 = 0xF << 4;
+const INT_ARB_LOST: u32 = 1 << 2;
+const INT_NO_ACK: u32 = 1 << 3;
+/// Packet header word 0 (I2C protocol) and I2C-specific header bits.
+const PACKET_PROT_I2C: u32 = 1 << 4;
+const HEADER_REP_START: u32 = 1 << 16;
+const HEADER_READ: u32 = 1 << 19;
+/// hekate's packet timeout.
+const PACKET_US: u64 = 200_000;
 
 /// Controllers 1-6: (mapped page, offset within the page).
 const BUSES: [(usize, usize); 6] = [
@@ -96,6 +114,56 @@ fn read(b: &Mmio, addr: u32, out: &mut [u8]) -> Result<(), i64> {
     Ok(())
 }
 
+/// Write `data` then read `out`, a repeated start between: packet mode,
+/// both packets queued at once (the TX FIFO holds 8 words).
+fn write_read(b: &Mmio, addr: u32, data: &[u8], out: &mut [u8]) -> Result<(), i64> {
+    b.w32(CMD_ADDR0, (addr << 1) | 1);
+    b.w32(CNFG, DEBOUNCE_CNT_4T | NEW_MASTER_FSM | CMD1_READ);
+    b.w32(FIFO_CONTROL, RX_FIFO_FLUSH | TX_FIFO_FLUSH);
+    b.w32(INT_STATUS, INT_NO_ACK | INT_ARB_LOST);
+    load_cfg(b);
+    b.w32(CNFG, (b.r32(CNFG) & !NORMAL_MODE_GO) | PACKET_MODE_GO);
+    let failed = || b.r32(INT_STATUS) & (INT_NO_ACK | INT_ARB_LOST) != 0;
+    let packet = |len: usize, header: u32| {
+        b.w32(TX_FIFO, PACKET_PROT_I2C);
+        b.w32(TX_FIFO, len as u32 - 1);
+        b.w32(TX_FIFO, header | addr << 1);
+    };
+    let r = (|| {
+        packet(data.len(), HEADER_REP_START);
+        for c in data.chunks(4) {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            b.w32(TX_FIFO, u32::from_le_bytes(w));
+        }
+        if !time::poll(PACKET_US, || {
+            b.r32(FIFO_STATUS) & TX_FIFO_EMPTY_CNT >= 3 << 4
+        }) {
+            return Err(-ETIMEDOUT);
+        }
+        packet(out.len(), HEADER_READ);
+        for c in out.chunks_mut(4) {
+            if !time::poll(PACKET_US, || {
+                failed() || b.r32(FIFO_STATUS) & RX_FIFO_FULL_CNT != 0
+            }) {
+                return Err(-ETIMEDOUT);
+            }
+            if failed() {
+                return Err(-EIO);
+            }
+            c.copy_from_slice(&b.r32(RX_FIFO).to_le_bytes()[..c.len()]);
+        }
+        Ok(())
+    })();
+    // Let the stop go out, then leave packet mode.
+    time::sleep_us(20);
+    b.modify(CNFG, PACKET_MODE_GO | NORMAL_MODE_GO, 0);
+    if r.is_ok() && failed() {
+        return Err(-EIO);
+    }
+    r
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -116,13 +184,19 @@ fn main() -> i32 {
             return Some(Msg::error(-EINVAL));
         }
         let h = ipc::header(&rx.msg, 0);
-        let (bus, addr, rlen) = (
+        let (bus, addr, rlen, joined) = (
             (h & 0xFF) as usize,
             ((h >> 8) & 0x7F) as u32,
             ((h >> 16) & 0xFF) as usize,
+            h & proto::REPEATED_START != 0,
         );
         let wlen = ipc::unpack_at(&rx.msg, 1, &mut data);
-        if !(1..=6).contains(&bus) || wlen > 8 || rlen > 8 || (wlen == 0 && rlen == 0) {
+        if !(1..=6).contains(&bus)
+            || wlen > 8
+            || rlen > 8
+            || (wlen == 0 && rlen == 0)
+            || (joined && (wlen == 0 || rlen == 0))
+        {
             return Some(Msg::error(-EINVAL));
         }
         let b = &mut buses[bus - 1];
@@ -133,6 +207,9 @@ fn main() -> i32 {
         }
         let mut out = [0u8; 8];
         let r = (|| {
+            if joined {
+                return write_read(&b.regs, addr, &data[..wlen], &mut out[..rlen]);
+            }
             if wlen > 0 {
                 write(&b.regs, addr, &data[..wlen])?;
             }
