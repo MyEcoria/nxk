@@ -19,8 +19,18 @@ impl I2c {
     /// Write `w` then read `r.len()` bytes (8 at most each) on
     /// device `addr` of bus `bus` (1 to 6).
     pub fn transfer(&self, bus: u8, addr: u8, w: &[u8], r: &mut [u8]) -> Result<(), i64> {
-        let head = [proto::header(bus as u64, addr as u64, r.len() as u64)];
-        let m = ipc::call_checked(self.ep, &ipc::pack_at(proto::TRANSFER, &head, w))?;
+        self.xfer(proto::header(bus as u64, addr as u64, r.len() as u64), w, r)
+    }
+
+    /// As `transfer`, but the read follows a repeated start, not a stop
+    /// (`w` and `r` both non-empty).
+    pub fn write_read(&self, bus: u8, addr: u8, w: &[u8], r: &mut [u8]) -> Result<(), i64> {
+        let h = proto::header(bus as u64, addr as u64, r.len() as u64) | proto::REP_START;
+        self.xfer(h, w, r)
+    }
+
+    fn xfer(&self, head: u64, w: &[u8], r: &mut [u8]) -> Result<(), i64> {
+        let m = ipc::call_checked(self.ep, &ipc::pack_at(proto::TRANSFER, &[head], w))?;
         if ipc::unpack(&m, r) != r.len() {
             return Err(-nxk_abi::err::EIO);
         }

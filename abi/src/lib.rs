@@ -1150,9 +1150,13 @@ pub mod proto {
     }
     /// I2C bus.
     pub mod i2c {
-        /// word 0 = bus (1..6) | address << 8 | read bytes << 16;
-        /// write bytes follow (see `pack`). Reply: bytes read.
+        /// word 0 = bus (1..6) | address << 8 | read bytes << 16, plus
+        /// `REP_START`; write bytes follow (see `pack`). Reply: bytes read.
         pub const TRANSFER: u32 = 1;
+        /// Header flag: read after a repeated start instead of a stop
+        /// (both a write and a read). Some devices (the touchscreen)
+        /// answer a read that follows a stop with an extra byte.
+        pub const REP_START: u64 = 1 << 24;
         pub const fn header(bus: u64, addr: u64, read: u64) -> u64 {
             bus | addr << 8 | read << 16
         }
