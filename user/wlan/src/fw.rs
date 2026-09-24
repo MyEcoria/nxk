@@ -13,7 +13,19 @@ use crate::chip::{self, Backplane, Core};
 
 /// Oldest to newest shared-area layout the host side understands.
 const SHARED_VERSIONS: core::ops::RangeInclusive<u32> = 5..=7;
+/// Shared area (DHD `pciedev_shared_t`): trap record and assert
+/// expression, file and line, then the console.
+const SHARED_TRAP_ADDR: u32 = 4;
+const SHARED_ASSERT_EXP: u32 = 8;
+const SHARED_ASSERT_FILE: u32 = 12;
+const SHARED_ASSERT_LINE: u32 = 16;
 const SHARED_CONSOLE: u32 = 20;
+/// Shared flags the firmware sets when it dies (`PCIE_SHARED_ASSERT`,
+/// `PCIE_SHARED_TRAP`).
+pub const SHARED_ASSERT: u32 = 0x200;
+pub const SHARED_TRAP: u32 = 0x400;
+/// ARM trap record (`trap_t`): type, epc, cpsr, spsr, r0-r15.
+const TRAP_WORDS: usize = 20;
 // Firmware console: ring buffer address, size and write index.
 const CONSOLE_BUF: u32 = 8;
 const CONSOLE_SIZE: u32 = 12;
@@ -148,6 +160,41 @@ pub fn boot(
         flags,
         console,
     })
+}
+
+/// What the firmware left when it died, from its shared area: the
+/// assert (expression, file, line) or the trap record's registers.
+pub fn crash(tcm: &Mmio, shared: u32, flags: u32) -> String {
+    let word = |a: u32| tcm.r32(a as usize);
+    let text = |a: u32| {
+        let mut s = String::new();
+        for k in 0..96 {
+            match tcm.r8((a + k) as usize) {
+                0 => break,
+                c @ 0x20..=0x7E => s.push(c as char),
+                _ => {}
+            }
+        }
+        s
+    };
+    let mut out = format!("firmware died (shared flags {:#x})", flags);
+    if flags & SHARED_ASSERT != 0 {
+        out.push_str(&format!(
+            ", assert \"{}\" at {}:{}",
+            text(word(shared + SHARED_ASSERT_EXP)),
+            text(word(shared + SHARED_ASSERT_FILE)),
+            word(shared + SHARED_ASSERT_LINE)
+        ));
+    }
+    if flags & SHARED_TRAP != 0 {
+        let at = word(shared + SHARED_TRAP_ADDR);
+        let t: Vec<u32> = (0..TRAP_WORDS as u32).map(|k| word(at + 4 * k)).collect();
+        out.push_str(&format!(
+            ", trap type {:#x} at pc {:#x} (epc {:#x}, lr {:#x}, sp {:#x}, cpsr {:#x}, r0-r3 {:#x} {:#x} {:#x} {:#x})",
+            t[0], t[19], t[1], t[18], t[17], t[2], t[4], t[5], t[6], t[7]
+        ));
+    }
+    out
 }
 
 /// Last `max` printable bytes of the firmware console, lines joined.

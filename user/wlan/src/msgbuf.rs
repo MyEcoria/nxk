@@ -217,7 +217,9 @@ pub struct Msgbuf {
     /// Other control completions: count, and the last one.
     other: (u32, [u8; 24]),
     reply: Option<Reply>,
-    /// The firmware console, for `console_tail`.
+    /// The firmware's shared area (crash flags) and its console, for
+    /// `fw::crash` and `console_tail`.
+    pub shared: u32,
     pub console: u32,
     /// Mailbox data word from the firmware, in TCM.
     dtoh_mb: u32,
@@ -340,6 +342,7 @@ impl Msgbuf {
             late: 0,
             other: (0, [0; 24]),
             reply: None,
+            shared: up.shared,
             console: up.console,
             dtoh_mb: t(up.shared + SHARED_DTOH_MB_DATA),
         };

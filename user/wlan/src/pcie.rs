@@ -673,6 +673,49 @@ impl Pcie {
         )
     }
 
+    /// Memory decoding still on at the endpoint: a chip that reset
+    /// itself comes back with its command register cleared.
+    pub fn ep_decodes(&self) -> bool {
+        self.cfg_read(1, 0, CFG_COMMAND) & CFG_COMMAND_MEMORY != 0
+    }
+
+    /// WIFI_EN and WIFI_RST as the GPIO block holds them (GPIO mode,
+    /// output enable, level), for a loss report: their pads have no
+    /// input buffer to read back.
+    pub fn module_pins(&self) -> String {
+        let off = (PORT_H >> 2) * 0x100 + (PORT_H & 3) * 4;
+        let (cnf, oe, out) = (
+            self.gpio.r32(GPIO_CNF + off),
+            self.gpio.r32(GPIO_OE + off),
+            self.gpio.r32(GPIO_OUT + off),
+        );
+        let pin = |p: u32| {
+            let b = |v: u32| u32::from(v & p != 0);
+            format!("{}{}{}", b(cnf), b(oe), b(out))
+        };
+        format!("EN {}, RST {} (gpio/oe/out)", pin(PIN_EN), pin(PIN_RST))
+    }
+
+    /// Module reset under PERST#, link trained again, endpoint
+    /// enumerated: the chip back after it reset or hung. Rail, clocks,
+    /// UPHY and AFI keep their boot setup.
+    pub fn restart(&self, port: usize) -> Result<Endpoint, Fail> {
+        let afi = self.afi();
+        afi.modify(AFI_PEX_CTRL[port], AFI_PEX_CTRL_RST, 0);
+        self.module_off();
+        time::sleep_ms(10);
+        self.module_on();
+        afi.modify(AFI_PEX_CTRL[port], 0, AFI_PEX_CTRL_RST);
+        if !self.port_link(port) {
+            return Err(Fail::read(
+                "no link after the module reset",
+                -ENODEV,
+                self.port(port).r32(RP_VEND_XP),
+            ));
+        }
+        self.enumerate(port)
+    }
+
     /// Latched AFI error code and the address it hit, left in place: why
     /// an access through a window read all ones.
     pub fn afi_error(&self) -> (u32, u32) {

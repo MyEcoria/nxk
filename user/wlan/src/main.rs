@@ -23,7 +23,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{self, EINVAL, EIO, ENOENT, ENOSYS, ETIMEDOUT};
+use libnx::abi::err::{self, EINVAL, EIO, ENETDOWN, ENOENT, ENOSYS, ETIMEDOUT};
 use libnx::abi::proto::{eth, wifi};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::drv::{self, Irq, Mmio};
@@ -47,9 +47,16 @@ const POLL_NS: u64 = 500_000_000;
 const FS_WAIT_NS: u64 = 30_000_000_000;
 /// Frames received and not read by `net` yet; older ones are dropped.
 const RX_QUEUE: usize = 256;
-/// While joined, the firmware console is saved this often: once the
-/// chip is gone, it is what it said last.
+/// The firmware console is saved this often: once the chip is gone, it
+/// is what it said last.
 const CONSOLE_SAVE_NS: u64 = 2_000_000_000;
+/// A running chip is checked this often (crash flags, bus, config
+/// space), joined or not: a loss is caught and undone at once.
+const CHECK_NS: u64 = 1_000_000_000;
+/// First wait before a recovery or rejoin attempt, doubled after each
+/// failure up to the maximum.
+const RETRY_FIRST_NS: u64 = 2_000_000_000;
+const RETRY_MAX_NS: u64 = 60_000_000_000;
 
 /// The root complex, the chip's BAR0 and TCM, and the rings to its
 /// firmware when it runs.
@@ -70,12 +77,29 @@ struct Hw {
     deep_sleeps: u64,
     mb_data: u32,
     afi_errors: (u64, u32),
-    /// The chip reads all ones: gone from the bus, its line left masked.
+    /// The chip was lost (`loss` says how): nothing goes to it until a
+    /// recovery, its interrupt line left masked meanwhile.
     gone: bool,
-    /// Root port the chip sits behind.
+    /// Root port the chip sits behind, and the BARs bring-up gave it: a
+    /// recovery must find them again.
     port: usize,
+    bars: [u64; 6],
     /// The firmware console as last saved, and when.
     console: (String, u64),
+    /// When the running firmware came up, and when to check it next.
+    up_at: u64,
+    next_check: u64,
+    /// Network and passphrase of the last join, kept to rejoin after a
+    /// loss; `rejoin` while that is still to do.
+    last: Option<(Vec<u8>, Vec<u8>)>,
+    rejoin: bool,
+    /// Chip losses, the report on the last one, and recoveries.
+    losses: u32,
+    loss: String,
+    recoveries: u32,
+    /// Next recovery or rejoin attempt, and the wait after a failure.
+    retry_at: u64,
+    backoff: u64,
 }
 
 /// The network in use: SSID, channel, signal (-dBm), and on a WPA2
@@ -90,6 +114,9 @@ struct Joined {
 impl Hw {
     /// A firmware call, with the backplane view it goes through.
     fn dev<R>(&mut self, f: impl FnOnce(&mut wl::Dev) -> R) -> Option<R> {
+        if self.gone {
+            return None;
+        }
         let rc = &self.rc;
         let window = |a| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, a);
         let bp = chip::Backplane::new(&self.bar0, &window);
@@ -134,6 +161,8 @@ impl Hw {
         match self.dev(|d| d.connect(ssid, psk, (security, &rsn), &MAC, timeout)) {
             Some(Ok(sup)) => {
                 println!("[wlan] joined {}", String::from_utf8_lossy(ssid));
+                self.last = Some((ssid.to_vec(), psk.to_vec()));
+                self.rejoin = false;
                 self.joined = Some(Joined {
                     ssid: ssid.to_vec(),
                     channel: 0,
@@ -152,6 +181,8 @@ impl Hw {
     }
 
     fn disconnect(&mut self) {
+        self.last = None;
+        self.rejoin = false;
         if self.joined.take().is_some() {
             if let Some(Err(e)) = self.dev(|d| d.disconnect()) {
                 println!("[wlan] leave: {}", e);
@@ -177,16 +208,14 @@ impl Hw {
     /// join.
     fn housekeeping(&mut self) {
         let Some(mut j) = self.joined.take() else {
+            // Not joined, events still come and their buffers must go
+            // back to the firmware; frames have no reader.
+            let mut rx = VecDeque::new();
+            if let Some(Err(e)) = self.dev(|d| d.housekeeping(None, &mut rx)) {
+                self.ring_error(&e, false);
+            }
             return;
         };
-        let now = time::now_ns();
-        if let Some(m) = self
-            .mb
-            .as_ref()
-            .filter(|_| now > self.console.1 + CONSOLE_SAVE_NS)
-        {
-            self.console = (fw::console_tail(&self.tcm, m.console, 600), now);
-        }
         let mut rx = core::mem::take(&mut self.rx);
         let r = self.dev(|d| d.housekeeping(j.sup.as_mut(), &mut rx));
         while rx.len() > RX_QUEUE {
@@ -198,15 +227,157 @@ impl Hw {
                 println!("[wlan] link lost");
                 return;
             }
-            // Ring errors mean a chip that stopped answering.
             Some(Err(e)) => {
                 println!("[wlan] link lost: {}", e);
-                self.gone |= self.dev(|d| !d.alive()).unwrap_or(false);
+                self.ring_error(&e, true);
                 return;
             }
             _ => {}
         }
         self.joined = Some(j);
+    }
+
+    /// A ring error: a chip that stopped answering is lost, anything
+    /// else only ended the join.
+    fn ring_error(&mut self, e: &str, joined: bool) {
+        if !self.dev(|d| d.alive()).unwrap_or(true) {
+            self.lost(&format!("rings: {}", e), joined);
+        }
+    }
+
+    /// Periodic look at a running chip, joined or not: the flags its
+    /// firmware sets when it dies, a bus reading all ones, a config
+    /// space back to reset values. The console is saved meanwhile.
+    fn check(&mut self, now: u64) {
+        if self.gone || now < self.next_check {
+            return;
+        }
+        self.next_check = now + CHECK_NS;
+        let Some((shared, console)) = self.mb.as_ref().map(|m| (m.shared, m.console)) else {
+            return;
+        };
+        let flags = self.tcm.r32(shared as usize);
+        let why = if flags == u32::MAX {
+            Some(String::from("chip reads all ones"))
+        } else if flags & (fw::SHARED_ASSERT | fw::SHARED_TRAP) != 0 {
+            Some(fw::crash(&self.tcm, shared, flags))
+        } else if !self.rc.ep_decodes() {
+            Some(String::from("chip reset itself (memory decoding off)"))
+        } else {
+            None
+        };
+        match why {
+            Some(why) => {
+                let joined = self.joined.take().is_some();
+                self.lost(&why, joined);
+            }
+            None if now > self.console.1 + CONSOLE_SAVE_NS => {
+                self.console = (fw::console_tail(&self.tcm, console, 600), now);
+            }
+            None => {}
+        }
+    }
+
+    /// The chip stopped: a report of what was seen (printed, and kept for
+    /// `wifi status`), the link down, a recovery due shortly.
+    fn lost(&mut self, why: &str, joined: bool) {
+        let now = time::now_ns();
+        self.gone = true;
+        self.joined = None;
+        self.losses += 1;
+        self.rejoin |= joined && self.last.is_some();
+        self.loss = format!(
+            "{} at {} ms, {} s after the firmware came up, {}; module {}; link: {}; console before: {}",
+            why,
+            now / 1_000_000,
+            now.saturating_sub(self.up_at) / 1_000_000_000,
+            if joined { "joined" } else { "not joined" },
+            self.rc.module_pins(),
+            self.rc.link_state(self.port, false),
+            self.console.0
+        );
+        println!("[wlan] chip lost: {}", self.loss);
+        self.backoff = RETRY_FIRST_NS;
+        self.retry_at = now + self.backoff;
+    }
+
+    /// The chip back after a loss, as `restart wlan` did by hand: module
+    /// reset, link, endpoint, firmware. The old rings are freed only once
+    /// the module is held in reset: nothing may DMA into them after.
+    fn recover(&mut self) -> Result<String, String> {
+        let ep = self.rc.restart(self.port);
+        self.mb = None;
+        let ep = ep.map_err(|f| format!("{}: {}", f.step, err::name(f.err)))?;
+        if ep.bars[0] != self.bars[0] || ep.bars[2] != self.bars[2] {
+            return Err(format!(
+                "BARs moved to {:#x} and {:#x}",
+                ep.bars[0], ep.bars[2]
+            ));
+        }
+        let (text, mb) = {
+            let rc = &self.rc;
+            let window = |a| rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, a);
+            let bp = chip::Backplane::new(&self.bar0, &window);
+            let c = chip::identify(&bp);
+            if c.id != chip::CHIP_BCM4356 || !c.firmware {
+                return Err(format!("chip reads as BCM{:x} after the reset", c.id));
+            }
+            let (text, mb) = firmware(&bp, &self.tcm);
+            (
+                format!(
+                    "BCM{:x} rev {} on PCIe port {}{}",
+                    c.id, c.rev, self.port, text
+                ),
+                mb,
+            )
+        };
+        self.mb = Some(mb.ok_or_else(|| text.clone())?);
+        let now = time::now_ns();
+        self.gone = false;
+        self.up_at = now;
+        self.next_check = now + CHECK_NS;
+        self.console = (String::new(), 0);
+        Ok(text)
+    }
+
+    /// A recovery or rejoin attempt, if one is due; a failure doubles the
+    /// wait before the next. The bring-up text when the chip came back
+    /// (its interrupt line to re-arm).
+    fn retry(&mut self, now: u64) -> Option<String> {
+        if !(self.gone || self.rejoin) || now < self.retry_at {
+            return None;
+        }
+        let mut back = None;
+        let failed = if self.gone {
+            match self.recover() {
+                Ok(text) => {
+                    self.recoveries += 1;
+                    println!("[wlan] chip back after loss {}", self.losses);
+                    back = Some(text);
+                    None
+                }
+                Err(e) => Some(format!("recovery failed: {}", e)),
+            }
+        } else {
+            None
+        };
+        let failed = match (failed, self.rejoin, self.last.clone()) {
+            (None, true, Some((ssid, psk))) => self
+                .connect(&ssid, &psk, CONNECT_TIMEOUT)
+                .err()
+                .map(|e| format!("rejoin: {}", err::name(e))),
+            (f, _, _) => f,
+        };
+        if let Some(why) = failed {
+            self.backoff = (self.backoff * 2).clamp(RETRY_FIRST_NS, RETRY_MAX_NS);
+            self.retry_at = time::now_ns() + self.backoff;
+            println!(
+                "[wlan] {}; next try in {} s",
+                why,
+                self.backoff / 1_000_000_000
+            );
+        }
+        back
     }
 
     /// The chip's interrupt (`brcmf_pcie_isr_thread`): causes cleared so
@@ -224,10 +395,10 @@ impl Hw {
             return true;
         };
         let (status, data) = mb.irq_take(&bp, &self.tcm);
+        let shared = mb.shared;
         if status == u32::MAX {
-            println!("[wlan] chip unreachable (reads all ones), its interrupt masked");
-            self.gone = true;
-            self.joined = None;
+            let joined = self.joined.is_some();
+            self.lost("chip reads all ones (interrupt)", joined);
             return false;
         }
         if status != 0 {
@@ -242,8 +413,11 @@ impl Hw {
         if data & msgbuf::D2H_DS_ENTER_REQ != 0 {
             self.deep_sleeps += 1;
         }
-        if data & msgbuf::D2H_FWHALT != 0 && self.joined.take().is_some() {
-            println!("[wlan] firmware halted");
+        if data & msgbuf::D2H_FWHALT != 0 {
+            let flags = self.tcm.r32(shared as usize);
+            let why = format!("firmware halted: {}", fw::crash(&self.tcm, shared, flags));
+            let joined = self.joined.is_some();
+            self.lost(&why, joined);
         }
         true
     }
@@ -267,6 +441,7 @@ enum Backend {
 impl Backend {
     fn state(&self) -> u64 {
         match self {
+            Backend::Chip(hw) if hw.gone => wifi::ST_DOWN,
             Backend::Chip(hw) if hw.joined.is_some() => wifi::ST_CONNECTED,
             Backend::Chip(hw) if hw.mb.is_some() => wifi::ST_IDLE,
             Backend::Chip(_) => wifi::ST_DOWN,
@@ -428,7 +603,17 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             afi_errors: (0, 0),
             gone: false,
             port: ep.port,
+            bars: ep.bars,
             console: (String::new(), 0),
+            up_at: time::now_ns(),
+            next_check: 0,
+            last: None,
+            rejoin: false,
+            losses: 0,
+            loss: String::new(),
+            recoveries: 0,
+            retry_at: 0,
+            backoff: 0,
         },
         irq,
         what,
@@ -558,19 +743,31 @@ fn main() -> i32 {
     }
     println!("[wlan] Wi-Fi service ready");
 
-    // Frame readers waiting on the link: (reply token, deadline).
+    // Frame readers waiting on the link: (reply token, deadline). A link
+    // that went down with no reader waiting is told to the next one.
     let mut readers: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut down_untold = false;
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
+        let linked = backend.state() == wifi::ST_CONNECTED;
         // Wake only for the earliest reader deadline: messages and the
         // interrupt wake us on their own.
         let mut wait = match readers.iter().filter(|r| r.1 != 0).map(|r| r.1).min() {
             Some(d) => d.saturating_sub(time::now_ns()).max(1),
             None => 0,
         };
-        // Joined: the rings are drained (after an interrupt, or by the
-        // safety-net poll), frames go to waiting readers.
+        // A lost chip is brought back, a lost join made again; a running
+        // chip is checked; joined, the rings are drained (after an
+        // interrupt, or by the safety-net poll), frames go to readers.
         if let Backend::Chip(hw) = &mut backend {
+            let now = time::now_ns();
+            if let Some(text) = hw.retry(now) {
+                diag = text;
+                if let Some(i) = irq.as_ref() {
+                    i.ack();
+                }
+            }
+            hw.check(now);
             hw.housekeeping();
             while !readers.is_empty() {
                 let Some(f) = hw.rx.pop_front() else { break };
@@ -579,6 +776,19 @@ fn main() -> i32 {
             }
             if hw.joined.is_some() && (wait == 0 || wait > POLL_NS) {
                 wait = POLL_NS;
+            }
+            let next = if hw.gone || hw.rejoin {
+                hw.retry_at
+            } else if hw.mb.is_some() {
+                hw.next_check
+            } else {
+                0
+            };
+            if next != 0 {
+                let d = next.saturating_sub(time::now_ns()).max(1);
+                if wait == 0 || d < wait {
+                    wait = d;
+                }
             }
         }
         match ipc::recv_timeout(ep, wait) {
@@ -617,6 +827,10 @@ fn main() -> i32 {
                                 Err(e) => Msg::error(e),
                             },
                         })
+                    }
+                    (wifi::BADGE_LINK, eth::RECV) if down_untold => {
+                        down_untold = false;
+                        Some(Msg::error(-ENETDOWN))
                     }
                     (wifi::BADGE_LINK, eth::RECV) => {
                         let t = rx.msg.mr[0];
@@ -668,12 +882,14 @@ fn main() -> i32 {
                         // failures show there first.
                         let live = match &backend {
                             Backend::Chip(hw) if hw.gone => format!(
-                                "; chip unreachable, interrupts {}, PCIe errors {} (last AFI code {}); link: {}; console before the loss: {}",
+                                "; chip lost ({} so far, {} recovered, next try in {} s), interrupts {}, PCIe errors {} (last AFI code {}); {}",
+                                hw.losses,
+                                hw.recoveries,
+                                hw.retry_at.saturating_sub(time::now_ns()) / 1_000_000_000,
                                 hw.irqs,
                                 hw.afi_errors.0,
                                 hw.afi_errors.1,
-                                hw.rc.link_state(hw.port, false),
-                                hw.console.0
+                                hw.loss
                             ),
                             Backend::Chip(hw) => match &hw.mb {
                                 Some(m) => format!(
@@ -684,7 +900,13 @@ fn main() -> i32 {
                                     hw.mb_data,
                                     hw.afi_errors.0,
                                     hw.afi_errors.1,
-                                    "",
+                                    match hw.losses {
+                                        0 => String::new(),
+                                        n => format!(
+                                            "; chip lost {} times, {} recovered, last: {}",
+                                            n, hw.recoveries, hw.loss
+                                        ),
+                                    },
                                     hw.rc.link_state(hw.port, true),
                                     fw::console_tail(&hw.tcm, m.console, 600)
                                 ),
@@ -697,18 +919,32 @@ fn main() -> i32 {
                     // Bring-up again, on demand: at boot the other
                     // services are still starting, which a single log
                     // line cannot tell apart from a dead register.
+                    // A chip goes through a recovery, as after a loss.
                     (wifi::BADGE_CTRL, wifi::RETRY) => {
-                        if matches!(backend, Backend::Sim(_)) {
-                            match hardware() {
-                                Ok((hw, i, what)) => {
-                                    let _ = sys::notify_bind(i.notification());
-                                    backend = Backend::Chip(alloc::boxed::Box::new(hw));
-                                    irq = Some(i);
-                                    diag = what;
+                        match &mut backend {
+                            Backend::Sim(_) => {
+                                match hardware() {
+                                    Ok((hw, i, what)) => {
+                                        let _ = sys::notify_bind(i.notification());
+                                        backend = Backend::Chip(alloc::boxed::Box::new(hw));
+                                        irq = Some(i);
+                                        diag = what;
+                                    }
+                                    Err(why) => diag = format!("simulated adapter, {}", why),
                                 }
-                                Err(why) => diag = format!("simulated adapter, {}", why),
+                                println!("[wlan] retry: {}", diag);
                             }
-                            println!("[wlan] retry: {}", diag);
+                            Backend::Chip(hw) => {
+                                let joined = hw.joined.is_some();
+                                hw.lost("recovery asked (wifi retry)", joined);
+                                hw.retry_at = 0;
+                                if let Some(text) = hw.retry(time::now_ns()) {
+                                    diag = text;
+                                    if let Some(i) = irq.as_ref() {
+                                        i.ack();
+                                    }
+                                }
+                            }
                         }
                         Some(ipc::pack(0, diag.as_bytes()))
                     }
@@ -735,6 +971,14 @@ fn main() -> i32 {
             }
             Err(e) if e == -ETIMEDOUT => {}
             Err(_) => time::sleep_ms(1),
+        }
+        // The link went down (chip lost, network lost, disconnect): the
+        // readers hear it, and `net` starts its DHCP over.
+        if linked && backend.state() != wifi::ST_CONNECTED {
+            down_untold = readers.is_empty();
+            for (token, _) in readers.drain(..) {
+                let _ = ipc::reply_to(token, &Msg::error(-ENETDOWN));
+            }
         }
         let now = time::now_ns();
         readers.retain(|&(token, deadline)| {

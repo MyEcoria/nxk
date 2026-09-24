@@ -1247,6 +1247,8 @@ pub mod proto {
         /// Frame to send (see `pack`).
         pub const SEND: u32 = 2;
         /// Wait for a frame (word 0 = timeout ns, 0: no limit).
+        /// `-ENETDOWN`: the link went down since (a Wi-Fi join lost),
+        /// the next call waits for frames again.
         pub const RECV: u32 = 3;
     }
     /// Wi-Fi station control (`wlan` driver). The link itself is the
@@ -1270,7 +1272,9 @@ pub mod proto {
         pub const DIAG: u32 = 5;
         /// Run the hardware bring-up again and report what happened:
         /// a boot-time race and a dead register read look the same in
-        /// the log, not here. Reply: bytes, like DIAG.
+        /// the log, not here. With an adapter up, a recovery instead
+        /// (module reset, firmware, rejoin), as after a chip loss.
+        /// Reply: bytes, like DIAG.
         pub const RETRY: u32 = 6;
         /// No adapter: no PCIe device, or its firmware is missing.
         pub const ST_DOWN: u64 = 0;
