@@ -1356,6 +1356,8 @@ pub mod proto {
         pub const STATS: u32 = 16;
         pub const LINK_ETH0: u64 = 1;
         pub const LINK_WLAN0: u64 = 2;
+        /// The USB-C port's network function (`usbcon`), shared by a PC.
+        pub const LINK_USB0: u64 = 3;
     }
     /// Input events.
     pub mod input {

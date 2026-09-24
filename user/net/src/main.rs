@@ -1,5 +1,7 @@
-//! net: TCP/IP stack (smoltcp) over "eth0" (`net` protocol).
-//! DHCP/DNS plus deferred replies for connect/accept/receive/resolve.
+//! net: TCP/IP stack (smoltcp) over one link at a time (`net` protocol):
+//! the PC's connection shared over USB-C ("usb0"), a USB Ethernet adapter
+//! ("eth0"), then Wi-Fi ("wlan0"), the first with a carrier. DHCP/DNS
+//! plus deferred replies for connect/accept/receive/resolve.
 
 #![no_std]
 #![no_main]
@@ -11,7 +13,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use libnx::abi::err::{
     EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETDOWN, ENETUNREACH, ENOENT,
@@ -48,9 +50,22 @@ static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// The link went down (`ENETDOWN` from the driver): DHCP starts over,
-/// since the network may be another one once it is back.
-static LINK_DOWN: AtomicBool = AtomicBool::new(false);
+/// Links that went down (`ENETDOWN` from their driver), one bit per
+/// `LINKS` entry: DHCP starts over on the one in use, since the network
+/// may be another one once it is back.
+static LINK_DOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Links in order of preference: name, `LINK_*`, wired.
+const LINKS: [(&str, u64, bool); 3] = [
+    ("usb0", proto::LINK_USB0, true),
+    ("eth0", proto::LINK_ETH0, true),
+    ("wlan0", proto::LINK_WLAN0, false),
+];
+/// How often links are looked up and their carriers asked.
+const LINK_CHECK_NS: u64 = 2_000_000_000;
+/// A wired link without a DHCP address this long gives way to another
+/// (a PC that does not share its connection), until its carrier drops.
+const WIRED_DHCP_NS: u64 = 10_000_000_000;
 /// DHCP retransmissions: a lost first DISCOVER (the port is often not
 /// open yet right after a Wi-Fi join) costs 2 s, not smoltcp's 10.
 const DHCP_RETRY: Duration = Duration::from_secs(2);
@@ -62,9 +77,14 @@ fn count(frames: &AtomicU64, bytes: &AtomicU64, n: usize) {
 
 // ------------------------------------------------------------ interface ---
 
+/// Frames of all links, tagged with their `LINKS` index.
+type Frames = Arc<Mutex<VecDeque<(usize, Vec<u8>)>>>;
+
 struct Dev {
+    /// Link in use (0: none) and its `LINKS` index.
     eth: u32,
-    rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    link: usize,
+    rx: Frames,
 }
 
 struct Rx(Vec<u8>);
@@ -103,13 +123,24 @@ impl Device for Dev {
         Self: 'a;
 
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx)> {
-        let f = self.rx.lock().pop_front()?;
+        if self.eth == 0 {
+            return None;
+        }
+        let mut q = self.rx.lock();
+        // Frames of links not in use are dropped.
+        let f = loop {
+            match q.pop_front()? {
+                (l, f) if l == self.link => break f,
+                _ => {}
+            }
+        };
+        drop(q);
         count(&RX_FRAMES, &RX_BYTES, f.len());
         Some((Rx(f), Tx(self.eth)))
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx> {
-        Some(Tx(self.eth))
+        (self.eth != 0).then_some(Tx(self.eth))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -190,8 +221,57 @@ struct Net {
     ident: u16,
     seq: u16,
     pongs: VecDeque<(u32, u16, u64)>,
-    /// Interface in use (`proto::LINK_*`).
+    /// Interface in use (`proto::LINK_*`, 0: none).
     link: u64,
+    links: [Link; 3],
+    /// `LINKS` index in use and since when.
+    active: Option<usize>,
+    since: u64,
+    rxq: Frames,
+    notif: u32,
+}
+
+/// A link as last seen.
+#[derive(Default)]
+struct Link {
+    /// Service handle (0: not published yet).
+    handle: u32,
+    mac: [u8; 6],
+    carrier: bool,
+    /// Gave way for want of a DHCP address; cleared when the carrier drops.
+    skipped: bool,
+}
+
+/// Receive thread of link `k`: blocks on its driver, queues frames and
+/// signals the main thread.
+fn receive(k: usize, eth: u32, q: Frames, notif: u32) {
+    let eth = sys::handle_dup(eth, libnx::abi::rights::SEND, 0).unwrap_or(eth);
+    let r = thread::spawn(move || {
+        let mut frame = vec![0u8; ipc::MAX_BYTES];
+        loop {
+            let mut m = Msg::new(eth::RECV, 1, 0);
+            m.mr[0] = 0;
+            match ipc::call(eth, &m) {
+                Ok(r) if r.label() == 0 => {
+                    let n = ipc::unpack(&r, &mut frame);
+                    let mut g = q.lock();
+                    if g.len() < 256 {
+                        g.push_back((k, frame[..n].to_vec()));
+                    }
+                    drop(g);
+                    let _ = sys::notify_signal(notif, 1);
+                }
+                Ok(r) if r.label() == ENETDOWN as u32 => {
+                    LINK_DOWN.fetch_or(1 << k, Ordering::Relaxed);
+                    let _ = sys::notify_signal(notif, 1);
+                }
+                _ => time::sleep_ms(10),
+            }
+        }
+    });
+    if r.is_err() {
+        println!("[net] {}: no receive thread", LINKS[k].0);
+    }
 }
 
 impl Net {
@@ -789,6 +869,86 @@ impl Net {
         }
     }
 
+    /// Look links up, ask their carriers, and run on the best one.
+    fn check_links(&mut self, now: u64) {
+        let down = LINK_DOWN.swap(0, Ordering::Relaxed);
+        for (k, &(name, _, _)) in LINKS.iter().enumerate() {
+            let l = &mut self.links[k];
+            if l.handle == 0 {
+                let Ok(h) = ns::lookup(name) else { continue };
+                l.handle = h;
+                receive(k, h, self.rxq.clone(), self.notif);
+            }
+            let (mac, carrier) =
+                match ipc::call_timeout(l.handle, &Msg::new(eth::INFO, 0, 0), LINK_CALL_NS) {
+                    Ok(m) if m.label() == 0 => {
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&m.mr[0].to_le_bytes()[..6]);
+                        (mac, m.words() < 3 || m.mr[2] != 0)
+                    }
+                    _ => (l.mac, false),
+                };
+            let carrier = carrier && down & (1 << k) == 0;
+            if !carrier {
+                l.skipped = false;
+            }
+            (l.mac, l.carrier) = (mac, carrier);
+        }
+        if down & self.active.map_or(0, |k| 1 << k) != 0 {
+            println!("[net] link down: DHCP starts over");
+            self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).reset();
+        }
+        // A wired link the PC does not share gives way to another one.
+        if let Some(k) = self.active {
+            let others = (0..LINKS.len()).any(|j| j != k && self.links[j].carrier);
+            if LINKS[k].2 && self.addr.is_none() && others && now > self.since + WIRED_DHCP_NS {
+                println!(
+                    "[net] {}: no DHCP answer, not shared: moving on",
+                    LINKS[k].0
+                );
+                self.links[k].skipped = true;
+            }
+        }
+        let best = (0..LINKS.len()).find(|&k| self.links[k].carrier && !self.links[k].skipped);
+        if best != self.active {
+            self.switch(best, now);
+        }
+    }
+
+    /// Leave the network in use (address, routes, connections) for link
+    /// `to`: its MAC, DHCP from scratch.
+    fn switch(&mut self, to: Option<usize>, now: u64) {
+        self.iface.update_ip_addrs(|a| a.clear());
+        self.iface.routes_mut().remove_default_ipv4_route();
+        (self.addr, self.gateway, self.dns_server) = (None, None, None);
+        let tcp: Vec<SocketHandle> = self
+            .table
+            .iter()
+            .filter_map(|s| match s {
+                Some(Sock::Tcp(h)) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        for h in tcp {
+            self.sockets.get_mut::<tcp::Socket>(h).abort();
+        }
+        self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).reset();
+        self.dev.rx.lock().clear();
+        match to {
+            Some(k) => {
+                let mac = EthernetAddress(self.links[k].mac);
+                self.iface.set_hardware_addr(HardwareAddress::Ethernet(mac));
+                (self.dev.eth, self.dev.link, self.link) = (self.links[k].handle, k, LINKS[k].1);
+                println!("[net] link {} ({})", LINKS[k].0, mac);
+            }
+            None => {
+                (self.dev.eth, self.link) = (0, 0);
+                println!("[net] no link");
+            }
+        }
+        (self.active, self.since) = (to, now);
+    }
+
     fn dhcp_events(&mut self) {
         let ev = match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
@@ -861,67 +1021,23 @@ fn now() -> Instant {
 
 libnx::entry!(main);
 
-/// Interface to run on. The wired link comes first: the USB driver
-/// may still be enumerating. Failing that, wait for the Wi-Fi station,
-/// which publishes "wlan0" the moment it associates. Both waits block
-/// in the name service: an idle core stays idle.
-fn link() -> Result<(u32, u64), i64> {
-    if let Ok(h) = ns::wait_for_timeout("eth0", 3_000_000_000) {
-        return Ok((h, proto::LINK_ETH0));
-    }
-    println!("[net] no wired link, waiting for Wi-Fi");
-    ns::wait_for("wlan0").map(|h| (h, proto::LINK_WLAN0))
-}
+/// Longest wait on a link driver's `INFO`.
+const LINK_CALL_NS: u64 = 50_000_000;
 
 fn main() -> i32 {
-    let (eth, link) = match link() {
-        Ok(l) => l,
-        Err(_) => {
-            println!("[net] no network interface");
-            return 0;
-        }
-    };
-    let info = ipc::call(eth, &Msg::new(eth::INFO, 0, 0)).expect("net: interface");
-    let mut mac = [0u8; 6];
-    mac.copy_from_slice(&info.mr[0].to_le_bytes()[..6]);
-
-    // Receive: one thread blocks on the driver, the main one is signaled.
-    let rxq: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Frames of every link land here; the receive threads signal.
+    let rxq: Frames = Arc::new(Mutex::new(VecDeque::new()));
     let notif = sys::notify_create().expect("net: notification");
     let _ = sys::notify_bind(notif);
-    {
-        let (q, eth2) = (
-            rxq.clone(),
-            sys::handle_dup(eth, libnx::abi::rights::SEND, 0).unwrap_or(eth),
-        );
-        thread::spawn(move || {
-            let mut frame = vec![0u8; ipc::MAX_BYTES];
-            loop {
-                let mut m = Msg::new(eth::RECV, 1, 0);
-                m.mr[0] = 0;
-                match ipc::call(eth2, &m) {
-                    Ok(r) if r.label() == 0 => {
-                        let n = ipc::unpack(&r, &mut frame);
-                        let mut g = q.lock();
-                        if g.len() < 256 {
-                            g.push_back(frame[..n].to_vec());
-                        }
-                        drop(g);
-                        let _ = sys::notify_signal(notif, 1);
-                    }
-                    Ok(r) if r.label() == ENETDOWN as u32 => {
-                        LINK_DOWN.store(true, Ordering::Relaxed);
-                        let _ = sys::notify_signal(notif, 1);
-                    }
-                    _ => time::sleep_ms(10),
-                }
-            }
-        })
-        .expect("net: receive thread");
-    }
 
-    let mut dev = Dev { eth, rx: rxq };
-    let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
+    // No link yet: a placeholder address until one is chosen.
+    let mut dev = Dev {
+        eth: 0,
+        link: 0,
+        rx: rxq.clone(),
+    };
+    let mac = EthernetAddress([0x02, 0, 0, 0, 0, 0]);
+    let mut cfg = Config::new(HardwareAddress::Ethernet(mac));
     let mut seed = [0u8; 8];
     sys::getrandom(&mut seed);
     cfg.random_seed = u64::from_le_bytes(seed);
@@ -965,19 +1081,29 @@ fn main() -> i32 {
         ident,
         seq: 0,
         pongs: VecDeque::new(),
-        link,
+        link: 0,
+        links: Default::default(),
+        active: None,
+        since: 0,
+        rxq,
+        notif,
     };
     let ep = drv::publish("net").expect("net: publish");
     let mut buf = vec![0u8; ipc::MAX_BYTES];
+    let mut next_check = 0;
     loop {
-        if LINK_DOWN.swap(false, Ordering::Relaxed) {
-            println!("[net] link down: DHCP starts over");
-            net.sockets.get_mut::<dhcpv4::Socket>(net.dhcp).reset();
+        let now_ns = time::now_ns();
+        if now_ns >= next_check || LINK_DOWN.load(Ordering::Relaxed) != 0 {
+            net.check_links(now_ns);
+            next_check = now_ns + LINK_CHECK_NS;
         }
-        let t = now();
-        net.iface.poll(t, &mut net.dev, &mut net.sockets);
-        net.dhcp_events();
-        net.icmp_events();
+        // Without a link the stack would only retry sends it cannot make.
+        let linked = net.dev.eth != 0;
+        if linked {
+            net.iface.poll(now(), &mut net.dev, &mut net.sockets);
+            net.dhcp_events();
+            net.icmp_events();
+        }
 
         // Pending operations.
         let now_ns = time::now_ns();
@@ -1007,11 +1133,17 @@ fn main() -> i32 {
             !done
         });
 
-        // Next deadline from stack timers and client timeouts (else wait).
-        let mut delay = net
-            .iface
-            .poll_delay(now(), &net.sockets)
-            .map(|d| d.total_micros() * 1000);
+        // Next deadline from stack timers, client timeouts and the link
+        // check.
+        let mut delay = if linked {
+            net.iface
+                .poll_delay(now(), &net.sockets)
+                .map(|d| d.total_micros() * 1000)
+        } else {
+            None
+        };
+        let left = next_check.saturating_sub(time::now_ns());
+        delay = Some(delay.map_or(left, |x| x.min(left)));
         if let Some(d) = net
             .waits
             .iter()
