@@ -58,6 +58,7 @@ const AUTOCAL_START: u32 = 1 << 31;
 const AUTOCAL_ACTIVE: u32 = 1 << 31;
 const TUNING_TAP_HW_UPDATED: u32 = 1 << 17;
 const PRESET_VAL_EN: u16 = 1 << 15;
+const VDD_180: u16 = 1 << 3;
 const CLOCK_CARD_EN: u16 = 1 << 2;
 
 const INT_CMD_DONE: u32 = 1 << 0;
@@ -117,7 +118,7 @@ impl Card {
 
     /// Pad trims (T210: trim 2, tap 4, vref 7; T210B01: 14, 11, 0) and
     /// 3.3 V drive auto-calibration, hekate values; SD clock off meanwhile.
-    fn tegra_pads(&self, board: &Board) {
+    fn tegra_pads(&self, board: &Board, v18: bool) {
         let (trim, tap, vref) = if board.mariko { (14, 11, 0) } else { (2, 4, 7) };
         self.regs.modify(IO_SPARE, 0, 1 << 19); // 1-cycle delayed cmd_oen
         self.regs.modify(VENDOR_IO_TRIM_CNTRL, 1 << 2, 0); // band gap supplies the DLL
@@ -127,7 +128,11 @@ impl Card {
             .modify(VENDOR_TUNING_CNTRL0, TUNING_TAP_HW_UPDATED, 0);
         self.regs.modify(SDMEMCOMPPADCTRL, 0xF, vref);
         // Offsets: T210 pull-down -3 (7-bit two's complement), pull-up 0.
-        let (pd, pu) = if board.mariko { (0, 0) } else { (0x7D, 0) };
+        let (pd, pu) = match (board.mariko, v18) {
+            (true, _) => (0, 0),
+            (false, false) => (0x7D, 0),
+            (false, true) => (0x7B, 0x7B), // -5, -5
+        };
         self.regs.modify(AUTO_CAL_CONFIG, 0x7F7F, pd << 8 | pu);
 
         self.regs.modify(SDMEMCOMPPADCTRL, 0, PADCTRL_E_INPUT_PWRD);
@@ -276,13 +281,17 @@ impl Card {
     }
 
     /// Controller already clocked and out of reset, slot powered.
-    fn init(&mut self, board: &Board) -> Result<(), i64> {
+    /// Card init at `v18` (1.8 V signaling) or 3.3 V, on a 4-bit bus or
+    /// a 1-bit one.
+    fn init(&mut self, board: &Board, v18: bool, bus4: bool) -> Result<(), i64> {
         self.reset(0x1);
-        self.tegra_pads(board);
+        self.tegra_pads(board, v18);
+        let ctrl2 = self.regs.r16(HOST_CONTROL2) & !(PRESET_VAL_EN | VDD_180);
         self.regs
-            .w16(HOST_CONTROL2, self.regs.r16(HOST_CONTROL2) & !PRESET_VAL_EN);
+            .w16(HOST_CONTROL2, ctrl2 | if v18 { VDD_180 } else { 0 });
         self.regs.w8(HOST_CONTROL, 0); // 1-bit bus, default speed
-        self.regs.w8(POWER_CONTROL, 0x0F); // 3.3 V, bus power on
+                                       // Bus voltage 3.3 V or 1.8 V, bus power on.
+        self.regs.w8(POWER_CONTROL, if v18 { 0x0B } else { 0x0F });
         self.set_clock(400)?;
         self.regs.w8(TIMEOUT_CONTROL, 0x0E);
         self.regs.w16(INT_ENABLE, 0xFFFF);
@@ -322,8 +331,10 @@ impl Card {
             ((c_size + 1) << (mult + 2)) << bl_len >> 9
         };
         self.command(7, self.rca << 16, Rsp::R1b, None)?;
-        self.app_command(6, 2, Rsp::R1)?; // 4-bit bus
-        self.regs.w8(HOST_CONTROL, self.regs.r8(HOST_CONTROL) | 2);
+        if bus4 {
+            self.app_command(6, 2, Rsp::R1)?;
+            self.regs.w8(HOST_CONTROL, self.regs.r8(HOST_CONTROL) | 2);
+        }
         if !self.block_addressed {
             self.command(16, BLOCK as u32, Rsp::R1, None)?;
         }
@@ -354,6 +365,30 @@ impl Card {
         self.command(idx, arg, Rsp::R1, Some((n, read))).map(|_| ())
     }
 
+    /// Host and Tegra pad registers, then the card's state (CMD13), for
+    /// a failed transfer.
+    fn describe(&self) -> alloc::string::String {
+        let r = &self.regs;
+        let card = match self.command(13, self.rca << 16, Rsp::R1, None) {
+            Ok(r) => alloc::format!("status {:#x} (state {})", r[0], r[0] >> 9 & 0xF),
+            Err(e) => alloc::format!("CMD13 {}", libnx::abi::err::name(e)),
+        };
+        alloc::format!(
+            "host ctrl {:#x} power {:#x} clock {:#x} ctrl2 {:#x} vendor clk {:#x} io trim {:#x} spare {:#x} pad {:#x} autocal {:#x}/{:#x}; card {}",
+            r.r8(HOST_CONTROL),
+            r.r8(POWER_CONTROL),
+            r.r16(CLOCK_CONTROL),
+            r.r16(HOST_CONTROL2),
+            r.r32(VENDOR_CLOCK_CNTRL),
+            r.r32(VENDOR_IO_TRIM_CNTRL),
+            r.r32(IO_SPARE),
+            r.r32(SDMEMCOMPPADCTRL),
+            r.r32(AUTO_CAL_CONFIG),
+            r.r32(AUTO_CAL_STATUS),
+            card
+        )
+    }
+
     fn data(&self) -> &mut [u8] {
         &mut self.dma.as_mut_slice()[DESC_BYTES..]
     }
@@ -368,6 +403,7 @@ fn map(slot: u32, phys: u64) -> Mmio {
 /// Slot power then controller clock. Card detect only reports: a card
 /// that answers beats a detect line read wrong.
 fn bring_up(board: &Board) -> Result<(), i64> {
+    println!("[sd] slot power cycle at {} ms", time::now_ns() / 1_000_000);
     if !board.card_present() {
         println!("[sd] no card detected, probing anyway");
     }
@@ -379,6 +415,51 @@ fn bring_up(board: &Board) -> Result<(), i64> {
     time::sleep_ms(239);
     board.power_on()?;
     libnx::clk::enable(clk::SDMMC1)
+}
+
+/// First block read before publishing: commands can pass while data
+/// never comes (a card left at 1.8 V, a bad line). Other ways are then
+/// tried, each reported; the first that reads wins.
+fn recover(card: &mut Card, board: &Board) {
+    let Err(e) = card.transfer(0, 1, true) else {
+        return;
+    };
+    println!(
+        "[sd] first read failed ({}): {}",
+        libnx::abi::err::name(e),
+        card.describe()
+    );
+    println!("[sd] slot: {}", board.describe());
+    // (1.8 V signaling, 4-bit bus, power-off ms before: none).
+    let tries: [(bool, bool, u64); 3] = [(true, true, 0), (false, true, 2000), (false, false, 239)];
+    for (v18, bus4, off_ms) in tries {
+        let r = (|| {
+            if off_ms != 0 {
+                card.stop();
+                board.power_off();
+                time::sleep_ms(off_ms);
+                board.power_on()?;
+            }
+            if v18 {
+                board.io_1v8()?;
+            }
+            card.init(board, v18, bus4)?;
+            card.transfer(0, 1, true)
+        })();
+        println!(
+            "[sd] retry at {} V, {}-bit bus, {} ms off: {}",
+            if v18 { "1.8" } else { "3.3" },
+            if bus4 { 4 } else { 1 },
+            off_ms,
+            match r {
+                Ok(()) => "block 0 read",
+                Err(e) => libnx::abi::err::name(e),
+            }
+        );
+        if r.is_ok() {
+            return;
+        }
+    }
 }
 
 fn main() -> i32 {
@@ -410,7 +491,7 @@ fn main() -> i32 {
     let mut clocked = false;
     let r = bring_up(&board).and_then(|()| {
         clocked = true;
-        card.init(&board)
+        card.init(&board, false, true)
     });
     if let Err(e) = r {
         let why = alloc::format!("no usable card ({})", libnx::abi::err::name(e));
@@ -423,8 +504,9 @@ fn main() -> i32 {
             time::sleep_ms(3_600_000);
         }
     }
+    recover(&mut card, &board);
     println!(
-        "[sd] {} card of {} MiB ({} blocks), DMA buffer at {:#x}",
+        "[sd] {} card of {} MiB ({} blocks), DMA buffer at {:#x}, ready at {} ms",
         if card.block_addressed {
             "SDHC/SDXC"
         } else {
@@ -432,10 +514,12 @@ fn main() -> i32 {
         },
         card.blocks / 2048,
         card.blocks,
-        card.dma_pa
+        card.dma_pa,
+        time::now_ns() / 1_000_000
     );
     let ep = drv::publish("blk:sd").expect("sd: publish");
     let mut client: Option<SharedMemory> = None;
+    let mut failures = 0u32;
     drv::serve(ep, |rx| {
         let m = &rx.msg;
         Some(match m.label() {
@@ -478,7 +562,24 @@ fn main() -> i32 {
                 };
                 match r {
                     Ok(()) => Msg::new(0, 0, 0),
-                    Err(e) => Msg::error(e),
+                    Err(e) => {
+                        // The first failures in full: rails, pads, card.
+                        failures += 1;
+                        if failures <= 3 {
+                            println!(
+                                "[sd] failure {} at {} ms: {}",
+                                failures,
+                                time::now_ns() / 1_000_000,
+                                card.describe()
+                            );
+                            println!("[sd] slot: {}", board.describe());
+                            // MAX77620 LDO2 (card I/O rail): voltage and mode.
+                            let ldo2 = libnx::i2c::I2c::connect()
+                                .map(|i| (i.read_reg(5, 0x3C, 0x27), i.read_reg(5, 0x3C, 0x28)));
+                            println!("[sd] PMIC LDO2 cfg, cfg2: {:?}", ldo2);
+                        }
+                        Msg::error(e)
+                    }
                 }
             }
             _ => Msg::error(-EINVAL),

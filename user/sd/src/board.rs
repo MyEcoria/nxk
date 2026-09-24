@@ -179,6 +179,43 @@ impl Board {
     }
 
     /// Standard 50-ohm drive when pad auto-calibration times out (3.3 V).
+    /// Slot state for a failure report: PMC I/O power and voltage, the
+    /// card power switch (E4), the pad GPIOs (M) and pinmux.
+    pub fn describe(&self) -> alloc::string::String {
+        let g = |reg, port| self.gpio_reg(reg, port);
+        alloc::format!(
+            "PMC no_iopower {:#x} pwr_det {:#x}; E4 cnf/oe/out/in {:#x}/{:#x}/{:#x}/{:#x}; M cnf/oe/out {:#x}/{:#x}/{:#x}; pinmux clk {:#x} cmd {:#x}; pad cfg {:#x} lpbk {:#x}",
+            self.pmc.r32(PMC_NO_IOPOWER),
+            self.pmc.r32(PMC_PWR_DET_VAL),
+            g(GPIO_CNF, PORT_E) >> 4 & 1,
+            g(GPIO_OE, PORT_E) >> 4 & 1,
+            g(GPIO_OUT, PORT_E) >> 4 & 1,
+            g(GPIO_IN, PORT_E) >> 4 & 1,
+            g(GPIO_CNF, PORT_M) & PADS,
+            g(GPIO_OE, PORT_M) & PADS,
+            g(GPIO_OUT, PORT_M) & PADS,
+            self.pinmux.r32(PIN_SDMMC1_CLK),
+            self.pinmux.r32(PIN_SDMMC1_CMD_DAT[0]),
+            self.misc.r32(GP_SDMMC1_PAD_CFGPADCTRL),
+            self.misc.r32(GP_SDMMC1_CLK_LPBK_CONTROL),
+        )
+    }
+
+    /// Card I/O at 1.8 V, hekate's order (`sdmmc_enable_low_voltage`):
+    /// LDO2 lowered first, then the pads told, Schmitt triggers on.
+    pub fn io_1v8(&self) -> Result<(), i64> {
+        let i2c = libnx::i2c::I2c::connect()?;
+        // MAX77620 LDO2: normal mode, 0.8 V + 20 x 50 mV.
+        i2c.write_reg(5, 0x3C, 0x27, 0xC0 | 20)?;
+        time::sleep_us(150);
+        self.pmc.modify(PMC_PWR_DET_VAL, PMC_SDMMC1, 0);
+        let _ = self.pmc.r32(PMC_PWR_DET_VAL);
+        for pin in [PIN_SDMMC1_CLK].into_iter().chain(PIN_SDMMC1_CMD_DAT) {
+            self.pinmux.modify(pin, 0, SCHMT);
+        }
+        Ok(())
+    }
+
     pub fn pad_fallback(&self) {
         let code = if self.mariko { 0x808 } else { 0xC0C };
         self.misc
