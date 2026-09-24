@@ -9,8 +9,9 @@
 
 Microkernel written **entirely in Rust**, with no host OS, for the
 NVIDIA Tegra X1 SoC in the Nintendo Switch (Erista and Mariko). It runs
-directly on the four Cortex-A57 cores, server-oriented: no graphical
-interface, a shell over the serial console.
+directly on the four Cortex-A57 cores, server-oriented: no windowing
+system, a shell over the serial console, and a touch dashboard on the
+screen.
 
 Like Linux, it is the interface between hardware and programs, which
 are written on top of system calls. But as a true microkernel, it keeps
@@ -36,7 +37,8 @@ EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 
 Everything has been verified in the `tegra_qemu` emulator. On a **real
 Switch** (Erista), nxk boots through hekate on its four cores; the
-`display` service turns the screen into a live statistics page and the
+`display` service turns the screen into a touch dashboard (home tiles,
+system, network, a mirror of the USB-C terminal, screen messages) and the
 shell is reached over the USB-C console (`usbcon`: the Switch as a USB
 serial device, `tools/usbterm.py` on the PC), with the SD card and
 Wi-Fi (see "Limits" and `hwboot/README.md`).
@@ -61,7 +63,8 @@ keyboard), `--machine tegrax1plus` (Mariko), `--monitor ELF --dtb DTB`
 (boot in EL2 under a PSCI monitor), `--screendump` (screen capture),
 `--usb-cmd CMD` (CMD typed on the USB-C console, the script acting as
 the PC), `--usb-put LOCAL:REMOTE` (file copied to the SD card over that
-console first). On a real Switch, `tools/usbterm.py --reload DRIVER`
+console first), `--tap X,Y[:OUT.ppm]` (touch the screen at landscape
+pixel X,Y after the commands, then capture it). On a real Switch, `tools/usbterm.py --reload DRIVER`
 replaces a running boot driver by a new build without touching the SD
 card (`hwboot/README.md`, "Driver updates over USB-C").
 
@@ -69,7 +72,10 @@ card (`hwboot/README.md`, "Driver updates over USB-C").
 `tegra_qemu`, which upstream lacks:
 `git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-usb-otg.patch`, then
 rebuild it. QEMU exposes the bus on chardev `usbotg`, where
-`tools/usbterm.py --emu SOCKET` plays the PC's USB host.
+`tools/usbterm.py --emu SOCKET` plays the PC's USB host. `--tap` needs
+the touch panel's interrupt line, wired to GPIO X1 as on the Switch:
+`git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-touch-irq.patch`
+(after the OTG patch).
 
 Build directories live in `~/.cache/nxk/`: the project is synced and
 does not have to carry build artifacts.
@@ -230,15 +236,15 @@ All in EL0, started by `init` with only their capabilities.
 
 | Service | Role | State |
 |---|---|---|
-| `console` | UART-A, line editing; mirrored to a terminal driver (input and all output). Output never waits: one 16 KiB ring, drained to UART-A by its TX-empty interrupt and read by the terminal driver at its own pace; the kernel log is drained into it | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
+| `console` | UART-A, line editing; mirrored to a terminal driver (input and all output). Output never waits: one 16 KiB ring, drained to UART-A by its TX-empty interrupt and read by the terminal driver at its own pace; the kernel log is drained into it. The screen reads the same ring without taking from it (`TAIL`, screen badge) | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
 | `usbcon` | USB-C port as a USB serial device (CDC-ACM, 1209:0001) on the Erista OTG controller: the terminal of a PC (`tools/usbterm.py`). One thread: console output is pulled into the DMA buffer when the IN endpoint is free, 100 ms after the PC opens the terminal (its tty echoes until it is raw); traffic counters for the home screen (`STATS`) | emulator (virtual host); **Erista**: the way in to the shell; Mariko has no such controller (stops) |
 | `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
 | `sd` | SD card (SDHCI, ADMA2 straight into `fs`'s uncached, contiguous buffer: no bounce copy), slot power cycle (239 ms off, as hekate) then power-up (pads, GPIOs, PMC I/O power, PMIC LDO2): a card hekate left in 1.8 V signaling starts over at 3.3 V. Block 0 is read before publishing; a card that answers commands but sends no data is reported (host, pads, rails, CMD13 state) and retried at 1.8 V, after a 2 s power cycle, then on a 1-bit bus; **Erista**: 64 GB card read and written | 3.3 V default speed; 4-bit bus only: a slot that carries DAT0 alone (a loose connector, `hwboot/README.md` runs 19 and 20) gets no data |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
-| `display` | screen (window A), home screen: the logo, then statistics refreshed every second (uptime, processes, cores, temperatures, per-core load bars, syscall/interrupt/switch rates, memory, USB-C console state and traffic, network address and traffic, Wi-Fi, SD card) from `sysinfo` and the services' `STATS`, each asked with a 20 ms cap; the last lines written to it (driver failures, `fbecho`) at the bottom (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
-| `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
+| `display` | screen (window A) as a touch dashboard (`docs/ui/home.html` is its mockup): a header (logo, USB, Ethernet, Wi-Fi and SD states, temperature, uptime), a tab bar and five pages. HOME: CPU, memory, SD card free space, network, the last commands; SYSTEM: per-core load, syscall/interrupt/switch rates, memory, temperatures, reboot and power off (confirmed); NETWORK: address, gateway and DNS of the link in use, the wired link, Wi-Fi with scan, recovery (`wifi::RETRY`) and leave; TERMINAL: the USB-C console as a zsh-like terminal, read from the console ring (prompts, directory and failed commands from the shell's OSC 7/133 marks, ANSI colors, `wifi connect` passphrase masked); LOGS: lines written to the screen (driver failures, `fbecho`). Statistics every second, each service asked with a 20 ms cap; slow Wi-Fi requests on a worker thread. A frame is drawn whole into a cached image, then only changed pixels are copied to the displayed one (Terminus font; a portrait panel is drawn turned) | emulator (touch via `--tap`); **Erista**: takes over the 720x1280 panel hekate left on; touch to validate; own panel init missing |
+| `input` | touchscreen (FTM3BD56) read when its interrupt line says it has events (GPIO X1, level low, as in the Switch's Linux device tree; bank 6 interrupt, SPI 87), polled if the line is missing or stuck; each reader asks for the event kinds it wants (`READ` word 1); USB keyboard | emulator (with the touch patch); **Erista**: interrupt pin to confirm (hekate polls) |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
 | `net` | TCP/IP (smoltcp): DHCP (retried every 2 s, started over when the Wi-Fi link drops), DNS, TCP, UDP, ICMP echo (`nettest ping HOST`), traffic counters (`STATS`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
 | `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again or resets a running chip; `wifi connect` returns once `net` has its DHCP address) | the chip still resets itself at times, joined or idle (hardware runs 16, 20, 21, cause unknown): `wlan` checks it every second, reports the loss in `wifi status` and brings it back by itself, rejoining the last network. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |

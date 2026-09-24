@@ -57,7 +57,9 @@ Tests: `user/ktest` (kernel tests, ~27), `apps/stdtest` (std tests, ~18).
 dependency. Prefer fixing nxk side; touch the emulator only when the bug is
 clearly in device emulation, and say so explicitly. Emulator changes nxk
 relies on are kept as patches in `tools/` (`tegra_qemu-usb-otg.patch`: OTG
-device mode behind chardev `usbotg`, needed by `nxtest.py --usb-cmd`).
+device mode behind chardev `usbotg`, needed by `nxtest.py --usb-cmd`;
+`tegra_qemu-touch-irq.patch`, applied after it: the touch panel's
+interrupt on GPIO X1, needed by `nxtest.py --tap`).
 
 ## 3. Mandatory workflow: build, run, test
 
@@ -121,7 +123,10 @@ Key details agents must respect:
 
 ## 4. Architecture rules (do not break)
 
-- No GUI: shell over serial console only.
+- No GUI toolkit or windows: the shell stays on the serial and USB-C
+  consoles. The screen is the `display` service's touch dashboard
+  (status pages, a read-only mirror of the USB-C terminal); its mockup
+  is `docs/ui/home.html`.
 - EL1/EL0 split: no driver or filesystem logic in the kernel. Services get
   least-privilege capabilities; designate objects only via handles with
   rights + generation (revocation by generation bump).

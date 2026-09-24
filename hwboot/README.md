@@ -162,15 +162,20 @@ order:
    init` lines: the kernel is running. A kernel panic or fault shows up
    here too.
 4. The `display` service takes over the screen, in landscape (hold the
-   console normally): midnight-blue background, the nxk logo with
-   `AArch64 microkernel for Tegra X1` under it, then the home screen:
-   SYSTEM (uptime, processes, cores, temperatures), CPU (a load bar per
-   core), LOAD (syscalls, interrupts and switches per second), MEMORY,
-   USB-C (console state and traffic), NETWORK, WI-FI and STORAGE,
-   refreshed every second. User space is alive. At the bottom,
-   `display: 720x1280 panel, turned landscape`, then only driver
-   failures (`usbcon:` or `sd:` lines): service logs and the shell go
-   to UART-A and the USB-C console.
+   console normally): midnight-blue background, a header with the nxk
+   logo, the USB, ETH, WI-FI and SD states, the temperature and the
+   uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
+   LOGS) and the HOME tiles: CPU, MEMORY, STORAGE (SD card free space),
+   NETWORK and TERMINAL, refreshed every second. User space is alive.
+   Driver failures (`usbcon:` or `sd:` lines) and `fbecho` go to the
+   LOGS page, whose tab counts the unread ones; `display: 720x1280
+   panel, turned landscape` is the first. Service logs and the shell
+   go to UART-A and the USB-C console, which the TERMINAL page mirrors.
+5. Tap the tabs: each opens its page at once. `[input] touchscreen
+   ready (interrupt on GPIO X1)` in the boot log means the controller
+   is read on its interrupt line; `touch interrupt stuck low, polling
+   instead` means the line never went back high (then taps still work,
+   up to 0.5 s late).
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
@@ -191,7 +196,7 @@ and the echo would be typed into the shell.
 
 1. Leave the USB-C cable in the PC after `./inject.sh`, then boot
    **More Configs → nxk**.
-2. The home screen's USB-C line reads `waiting for a PC`, then
+2. The TERMINAL page's status line reads `waiting for a PC`, then
    `host seen, not configured` and `connected, high speed, terminal
    closed` once the PC has enumerated it (`dmesg`: `cdc_acm ...
    ttyACM0: USB ACM device`).
