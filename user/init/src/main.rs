@@ -78,11 +78,13 @@ const DRIVERS: &[Driver] = &[
         prio: 10,
     },
     // Touchscreen (via the i2c service) and events from other drivers.
+    // Touch interrupt on GPIO X1: GPIO controller, pinmux, GPIO bank 6
+    // (ports U-X) interrupt, SPI 87.
     Driver {
         name: "input",
-        mmio: &[],
+        mmio: &[(0x6000_D000, 0x1000), (0x7000_3000, 0x1000)],
         ro_mmio: &[],
-        irqs: &[],
+        irqs: &[119],
         sysctl: false,
         terminal: false,
         prio: 8,

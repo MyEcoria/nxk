@@ -1342,7 +1342,8 @@ pub mod proto {
     /// Input events.
     pub mod input {
         /// Wait for the next event. Reply: kind, code, value, x, y.
-        /// Request word 0: timeout ns (0: no limit).
+        /// Request word 0: timeout ns (0: no limit); word 1: kinds
+        /// wanted, `1 << KIND_*` each (0 or absent: all).
         pub const READ: u32 = 1;
         /// Event from another driver (USB keyboard...): same words.
         pub const INJECT: u32 = 2;
