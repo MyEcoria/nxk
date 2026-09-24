@@ -257,7 +257,7 @@ def main():
                 if proc.poll() is not None:
                     raise SystemExit(open(os.path.join(tmp, "qemu.log")).read())
                 time.sleep(0.1)
-        _, found = read_until(s, PROMPT, a.timeout, sys.stdout)
+        seen, found = read_until(s, PROMPT, a.timeout, sys.stdout)
         if not found:
             print("\n[nxtest] no shell prompt", file=sys.stderr)
             dump_cpus(mon, a.kernel)
@@ -272,7 +272,8 @@ def main():
                     m.sendall(f"sendkey {k}\n".encode())
                     time.sleep(0.15)
                 m.close()
-            _, found = read_until(s, PROMPT, a.timeout, sys.stdout)
+            out, found = read_until(s, PROMPT, a.timeout, sys.stdout)
+            seen += out
             if not found:
                 print(f"\n[nxtest] '{c}' missed the prompt in {a.timeout} s", file=sys.stderr)
                 dump_cpus(mon, a.kernel)
@@ -305,6 +306,10 @@ def main():
                 print(f"\n[nxtest] USB console: {e}", file=sys.stderr)
                 dump_cpus(mon, a.kernel)
                 ok = False
+        if ok and a.tap and b"[input] touchscreen" not in seen and not (a.usb_cmd or a.usb_put):
+            # input starts the panel once `power` is up, at times past the
+            # prompt; a tap before that is lost to the controller's reset.
+            read_until(s, b"[input] touchscreen", a.timeout, sys.stdout)
         for t in a.tap if ok else []:
             xy, _, shot = t.partition(":")
             x, y = (int(v) for v in xy.split(","))
