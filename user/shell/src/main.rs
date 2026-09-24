@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
-use libnx::abi::proto::{pm, power};
+use libnx::abi::proto::{fan, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
@@ -186,6 +186,7 @@ fn command(line: &str) {
         "date" => date(),
         "sleep" => time::sleep_ms(argv.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000)),
         "temp" => temp(),
+        "fan" => fan_cmd(argv.get(1).copied()),
         "services" => {
             let mut buf = [0u8; 512];
             let n = ns::services(&mut buf);
@@ -222,6 +223,7 @@ fn help() {
     println!("  date            wall-clock time (RTC)");
     println!("  sleep MS        wait MS milliseconds");
     println!("  temp            chip and package temperatures");
+    println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
@@ -612,6 +614,60 @@ fn temp() {
         }
         Err(e) => {
             println!("temp: {}", err::name(e));
+            fail(e);
+        }
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `fan`: its state with a fresh speed reading (1 s); `fan auto` or
+/// `fan PCT` (0-100) sets it.
+fn fan_cmd(arg: Option<&str>) {
+    let set = match arg {
+        None => None,
+        Some("auto") => Some(fan::AUTO),
+        Some(p) => match p.parse::<u64>() {
+            Ok(p) if p <= 100 => Some(p),
+            _ => {
+                println!("usage: fan [auto|0-100]");
+                fail(-err::EINVAL);
+                return;
+            }
+        },
+    };
+    let Some(h) = service("fan") else { return };
+    let r = match set {
+        Some(w) => ipc::call(h, &Msg::from_words(fan::SET, &[w])),
+        None => {
+            // No tachometer: the state still shows, without a speed.
+            let _ = ipc::call(h, &Msg::new(fan::MEASURE, 0, 0));
+            ipc::call(h, &Msg::new(fan::STATUS, 0, 0))
+        }
+    };
+    match r.and_then(ipc::checked) {
+        Ok(m) => {
+            let (st, t, rpm) = (m.mr[1], m.mr[2], m.mr[3]);
+            let mode = if st & fan::ST_HOT != 0 {
+                "full speed: SoC hot"
+            } else if st & fan::ST_NO_SENSOR != 0 {
+                "no temperature: safe speed"
+            } else if st & fan::ST_MANUAL != 0 {
+                "manual"
+            } else {
+                "auto"
+            };
+            print!("fan {}% ({})", m.mr[0], mode);
+            if t != fan::NO_TEMP {
+                let t = t as i64;
+                print!(", SoC {}.{} C", t / 1000, (t % 1000).abs() / 100);
+            }
+            if rpm != fan::NO_RPM {
+                print!(", {} rpm", rpm);
+            }
+            println!();
+        }
+        Err(e) => {
+            println!("fan: {}", err::name(e));
             fail(e);
         }
     }
