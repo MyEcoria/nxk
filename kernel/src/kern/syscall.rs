@@ -733,6 +733,7 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
                     irqs: pc.stats.irqs,
                     idle_ns: timer::ticks_to_ns(idle),
                     busy_ns: timer::ticks_to_ns(busy),
+                    timer_late_ns: timer::ticks_to_ns(pc.stats.timer_late),
                 };
                 uaccess::write(buf + c as u64 * sz, &ci)?;
             }

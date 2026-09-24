@@ -104,6 +104,9 @@ pub fn on_irq() {
     let c = percpu::this();
     let now = counter();
     crate::trace!("[s{}] timer irq now {} cval {}", c.id, now, c.timer_cval);
+    if now > c.timer_cval {
+        c.stats.timer_late += now - c.timer_cval;
+    }
     if c.slice_end != 0 && now >= c.slice_end {
         c.slice_end = 0;
         c.slice_expired = true;

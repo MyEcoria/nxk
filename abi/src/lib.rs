@@ -992,6 +992,9 @@ pub mod info {
         pub irqs: u64,
         pub idle_ns: u64,
         pub busy_ns: u64,
+        /// Timer interrupts past their deadline, summed: the platform's
+        /// delivery latency (an emulator host can stall it).
+        pub timer_late_ns: u64,
     }
 }
 
