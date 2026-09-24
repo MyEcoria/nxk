@@ -12,18 +12,27 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EINVAL, ETIMEDOUT};
-use libnx::abi::proto::input as proto;
+use libnx::abi::err::{self, EINVAL, EIO, ETIMEDOUT};
+use libnx::abi::proto::{input as proto, power};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::i2c::I2c;
 use libnx::ipc::{self, Msg, Received};
-use libnx::{println, sys, time};
+use libnx::{ns, println, sys, time};
 
+/// STMicro FingerTip S controller on I2C3, as hekate bdk/input/touch.c.
+const TOUCH_BUS: u8 = 3;
 const TOUCH_ADDR: u8 = 0x49;
 const READ_ONE_EVENT: u8 = 0x85;
 const MS_MT_SENSE_ON: u8 = 0x93;
-/// Register read: 0x0023 = pending event count (x2).
-const READ_REG: u8 = 0xB6;
+const CLEAR_EVENT_STACK: u8 = 0xA1;
+const SWITCH_SENSE_MODE: u8 = 0xC3;
+const FINGER_MODE: u8 = 0x01;
+/// Hardware registers (u16 big-endian address, reads lead with a dummy
+/// byte): 0x0004 chip ID and firmware, 0x0023 event count (x2), 0x0028
+/// system reset.
+const HW_REG: u8 = 0xB6;
+const EV_CONTROLLER_READY: u8 = 0x10;
+const CHIP_ID: u16 = 0x3670;
 const POLL_NS: u64 = 10_000_000;
 /// No finger down, soon after a contact.
 const POLL_NEAR_NS: u64 = 40_000_000;
@@ -32,28 +41,145 @@ const NEAR_NS: u64 = 3_000_000_000;
 /// is still seen whole.
 const POLL_IDLE_NS: u64 = 500_000_000;
 
-/// Touch controller interrupt: GPIO X1, active low (Switch device tree,
-/// tegra210-nintendo-switch.dts). Registers as hekate bdk/soc/gpio.c:
-/// port 23, bank 5 (0x100 each), 4 bytes per port; masked writes set
-/// the bits of their high byte to their low byte.
+/// GPIO registers as hekate bdk/soc/gpio.c: 4 ports per bank (0x100
+/// each), 4 bytes per port; masked writes set the bits of their high
+/// byte to their low byte.
 const GPIO: u64 = 0x6000_D000;
 const PINMUX: u64 = 0x7000_3000;
-const fn port_x(reg: usize) -> usize {
-    reg + (23 >> 2) * 0x100 + (23 & 3) * 4
+const fn port(p: usize, reg: usize) -> usize {
+    reg + (p >> 2) * 0x100 + (p & 3) * 4
 }
-const GPIO_INT_LVL: usize = port_x(0x60);
-const GPIO_INT_CLR: usize = port_x(0x70);
-const GPIO_CNF_MSK: usize = port_x(0x80);
-const GPIO_OE_MSK: usize = port_x(0x90);
-const GPIO_INT_ENB_MSK: usize = port_x(0xD0);
+const PORT_J: usize = 9;
+const PORT_X: usize = 23;
+const GPIO_INT_LVL: usize = 0x60;
+const GPIO_INT_CLR: usize = 0x70;
+const GPIO_CNF_MSK: usize = 0x80;
+const GPIO_OE_MSK: usize = 0x90;
+const GPIO_OUT_MSK: usize = 0xA0;
+const GPIO_INT_ENB_MSK: usize = 0xD0;
+/// Touch controller interrupt: GPIO X1, active low (Switch device tree,
+/// tegra210-nintendo-switch.dts).
 const PIN: u32 = 1 << 1;
-/// PINMUX_AUX_GPIO_X1_AUD (hekate bdk/soc/pinmux.h): parked at reset,
-/// its input buffer enabled here.
+/// Touch controller reset: GPIO J7 (pad DAP4_SCLK), active low.
+const RESET: u32 = 1 << 7;
+/// Pinmux (hekate bdk/soc/pinmux.h): PINMUX_AUX_GPIO_X1_AUD is parked
+/// at reset, its input buffer enabled here.
 const PINMUX_X1: usize = 0x18C;
+const PINMUX_DAP4_SCLK: usize = 0x150;
+/// I2C3 pads, then I2C4's, taken off the I2C3 function.
+const PINMUX_I2C3: [usize; 2] = [0xCC, 0xD0];
+const PINMUX_I2C4: [usize; 2] = [0xD4, 0xD8];
+const PINMUX_PULL_DOWN: u32 = 1 << 2;
 const PINMUX_PARKED: u32 = 1 << 5;
 const PINMUX_INPUT_ENABLE: u32 = 1 << 6;
 /// Interrupts in a row without an event: the line is stuck, poll instead.
 const STUCK: u32 = 64;
+
+/// Command `cmd` then a read, one transaction as the controller wants.
+fn touch_read(i2c: &I2c, cmd: &[u8], out: &mut [u8]) -> Result<(), i64> {
+    i2c.write_read(TOUCH_BUS, TOUCH_ADDR, cmd, out)
+}
+
+fn touch_cmd(i2c: &I2c, cmd: &[u8]) -> Result<(), i64> {
+    i2c.transfer(TOUCH_BUS, TOUCH_ADDR, cmd, &mut [])
+}
+
+fn event_count(i2c: &I2c) -> Result<u8, i64> {
+    let mut c = [0u8; 2];
+    touch_read(i2c, &[HW_REG, 0x00, 0x23], &mut c)?;
+    Ok(c[1] >> 1)
+}
+
+/// Wait at most `ms` for event `id` with status `status`, dropping the
+/// others (hekate `_touch_wait_event`).
+fn wait_event(i2c: &I2c, id: u8, status: u8, ms: u64) -> bool {
+    let end = time::now_ns() + ms * 1_000_000;
+    loop {
+        if event_count(i2c).unwrap_or(0) > 0 {
+            let mut ev = [0u8; 8];
+            if touch_read(i2c, &[READ_ONE_EVENT], &mut ev).is_ok() && ev[..2] == [id, status] {
+                return true;
+            }
+        }
+        if time::now_ns() > end {
+            return false;
+        }
+        time::sleep_us(500);
+    }
+}
+
+/// hekate `touch_power_on`: Nyx powers the panel off (`hw_deinit`)
+/// before chaining to nxk. Reset held while LDO6 and I2C3 come up.
+fn power_on(gpio: &Mmio, pinmux: &Mmio) -> Result<(), i64> {
+    pinmux.w32(PINMUX_DAP4_SCLK, PINMUX_PULL_DOWN | 1);
+    gpio.w32(port(PORT_J, GPIO_CNF_MSK), RESET << 8 | RESET);
+    gpio.w32(port(PORT_J, GPIO_OUT_MSK), RESET << 8);
+    gpio.w32(port(PORT_J, GPIO_OE_MSK), RESET << 8 | RESET);
+    time::sleep_us(20);
+    let ep = ns::wait_for_timeout("power", 2_000_000_000)?;
+    let mut m = Msg::new(power::TOUCH_POWER, 1, 0);
+    m.mr[0] = 1;
+    ipc::checked(ipc::call(ep, &m)?)?;
+    for p in PINMUX_I2C3 {
+        pinmux.w32(p, PINMUX_INPUT_ENABLE);
+    }
+    for p in PINMUX_I2C4 {
+        pinmux.modify(p, 0, 1);
+    }
+    time::sleep_ms(1);
+    gpio.w32(port(PORT_J, GPIO_OUT_MSK), RESET << 8 | RESET);
+    time::sleep_ms(10);
+    Ok(())
+}
+
+/// hekate `touch_init`: system reset, finger mode, sensing on. Returns
+/// the chip ID and firmware version.
+fn touch_init(i2c: &I2c) -> Result<(u16, u16), i64> {
+    let mut info = [0u8; 7];
+    touch_read(i2c, &[HW_REG, 0x00, 0x04], &mut info)?;
+    let reset = (0..3).any(|_| {
+        let sent = touch_cmd(i2c, &[HW_REG, 0x00, 0x28, 0x80]).is_ok();
+        time::sleep_ms(10);
+        sent && wait_event(i2c, EV_CONTROLLER_READY, 0, 20)
+    });
+    if !reset {
+        return Err(-ETIMEDOUT);
+    }
+    touch_cmd(i2c, &[SWITCH_SENSE_MODE, FINGER_MODE])?;
+    touch_cmd(i2c, &[MS_MT_SENSE_ON])?;
+    touch_cmd(i2c, &[CLEAR_EVENT_STACK])?;
+    Ok((
+        u16::from_be_bytes([info[1], info[2]]),
+        u16::from_be_bytes([info[3], info[4]]),
+    ))
+}
+
+/// Power the panel up and start it, 3 tries (hekate). The emulator's
+/// controller has no chip ID: a wrong one is only reported.
+fn touch_start(i2c: &I2c, gpio: &Mmio, pinmux: &Mmio) -> Result<(), i64> {
+    power_on(gpio, pinmux)?;
+    wait_event(i2c, EV_CONTROLLER_READY, 0, 20);
+    let mut r = Err(-EIO);
+    for _ in 0..3 {
+        r = touch_init(i2c);
+        if r.is_ok() {
+            break;
+        }
+    }
+    let (chip, fw) = r?;
+    if chip != CHIP_ID {
+        println!(
+            "[input] touch controller ID {:#06x}, not {:#06x}",
+            chip, CHIP_ID
+        );
+    } else {
+        println!(
+            "[input] touch controller {:#06x}, firmware {:#06x}",
+            chip, fw
+        );
+    }
+    Ok(())
+}
 
 /// The controller's interrupt line, level low.
 struct TouchIrq {
@@ -62,30 +188,29 @@ struct TouchIrq {
 }
 
 impl TouchIrq {
-    fn new() -> Option<Self> {
-        let gpio = Mmio::map(drv::dev_slot(0), GPIO, 0x1000).ok()?;
-        let pinmux = Mmio::map(drv::dev_slot(1), PINMUX, 0x1000).ok()?;
+    fn new(gpio: Mmio, pinmux: &Mmio) -> Option<Self> {
         let irq = Irq::new(drv::dev_slot(2)).ok()?;
         pinmux.modify(PINMUX_X1, PINMUX_PARKED, PINMUX_INPUT_ENABLE);
-        gpio.w32(GPIO_CNF_MSK, PIN << 8 | PIN); // GPIO, not the pad's function
-        gpio.w32(GPIO_OE_MSK, PIN << 8); // input
-                                         // Level (not edge, not both edges), low.
-        gpio.modify(GPIO_INT_LVL, PIN | PIN << 8 | PIN << 16, 0);
-        gpio.w32(GPIO_INT_CLR, PIN);
-        gpio.w32(GPIO_INT_ENB_MSK, PIN << 8 | PIN);
+        // GPIO (not the pad's function), input, interrupt on level (not
+        // edge, not both edges) low.
+        gpio.w32(port(PORT_X, GPIO_CNF_MSK), PIN << 8 | PIN);
+        gpio.w32(port(PORT_X, GPIO_OE_MSK), PIN << 8);
+        gpio.modify(port(PORT_X, GPIO_INT_LVL), PIN | PIN << 8 | PIN << 16, 0);
+        gpio.w32(port(PORT_X, GPIO_INT_CLR), PIN);
+        gpio.w32(port(PORT_X, GPIO_INT_ENB_MSK), PIN << 8 | PIN);
         sys::notify_bind(irq.notification()).ok()?;
         Some(Self { gpio, irq })
     }
 
     /// Events read: the status is latched again if the line stays low.
     fn done(&self) {
-        self.gpio.w32(GPIO_INT_CLR, PIN);
+        self.gpio.w32(port(PORT_X, GPIO_INT_CLR), PIN);
         self.irq.ack();
     }
 
     fn off(&self) {
-        self.gpio.w32(GPIO_INT_ENB_MSK, PIN << 8);
-        self.gpio.w32(GPIO_INT_CLR, PIN);
+        self.gpio.w32(port(PORT_X, GPIO_INT_ENB_MSK), PIN << 8);
+        self.gpio.w32(port(PORT_X, GPIO_INT_CLR), PIN);
     }
 }
 
@@ -106,19 +231,12 @@ fn reply(e: Event) -> Msg {
 /// Pending events in the touch controller; true if a finger is still
 /// down afterwards.
 fn poll_touch(i2c: &I2c, out: &mut VecDeque<Event>, mut down: bool) -> bool {
-    let mut count = [0u8; 2];
-    if i2c
-        .transfer(3, TOUCH_ADDR, &[READ_REG, 0x00, 0x23], &mut count)
-        .is_err()
-    {
+    let Ok(count) = event_count(i2c) else {
         return down;
-    }
-    for _ in 0..(count[1] >> 1).min(32) {
+    };
+    for _ in 0..count.min(32) {
         let mut ev = [0u8; 8];
-        if i2c
-            .transfer(3, TOUCH_ADDR, &[READ_ONE_EVENT], &mut ev)
-            .is_err()
-        {
+        if touch_read(i2c, &[READ_ONE_EVENT], &mut ev).is_err() {
             return down;
         }
         let code = match ev[0] & 0x0F {
@@ -140,19 +258,36 @@ libnx::entry!(main);
 
 fn main() -> i32 {
     let i2c = I2c::connect().expect("input: i2c service");
-    let touch = i2c
-        .transfer(3, TOUCH_ADDR, &[MS_MT_SENSE_ON], &mut [])
-        .is_ok();
-    let mut line = if touch { TouchIrq::new() } else { None };
-    let ep = drv::publish("input").expect("input: publish");
-    println!(
-        "[input] touchscreen {}",
-        match (touch, &line) {
-            (false, _) => "missing",
-            (true, Some(_)) => "ready (interrupt on GPIO X1)",
-            (true, None) => "ready (polled)",
-        }
+    let pads = (
+        Mmio::map(drv::dev_slot(0), GPIO, 0x1000),
+        Mmio::map(drv::dev_slot(1), PINMUX, 0x1000),
     );
+    let started = match pads {
+        (Ok(gpio), Ok(pinmux)) => touch_start(&i2c, &gpio, &pinmux).map(|_| (gpio, pinmux)),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    let touch = started.is_ok();
+    let mut line = match started {
+        Ok((gpio, pinmux)) => TouchIrq::new(gpio, &pinmux),
+        Err(e) => {
+            drv::report(
+                "input",
+                &alloc::format!("touchscreen missing ({})", err::name(e)),
+            );
+            None
+        }
+    };
+    let ep = drv::publish("input").expect("input: publish");
+    if touch {
+        println!(
+            "[input] touchscreen ready ({})",
+            if line.is_some() {
+                "interrupt on GPIO X1"
+            } else {
+                "polled"
+            }
+        );
+    }
     let mut stuck = 0;
 
     let mut queue: VecDeque<Event> = VecDeque::new();
