@@ -1249,10 +1249,18 @@ pub mod proto {
         pub const ST_HIGH_SPEED: u64 = 4;
         /// Terminal open on the host (configured, DTR up).
         pub const ST_TERMINAL: u64 = 8;
+        /// The host turned the network function on (CDC-ECM data
+        /// interface, alternate setting 1): link `usb0` has a carrier.
+        pub const ST_NET: u64 = 16;
+        /// One endpoint, two names: "usbcon" (`STATS`) and "usb0", the
+        /// network function as an `eth` link.
+        pub const BADGE_CTRL: u64 = 1;
+        pub const BADGE_LINK: u64 = 2;
     }
     /// Ethernet interface (link layer).
     pub mod eth {
-        /// Reply: word 0 = MAC (low 6 bytes, byte 0 first), word 1 = MTU.
+        /// Reply: word 0 = MAC (low 6 bytes, byte 0 first), word 1 = MTU,
+        /// word 2 = carrier (1: up; absent: up while published).
         pub const INFO: u32 = 1;
         /// Frame to send (see `pack`).
         pub const SEND: u32 = 2;

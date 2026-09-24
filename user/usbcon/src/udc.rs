@@ -91,11 +91,12 @@ const TOK_ACTIVE: u32 = 1 << 7;
 const TOK_ERRORS: u32 = (1 << 6) | (1 << 5) | (1 << 3);
 const TOK_IOC: u32 = 1 << 15;
 
-/// Endpoints used: 0 (control), 1 (bulk), 2 (interrupt IN).
-pub const NUM_EPS: usize = 3;
+/// Endpoints used: 0 (control), 1 and 2 (console: bulk, interrupt IN),
+/// 3 and 4 (network: bulk, interrupt IN).
+pub const NUM_EPS: usize = 5;
 /// dTD of the zero-length packet ending a control IN data stage.
 const TD_ZLP: usize = NUM_EPS * 2;
-pub const DMA_SIZE: usize = 0x2000;
+pub const DMA_SIZE: usize = 0x4000;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Dir {
@@ -305,8 +306,13 @@ impl Udc {
     /// Endpoints other than 0 off.
     pub fn disable_data_eps(&self) {
         for ep in 1..NUM_EPS {
-            self.regs.w32(EPCTRL0 + 4 * ep, 0);
+            self.disable(ep);
         }
+    }
+
+    /// Both halves of endpoint `ep` off.
+    pub fn disable(&self, ep: usize) {
+        self.regs.w32(EPCTRL0 + 4 * ep, 0);
     }
 
     pub fn set_address(&self, addr: u8) {

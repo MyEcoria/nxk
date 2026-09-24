@@ -1,23 +1,27 @@
-//! usbcon: the USB-C port as a serial console (USB CDC-ACM) for a PC.
-//! Erista's OTG controller in device mode: bytes typed on the PC go to
-//! the console as input, all console output goes back to the PC. One
-//! thread: console output is pulled only when the IN endpoint is free,
-//! so the console's ring is the only buffer.
+//! usbcon: the USB-C port as a composite device for a PC: a serial
+//! console (CDC-ACM) and a network link (CDC-ECM, `usb0`) the PC may
+//! share its connection over. Erista's OTG controller in device mode:
+//! bytes typed on the PC go to the console as input, all console output
+//! goes back to the PC. One thread: console output is pulled only when
+//! the IN endpoint is free, so the console's ring is the only buffer.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
 mod udc;
 
-use libnx::abi::err::EINVAL;
-use libnx::abi::proto::{clk, console as con, usbcon as proto};
-use libnx::abi::rights::{GRANT, SIGNAL};
+use libnx::abi::err::{EAGAIN, EINVAL, ENETDOWN, ETIMEDOUT};
+use libnx::abi::proto::{clk, console as con, eth, usbcon as proto};
+use libnx::abi::rights::{DUP, GRANT, SEND, SIGNAL};
 use libnx::abi::slots;
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
-use libnx::{println, sys, time};
+use libnx::{ns, println, sys, time};
 
 use udc::{bit, Dir, EpType, Udc};
 
@@ -43,6 +47,24 @@ const RX_BUF: usize = 0x800;
 const RX_LEN: usize = 512;
 const TX_BUF: usize = 0x1000;
 const TX_LEN: usize = 0x1000;
+/// Network function: receive, transmit, notification buffers.
+const NET_RX_BUF: usize = 0x2000;
+const NET_RX_LEN: usize = 0x800;
+const NET_TX_BUF: usize = 0x2800;
+const NET_NOTE_BUF: usize = 0x3000;
+
+/// Network function (ECM): interfaces 2 (control) and 3 (data).
+const NET_IFACE: u8 = 2;
+const NET_DATA: u16 = 3;
+const MTU: u64 = 1500;
+/// Largest frame, header included.
+const FRAME: usize = 1514;
+/// Frames held each way.
+const NET_QUEUE: usize = 32;
+/// Locally administered: the Switch's end of the link, and the PC's
+/// (the ECM descriptor gives it to the host, string 4).
+const NET_MAC: [u8; 6] = [0x02, 0x4E, 0x58, 0x4B, 0x00, 0x01];
+const HOST_MAC: &str = "024E584B0002";
 
 /// pid.codes test IDs: private use only.
 const VID: u16 = 0x1209;
@@ -51,20 +73,24 @@ const PID: u16 = 0x0001;
 #[rustfmt::skip]
 const DEVICE: [u8; 18] = [
     18, 1, 0x00, 0x02, // USB 2.0
-    0x02, 0, 0, 64, // CDC device, EP0 max packet 64
+    0xEF, 0x02, 0x01, 64, // functions in interface associations, EP0 max packet 64
     VID as u8, (VID >> 8) as u8, PID as u8, (PID >> 8) as u8,
-    0x00, 0x01, 1, 2, 3, 1, // release 1.0, strings, 1 configuration
+    0x00, 0x02, 1, 2, 3, 1, // release 2.0, strings, 1 configuration
 ];
-const QUALIFIER: [u8; 10] = [10, 6, 0x00, 0x02, 0x02, 0, 0, 64, 1, 0];
+const QUALIFIER: [u8; 10] = [10, 6, 0x00, 0x02, 0xEF, 0x02, 0x01, 64, 1, 0];
 
-/// Configuration: CDC-ACM control interface (notification endpoint,
-/// never used) and data interface (bulk pair); sizes per bus speed.
+/// Configuration: the console (CDC-ACM control interface, whose
+/// notification endpoint is never used, and data interface) and the
+/// network (CDC-ECM control interface, data interface whose bulk pair
+/// is alternate setting 1); sizes per bus speed.
 #[rustfmt::skip]
-fn config(hs: bool) -> [u8; 67] {
+fn config(hs: bool) -> Vec<u8> {
     let [lo, hi] = if hs { 512u16 } else { 64 }.to_le_bytes();
     let interval = if hs { 9 } else { 32 }; // 32 ms
-    [
-        9, 2, 67, 0, 2, 1, 0, 0xC0, 1, // self-powered
+    let [flo, fhi] = (FRAME as u16).to_le_bytes();
+    let mut d = alloc::vec![
+        9, 2, 0, 0, 4, 1, 0, 0xC0, 1, // length below, 4 interfaces, self-powered
+        8, 11, 0, 2, 0x02, 0x02, 0, 0, // association: interfaces 0-1, ACM
         9, 4, 0, 0, 1, 0x02, 0x02, 0, 0, // communication: ACM, no AT commands
         5, 0x24, 0x00, 0x10, 0x01, // header: CDC 1.10
         5, 0x24, 0x01, 0x00, 1, // call management: data on interface 1
@@ -74,7 +100,29 @@ fn config(hs: bool) -> [u8; 67] {
         9, 4, 1, 0, 2, 0x0A, 0, 0, 0, // data interface
         7, 5, 0x01, 2, lo, hi, 0, // bulk OUT 1
         7, 5, 0x81, 2, lo, hi, 0, // bulk IN 1
-    ]
+        8, 11, 2, 2, 0x02, 0x06, 0, 0, // association: interfaces 2-3, ECM
+        9, 4, 2, 0, 1, 0x02, 0x06, 0, 0, // communication: ECM
+        5, 0x24, 0x00, 0x10, 0x01, // header: CDC 1.10
+        5, 0x24, 0x06, 2, 3, // union: 2 controls 3
+        // Ethernet: host MAC in string 4, no statistics, frames of
+        // 1514 bytes, no multicast or power filters.
+        13, 0x24, 0x0F, 4, 0, 0, 0, 0, flo, fhi, 0, 0, 0,
+        7, 5, 0x84, 3, 16, 0, interval, // link notifications, interrupt IN 4
+        9, 4, 3, 0, 0, 0x0A, 0, 0, 0, // data interface, off
+        9, 4, 3, 1, 2, 0x0A, 0, 0, 0, // data interface, on
+        7, 5, 0x03, 2, lo, hi, 0, // bulk OUT 3
+        7, 5, 0x83, 2, lo, hi, 0, // bulk IN 3
+    ];
+    let n = d.len() as u16;
+    d[2..4].copy_from_slice(&n.to_le_bytes());
+    d
+}
+
+/// MAC as the `eth` protocol's word: byte 0 lowest.
+fn mac_word() -> u64 {
+    let mut b = [0u8; 8];
+    b[..6].copy_from_slice(&NET_MAC);
+    u64::from_le_bytes(b)
 }
 
 /// String descriptor `index` in `out`; `None`: no such string.
@@ -87,6 +135,7 @@ fn string(index: u8, out: &mut [u8; 32]) -> Option<usize> {
         1 => "nxk",
         2 => "nxk console",
         3 => "0001",
+        4 => HOST_MAC,
         _ => return None,
     };
     let n = 2 + 2 * s.len();
@@ -141,6 +190,17 @@ struct Dev {
     tx_len: usize,
     /// A host reset the bus once: a PC sees the Switch.
     seen: bool,
+    /// Network function on: the host chose the data interface's bulk pair.
+    net: bool,
+    /// Frames from the host not yet taken, frames for it not yet sent,
+    /// bytes of the one in flight (0: none).
+    net_rx: VecDeque<Vec<u8>>,
+    net_tx: VecDeque<Vec<u8>>,
+    net_tx_len: usize,
+    /// `RECV` callers waiting: reply token, deadline (0: none).
+    net_readers: VecDeque<(u64, u64)>,
+    /// The link went down with nobody waiting: the next `RECV` hears it.
+    net_down_untold: bool,
 }
 
 impl Dev {
@@ -180,6 +240,7 @@ impl Dev {
             | bit(self.config != 0, proto::ST_CONFIGURED)
             | bit(self.hs, proto::ST_HIGH_SPEED)
             | bit(self.online, proto::ST_TERMINAL)
+            | bit(self.net, proto::ST_NET)
     }
 
     fn interrupt(&mut self) {
@@ -209,6 +270,12 @@ impl Dev {
             self.stats.tx_xfers += 1;
             self.tx_len = 0;
         }
+        if done & bit(3, Dir::Out) != 0 {
+            self.net_rx_done();
+        }
+        if done & bit(3, Dir::In) != 0 {
+            self.net_tx_len = 0;
+        }
         while let Some(p) = self.udc.take_setup() {
             self.setup(p);
         }
@@ -228,11 +295,13 @@ impl Dev {
         self.dtr = false;
         self.tx_len = 0;
         self.set_online();
+        self.set_net(false);
     }
 
     fn configure(&mut self, value: u8) {
+        self.set_net(false);
         self.udc
-            .flush(bit(1, Dir::Out) | bit(1, Dir::In) | bit(2, Dir::In));
+            .flush(bit(1, Dir::Out) | bit(1, Dir::In) | bit(2, Dir::In) | bit(4, Dir::In));
         self.tx_len = 0;
         self.carry = None;
         self.config = value;
@@ -241,6 +310,7 @@ impl Dev {
             self.udc.enable(1, Dir::Out, EpType::Bulk, mps);
             self.udc.enable(1, Dir::In, EpType::Bulk, mps);
             self.udc.enable(2, Dir::In, EpType::Interrupt, 16);
+            self.udc.enable(4, Dir::In, EpType::Interrupt, 16);
             self.udc.start(1, Dir::Out, RX_BUF, RX_LEN, false);
             println!(
                 "[usbcon] configured by the host ({} speed)",
@@ -310,7 +380,8 @@ impl Dev {
         self.ep0 = Ep0::Idle;
         let ep = (index & 0xF) as usize;
         let dir = if index & 0x80 != 0 { Dir::In } else { Dir::Out };
-        let data_ep = (ep == 1 || (ep == 2 && dir == Dir::In)) && self.config != 0;
+        let data_ep =
+            (matches!(ep, 1 | 3) || (matches!(ep, 2 | 4) && dir == Dir::In)) && self.config != 0;
         match (kind, req) {
             // GET_DESCRIPTOR
             (0x80, 6) => match (value >> 8) as u8 {
@@ -338,8 +409,19 @@ impl Dev {
                 let halted = ep != 0 && self.udc.stalled(ep, dir);
                 self.data_in(&[halted as u8, 0], max);
             }
-            (0x81, 10) => self.data_in(&[0], max), // GET_INTERFACE
-            (0x01, 11) if value == 0 => self.status_in(None), // SET_INTERFACE
+            // GET_INTERFACE, SET_INTERFACE: the network's data interface
+            // has its bulk pair in alternate setting 1.
+            (0x81, 10) => {
+                let alt = (index == NET_DATA && self.net) as u8;
+                self.data_in(&[alt], max)
+            }
+            (0x01, 11) if index == NET_DATA && value <= 1 && self.config != 0 => {
+                self.status_in(None);
+                self.set_net(value == 1);
+            }
+            (0x01, 11) if value == 0 => self.status_in(None),
+            // CDC-ECM: SET_ETHERNET_PACKET_FILTER (all frames go anyway).
+            (0x21, 0x43) if index == NET_IFACE as u16 => self.status_in(None),
             // CLEAR_FEATURE, SET_FEATURE (ENDPOINT_HALT)
             (0x02, 1 | 3) if value == 0 && (ep == 0 || data_ep) => {
                 if ep != 0 {
@@ -425,6 +507,141 @@ impl Dev {
         }
     }
 
+    /// Network function on (fresh endpoints, carrier to the host) or off.
+    fn set_net(&mut self, on: bool) {
+        let was = self.net;
+        self.udc.flush(bit(3, Dir::Out) | bit(3, Dir::In));
+        self.net_tx_len = 0;
+        self.net_tx.clear();
+        self.net_rx.clear();
+        self.net = on;
+        if on {
+            let mps = self.max_packet() as u32;
+            self.udc.enable(3, Dir::Out, EpType::Bulk, mps);
+            self.udc.enable(3, Dir::In, EpType::Bulk, mps);
+            self.udc.start(3, Dir::Out, NET_RX_BUF, NET_RX_LEN, false);
+            // NETWORK_CONNECTION, connected: the host's carrier.
+            let note = [0xA1, 0x00, 1, 0, NET_IFACE, 0, 0, 0];
+            self.udc.buf(NET_NOTE_BUF, 8).copy_from_slice(&note);
+            self.udc.start(4, Dir::In, NET_NOTE_BUF, 8, false);
+            println!("[usbcon] network on (usb0)");
+        } else {
+            self.udc.disable(3);
+            if was {
+                println!("[usbcon] network off");
+            }
+            // Readers hear the loss; `net` starts its DHCP over.
+            self.net_down_untold = self.net_readers.is_empty();
+            for (token, _) in self.net_readers.drain(..) {
+                let _ = ipc::reply_to(token, &Msg::error(-ENETDOWN));
+            }
+        }
+    }
+
+    /// A frame from the host: to a waiting reader, else queued.
+    fn net_rx_done(&mut self) {
+        let n = match self.udc.finished(3, Dir::Out) {
+            None => return,
+            Some(Ok(left)) => NET_RX_LEN - left,
+            Some(Err(_)) => 0,
+        };
+        let frame = self.udc.buf(NET_RX_BUF, n).to_vec();
+        if self.net {
+            self.udc.start(3, Dir::Out, NET_RX_BUF, NET_RX_LEN, false);
+        }
+        if n < 14 {
+            return;
+        }
+        match self.net_readers.pop_front() {
+            Some((token, _)) => {
+                let _ = ipc::reply_to(token, &ipc::pack(0, &frame));
+            }
+            None => {
+                if self.net_rx.len() == NET_QUEUE {
+                    self.net_rx.pop_front();
+                }
+                self.net_rx.push_back(frame);
+            }
+        }
+    }
+
+    /// Next frame to the host, if the endpoint is free.
+    fn net_send(&mut self) {
+        if !self.net || self.net_tx_len != 0 {
+            return;
+        }
+        let Some(f) = self.net_tx.pop_front() else {
+            return;
+        };
+        let mut n = f.len();
+        self.udc.buf(NET_TX_BUF, n).copy_from_slice(&f);
+        // Never a whole number of packets, so no zero-length packet: one
+        // byte of padding, which the host's IP layer drops.
+        if n.is_multiple_of(self.max_packet()) {
+            self.udc.buf(NET_TX_BUF + n, 1)[0] = 0;
+            n += 1;
+        }
+        self.udc.start(3, Dir::In, NET_TX_BUF, n, false);
+        self.net_tx_len = n;
+    }
+
+    /// `eth` request on "usb0"; `None`: the reply waits for a frame.
+    fn link(&mut self, rx: &ipc::Received, buf: &mut [u8]) -> Option<Msg> {
+        Some(match rx.msg.label() {
+            eth::INFO => Msg::from_words(0, &[mac_word(), MTU, self.net as u64]),
+            eth::SEND => {
+                let n = ipc::unpack(&rx.msg, buf);
+                if !self.net {
+                    Msg::error(-ENETDOWN)
+                } else if !(14..=FRAME).contains(&n) {
+                    Msg::error(-EINVAL)
+                } else if self.net_tx.len() >= NET_QUEUE {
+                    Msg::error(-EAGAIN)
+                } else {
+                    self.net_tx.push_back(buf[..n].to_vec());
+                    Msg::new(0, 0, 0)
+                }
+            }
+            eth::RECV => match self.net_rx.pop_front() {
+                Some(f) => ipc::pack(0, &f),
+                None if self.net_down_untold => {
+                    self.net_down_untold = false;
+                    Msg::error(-ENETDOWN)
+                }
+                None => {
+                    let t = rx.msg.mr[0];
+                    let deadline = if t == 0 { 0 } else { time::now_ns() + t };
+                    self.net_readers.push_back((rx.token, deadline));
+                    return None;
+                }
+            },
+            _ => Msg::error(-EINVAL),
+        })
+    }
+
+    /// `RECV` callers past their deadline.
+    fn net_expire(&mut self) {
+        let now = time::now_ns();
+        self.net_readers.retain(|&(token, deadline)| {
+            let expired = deadline != 0 && now >= deadline;
+            if expired {
+                let _ = ipc::reply_to(token, &Msg::error(-ETIMEDOUT));
+            }
+            !expired
+        });
+    }
+
+    /// ns until the nearest `RECV` deadline (0: none).
+    fn net_left(&self) -> u64 {
+        let now = time::now_ns();
+        self.net_readers
+            .iter()
+            .filter(|r| r.1 != 0)
+            .map(|r| r.1.saturating_sub(now).max(1))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn stats_reply(&self) -> Msg {
         let s = &self.stats;
         Msg::from_words(
@@ -463,6 +680,12 @@ fn main() -> i32 {
         line: [0x00, 0xC2, 0x01, 0x00, 0, 0, 8], // 115200 8N1
         tx_len: 0,
         seen: false,
+        net: false,
+        net_rx: VecDeque::new(),
+        net_tx: VecDeque::new(),
+        net_tx_len: 0,
+        net_readers: VecDeque::new(),
+        net_down_untold: false,
     };
     // T210B01 (Mariko) has no such controller: its OTG port is XUSB's.
     if (misc.r32(HIDREV) >> 4) & 0xF >= 2 {
@@ -519,7 +742,9 @@ fn main() -> i32 {
         return 0;
     }
     let _ = sys::handle_close(signal);
-    let ep = drv::publish("usbcon").expect("usbcon: publish");
+    let ep = sys::endpoint_create().expect("usbcon: endpoint");
+    publish(ep, "usbcon", proto::BADGE_CTRL).expect("usbcon: publish");
+    publish(ep, "usb0", proto::BADGE_LINK).expect("usbcon: publish usb0");
     if !dev
         .udc
         .attach(udc::STS_UI | udc::STS_UEI | udc::STS_PCI | udc::STS_URI)
@@ -528,10 +753,14 @@ fn main() -> i32 {
         return 0;
     }
     println!("[usbcon] USB-C console ready, waiting for a PC (tools/usbterm.py)");
-    // Requests and events; a timeout ends the output hold.
+    // Requests and events; a timeout ends the output hold or a wait.
     let mut reply: Option<Msg> = None;
+    let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
-        let wait = dev.hold_left();
+        let wait = match (dev.hold_left(), dev.net_left()) {
+            (0, n) | (n, 0) => n,
+            (h, n) => h.min(n),
+        };
         let rx = match reply.take() {
             Some(m) => ipc::reply_recv_timeout(ep, &m, wait),
             None => ipc::recv_timeout(ep, wait),
@@ -544,13 +773,25 @@ fn main() -> i32 {
                 }
             }
             Ok(rx) => {
-                reply = Some(match rx.msg.label() {
-                    proto::STATS => dev.stats_reply(),
-                    _ => Msg::error(-EINVAL),
-                })
+                reply = match (rx.badge, rx.msg.label()) {
+                    (proto::BADGE_LINK, _) => dev.link(&rx, &mut buf),
+                    (_, proto::STATS) => Some(dev.stats_reply()),
+                    _ => Some(Msg::error(-EINVAL)),
+                }
             }
             Err(_) => {}
         }
+        dev.net_expire();
         dev.send();
+        dev.net_send();
     }
+}
+
+/// Register `ep` under a name with its own badge: one service, two
+/// protocols whose labels would otherwise collide.
+fn publish(ep: u32, name: &str, badge: u64) -> Result<(), i64> {
+    let h = sys::handle_dup(ep, SEND | GRANT | DUP, badge)?;
+    let r = ns::register(name, h);
+    let _ = sys::handle_close(h);
+    r
 }
