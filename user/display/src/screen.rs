@@ -1,6 +1,7 @@
-//! Landscape drawing on the window image: rectangles, 8x16 glyphs and
-//! text grids that redraw a cell only when it changes. A portrait panel
-//! (Switch) is drawn turned, as hekate stores its boot logo.
+//! Landscape drawing: rectangles, 8x16 glyphs, the logo. A frame is drawn
+//! whole into a cached image, then only its changed pixels are copied to
+//! the displayed one (uncached): no flicker, few slow writes. A portrait
+//! panel (Switch) is drawn turned, as hekate stores its boot logo.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -9,20 +10,55 @@ use core::fmt;
 use libnx::mem::SharedMemory;
 
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
+/// tools/mklogo.py --raw: width, height, 8 R G B A palette entries, indices.
+const LOGO: &[u8] = include_bytes!("../../../build/logo.bin");
 
-// Colors, A B G R.
+// Colors, A B G R (docs/ui/home.html uses the same values).
 pub const BG: u32 = 0xFF3A_1E10;
 pub const FG: u32 = 0xFFD8_D8D8;
 pub const DIM: u32 = 0xFF98_8880;
 pub const GOOD: u32 = 0xFF6A_D06A;
 pub const WARN: u32 = 0xFF40_C0F0;
 pub const BAD: u32 = 0xFF50_60F0;
+/// Empty part of a bar.
+pub const TRACK: u32 = 0xFF50_3020;
+/// Cards, their outline, a pressed control.
+pub const PANEL: u32 = 0xFF4C_2916;
+pub const EDGE: u32 = 0xFF75_462B;
+pub const PRESS: u32 = 0xFF8A_4F2A;
+pub const BLUE: u32 = 0xFFF0_A06C;
+pub const TERM_BG: u32 = 0xFF24_130B;
 
-/// Widest text line: 1280 px of 8 px glyphs.
-pub const MAX_COLS: usize = 160;
+/// Logo palette entry `i` (A B G R).
+pub fn palette(i: usize) -> u32 {
+    u32::from_le_bytes([
+        LOGO[2 + 4 * i],
+        LOGO[3 + 4 * i],
+        LOGO[4 + 4 * i],
+        LOGO[5 + 4 * i],
+    ])
+}
+
+/// Labels and titles: the logo's light amber.
+pub fn accent() -> u32 {
+    palette(6)
+}
+
+pub fn logo_size() -> (usize, usize) {
+    (LOGO[0] as usize, LOGO[1] as usize)
+}
+
+/// Width of `s` in pixels at `scale`.
+pub fn width(s: &str, scale: usize) -> usize {
+    s.chars().count() * 8 * scale
+}
 
 pub struct Screen {
     pub fb: SharedMemory,
+    /// Frame being drawn, and what the displayed image holds; both in
+    /// panel scan order.
+    back: Vec<u32>,
+    shown: Vec<u32>,
     /// Image size, in panel scan order.
     w: usize,
     h: usize,
@@ -34,14 +70,13 @@ impl Screen {
     pub fn new(fb: SharedMemory, w: usize, h: usize) -> Self {
         Self {
             fb,
+            back: vec![BG; w * h],
+            // No drawn color is 0 (all opaque): the first frame is copied whole.
+            shown: vec![0; w * h],
             w,
             h,
             rot: h > w,
         }
-    }
-
-    fn pixels(&mut self) -> &mut [u32] {
-        unsafe { core::slice::from_raw_parts_mut(self.fb.as_ptr() as *mut u32, self.w * self.h) }
     }
 
     /// Landscape size.
@@ -57,28 +92,42 @@ impl Screen {
         self.rot
     }
 
-    /// Landscape rectangle: runs of image rows (image columns when turned).
+    /// Landscape rectangle, clipped to the screen: runs of image rows
+    /// (image columns when turned).
     pub fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32) {
-        let (iw, ih, rot) = (self.w, self.h, self.rot);
-        let px = self.pixels();
-        if rot {
+        let (sw, sh) = self.size();
+        let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
+        if w == 0 || h == 0 {
+            return;
+        }
+        let (iw, ih) = (self.w, self.h);
+        if self.rot {
             // Landscape (x, y) is image pixel (row ih-1-x, column y).
             for r in ih - x - w..ih - x {
-                px[r * iw + y..r * iw + y + h].fill(c);
+                self.back[r * iw + y..r * iw + y + h].fill(c);
             }
         } else {
             for r in y..y + h {
-                px[r * iw + x..r * iw + x + w].fill(c);
+                self.back[r * iw + x..r * iw + x + w].fill(c);
             }
         }
     }
 
-    pub fn clear(&mut self) {
-        self.pixels().fill(BG);
+    pub fn clear(&mut self, c: u32) {
+        self.back.fill(c);
     }
 
-    /// Glyph `ch` (Latin-1) at landscape pixel (x, y), `scale` times enlarged.
-    pub fn glyph(&mut self, x: usize, y: usize, ch: u8, scale: usize, fg: u32) {
+    /// Outline `t` pixels thick.
+    pub fn frame(&mut self, x: usize, y: usize, w: usize, h: usize, t: usize, c: u32) {
+        self.fill(x, y, w, t, c);
+        self.fill(x, y + h - t, w, t, c);
+        self.fill(x, y, t, h, c);
+        self.fill(x + w - t, y, t, h, c);
+    }
+
+    /// Glyph `ch` (Latin-1) at landscape pixel (x, y), `scale` times
+    /// enlarged, on `bg`.
+    pub fn glyph(&mut self, x: usize, y: usize, ch: u8, scale: usize, fg: u32, bg: u32) {
         let g = ch as usize * 16;
         for (dy, &bits) in FONT[g..g + 16].iter().enumerate() {
             // Runs of equal pixels in the row: one rectangle each.
@@ -89,113 +138,85 @@ impl Screen {
                 while end < 8 && (bits & (0x80 >> end) != 0) == on {
                     end += 1;
                 }
-                let c = if on { fg } else { BG };
+                let c = if on { fg } else { bg };
                 self.fill(x + dx * scale, y + dy * scale, (end - dx) * scale, scale, c);
                 dx = end;
             }
         }
     }
-}
 
-/// One line being composed: characters with their colors.
-pub struct Line {
-    cells: [(u8, u32); MAX_COLS],
-    len: usize,
-    color: u32,
-}
-
-impl Line {
-    pub fn new() -> Self {
-        Self {
-            cells: [(b' ', FG); MAX_COLS],
-            len: 0,
-            color: FG,
-        }
-    }
-
-    /// Color of what is written next.
-    pub fn color(&mut self, c: u32) -> &mut Self {
-        self.color = c;
-        self
-    }
-
-    /// Spaces up to column `col`.
-    pub fn pad(&mut self, col: usize) -> &mut Self {
-        while self.len < col.min(MAX_COLS) {
-            self.cells[self.len] = (b' ', FG);
-            self.len += 1;
-        }
-        self
-    }
-
-    fn cell(&self, col: usize) -> (u8, u32) {
-        if col < self.len {
-            self.cells[col]
-        } else {
-            (b' ', FG)
-        }
-    }
-}
-
-impl fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
+    /// Text from (x, y), a character outside Latin-1 as '?'; returns its width.
+    pub fn text(&mut self, x: usize, y: usize, s: &str, scale: usize, fg: u32, bg: u32) -> usize {
+        let mut k = 0;
         for ch in s.chars() {
-            if self.len == MAX_COLS {
-                break;
-            }
             let b = u8::try_from(ch as u32).unwrap_or(b'?');
-            self.cells[self.len] = (b, self.color);
-            self.len += 1;
+            self.glyph(x + 8 * scale * k, y, b, scale, fg, bg);
+            k += 1;
         }
-        Ok(())
-    }
-}
-
-/// Text cells at `scale` from landscape pixel (x0, y0).
-pub struct Grid {
-    x0: usize,
-    y0: usize,
-    pub scale: usize,
-    pub cols: usize,
-    pub rows: usize,
-    cells: Vec<(u8, u32)>,
-}
-
-impl Grid {
-    pub fn new(x0: usize, y0: usize, scale: usize, cols: usize, rows: usize) -> Self {
-        Self {
-            x0,
-            y0,
-            scale,
-            cols,
-            rows,
-            cells: vec![(b' ', FG); cols * rows],
-        }
+        8 * scale * k
     }
 
-    /// Landscape pixel of cell (col, row).
-    pub fn pos(&self, col: usize, row: usize) -> (usize, usize) {
-        (
-            self.x0 + col * 8 * self.scale,
-            self.y0 + row * 16 * self.scale,
-        )
+    /// Text ending at `xr`.
+    pub fn text_r(
+        &mut self,
+        xr: usize,
+        y: usize,
+        s: &str,
+        scale: usize,
+        fg: u32,
+        bg: u32,
+    ) -> usize {
+        self.text(xr.saturating_sub(width(s, scale)), y, s, scale, fg, bg)
     }
 
-    /// Row `row` becomes `l` (blank past its end); only changed cells
-    /// are drawn.
-    pub fn line(&mut self, scr: &mut Screen, row: usize, l: &Line) {
-        if row >= self.rows {
-            return;
-        }
-        for col in 0..self.cols {
-            let c = l.cell(col);
-            let i = row * self.cols + col;
-            if self.cells[i] != c {
-                self.cells[i] = c;
-                let (x, y) = self.pos(col, row);
-                scr.glyph(x, y, c.0, self.scale, c.1);
+    /// Text centered on `cx`.
+    pub fn text_c(
+        &mut self,
+        cx: usize,
+        y: usize,
+        s: &str,
+        scale: usize,
+        fg: u32,
+        bg: u32,
+    ) -> usize {
+        self.text(cx.saturating_sub(width(s, scale) / 2), y, s, scale, fg, bg)
+    }
+
+    /// The logo, `s` times enlarged, index 0 transparent.
+    pub fn logo(&mut self, x0: usize, y0: usize, s: usize) {
+        let (w, h) = logo_size();
+        for (i, &p) in LOGO[34..34 + w * h].iter().enumerate() {
+            if p != 0 {
+                self.fill(x0 + i % w * s, y0 + i / w * s, s, s, palette(p as usize));
             }
         }
+    }
+
+    /// Copy the pixels that changed since the last call to the displayed
+    /// image: per image row, the span from the first to the last change.
+    pub fn present(&mut self) {
+        let fb = unsafe {
+            core::slice::from_raw_parts_mut(self.fb.as_ptr() as *mut u32, self.w * self.h)
+        };
+        for r in 0..self.h {
+            let row = r * self.w..(r + 1) * self.w;
+            let (b, s) = (&self.back[row.clone()], &mut self.shown[row.clone()]);
+            let Some(first) = b.iter().zip(s.iter()).position(|(a, c)| a != c) else {
+                continue;
+            };
+            let last = b
+                .iter()
+                .zip(s.iter())
+                .rposition(|(a, c)| a != c)
+                .unwrap_or(first);
+            s[first..=last].copy_from_slice(&b[first..=last]);
+            fb[row.start + first..=row.start + last].copy_from_slice(&b[first..=last]);
+        }
+    }
+
+    /// A client drew on the image itself: the next frame is copied whole.
+    pub fn forget(&mut self) {
+        self.shown.fill(0);
     }
 }
 
@@ -228,5 +249,29 @@ impl fmt::Display for Ipv4 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let [a, b, c, d] = self.0.to_be_bytes();
         write!(f, "{}.{}.{}.{}", a, b, c, d)
+    }
+}
+
+/// Millidegrees as `42.1°C`.
+pub struct Celsius(pub i64);
+
+impl fmt::Display for Celsius {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}\u{b0}C",
+            self.0 / 1000,
+            (self.0 % 1000).abs() / 100
+        )
+    }
+}
+
+/// Seconds as `h:mm:ss`.
+pub struct Hms(pub u64);
+
+impl fmt::Display for Hms {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = self.0;
+        write!(f, "{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
     }
 }
