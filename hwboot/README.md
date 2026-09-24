@@ -167,10 +167,11 @@ order:
    uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
    LOGS) and the HOME tiles: CPU, MEMORY, STORAGE (SD card free space),
    NETWORK and TERMINAL, refreshed every second. User space is alive.
-   Driver failures (`usbcon:` or `sd:` lines) and `fbecho` go to the
-   LOGS page, whose tab counts the unread ones; `display: 720x1280
-   panel, turned landscape` is the first. Service logs and the shell
-   go to UART-A and the USB-C console, which the TERMINAL page mirrors.
+   Logs (the kernel's, the services' such as `[usbcon]` or `[sd]`
+   lines, and `fbecho`) go to the LOGS page, whose tab counts the
+   unread ones; the TERMINAL page shows the shell's session only, the
+   commands typed and their results. Both also go to UART-A and the
+   USB-C console.
 5. Tap the tabs: each opens its page at once. Nyx powers the panel
    off before chaining to nxk, so `input` powers it up again (reset pin
    J7, LDO6, then a system reset). `[input] touch controller 0x3670,
@@ -218,7 +219,9 @@ last status (`✘ 2 ENOENT`), its duration and the time. Messages that
 come while a line is edited print above the prompt; keys typed while a
 command runs reach it as typed, and whatever was left unsent comes back
 in the next prompt. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
-`--raw` is the plain terminal (the shell's `nxk> ` and echo).
+`--raw` is the plain terminal (the shell's `nxk> ` and echo). Logs are
+left out, as on the TERMINAL page: `--logs` shows them (dimmed), and
+`--reload` does too, to see the driver start.
 
 The USB-C line locates a failure:
 
