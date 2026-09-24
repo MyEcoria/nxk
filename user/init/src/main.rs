@@ -70,6 +70,23 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 8,
     },
+    // PWM (fan on channel 1), pinmux, GPIO (5V enable A5, PWM pad V4,
+    // tachometer S7), PMC (GPIO pad power); APB_MISC read-only (chip
+    // revision). IRQ: GPIO bank 4 (ports Q-T), SPI 55.
+    Driver {
+        name: "fan",
+        mmio: &[
+            (0x7000_A000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+            (0x7000_E000, 0x1000),
+        ],
+        ro_mmio: &[(0x7000_0000, 0x1000)],
+        irqs: &[87],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
     Driver {
         name: "display",
         mmio: &[(0x5420_0000, 0x40000)],

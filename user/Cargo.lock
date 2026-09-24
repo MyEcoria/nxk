@@ -87,6 +87,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fan"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+]
+
+[[package]]
 name = "fptest"
 version = "0.1.0"
 dependencies = [
