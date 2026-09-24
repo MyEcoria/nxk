@@ -15,6 +15,11 @@ missed the prompt in time.
 import argparse, bisect, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.dont_write_bytecode = True
+import usbterm  # noqa: E402  (console output filter, USB-C host)
+# UART output shown without the console's log marks (logs kept).
+SHOWN = usbterm.Logs(True)
 ROOT = os.path.dirname(HERE)
 QEMU = os.environ.get("QEMU", os.path.expanduser("~/.cache/tegra_qemu/build/qemu-system-aarch64"))
 PROMPT = b"nxk> "
@@ -33,7 +38,7 @@ def read_until(sock, marker, timeout, out):
         if not chunk:
             break
         buf += chunk
-        out.write(chunk.decode("utf-8", "replace"))
+        out.write(SHOWN(chunk).decode("utf-8", "replace"))
         out.flush()
         if marker in buf:
             return buf, True
@@ -281,9 +286,6 @@ def main():
                 break
         print()
         if ok and (a.usb_cmd or a.usb_put):
-            sys.path.insert(0, HERE)
-            sys.dont_write_bytecode = True
-            import usbterm
             # Unread, the emulated UART stalls the console that feeds USB too.
             s.settimeout(None)
             threading.Thread(target=lambda: all(iter(lambda: s.recv(65536), b"")), daemon=True).start()
