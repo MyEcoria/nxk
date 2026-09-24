@@ -163,8 +163,8 @@ order:
    here too.
 4. The `display` service takes over the screen, in landscape (hold the
    console normally): midnight-blue background, a header with the nxk
-   logo, the USB, ETH, WI-FI and SD states, the temperature and the
-   uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
+   logo, the USB, ETH, WI-FI, SD and FAN states, the temperature and
+   the uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
    LOGS) and the HOME tiles: CPU, MEMORY, STORAGE (SD card free space),
    NETWORK and TERMINAL, refreshed every second. User space is alive.
    Logs (the kernel's, the services' such as `[usbcon]` or `[sd]`
@@ -289,6 +289,29 @@ for it (`mkbl31.py`): the monitor copies the kernel with the size baked
 into it, and a larger kernel loaded by an older `bl31.bin` loses its
 tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
 5 s (each 512-character line is echoed back before the next).
+
+## Fan
+
+Nyx stops the fan, turns the 5V regulators off and shuts the TMP451
+down before chaining to nxk: until `fan` and `power` start, the SoC
+has no cooling and the last temperature reading stays frozen. Expected
+in the boot log: `[power] temperature sensor was shut down, started`
+(nothing if it was running), then `[fan] ready: SoC NN.N C, duty N%`;
+`[fan] no fan control (ERRNO)` means the PWM block could not be
+clocked, the fan stays off. At the shell:
+
+```text
+fan             duty, mode, SoC temperature, speed measured over 1 s
+fan 100         full speed by hand: audible, about 11000 rpm
+fan 0           stopped (unless the SoC is at 60 C or more)
+fan auto        back to the temperature steps
+```
+
+The header's FAN square is green while it spins, yellow when forced
+(SoC hot, sensor lost), grey when stopped. `fan` reading 0 rpm while
+audible points at the tachometer (GPIO S7, bank 4 interrupt); silent
+at 100% points at the 5V rail (GPIO A5) or the PWM pad (V4).
+`./tools/usbterm.py --reload fan` replaces the driver in place.
 
 ## Hardware runs
 
