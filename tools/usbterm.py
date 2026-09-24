@@ -12,11 +12,18 @@ back. Standard library only.
     usbterm.py --reload wlan -c "wifi status"   # new driver build, restarted
     usbterm.py --emu /tmp/usb.sock   # tegra_qemu: act as the PC's USB host
 
-Interactive mode: Ctrl-] quits. In the emulator, QEMU needs
+Interactive mode edits lines as zsh does: on the PC (Emacs keys, history
+in ~/.local/state/nxk/history with Up/Down prefix search and Ctrl-R,
+syntax highlighting), each typed whole once Enter is pressed. A two-line
+prompt (powerlevel10k "lean") shows the directory, the last status and
+duration, and the time. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
+--raw keeps a plain terminal (keys typed as they come, the shell's echo).
+
+In the emulator, QEMU needs
 `-chardev socket,id=usbotg,path=SOCK,server=on,wait=off`; this script then
 plays the host side of the bus (enumeration, bulk transfers).
 """
-import argparse, base64, glob, io, os, select, socket, struct, sys, termios, threading, time, tty, zlib
+import argparse, base64, codecs, glob, io, os, re, select, signal, socket, struct, sys, termios, threading, time, tty, unicodedata, zlib
 
 VID, PID = 0x1209, 0x0001
 PROMPT = b"nxk> "
@@ -328,27 +335,790 @@ def run(link, cmds, timeout, out=sys.stdout, puts=()):
     return True
 
 
-def interactive(link):
+# Words user/shell's command() runs itself (keep in step with it).
+BUILTINS = set("help echo ps mem cpu uptime progs ls cd pwd cat rm mkdir rmdir mv cp stat df "
+               "sync fbecho events env export unset date sleep temp services poweroff reboot "
+               "recv restart run".split())
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "nxk")
+HISTORY_MAX = 5000
+LINE_MAX = 1000  # bytes the console keeps per line
+# zsh's default WORDCHARS: word motions and Ctrl-W stop at other punctuation.
+WORDCHARS = "*?_-.[]~=/&;!#$%^(){}<>"
+# powerlevel10k "lean" and zsh-syntax-highlighting colors (256-color SGR).
+DIR, OK, ERR, DUR, CLOCK, DIM = "1;38;5;39", "38;5;76", "38;5;196", "38;5;101", "38;5;66", "38;5;242"
+CMD, BAD, QUOTE, PATH, MATCH = "38;5;76", "1;38;5;196", "38;5;178", "4", "1;4"
+CSI_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end"}
+TILDE_KEYS = {"1": "home", "7": "home", "4": "end", "8": "end", "3": "delete"}
+PASTE_ON, PASTE_OFF = "\x1b[200~", "\x1b[201~"
+
+
+def sgr(style, text):
+    return f"\x1b[{style}m{text}\x1b[0m" if text else ""
+
+
+def cells(text):
+    """Terminal columns taken by `text` (no escape sequences)."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in text)
+
+
+def is_word(c):
+    return c.isalnum() or c in WORDCHARS
+
+
+def boot_programs():
+    """Program names of the local boot image (build/bootfs.img), if built."""
+    img = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build", "bootfs.img")
+    try:
+        with open(img, "rb") as f:
+            head = f.read(16)
+            table = f.read(32 * struct.unpack_from("<I", head, 8)[0]) if head[:8] == b"NXKBOOT1" else b""
+    except (OSError, struct.error):
+        return set()
+    return {table[i:i + 24].rstrip(b"\0").decode("utf-8", "replace") for i in range(0, len(table), 32)}
+
+
+def quoted(word):
+    """`word` with its quoted parts colored."""
+    out, seg, quote = [], "", None
+    for c in word:
+        if quote:
+            seg += c
+            if c == quote:
+                out.append(sgr(QUOTE, seg))
+                seg, quote = "", None
+        elif c in "\"'":
+            out.append(seg)
+            seg, quote = c, c
+        else:
+            seg += c
+    out.append(sgr(QUOTE, seg) if quote else seg)
+    return "".join(out)
+
+
+def highlight(line, known):
+    """zsh-syntax-highlighting's main rules: a known command green, an
+    unknown one red, a path underlined, quotes and redirections yellow."""
+    out, i, n, command = [], 0, len(line), True
+    while i < n:
+        j = i
+        if line[i].isspace():
+            while j < n and line[j].isspace():
+                j += 1
+            out.append(line[i:j])
+            i = j
+            continue
+        quote = None
+        while j < n and (quote or not line[j].isspace()):
+            if quote and line[j] == quote:
+                quote = None
+            elif not quote and line[j] in "\"'":
+                quote = line[j]
+            j += 1
+        word = line[i:j]
+        bare = word.replace('"', "").replace("'", "")
+        if word in (">", ">>"):
+            out.append(sgr(QUOTE, word))
+        elif command:
+            out.append(sgr(CMD if bare in known else PATH if "/" in bare else BAD, word))
+            command = bare == "run"
+        else:
+            out.append(quoted(word))
+        i = j
+    return "".join(out)
+
+
+def keys(text):
+    """Keys of typed text: characters (control ones too) as themselves,
+    escape sequences by name ("up", "ctrl-left", "alt-b", "esc")."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c != "\x1b":
+            out.append(c)
+            i += 1
+        elif i + 1 == n:
+            out.append("esc")
+            i += 1
+        elif text[i + 1] in "[O":
+            j = i + 2
+            while j < n and not "\x40" <= text[j] <= "\x7e":
+                j += 1
+            if j == n:
+                break  # truncated sequence
+            params, final = text[i + 2:j], text[j]
+            name = TILDE_KEYS.get(params.split(";")[0]) if final == "~" else CSI_KEYS.get(final)
+            mod = params.split(";")[1] if ";" in params else ""
+            if name and mod in ("3", "5", "9"):
+                name = ("ctrl-" if mod == "5" else "alt-") + name
+            out.append(name or "unknown")
+            i = j + 1
+        else:
+            out.append("alt-backspace" if text[i + 1] in "\x7f\x08" else "alt-" + text[i + 1])
+            i += 2
+    return out
+
+
+def duration(t):
+    if t < 1:
+        return f"{t * 1000:.0f}ms"
+    return f"{t:.1f}s" if t < 60 else f"{int(t // 60)}m{int(t % 60):02d}s"
+
+
+class History:
+    """Command lines, oldest first, kept in a file (zsh's HIST_IGNORE_DUPS
+    and HIST_IGNORE_SPACE)."""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [l.rstrip("\n") for l in f]
+        except OSError:
+            lines = []
+        self.lines = lines[-HISTORY_MAX:]
+        if len(lines) > 2 * HISTORY_MAX:
+            self.save("w", self.lines)
+
+    def add(self, line):
+        if not line.strip() or line[0] == " " or self.lines[-1:] == [line]:
+            return
+        self.lines.append(line)
+        self.save("a", [line])
+
+    def save(self, mode, lines):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, mode, encoding="utf-8") as f:
+                f.writelines(l + "\n" for l in lines)
+        except OSError:
+            pass
+
+
+class Zsh:
+    """zsh-style terminal: the line is edited here and typed whole on
+    Enter. The shell's OSC marks (7: directory, 133: prompt, command,
+    status) drive the prompt drawn here; its `nxk> ` and echo are hidden.
+    While a command runs, keys go through as typed (programs read lines)."""
+
+    def __init__(self, link):
+        self.link = link
+        self.history = History(os.path.join(STATE, "history"))
+        self.learned_path = os.path.join(STATE, "commands")
+        try:
+            self.learned = set(open(self.learned_path, encoding="utf-8").read().split())
+        except OSError:
+            self.learned = set()
+        self.known = BUILTINS | boot_programs() | self.learned
+        # Line editor: characters, cursor, cursor row below the prompt's
+        # second line, kill buffer, last key, Ctrl-R state, pasted lines.
+        self.buf, self.cur, self.row = [], 0, 0
+        self.killed, self.last, self.search, self.paste, self.queue = "", None, None, None, []
+        self.hpos, self.saved, self.prefix = 0, "", ""
+        # What the shell reported, and where the screen stands.
+        self.cwd, self.status, self.took = "/", None, None
+        self.editing = self.at_prompt = self.drawn = self.dirty = self.in_prompt = False
+        self.bol = True
+        self.carry = b""
+        # Echo of the line sent, expected until `deadline`; output held
+        # while editing, until its line ends.
+        self.expect, self.etail, self.ebuf, self.deadline = None, True, b"", 0.0
+        self.pending, self.pending_t = b"", 0.0
+        self.sent_t, self.word, self.cmd_out = None, None, b""
+        # Typed while a command ran: the console's open line, whole lines.
+        self.typed, self.typed_lines = [], []
+        self.t0 = self.last_rx = time.time()
+        self.started = self.resized = self.quit = False
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.obuf = []
+
+    # -- screen ------------------------------------------------------------
+
+    def out(self, data):
+        self.obuf.append(data.encode() if isinstance(data, str) else data)
+
+    def flush(self):
+        data = b"".join(self.obuf)
+        self.obuf = []
+        while data:
+            data = data[os.write(sys.stdout.fileno(), data):]
+
+    @staticmethod
+    def cols():
+        try:
+            return max(os.get_terminal_size(sys.stdout.fileno()).columns, 20)
+        except OSError:
+            return 80
+
+    @staticmethod
+    def up(n):
+        return f"\x1b[{n}A" if n > 0 else ""
+
+    def newline(self):
+        if not self.bol:
+            self.out("\r\n")
+            self.bol = True
+
+    def mark(self):
+        ok = self.status is None or self.status[0] == 0
+        return sgr(OK if ok else ERR, "❯") + " "
+
+    def info(self):
+        """First prompt line: directory left; status, duration, time right."""
+        cols = self.cols()
+        left = sgr(DIR, self.cwd)
+        width = cells(self.cwd)
+        if self.queue:
+            more = f" ({len(self.queue)} pasted line{'s' if len(self.queue) > 1 else ''} next)"
+            left += sgr(DIM, more)
+            width += cells(more)
+        right = []
+        if self.status is not None:
+            code, name = self.status
+            right.append((OK, "✔") if code == 0 else (ERR, f"✘ {code}" + (f" {name}" if name else "")))
+        if self.took is not None:
+            right.append((DUR, duration(self.took)))
+        right.append((CLOCK, " " + time.strftime("%H:%M:%S")))
+        while right:
+            text = " ".join(t for _, t in right)
+            if width + 1 + cells(text) <= cols - 1:
+                pad = " " * (cols - 1 - width - cells(text))
+                return left + pad + " ".join(sgr(s, t) for s, t in right)
+            right.pop()
+        return left
+
+    def draw(self):
+        """Redraw the edited line (from the prompt's second line down)."""
+        cols = self.cols()
+        text = "".join(self.buf)
+        s = self.search
+        if s is not None and s["query"] and s["idx"] < len(self.history.lines):
+            p, q = s["pos"], len(s["query"])
+            body = text[:p] + sgr(MATCH, text[p:p + q]) + text[p + q:]
+        else:
+            body = highlight(text, self.known)
+        end, at = 2 + cells(text), 2 + cells(text[:self.cur])
+        out = [self.up(self.row), "\r\x1b[J", self.mark(), body]
+        end_row = end // cols
+        if end % cols == 0:
+            out.append("\r\n")  # leave the pending wrap: rows stay countable
+        if s is not None:
+            if end % cols:
+                out.append("\r\n")
+                end_row += 1
+            label = ("failing " if s["failing"] else "") + "bck-i-search: " + s["query"] + "_"
+            out.append(label[-(cols - 1):])
+        self.row = at // cols
+        out.append(self.up(end_row - self.row) + "\r" + (f"\x1b[{at % cols}C" if at % cols else ""))
+        self.out("".join(out))
+        self.bol = False
+
+    def draw_full(self, static=False):
+        """Whole prompt; `static`: its second line only up to the mark."""
+        self.out("\x1b[0m" + self.info() + "\r\n")
+        self.row = 0
+        if static:
+            self.out(self.mark())
+            self.bol = False
+        else:
+            self.draw()
+
+    def erase(self):
+        """Remove the prompt being edited (output goes in its place)."""
+        self.out(self.up(self.row + 1) + "\r\x1b[J")
+        self.row = 0
+        self.bol = True
+
+    # -- output of the Switch -----------------------------------------------
+
+    def on_output(self, data):
+        self.last_rx = time.time()
+        if self.expect is not None:
+            self.ebuf += data
+            data = self.unecho(False)
+            if data is None:
+                return
+        self.parse(data)
+
+    def unecho(self, force):
+        """Held output less the echo of the line sent; None while waiting."""
+        buf, echo = self.ebuf, self.expect
+        for tail in (b"\r\n", b"\n") if self.etail else (b"",):
+            k = buf.find(echo + tail)
+            if k >= 0:
+                self.expect, self.ebuf = None, b""
+                return buf[:k] + buf[k + len(echo) + len(tail):]
+        if force or b"\x1b]133;" in buf:  # echo lost: show all
+            self.expect, self.ebuf = None, b""
+            return buf
+        return None
+
+    def parse(self, data):
+        """Split output into text and OSC sequences (ESC ] ... BEL)."""
+        buf, self.carry = self.carry + data, b""
+        start = 0
+        while True:
+            k = buf.find(b"\x1b]", start)
+            if k < 0:
+                if buf.endswith(b"\x1b"):
+                    self.text(buf[start:-1])
+                    self.carry = b"\x1b"
+                else:
+                    self.text(buf[start:])
+                return
+            self.text(buf[start:k])
+            e = buf.find(b"\x07", k)
+            if e < 0:
+                if len(buf) - k < 512:
+                    self.carry = buf[k:]
+                else:
+                    self.text(buf[k:])
+                return
+            self.osc(buf[k + 2:e].decode("utf-8", "replace"))
+            start = e + 1
+
+    def osc(self, body):
+        if body.startswith("7;"):
+            m = re.match(r"7;file://[^/]*(/.*)", body)
+            self.cwd = m.group(1) if m else self.cwd
+        elif body == "133;A":
+            self.in_prompt = True
+        elif body.startswith("133;B"):
+            self.in_prompt = False
+            if not self.editing:
+                self.at_prompt, self.drawn, self.dirty = True, False, False
+        elif body.startswith("133;C"):
+            if self.editing:  # someone typed on UART-A
+                self.flush_pending(True)
+                self.erase()
+                self.editing = False
+            elif self.at_prompt and self.typed_lines:
+                # A line typed during the last command, run by the shell now.
+                line = self.typed_lines.pop(0)
+                if not self.drawn:
+                    self.newline()
+                    self.draw_full(static=True)
+                self.out(highlight(line, self.known) + "\r\n")
+                self.bol = True
+                self.started_cmd(line)
+            self.at_prompt = False
+        elif body.startswith("133;D"):
+            parts = body.split(";")
+            code = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+            self.status = (code, next((p[4:] for p in parts[3:] if p.startswith("err=")), ""))
+            self.took = time.time() - self.sent_t if self.sent_t else None
+            self.sent_t = None
+            self.learn()
+        else:
+            self.text(f"\x1b]{body}\x07".encode())
+
+    def text(self, data):
+        if not data or self.in_prompt:
+            return
+        if self.word and len(self.cmd_out) < 8192:
+            self.cmd_out += data
+        if self.editing:
+            if not self.pending:
+                self.pending_t = time.time()
+            self.pending += data
+            self.flush_pending(False)
+            return
+        if self.at_prompt:
+            # Output after a prompt not edited yet: an echo in the history
+            # replayed at start, or a message; drawn after that prompt.
+            if not self.drawn:
+                self.newline()
+                self.draw_full(static=True)
+                self.drawn = True
+            self.dirty = True
+        self.out(data)
+        self.bol = data.endswith(b"\n")
+
+    def flush_pending(self, force):
+        """Output that came while editing, above the prompt: whole lines,
+        or everything once `force`d (a line left open for 100 ms)."""
+        if not self.pending:
+            return
+        if force:
+            chunk, self.pending = self.pending, b""
+        else:
+            k = self.pending.rfind(b"\n")
+            if k < 0:
+                return
+            chunk, self.pending = self.pending[:k + 1], self.pending[k + 1:]
+            self.pending_t = time.time()
+        self.erase()
+        self.out(chunk)
+        self.bol = chunk.endswith(b"\n")
+        self.newline()
+        self.draw_full()
+
+    def learn(self):
+        """Commands learned from their outcome, for the highlighting."""
+        word, self.word = self.word, None
+        out = self.cmd_out.decode("utf-8", "replace")
+        new = set(self.learned)
+        if word == "progs" and self.status[0] == 0:
+            new |= {w for w in out.split() if re.fullmatch(r"[\w.+-]+", w)}
+        elif word and word not in BUILTINS and "/" not in word:
+            if "unknown command or program" in out:
+                new.discard(word)
+                self.known.discard(word)
+            else:
+                new.add(word)
+        if new != self.learned:
+            self.learned = new
+            self.known |= new
+            try:
+                os.makedirs(STATE, exist_ok=True)
+                with open(self.learned_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(sorted(new)) + "\n")
+            except OSError:
+                pass
+
+    def tick(self):
+        now = time.time()
+        if self.expect is not None and now > self.deadline:
+            self.parse(self.unecho(True))
+        if self.pending and now - self.pending_t > 0.1:
+            self.flush_pending(True)
+        if not self.started and (now - self.t0 > 0.3 and now - self.last_rx > 0.15 or now - self.t0 > 3):
+            # History replayed; no prompt at its end (a command runs, or
+            # nothing new since the last terminal): ask for one.
+            self.started = True
+            if not self.at_prompt and not self.editing:
+                self.send("")
+        if self.at_prompt and not self.editing and now - self.last_rx > 0.05:
+            self.activate()
+        if self.resized and self.editing:
+            self.draw()
+        self.resized = False
+
+    # -- line editor ---------------------------------------------------------
+
+    def activate(self):
+        self.editing = True
+        self.typed_lines = []
+        if self.typed:
+            # Typed during the last command, still open in the console:
+            # erased there, edited here (zsh's type-ahead).
+            n = len(self.typed)
+            self.buf, self.typed = self.typed + self.buf, []
+            self.cur = len(self.buf)
+            self.link.write(b"\x7f" * n)
+            self.expect, self.etail, self.ebuf, self.deadline = b"\x08 \x08" * n, False, b"", time.time() + 1.0
+        if self.queue and not self.buf:
+            self.set_line(self.queue.pop(0))
+        if self.drawn and not self.dirty:
+            self.row = 0
+            self.draw()
+        else:
+            self.newline()
+            self.draw_full()
+
+    def send(self, line):
+        data = line.encode()
+        self.link.write(data + b"\r")
+        self.expect, self.etail, self.ebuf, self.deadline = data, True, b"", time.time() + 1.0
+
+    def started_cmd(self, line):
+        """A command sent: its word (learned from its outcome), start time."""
+        words = line.split()
+        if words and words[0] == "run":
+            words = words[1:]
+        self.word = words[0].replace('"', "").replace("'", "") if words else None
+        self.cmd_out = b""
+        self.sent_t = time.time() if words else None
+        if not words:
+            self.took = None
+
+    def submit(self):
+        line = "".join(self.buf)
+        self.search = None
+        self.cur = len(self.buf)
+        self.draw()
+        self.out("\r\n")
+        self.bol, self.row = True, 0
+        self.editing = self.at_prompt = False
+        self.buf, self.cur = [], 0
+        if line.strip() in ("exit", "logout"):
+            self.quit = True
+            return
+        self.history.add(line)
+        self.hpos = len(self.history.lines)
+        self.started_cmd(line)
+        self.send(line)
+
+    def set_line(self, text):
+        self.buf, self.cur = list(text), len(text)
+
+    def insert(self, text):
+        text = "".join(c for c in text if c.isprintable())
+        room = LINE_MAX - len("".join(self.buf).encode())
+        while text and len(text.encode()) > room:
+            text = text[:-1]
+        self.buf[self.cur:self.cur] = text
+        self.cur += len(text)
+
+    def kill(self, a, b):
+        if a < b:
+            self.killed = "".join(self.buf[a:b])
+            del self.buf[a:b]
+            self.cur = a
+
+    def word_left(self):
+        i = self.cur
+        while i > 0 and not is_word(self.buf[i - 1]):
+            i -= 1
+        while i > 0 and is_word(self.buf[i - 1]):
+            i -= 1
+        return i
+
+    def word_right(self):
+        i, n = self.cur, len(self.buf)
+        while i < n and not is_word(self.buf[i]):
+            i += 1
+        while i < n and is_word(self.buf[i]):
+            i += 1
+        return i
+
+    def history_move(self, step, prefix):
+        """Up/Down: older/newer lines starting like the text before the
+        cursor (up-line-or-beginning-search); Ctrl-P/N: any line."""
+        h = self.history.lines
+        if self.last not in ("up", "down", "\x10", "\x0e"):
+            self.hpos, self.saved = len(h), "".join(self.buf)
+            self.prefix = "".join(self.buf[:self.cur]) if prefix else ""
+        now = "".join(self.buf)
+        i = self.hpos + step
+        while 0 <= i < len(h) and (not h[i].startswith(self.prefix) or h[i] == now):
+            i += step
+        if i < 0:
+            return
+        self.hpos = min(i, len(h))
+        self.set_line(h[i] if i < len(h) else self.saved)
+
+    def find(self, start, step):
+        s, h = self.search, self.history.lines
+        i = start
+        while s["query"] and 0 <= i < len(h):
+            k = h[i].find(s["query"])
+            if k >= 0:
+                s.update(idx=i, pos=k, failing=False)
+                self.set_line(h[i])
+                self.cur = k
+                return
+            i += step
+        s["failing"] = bool(s["query"])
+
+    def isearch(self, t):
+        """Ctrl-R incremental search; False: the key leaves the search and
+        then acts on the line found."""
+        s, h = self.search, self.history.lines
+        if t in ("\x12", "\x13"):
+            self.find(s["idx"] + (-1 if t == "\x12" else 1), -1 if t == "\x12" else 1)
+        elif t in ("\x7f", "\x08"):
+            s["query"] = s["query"][:-1]
+            s.update(idx=len(h), failing=False)
+            self.set_line(s["orig"])
+            self.find(len(h) - 1, -1)
+        elif t in ("\x07", "esc"):
+            self.set_line(s["orig"])
+            self.search = None
+        elif isinstance(t, str) and len(t) == 1 and t.isprintable():
+            s["query"] += t
+            self.find(min(s["idx"], len(h) - 1), -1)
+        else:
+            self.search = None
+            return False
+        return True
+
+    def edit(self, t):
+        if self.search is not None and self.isearch(t):
+            self.last = t
+            self.draw()
+            return
+        b = self.buf
+        if isinstance(t, tuple):  # bracketed paste: one line, others next
+            lines = [l for l in t[1].replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").split("\n")]
+            self.insert(lines[0])
+            self.queue += [l for l in lines[1:] if l.strip()]
+            if len(lines) > 1:
+                self.erase()
+                self.draw_full()
+                self.last = None
+                return
+        elif t in ("\r", "\n"):
+            self.last = None
+            return self.submit()
+        elif t == "\x04" and not b:
+            self.quit = True
+            return
+        elif t in ("\x04", "delete"):
+            del b[self.cur:self.cur + 1]
+        elif t in ("\x7f", "\x08"):
+            if self.cur:
+                self.cur -= 1
+                del b[self.cur]
+        elif t in ("left", "\x02"):
+            self.cur = max(0, self.cur - 1)
+        elif t in ("right", "\x06"):
+            self.cur = min(len(b), self.cur + 1)
+        elif t in ("home", "\x01"):
+            self.cur = 0
+        elif t in ("end", "\x05"):
+            self.cur = len(b)
+        elif t in ("alt-b", "ctrl-left", "alt-left"):
+            self.cur = self.word_left()
+        elif t in ("alt-f", "ctrl-right", "alt-right"):
+            self.cur = self.word_right()
+        elif t in ("\x17", "alt-backspace"):
+            self.kill(self.word_left(), self.cur)
+        elif t == "alt-d":
+            self.kill(self.cur, self.word_right())
+        elif t == "\x0b":
+            self.kill(self.cur, len(b))
+        elif t == "\x15":
+            self.kill(0, len(b))
+        elif t == "\x19":
+            self.insert(self.killed)
+        elif t == "\x14" and 0 < self.cur:  # Ctrl-T: swap the last two
+            i = min(self.cur, len(b) - 1)
+            if i > 0:
+                b[i - 1], b[i] = b[i], b[i - 1]
+                self.cur = i + 1
+        elif t in ("up", "\x10", "down", "\x0e"):
+            self.history_move(-1 if t in ("up", "\x10") else 1, t in ("up", "down"))
+        elif t == "\x12":
+            h = self.history.lines
+            self.search = dict(query="", idx=len(h), pos=0, failing=False, orig="".join(b))
+        elif t == "\x0c":  # Ctrl-L
+            self.out("\x1b[H\x1b[2J")
+            self.draw_full()
+            self.last = t
+            return
+        elif t == "\x03":  # Ctrl-C: leave the line, new prompt
+            self.search, self.cur, self.queue = None, len(b), []
+            self.draw()
+            self.out("\r\n")
+            self.buf, self.cur = [], 0
+            self.draw_full()
+            self.last = t
+            return
+        elif len(t) == 1 and t.isprintable():
+            self.insert(t)
+        self.last = t
+        self.draw()
+
+    # -- keyboard ------------------------------------------------------------
+
+    def on_keys(self, data):
+        if QUIT in data:
+            data = data[:data.index(QUIT)]
+            self.quit = True
+        text = self.decoder.decode(data)
+        while text:
+            if self.paste is not None:
+                k = text.find(PASTE_OFF)
+                self.paste += text if k < 0 else text[:k]
+                if k < 0:
+                    return
+                text, pasted, self.paste = text[k + len(PASTE_OFF):], self.paste, None
+                self.key(("paste", pasted))
+                continue
+            k = text.find(PASTE_ON)
+            head, text = (text, "") if k < 0 else (text[:k], text[k + len(PASTE_ON):])
+            for t in keys(head):
+                self.key(t)
+            if k >= 0:
+                self.paste = ""
+
+    def key(self, t):
+        if self.quit:
+            return
+        if self.editing:
+            self.edit(t)
+        elif self.at_prompt:
+            self.activate()
+            self.edit(t)
+        elif isinstance(t, tuple) or len(t) == 1:
+            # A command runs: keys typed as they come (programs read lines).
+            text = t[1].replace("\r\n", "\r").replace("\n", "\r") if isinstance(t, tuple) else t
+            for c in text:
+                if c == "\r":
+                    self.typed_lines.append("".join(self.typed))
+                    self.typed = []
+                elif c in "\x7f\x08":
+                    self.typed = self.typed[:-1]
+                elif c.isprintable():
+                    self.typed.append(c)
+                self.link.write(c.encode())
+
+    def run(self):
+        print(f"[usbterm] {self.link.name}; Ctrl-D or Ctrl-] quits\r", file=sys.stderr)
+        stdin = sys.stdin.fileno()
+        saved = termios.tcgetattr(stdin)
+        tty.setraw(stdin)
+        old = signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "resized", True))
+        serial = isinstance(self.link, Serial)
+        fds = [stdin] + ([self.link.fd] if serial else [])
+        self.out("\x1b[?2004h")  # bracketed paste
+        self.flush()
+        try:
+            while not self.quit:
+                busy = (self.expect is not None or self.pending or not self.started
+                        or self.at_prompt and not self.editing)
+                ready = select.select(fds, [], [], (0.02 if busy else 0.25) if serial else 0.0)[0]
+                if stdin in ready:
+                    self.on_keys(os.read(stdin, 4096))
+                if not serial or self.link.fd in ready:
+                    data = self.link.read(0.0 if serial else 0.02)
+                    if data:
+                        self.on_output(data)
+                self.tick()
+                self.flush()
+        finally:
+            self.obuf = []
+            self.out("\x1b[?2004l\x1b[0m")
+            self.flush()
+            signal.signal(signal.SIGWINCH, old)
+            termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
+            print(("" if self.bol else "\r\n") + "[usbterm] bye", file=sys.stderr)
+
+
+def interactive(link, raw=False):
+    """zsh-style terminal, or the plain one (`raw`, or not a terminal)."""
+    if raw or not (os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())):
+        passthrough(link)
+    else:
+        Zsh(link).run()
+
+
+def passthrough(link):
     """Keyboard to the Switch, its output to the screen, until Ctrl-]."""
     print(f"[usbterm] {link.name}; Ctrl-] quits\r", file=sys.stderr)
     stdin = sys.stdin.fileno()
-    saved = termios.tcgetattr(stdin)
-    tty.setraw(stdin)
+    saved = termios.tcgetattr(stdin) if os.isatty(stdin) else None
+    if saved:
+        tty.setraw(stdin)
+    fds = [stdin]
     try:
         link.write(b"\r")
         while True:
-            if select.select([stdin], [], [], 0.0)[0]:
-                keys = os.read(stdin, 1024)
-                if QUIT in keys:
-                    keys = keys[:keys.index(QUIT)]
-                    link.write(keys)
+            if select.select(fds, [], [], 0.0)[0]:
+                typed = os.read(stdin, 1024)
+                if not typed:
+                    fds = []  # end of piped input
+                if QUIT in typed:
+                    link.write(typed[:typed.index(QUIT)])
                     break
-                link.write(keys)
+                link.write(typed)
             data = link.read(0.02)
             if data:
                 os.write(sys.stdout.fileno(), data)
     finally:
-        termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
+        if saved:
+            termios.tcsetattr(stdin, termios.TCSADRAIN, saved)
         print("\r\n[usbterm] bye", file=sys.stderr)
 
 
@@ -358,6 +1128,8 @@ def main():
     ap.add_argument("--emu", metavar="SOCKET", help="tegra_qemu 'usbotg' chardev socket")
     ap.add_argument("-c", "--cmd", action="append", default=[], help="command to type (repeatable)")
     ap.add_argument("--timeout", type=float, default=30, help="per-command timeout (s)")
+    ap.add_argument("--raw", action="store_true",
+                    help="plain terminal: keys typed as they come, the shell's own prompt and echo")
     ap.add_argument("--put", action="append", default=[], metavar="LOCAL:REMOTE",
                     help="copy a file to the Switch's card first (repeatable)")
     ap.add_argument("--reload", action="append", default=[], metavar="DRIVER",
@@ -386,7 +1158,7 @@ def main():
         if cmds or puts:
             print(f"[usbterm] {link.name}", file=sys.stderr)
             sys.exit(0 if run(link, cmds, a.timeout, puts=puts) else 1)
-        interactive(link)
+        interactive(link, a.raw)
     except (ConnectionError, TimeoutError, Stall) as e:
         sys.exit(f"\n[usbterm] {e}")
     finally:

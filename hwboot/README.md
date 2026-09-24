@@ -204,10 +204,21 @@ and the echo would be typed into the shell.
    `host seen, not configured` and `connected, high speed, terminal
    closed` once the PC has enumerated it (`dmesg`: `cdc_acm ...
    ttyACM0: USB ACM device`).
-3. On the PC: `../tools/usbterm.py` (Ctrl-] quits), or
+3. On the PC: `../tools/usbterm.py`, or
    `../tools/usbterm.py -c ps -c mem` to run commands and exit. Any
    serial terminal works too (`picocom /dev/nxk-console`). The line
    then reads `terminal open, high speed` with the bytes each way.
+
+`usbterm.py` edits lines as zsh does: the line is edited on the PC and
+typed whole on Enter (Emacs keys, Up/Down search the history for lines
+starting with what is typed, Ctrl-R searches it, `~/.local/state/nxk/`
+keeps it), commands are colored as typed (known ones green, unknown red,
+quotes and `>` yellow), and a two-line prompt gives the directory, the
+last status (`✘ 2 ENOENT`), its duration and the time. Messages that
+come while a line is edited print above the prompt; keys typed while a
+command runs reach it as typed, and whatever was left unsent comes back
+in the next prompt. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
+`--raw` is the plain terminal (the shell's `nxk> ` and echo).
 
 The USB-C line locates a failure:
 
