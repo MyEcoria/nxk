@@ -19,11 +19,10 @@ pub fn screen(text: &str) -> Result<(), i64> {
         .map(|_| ())
 }
 
-/// A driver failure: `[who] text` on the console, `who: text` on the
-/// screen, a Switch's only output without a PC attached.
+/// A driver failure: `[who] text` on the console, a log, which the
+/// screen's LOGS page shows too (a Switch's only output without a PC).
 pub fn report(who: &str, text: &str) {
     crate::println!("[{}] {}", who, text);
-    let _ = screen(&alloc::format!("{}: {}\n", who, text));
 }
 
 /// Hardware capability number `k` received from init.
