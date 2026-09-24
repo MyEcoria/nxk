@@ -4,7 +4,8 @@
 //! Nothing waits on the UART: output lands in one ring that the TX-empty
 //! interrupt drains to UART-A and the terminal driver reads at its own
 //! pace; the kernel log is drained into it too. The screen reads the
-//! same ring without taking from it (TERMINAL page).
+//! same ring without taking from it (TERMINAL page). Everything but the
+//! shell's session (its handle's badge) comes between LOG marks.
 
 #![no_std]
 #![no_main]
@@ -100,6 +101,15 @@ impl Console {
         self.term_wake();
     }
 
+    /// A log (not the session's output): between the LOG marks.
+    fn log(&mut self, data: &[u8]) {
+        if !data.is_empty() {
+            self.push(proto::LOG_START);
+            self.push(data);
+            self.out(proto::LOG_END);
+        }
+    }
+
     /// Fill the TX FIFO if it is empty; the TX-empty interrupt stays
     /// armed while bytes remain.
     fn uart_tx(&mut self) {
@@ -152,11 +162,13 @@ impl Console {
             let quiet = skip.min(n as u64) as usize;
             skip -= quiet as u64;
             let caught_up = self.uart_pos >= self.out.head;
+            self.push(proto::LOG_START);
             self.push(&buf[..quiet]);
             if caught_up {
                 self.uart_pos = self.out.head;
             }
-            self.out(&buf[quiet..n]);
+            self.push(&buf[quiet..n]);
+            self.out(proto::LOG_END);
         }
     }
 
@@ -219,7 +231,11 @@ impl Console {
         Some(match rx.msg.label() {
             proto::WRITE => {
                 let n = ipc::unpack(&rx.msg, buf);
-                self.out(&buf[..n]);
+                if rx.badge == proto::BADGE_SESSION {
+                    self.out(&buf[..n]);
+                } else {
+                    self.log(&buf[..n]);
+                }
                 Msg::new(0, 0, 0)
             }
             proto::READ_LINE => match self.lines.pop_front() {
