@@ -60,10 +60,11 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 6,
     },
+    // APB_MISC read-only: the chip revision (the TMP451's Mariko offset).
     Driver {
         name: "power",
         mmio: &[],
-        ro_mmio: &[],
+        ro_mmio: &[(0x7000_0000, 0x1000)],
         irqs: &[],
         sysctl: true,
         console: 0,

@@ -1,13 +1,14 @@
 //! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
 //! PCIe and touchscreen rails.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
+//! The TMP451 is started again as hekate's `tmp451_init` does.
 
 #![no_std]
 #![no_main]
 
 use libnx::abi::err::EINVAL;
 use libnx::abi::proto::power as proto;
-use libnx::drv;
+use libnx::drv::{self, Mmio};
 use libnx::i2c::I2c;
 use libnx::ipc::Msg;
 use libnx::{println, sys, time};
@@ -15,6 +16,21 @@ use libnx::{println, sys, time};
 const PMIC: u8 = 0x3C;
 const RTC: u8 = 0x68;
 const TMP451: u8 = 0x4C;
+/// TMP451 registers (hekate bdk/thermal/tmp451.h): configuration and
+/// conversion rate are written at 0x09, 0x0A, read back at 0x03, 0x04.
+const TMP451_CONFIG: u8 = 0x09;
+const TMP451_CONFIG_READ: u8 = 0x03;
+const TMP451_RATE: u8 = 0x0A;
+const TMP451_OFFSET: [u8; 2] = [0x11, 0x12];
+/// ALERT masked, converting (bit 6 = shut down), 0-127 C range.
+const TMP451_RUN: u8 = 0x80;
+const TMP451_SHUTDOWN: u8 = 1 << 6;
+/// Conversion rate codes: 31 ms, 4 s.
+const RATE_31MS: u8 = 9;
+const RATE_4S: u8 = 2;
+
+const APB_MISC: u64 = 0x7000_0000;
+const GP_HIDREV: usize = 0x804;
 
 /// MAX77620 LDO2 (SD card I/O): voltage in bits 5:0 (0.8 V + 50 mV steps),
 /// power mode in bits 7:6 (3 = normal), as hekate bdk/power/max7762x.c.
@@ -109,6 +125,23 @@ fn sync_time(i2c: &I2c, sysctl: u32) -> Result<i64, i64> {
     Ok(s)
 }
 
+/// hekate `tmp451_init`: Nyx shuts the sensor down (`tmp451_end`) before
+/// chaining to nxk, freezing its last reading. Mariko's SoC diode reads
+/// 12.5 C high. Returns the configuration found.
+fn sensor_start(i2c: &I2c, mariko: bool) -> Result<u8, i64> {
+    let was = i2c.read_reg(1, TMP451, TMP451_CONFIG_READ)?;
+    i2c.write_reg(1, TMP451, TMP451_CONFIG, TMP451_RUN)?;
+    let offset = if mariko { [0xF3, 0x80] } else { [0, 0] };
+    for (reg, v) in TMP451_OFFSET.into_iter().zip(offset) {
+        i2c.write_reg(1, TMP451, reg, v)?;
+    }
+    // A fresh reading at once, then one every 4 s.
+    i2c.write_reg(1, TMP451, TMP451_RATE, RATE_31MS)?;
+    time::sleep_ms(70);
+    i2c.write_reg(1, TMP451, TMP451_RATE, RATE_4S)?;
+    Ok(was)
+}
+
 /// Temperature in millidegrees (high byte + 4 fraction bits).
 fn temperature(i2c: &I2c, hi: u8, lo: u8) -> Result<i64, i64> {
     let h = i2c.read_reg(1, TMP451, hi)? as i64;
@@ -119,8 +152,20 @@ fn temperature(i2c: &I2c, hi: u8, lo: u8) -> Result<i64, i64> {
 libnx::entry!(main);
 
 fn main() -> i32 {
-    let sysctl = drv::dev_slot(0);
+    let mariko = Mmio::map(drv::dev_slot(0), APB_MISC, 0x1000)
+        .is_ok_and(|m| (m.r32(GP_HIDREV) >> 4) & 0xF >= 2);
+    let sysctl = drv::dev_slot(1);
     let i2c = I2c::connect().expect("power: i2c service");
+    match sensor_start(&i2c, mariko) {
+        Ok(was) if was & TMP451_SHUTDOWN != 0 => {
+            println!("[power] temperature sensor was shut down, started")
+        }
+        Ok(_) => {}
+        Err(e) => println!(
+            "[power] temperature sensor missing ({})",
+            libnx::abi::err::name(e)
+        ),
+    }
     match sync_time(&i2c, sysctl) {
         Ok(s) => {
             let d = s / 86_400;
