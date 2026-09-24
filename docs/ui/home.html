@@ -673,7 +673,7 @@ const HEAD = 64, TABS = 96, M = 16;
 const CY = HEAD + M, CH = H - HEAD - TABS - 2 * M; // content: y 80, 528 high
 const PAGES = ['HOME', 'SYSTEM', 'NETWORK', 'TERMINAL', 'LOGS'];
 const ui = {
-  view: 'proposal', page: 0, pressed: null, down: null, modal: null, toast: null, scan: null,
+  view: 'proposal', page: 0, pressed: null, down: null, modal: null, fanPanel: false, toast: null, scan: null,
   logScale: 1, termScale: 1, unread: 0, off: false, blackUntil: 0, grid: 0, showZones: false,
 };
 let zones = [];
@@ -755,14 +755,17 @@ function header() {
   x -= scr.textR(x, 16, `up ${hms(up())}`, 2, FG, PANEL) + 32;
   const [t, tc] = sim.temps === 'value' ? [celsius(sim.chip), FG] : ['--.-°C', DIM];
   x -= scr.textR(x, 16, t, 2, tc, PANEL) + 32;
-  for (const [id, name, color, page] of [['c-fan', 'FAN', fanColor(), 1], ['c-sd', 'SD', sdColor(), null],
-                                         ['c-wifi', 'WI-FI', wifiColor(), 2],
-                                         ['c-eth', 'ETH', ethColor(), 2], ['c-usb', 'USB', usbColor(), 3]]) {
+  // Each chip opens a page, or the FAN panel.
+  const openFan = () => { ui.fanPanel = true; };
+  for (const [id, name, color, open] of [['c-fan', 'FAN', fanColor(), openFan], ['c-sd', 'SD', sdColor(), null],
+                                         ['c-wifi', 'WI-FI', wifiColor(), () => go(2)],
+                                         ['c-eth', 'ETH', ethColor(), () => go(2)],
+                                         ['c-usb', 'USB', usbColor(), () => go(3)]]) {
     const w = 20 + tw(name, 2), bx = x - w, bg = ui.pressed === id ? PRESS : PANEL;
     if (bg !== PANEL) scr.fill(bx - 8, 8, w + 16, HEAD - 18, bg);
     scr.fill(bx, 26, 12, 12, color);
     scr.text(bx + 20, 16, name, 2, color === DIM ? DIM : FG, bg);
-    if (page !== null) zone(id, bx - 8, 0, w + 16, HEAD - 2, () => go(page));
+    if (open) zone(id, bx - 8, 0, w + 16, HEAD - 2, open);
     x = bx - 24;
   }
 }
@@ -890,7 +893,13 @@ function system() {
   const f = fanNow();
   const [ft, fc] = f ? [`${f.mode[0]}: ${f.pct ? `${f.pct}%, ${f.rpm} rpm` : 'off'}`, f.mode[1]]
     : [sim.fan === 'missing' ? 'no fan control' : 'starting', DIM];
-  kv(xR + 16, xR + w - 16, py + 136, 'fan', ft, fc);
+  // The fan row opens the FAN panel.
+  const fy = py + 136, fbg = ui.pressed === 's-fan' ? PRESS : PANEL;
+  scr.fill(xR + 8, fy - 8, w - 16, 48, fbg);
+  scr.text(xR + 16, fy, 'fan', 2, DIM, fbg);
+  scr.textR(xR + w - 48, fy, ft, 2, fc, fbg);
+  scr.textR(xR + w - 16, fy, '>', 2, DIM, fbg);
+  zone('s-fan', xR + 8, fy - 8, w - 16, 48, () => { ui.fanPanel = true; });
   const bw = (w - 48) / 2, bh = 64, by = py + 256 - 16 - bh;
   button('reboot', xR + 16, by, bw, bh, 'REBOOT', WARN, () => ask({
     title: 'Reboot the Switch?', ok: 'REBOOT', tone: WARN,
@@ -1059,6 +1068,48 @@ function toastBar() {
   scr.text(2 * M, y + 8, ui.toast.text, 2, FG, PANEL);
 }
 
+// FAN panel (user/display ui.rs fan_panel): auto or by hand, 10% steps.
+const FAN_STEP = 10;
+function setFan(v) {
+  act(`fan::SET ${v === 'auto' ? 'AUTO' : v + '%'}`);
+  if (v === 'auto') sim.fan = 'auto'; else Object.assign(sim, { fan: 'manual', fanManual: v });
+  syncControls();
+}
+function fanPanel() {
+  const x = 240, y = 96, w = 800, h = 528, bh = 72;
+  scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
+  scr.fill(x, y, w, h, PANEL);
+  scr.frame(x, y, w, h, 4, ACCENT);
+  scr.text(x + 32, y + 32, 'FAN', 2, ACCENT, PANEL);
+  const f = fanNow();
+  if (f) {
+    const soc = sim.fan === 'nosensor' ? '' : `SoC ${celsius(sim.pkg)}`;
+    scr.textR(x + w - 32, y + 32, f.pct ? `${soc}   ${f.rpm} rpm` : soc, 2, FG, PANEL);
+    const manual = sim.fan === 'manual' ? sim.fanManual : null, bw = (w - 96) / 2;
+    [['f-auto', 'AUTO', manual === null, () => { if (manual !== null) setFan('auto'); }],
+     ['f-manual', 'MANUAL', manual !== null, () => { if (manual === null) setFan(f.pct); }]]
+      .forEach(([id, name, on, tap], k) => {
+        const bx = x + 32 + k * (bw + 32);
+        button(id, bx, y + 96, bw, bh, name, on ? ACCENT : null, tap);
+        if (on) scr.fill(bx + 16, y + 96 + bh - 12, bw - 32, 4, ACCENT);
+      });
+    const forced = sim.fan === 'hot' || sim.fan === 'nosensor';
+    const sw = 160, sh = 112, sy = y + 200, shown = manual ?? f.pct;
+    button('f-down', x + 32, sy, sw, sh, '-10%', null, manual !== null && shown > 0
+      ? () => setFan(Math.max(0, (Math.ceil(shown / FAN_STEP) - 1) * FAN_STEP)) : null);
+    button('f-up', x + w - 32 - sw, sy, sw, sh, '+10%', null, manual !== null && shown < 100
+      ? () => setFan(Math.min(100, (Math.floor(shown / FAN_STEP) + 1) * FAN_STEP)) : null);
+    scr.textC(x + w / 2, sy + 4, `${shown}%`, 4, forced ? WARN : FG, PANEL);
+    const bx = x + 32 + sw + 24;
+    bar(bx, sy + 88, w - 2 * (32 + sw + 24), 16, f.pct, forced ? WARN : GOOD);
+    const [note, c] = sim.fan === 'hot' ? ['SoC hot: full speed until below 57°C', WARN]
+      : sim.fan === 'nosensor' ? ['No temperature: at least 43%', WARN]
+      : manual !== null ? ['Full speed anyway from 60°C', DIM] : ['Follows the SoC temperature', DIM];
+    scr.text(x + 32, y + 352, note, 2, c, PANEL);
+  } else scr.text(x + 32, y + 96, sim.fan === 'missing' ? 'no fan control' : 'starting', 2, DIM, PANEL);
+  const cw = 240;
+  button('f-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.fanPanel = false; });
+}
 function modal() {
   const m = ui.modal, x = 240, y = 180, w = 800, h = 320;
   scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
@@ -1082,6 +1133,7 @@ function drawProposal() {
   [home, system, network, terminal, logs][ui.page]();
   tabBar();
   if (ui.toast && Date.now() < ui.toast.until) toastBar();
+  if (ui.fanPanel) { zones = []; fanPanel(); }
   if (ui.modal) { zones = []; modal(); }
 }
 
@@ -1127,7 +1179,7 @@ function boot() {
   const gen = ++bootGen;
   Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', usb: 'waiting', eth: 'nopc', wifi: 'unknown',
                        sd: 'unknown', msgs: [], partial: '', usbIn: 0, usbOut: 0, rx: 0, tx: 0 });
-  Object.assign(ui, { page: 0, scan: null, modal: null, unread: 0 });
+  Object.assign(ui, { page: 0, scan: null, modal: null, fanPanel: false, unread: 0 });
   write('display: 720x1280 panel, turned landscape\n');
   termBoot();
   const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', eth: 'dhcp' }],

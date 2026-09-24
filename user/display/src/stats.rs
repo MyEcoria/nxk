@@ -76,6 +76,23 @@ pub struct Fan {
     pub state: u64,
     /// Last speed measured (RPM).
     pub rpm: Option<u64>,
+    /// Duty set by hand (%); none in auto.
+    pub manual: Option<u64>,
+    /// SoC temperature (millidegrees C).
+    pub temp: Option<i64>,
+}
+
+impl Fan {
+    /// A `fan::STATUS` (or `SET`) reply.
+    pub fn from_reply(m: &Msg) -> Self {
+        Self {
+            percent: m.mr[0],
+            state: m.mr[1],
+            rpm: (m.mr[3] != fan::NO_RPM).then_some(m.mr[3]),
+            manual: (m.mr[4] != fan::AUTO).then_some(m.mr[4]),
+            temp: (m.mr[2] != fan::NO_TEMP).then_some(m.mr[2] as i64),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -253,11 +270,7 @@ impl Data {
         self.temps.poll(&POWER, power::TEMPERATURE, n, force, |m| {
             (m.mr[0] as i64, m.mr[1] as i64)
         });
-        self.fan.poll(&FAN, fan::STATUS, n, true, |m| Fan {
-            percent: m.mr[0],
-            state: m.mr[1],
-            rpm: (m.mr[3] != fan::NO_RPM).then_some(m.mr[3]),
-        });
+        self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {
                 state: m.mr[0],

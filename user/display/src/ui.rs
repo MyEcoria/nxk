@@ -32,14 +32,22 @@ const SYSTEM: usize = 1;
 const NETWORK: usize = 2;
 pub const TERMINAL: usize = 3;
 pub const LOGS: usize = 4;
-/// Header chips (fan, SD, Wi-Fi, Ethernet, USB) and the page each opens.
-const CHIP_PAGES: [Option<usize>; 5] = [
-    Some(SYSTEM),
-    None,
-    Some(NETWORK),
-    Some(NETWORK),
-    Some(TERMINAL),
+/// What a header chip opens.
+#[derive(Clone, Copy)]
+enum Opens {
+    Page(usize),
+    Fan,
+}
+/// Header chips (fan, SD, Wi-Fi, Ethernet, USB) and what each opens.
+const CHIPS: [(&str, Option<Opens>); 5] = [
+    ("FAN", Some(Opens::Fan)),
+    ("SD", None),
+    ("WI-FI", Some(Opens::Page(NETWORK))),
+    ("ETH", Some(Opens::Page(NETWORK))),
+    ("USB", Some(Opens::Page(TERMINAL))),
 ];
+/// Fan duty step of the FAN panel's buttons (%).
+const FAN_STEP: u64 = 10;
 const TAGLINE: &str = "AArch64 microkernel for Tegra X1";
 const TOAST_NS: u64 = 2_500_000_000;
 
@@ -60,6 +68,12 @@ enum Id {
     LogSize,
     LogClear,
     TermSize,
+    FanOpen,
+    FanAuto,
+    FanManual,
+    FanDown,
+    FanUp,
+    FanClose,
 }
 
 /// What a tap asks the service to do.
@@ -70,6 +84,8 @@ pub enum Action {
     Retry,
     Leave,
     ClearLogs,
+    /// `fan::SET`: `fan::AUTO` or a duty (%).
+    Fan(u64),
 }
 
 struct Zone {
@@ -112,6 +128,13 @@ pub struct Ui {
     pub unread: usize,
     /// Network of the Wi-Fi card, for the LEAVE confirmation.
     ssid: String,
+    /// The FAN panel is open.
+    fan_panel: bool,
+    /// Fan state as last drawn: taps count from it.
+    fan: Seen<Fan>,
+    /// Fan requests in flight, and the last one (`fan::AUTO` or %).
+    fan_sent: u32,
+    fan_last: u64,
     zones: Vec<Zone>,
 }
 
@@ -316,8 +339,36 @@ impl Ui {
             term_scale: 1,
             unread: 0,
             ssid: String::new(),
+            fan_panel: false,
+            fan: Seen::Unknown,
+            fan_sent: 0,
+            fan_last: fan::AUTO,
             zones: Vec::new(),
         }
+    }
+
+    /// A fan request came back.
+    pub fn fan_done(&mut self) {
+        self.fan_sent = self.fan_sent.saturating_sub(1);
+    }
+
+    /// Duty set by hand (%) as the FAN panel shows it, none in auto:
+    /// the last request while one is in flight.
+    fn fan_manual(&self) -> Option<u64> {
+        if self.fan_sent > 0 {
+            (self.fan_last != fan::AUTO).then_some(self.fan_last)
+        } else {
+            match self.fan {
+                Seen::Value(f) => f.manual,
+                _ => None,
+            }
+        }
+    }
+
+    fn fan_set(&mut self, v: u64) -> Option<Action> {
+        self.fan_sent += 1;
+        self.fan_last = v;
+        Some(Action::Fan(v))
     }
 
     /// Short notice above the tab bar.
@@ -367,9 +418,32 @@ impl Ui {
     fn tap(&mut self, id: Id) -> Option<Action> {
         match id {
             Id::Tab(p) | Id::Tile(_, p) => self.go(p),
-            Id::Chip(k) => {
-                if let Some(p) = CHIP_PAGES[k] {
-                    self.go(p);
+            Id::Chip(k) => match CHIPS[k].1 {
+                Some(Opens::Page(p)) => self.go(p),
+                Some(Opens::Fan) => self.fan_panel = true,
+                None => {}
+            },
+            Id::FanOpen => self.fan_panel = true,
+            Id::FanClose => self.fan_panel = false,
+            Id::FanAuto if self.fan_manual().is_some() => return self.fan_set(fan::AUTO),
+            // By hand from the duty running now.
+            Id::FanManual if self.fan_manual().is_none() => {
+                let Seen::Value(f) = self.fan else {
+                    return None;
+                };
+                let p = f.percent;
+                return self.fan_set(p);
+            }
+            Id::FanAuto | Id::FanManual => {}
+            Id::FanDown | Id::FanUp => {
+                let p = self.fan_manual()?;
+                let q = match id {
+                    Id::FanUp => (p / FAN_STEP + 1) * FAN_STEP,
+                    _ => p.div_ceil(FAN_STEP).saturating_sub(1) * FAN_STEP,
+                }
+                .min(100);
+                if q != p {
+                    return self.fan_set(q);
                 }
             }
             Id::Reboot => {
@@ -448,6 +522,11 @@ impl Ui {
             s.fill(M, y, W - 2 * M, 48, PANEL);
             s.frame(M, y, W - 2 * M, 48, 2, accent());
             s.text(2 * M, y + 8, t, 2, FG, PANEL);
+        }
+        self.fan = d.fan;
+        if self.fan_panel {
+            self.zones.clear();
+            self.fan_panel(s);
         }
         if self.modal.is_some() {
             self.zones.clear();
@@ -530,7 +609,7 @@ impl Ui {
             eth_text(d, true).1,
             usb_c,
         ];
-        for (k, name) in ["FAN", "SD", "WI-FI", "ETH", "USB"].iter().enumerate() {
+        for (k, (name, opens)) in CHIPS.iter().enumerate() {
             let w = 20 + width(name, 2);
             let bx = x - w;
             let bg = if self.pressed == Some(Id::Chip(k)) {
@@ -548,7 +627,7 @@ impl Ui {
                 if colors[k] == DIM { DIM } else { FG },
                 bg,
             );
-            if CHIP_PAGES[k].is_some() {
+            if opens.is_some() {
                 self.zone(Id::Chip(k), bx - 8, 0, w + 16, HEAD - 2);
             }
             x = bx - 24;
@@ -953,13 +1032,23 @@ impl Ui {
                 s.text(xr + 16, py + 60, "starting", 2, DIM, PANEL);
             }
         }
-        s.text(xr + 16, py + 136, "fan", 2, DIM, PANEL);
+        // The fan row opens the FAN panel.
+        let fy = py + 136;
+        let bg = if self.pressed == Some(Id::FanOpen) {
+            PRESS
+        } else {
+            PANEL
+        };
+        s.fill(xr + 8, fy - 8, w - 16, 48, bg);
+        s.text(xr + 16, fy, "fan", 2, DIM, bg);
         let (t, c) = match d.fan {
             Seen::Value(f) => fan_text(&f),
             Seen::Missing => ("no fan control".into(), DIM),
             Seen::Unknown => ("starting".into(), DIM),
         };
-        s.text_r(xr + w - 16, py + 136, &t, 2, c, PANEL);
+        s.text_r(xr + w - 48, fy, &t, 2, c, bg);
+        s.text_r(xr + w - 16, fy, ">", 2, DIM, bg);
+        self.zone(Id::FanOpen, xr + 8, fy - 8, w - 16, 48);
         let (bw, bh) = ((w - 48) / 2, 64);
         let by = py + 256 - 16 - bh;
         self.button(
@@ -1327,6 +1416,112 @@ impl Ui {
         {
             s.text(2 * M, CY + 64 + r * 16 * sc, t, sc, FG, PANEL);
         }
+    }
+
+    /// FAN panel: auto or by hand, the duty in `FAN_STEP` steps. The
+    /// fan service still runs it full speed when the SoC is hot.
+    fn fan_panel(&mut self, s: &mut Screen) {
+        let (x, y, w, h) = (240, 96, 800, 528);
+        s.fill(x - 8, y - 8, w + 16, h + 16, BG);
+        s.fill(x, y, w, h, PANEL);
+        s.frame(x, y, w, h, 4, accent());
+        s.text(x + 32, y + 32, "FAN", 2, accent(), PANEL);
+        let bh = 72;
+        if let Seen::Value(f) = self.fan {
+            let mut state = String::new();
+            if let Some(t) = f.temp {
+                state = format!("SoC {}", Celsius(t));
+            }
+            if let Some(rpm) = f.rpm {
+                state = format!("{}   {} rpm", state, rpm);
+            }
+            s.text_r(x + w - 32, y + 32, &state, 2, FG, PANEL);
+
+            let manual = self.fan_manual();
+            let bw = (w - 96) / 2;
+            for (k, (id, name, on)) in [
+                (Id::FanAuto, "AUTO", manual.is_none()),
+                (Id::FanManual, "MANUAL", manual.is_some()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let bx = x + 32 + k * (bw + 32);
+                let tone = on.then(accent);
+                self.button(s, id, bx, y + 96, bw, bh, name, tone, true);
+                if on {
+                    s.fill(bx + 16, y + 96 + bh - 12, bw - 32, 4, accent());
+                }
+            }
+
+            let forced = f.state & (fan::ST_HOT | fan::ST_NO_SENSOR) != 0;
+            let (sw, sh, sy) = (160, 112, y + 200);
+            let shown = manual.unwrap_or(f.percent);
+            let can = |ok: bool| manual.is_some() && ok;
+            self.button(
+                s,
+                Id::FanDown,
+                x + 32,
+                sy,
+                sw,
+                sh,
+                "-10%",
+                None,
+                can(shown > 0),
+            );
+            self.button(
+                s,
+                Id::FanUp,
+                x + w - 32 - sw,
+                sy,
+                sw,
+                sh,
+                "+10%",
+                None,
+                can(shown < 100),
+            );
+            let c = if forced { WARN } else { FG };
+            s.text_c(x + w / 2, sy + 4, &format!("{}%", shown), 4, c, PANEL);
+            let (bx, bw) = (x + 32 + sw + 24, w - 2 * (32 + sw + 24));
+            bar(
+                s,
+                bx,
+                sy + 88,
+                bw,
+                16,
+                f.percent,
+                if forced { WARN } else { GOOD },
+            );
+
+            let (note, c) = if f.state & fan::ST_HOT != 0 {
+                ("SoC hot: full speed until below 57\u{b0}C", WARN)
+            } else if f.state & fan::ST_NO_SENSOR != 0 {
+                ("No temperature: at least 43%", WARN)
+            } else if manual.is_some() {
+                ("Full speed anyway from 60\u{b0}C", DIM)
+            } else {
+                ("Follows the SoC temperature", DIM)
+            };
+            s.text(x + 32, y + 352, note, 2, c, PANEL);
+        } else {
+            let t = match self.fan {
+                Seen::Missing => "no fan control",
+                _ => "starting",
+            };
+            s.text(x + 32, y + 96, t, 2, DIM, PANEL);
+        }
+        let cw = 240;
+        self.button(
+            s,
+            Id::FanClose,
+            x + w - 32 - cw,
+            y + h - 32 - bh,
+            cw,
+            bh,
+            "CLOSE",
+            None,
+            true,
+        );
     }
 
     fn modal(&mut self, s: &mut Screen) {

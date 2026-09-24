@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use libnx::abi::err::EINVAL;
-use libnx::abi::proto::{console as con, display as proto, input, wifi};
+use libnx::abi::proto::{console as con, display as proto, fan, input, wifi};
 use libnx::abi::rights::{DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
@@ -85,6 +85,7 @@ const R8G8B8A8: u32 = 13;
 static INPUT: Service = Service::new("input", 0);
 static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
+static FAN: Service = Service::optional("fan");
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -147,6 +148,8 @@ enum Done {
     Retry(Result<String, i64>),
     Leave(Result<(), i64>),
     Power(i64),
+    /// The fan's state after a `SET`.
+    Fan(Result<stats::Fan, i64>),
 }
 
 struct Worker {
@@ -185,8 +188,8 @@ fn scan() -> Result<Vec<ScanNet>, i64> {
     Ok(nets)
 }
 
-/// Runs the actions that may take seconds (Wi-Fi scan, chip recovery)
-/// one at a time, off the drawing loop.
+/// Runs the actions that may take seconds (Wi-Fi scan, chip recovery, a
+/// fan busy measuring its speed) one at a time, off the drawing loop.
 fn work(w: &Worker, notif: u32) -> ! {
     loop {
         let mut q = w.jobs.lock();
@@ -208,6 +211,10 @@ fn work(w: &Worker, notif: u32) -> ! {
             Action::Power(label) => {
                 Done::Power(POWER.call(&Msg::new(label, 0, 0)).err().unwrap_or(0))
             }
+            Action::Fan(v) => Done::Fan(
+                FAN.call(&Msg::from_words(fan::SET, &[v]))
+                    .map(|m| stats::Fan::from_reply(&m)),
+            ),
             Action::ClearLogs => continue,
         };
         w.done.lock().push_back(done);
@@ -438,8 +445,19 @@ fn main() -> i32 {
                 let batch: Vec<Done> = worker.done.lock().drain(..).collect();
                 let now = time::now_ns();
                 for d in batch {
-                    ui.busy = false;
+                    if !matches!(d, Done::Fan(_)) {
+                        ui.busy = false;
+                    }
                     match d {
+                        Done::Fan(r) => {
+                            ui.fan_done();
+                            match r {
+                                Ok(f) => data.fan = stats::Seen::Value(f),
+                                Err(e) => {
+                                    ui.toast(format!("fan: {}", libnx::abi::err::name(e)), now)
+                                }
+                            }
+                        }
                         Done::Scan(Ok(nets)) => ui.scan = Some(nets),
                         Done::Retry(Ok(t)) => ui.toast(format!("wlan: {}", t), now),
                         Done::Leave(Ok(())) => ui.toast("wlan: left the network".into(), now),
