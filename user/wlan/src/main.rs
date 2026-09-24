@@ -809,9 +809,10 @@ fn main() -> i32 {
             Ok(rx) => {
                 let reply = match (rx.badge, rx.msg.label()) {
                     (wifi::BADGE_LINK, eth::INFO) => {
-                        let mut m = Msg::new(0, 2, 0);
+                        let mut m = Msg::new(0, 3, 0);
                         m.mr[0] = mac_word();
                         m.mr[1] = MTU;
+                        m.mr[2] = (backend.state() == wifi::ST_CONNECTED) as u64;
                         Some(m)
                     }
                     (wifi::BADGE_LINK, eth::SEND) => {
