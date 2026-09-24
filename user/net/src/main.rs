@@ -11,11 +11,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libnx::abi::err::{
-    EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETUNREACH, ENOENT, ENOTCONN,
-    EPIPE, ETIMEDOUT,
+    EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETDOWN, ENETUNREACH, ENOENT,
+    ENOTCONN, EPIPE, ETIMEDOUT,
 };
 use libnx::abi::proto::{eth, net as proto};
 use libnx::drv;
@@ -26,7 +26,7 @@ use libnx::{ns, println, sys, thread, time};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
     IpEndpoint, Ipv4Address,
@@ -47,6 +47,13 @@ static RX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static TX_FRAMES: AtomicU64 = AtomicU64::new(0);
 static TX_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The link went down (`ENETDOWN` from the driver): DHCP starts over,
+/// since the network may be another one once it is back.
+static LINK_DOWN: AtomicBool = AtomicBool::new(false);
+/// DHCP retransmissions: a lost first DISCOVER (the port is often not
+/// open yet right after a Wi-Fi join) costs 2 s, not smoltcp's 10.
+const DHCP_RETRY: Duration = Duration::from_secs(2);
 
 fn count(frames: &AtomicU64, bytes: &AtomicU64, n: usize) {
     frames.fetch_add(1, Ordering::Relaxed);
@@ -902,6 +909,10 @@ fn main() -> i32 {
                         drop(g);
                         let _ = sys::notify_signal(notif, 1);
                     }
+                    Ok(r) if r.label() == ENETDOWN as u32 => {
+                        LINK_DOWN.store(true, Ordering::Relaxed);
+                        let _ = sys::notify_signal(notif, 1);
+                    }
                     _ => time::sleep_ms(10),
                 }
             }
@@ -916,7 +927,12 @@ fn main() -> i32 {
     cfg.random_seed = u64::from_le_bytes(seed);
     let iface = Interface::new(cfg, &mut dev, now());
     let mut sockets = SocketSet::new(Vec::new());
-    let dhcp = sockets.add(dhcpv4::Socket::new());
+    let mut client = dhcpv4::Socket::new();
+    let mut retry = dhcpv4::RetryConfig::default();
+    retry.discover_timeout = DHCP_RETRY;
+    retry.initial_request_timeout = DHCP_RETRY;
+    client.set_retry_config(retry);
+    let dhcp = sockets.add(client);
     let dns = sockets.add(dns::Socket::new(
         &[],
         vec![None, None, None, None, None, None, None, None],
@@ -954,6 +970,10 @@ fn main() -> i32 {
     let ep = drv::publish("net").expect("net: publish");
     let mut buf = vec![0u8; ipc::MAX_BYTES];
     loop {
+        if LINK_DOWN.swap(false, Ordering::Relaxed) {
+            println!("[net] link down: DHCP starts over");
+            net.sockets.get_mut::<dhcpv4::Socket>(net.dhcp).reset();
+        }
         let t = now();
         net.iface.poll(t, &mut net.dev, &mut net.sockets);
         net.dhcp_events();
