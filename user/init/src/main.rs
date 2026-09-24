@@ -181,6 +181,8 @@ struct Service {
 struct State {
     fs: Bootfs,
     console: u32,
+    /// Console handle of the shell and the programs it starts.
+    session: u32,
     /// Console handles with the terminal and screen badges.
     terminal: u32,
     screen: u32,
@@ -246,6 +248,8 @@ fn main() -> i32 {
         sys::handle_dup(ep_console, SEND | GRANT, con::BADGE_TERMINAL).expect("dup console");
     let console_screen =
         sys::handle_dup(ep_console, SEND | GRANT, con::BADGE_SCREEN).expect("dup console");
+    let console_session =
+        sys::handle_dup(ep_console, SEND | GRANT | DUP, con::BADGE_SESSION).expect("dup console");
     for h in [ep_console, uart, uart_irq, console_drv] {
         let _ = sys::handle_close(h);
     }
@@ -259,6 +263,7 @@ fn main() -> i32 {
     let mut st = State {
         fs,
         console: console_send,
+        session: console_session,
         terminal: console_term,
         screen: console_screen,
         pm_app,
@@ -287,7 +292,7 @@ fn main() -> i32 {
         &["shell"],
         &[String::from("HOME=/"), String::from("PATH=/bin")],
     );
-    match launch(&st, &shell, pm_app, &Stdio::CONSOLE) {
+    match launch(&st, &shell, pm_app, &Stdio::CONSOLE, st.session) {
         Ok(h) => {
             st.shell_pid = sys::getpid(h).unwrap_or(0);
             let _ = sys::handle_close(h);
@@ -475,13 +480,13 @@ impl Stdio {
     }
 }
 
-/// Launch an application with standard capabilities: console (or pipes)
-/// and manager (application badge).
-fn launch(st: &State, strings: &Strings, pm: u32, io: &Stdio) -> Result<u32, i64> {
+/// Launch an application with standard capabilities: `console` (or
+/// pipes) and manager (application badge).
+fn launch(st: &State, strings: &Strings, pm: u32, io: &Stdio, console: u32) -> Result<u32, i64> {
     let path = strings.program();
     let elf = load(st, path)?;
     let name = path.rsplit('/').next().unwrap_or(path);
-    let [stdin, stdout, stderr] = io.handles.map(|h| h.unwrap_or(st.console));
+    let [stdin, stdout, stderr] = io.handles.map(|h| h.unwrap_or(console));
     // Only kernel-owned spawn flags (debugger stop).
     let mut strings = strings.clone();
     strings.flags &= spawn::SUSPENDED as u32;
@@ -532,7 +537,13 @@ fn serve(st: &mut State, ep: u32) -> ! {
                 let r = match Strings::decode(&buf[..n]) {
                     Some(s) => {
                         let io = Stdio::from_request(s.flags as u64, &rx.msg);
-                        let r = launch(st, &s, st.pm_app, &io);
+                        // Programs started by the shell's: its session.
+                        let console = if rx.badge == pm::BADGE_APP {
+                            st.session
+                        } else {
+                            st.console
+                        };
+                        let r = launch(st, &s, st.pm_app, &io, console);
                         io.close();
                         r
                     }
