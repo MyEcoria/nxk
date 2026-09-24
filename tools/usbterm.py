@@ -372,7 +372,7 @@ def run(link, cmds, timeout, out=sys.stdout, puts=(), logs=True):
 
 # Words user/shell's command() runs itself (keep in step with it).
 BUILTINS = set("help echo ps mem cpu uptime progs ls cd pwd cat rm mkdir rmdir mv cp stat df "
-               "sync fbecho events env export unset date sleep temp services poweroff reboot "
+               "sync fbecho events env export unset date sleep temp fan services poweroff reboot "
                "recv restart run".split())
 # Commands the client runs itself, never typed on the Switch.
 LOCAL = {"clear", "exit", "logout"}
