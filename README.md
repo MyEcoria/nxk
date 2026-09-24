@@ -35,11 +35,11 @@ EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 ```
 
 Everything has been verified in the `tegra_qemu` emulator. On a **real
-Switch** (Erista), nxk boots through hekate up to user space on one
-core: the `display` service takes over the screen; the shell has not
-been reached there yet. The USB-C console (`usbcon`: the Switch as a
-USB serial device, `tools/usbterm.py` on the PC) is the way in, tested
-in the emulator only (see "Limits" and `hwboot/README.md`).
+Switch** (Erista), nxk boots through hekate on its four cores; the
+`display` service turns the screen into a live statistics page and the
+shell is reached over the USB-C console (`usbcon`: the Switch as a USB
+serial device, `tools/usbterm.py` on the PC), with the SD card and
+Wi-Fi (see "Limits" and `hwboot/README.md`).
 
 ## Build, run, test
 
@@ -171,11 +171,16 @@ Time is read with no system call: the kernel opens `CNTVCT_EL0` to EL0
 
 **One kernel stack per core, not per thread** (seL4 model). Registers
 are stored directly in the thread control block; the kernel never blocks
-in the middle of a call.
+in the middle of a call, and never waits on a device: its messages go
+to an 8 KiB log ring that the `console` service drains (`klog_bind`,
+`klog_read`); only the boot log, before that service starts, and panics
+are printed directly.
 
 **One global lock**, as in multiprocessor seL4: kernel paths last a few
 microseconds. Calls with no shared state (`clock`, `getcpu`, `gettid`)
-take a lock-free fast path.
+take a lock-free fast path. Long work (zeroing a large shared-memory
+object or populated mapping, unmapping megabytes) lets the lock go every
+64 pages, so other cores wait at most one such batch.
 
 **Capabilities**: every object (endpoint, thread, process,
 notification, shared memory, interrupt line, register range) is named by
@@ -225,17 +230,17 @@ All in EL0, started by `init` with only their capabilities.
 
 | Service | Role | State |
 |---|---|---|
-| `console` | UART-A, line editing; mirrored to a terminal driver (input and all output) | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
-| `usbcon` | USB-C port as a USB serial device (CDC-ACM, 1209:0001) on the Erista OTG controller: the terminal of a PC (`tools/usbterm.py`) | emulator (virtual host); **Erista**: not tried yet; Mariko has no such controller (stops) |
+| `console` | UART-A, line editing; mirrored to a terminal driver (input and all output). Output never waits: one 16 KiB ring, drained to UART-A by its TX-empty interrupt and read by the terminal driver at its own pace; the kernel log is drained into it | emulator; on a Switch, UART-A pads are internal (not on the Joy-Con rail) |
+| `usbcon` | USB-C port as a USB serial device (CDC-ACM, 1209:0001) on the Erista OTG controller: the terminal of a PC (`tools/usbterm.py`). One thread: console output is pulled into the DMA buffer when the IN endpoint is free, 100 ms after the PC opens the terminal (its tty echoes until it is raw); traffic counters for the home screen (`STATS`) | emulator (virtual host); **Erista**: the way in to the shell; Mariko has no such controller (stops) |
 | `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC) | emulator |
 | `i2c` | six I2C buses | emulator |
 | `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451) | emulator |
-| `sd` | SD card (SDHCI, ADMA2), slot power cycle then power-up (pads, GPIOs, PMC I/O power, PMIC LDO2): a card hekate left in 1.8 V signaling starts over at 3.3 V; **Erista**: 64 GB card read and written | 3.3 V default speed only (no UHS / 1.8 V) |
+| `sd` | SD card (SDHCI, ADMA2), slot power cycle (239 ms off, as hekate) then power-up (pads, GPIOs, PMC I/O power, PMIC LDO2): a card hekate left in 1.8 V signaling starts over at 3.3 V. Block 0 is read before publishing; a card that answers commands but sends no data is reported (host, pads, rails, CMD13 state) and retried at 1.8 V, after a 2 s power cycle, then on a 1-bit bus; **Erista**: 64 GB card read and written | 3.3 V default speed; on the Switch the card sometimes sends no data at all (see `hwboot/README.md`, run 18) |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
-| `display` | screen (window A), boot logo and landscape text terminal (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
+| `display` | screen (window A), home screen: the logo, then statistics refreshed every second (uptime, processes, cores, temperatures, per-core load bars, syscall/interrupt/switch rates, memory, USB-C console state and traffic, network address and traffic, Wi-Fi, SD card) from `sysinfo` and the services' `STATS`, each asked with a 20 ms cap; the last lines written to it (driver failures, `fbecho`) at the bottom (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
-| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP, ICMP echo (`nettest ping HOST`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
+| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP, ICMP echo (`nettest ping HOST`), traffic counters (`STATS`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
 | `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the chip sometimes stops answering a few minutes after a join (hardware run 16, cause unknown): `wlan` reports it in `wifi status` and `restart wlan` brings it back. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
@@ -256,7 +261,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
 | Hardware | UART, I2C, PMIC, RTC, temperatures, screen, touchscreen, USB host, USB device (serial console) | GPU, audio, Joy-Con, buttons (GPIO), frequencies (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
-| Tools | build, SD card, tests (`ktest` 27, `stdtest` 18, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
+| Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
 ## Limits
 
@@ -266,11 +271,13 @@ program that vanished without closing them (crash) are reclaimed.
   nxk-bl31) and no SD card (see `hwboot/README.md`, "Hardware runs").
   A USB keyboard does not help: its keys go to `input`, not to the
   shell, and hekate's L4T path leaves the xHCI unpowered. Seen there:
-  4 cores, SD card and filesystem, `ktest` 27/27, `stdtest` 17/17
+  4 cores, SD card and filesystem, `ktest` 29/29, `stdtest` 17/17
   (`hwboot/README.md`, "Hardware runs").
-- Kernel messages (`[nxk]` fault reports) go to UART-A and the loader's
-  screen only, not to the USB console. Mariko lacks the USB2 OTG device
-  controller (its OTG port belongs to XUSB): no USB console there.
+- Kernel messages (`[nxk]` fault reports) reach the USB console through
+  `console`, boot log included; before `console` starts and on a panic
+  they go to UART-A and the loader's screen. Mariko lacks the USB2 OTG
+  device controller (its OTG port belongs to XUSB): no USB console
+  there.
 - The real USB controller (xHCI) needs a proprietary NVIDIA firmware;
   the SD reader needs power and pin setup; without hekate the screen
   needs DSI panel init; buttons need GPIOs the emulator cannot drive.

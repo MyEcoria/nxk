@@ -23,7 +23,7 @@ This file guides AI coding agents working on **nxk**. Follow it on every task
   hekate's L4T entry and `hwboot/nxk-bl31` (EL2; PSCI `CPU_ON` for
   cores 1-3), on its 4 cores and with its SD card, up to the shell over
   `usbcon`, the USB-C serial console (`tools/usbterm.py` on the PC;
-  UART-A pads are internal). `ktest` 27/27 and `stdtest` 17/17 pass
+  UART-A pads are internal). `ktest` 29/29 and `stdtest` 17/17 pass
   there. Run log and expected screen output: `hwboot/README.md`.
 - Syscall convention: `svc #0`, number in `x8`, args in `x0`–`x5`, result in
   `x0`, errors as `-errno` (Linux values). Single source of truth: `abi/`

@@ -162,12 +162,15 @@ order:
    init` lines: the kernel is running. A kernel panic or fault shows up
    here too.
 4. The `display` service takes over the screen, in landscape (hold the
-   console normally): midnight-blue background, the nxk logo centered
-   with `AArch64 microkernel for Tegra X1` under it, then one
-   `nxk - screen 720x1280 turned landscape, terminal 160x45` line. User
-   space is alive. Only `usbcon:` status lines follow (see "Shell over
-   USB-C"): service logs and the shell go to UART-A and the USB-C
-   console.
+   console normally): midnight-blue background, the nxk logo with
+   `AArch64 microkernel for Tegra X1` under it, then the home screen:
+   SYSTEM (uptime, processes, cores, temperatures), CPU (a load bar per
+   core), LOAD (syscalls, interrupts and switches per second), MEMORY,
+   USB-C (console state and traffic), NETWORK, WI-FI and STORAGE,
+   refreshed every second. User space is alive. At the bottom,
+   `display: 720x1280 panel, turned landscape`, then only driver
+   failures (`usbcon:` or `sd:` lines): service logs and the shell go
+   to UART-A and the USB-C console.
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
@@ -181,32 +184,34 @@ driver turns the Switch into a USB serial device (CDC-ACM, ID
 boot ROM uses for RCM, programmed as hekate's `bdk/usb/usbd.c` does. The
 PC sees a `/dev/ttyACM*` (`/dev/nxk-console` with the udev rule): keys
 typed there reach the shell, and all console output comes back,
-including the last 16 KiB printed before the PC attached. Kernel
-messages (`[nxk]` fault reports) stay on UART-A and the screen.
+including the last 16 KiB printed before the PC attached (kernel boot
+log and `[nxk]` fault reports too). Output starts 100 ms after the
+terminal opens: a fresh ttyACM echoes until its program sets it raw,
+and the echo would be typed into the shell.
 
 1. Leave the USB-C cable in the PC after `./inject.sh`, then boot
    **More Configs → nxk**.
-2. Under the nxk logo, the screen shows
-   `usbcon: USB-C console ready, waiting for a PC (tools/usbterm.py)`,
-   then `usbcon: host detected (bus reset)` and
-   `usbcon: configured by the host (high speed)` once the PC has
-   enumerated it (`dmesg`: `cdc_acm ... ttyACM0: USB ACM device`).
+2. The home screen's USB-C line reads `waiting for a PC`, then
+   `host seen, not configured` and `connected, high speed, terminal
+   closed` once the PC has enumerated it (`dmesg`: `cdc_acm ...
+   ttyACM0: USB ACM device`).
 3. On the PC: `../tools/usbterm.py` (Ctrl-] quits), or
    `../tools/usbterm.py -c ps -c mem` to run commands and exit. Any
-   serial terminal works too (`picocom /dev/nxk-console`). The screen
-   then shows `usbcon: terminal open on the host`.
+   serial terminal works too (`picocom /dev/nxk-console`). The line
+   then reads `terminal open, high speed` with the bytes each way.
 
-The last `usbcon:` line locates a failure:
+The USB-C line locates a failure:
 
-- `ready` but no `host detected`: the PC saw nothing (`lsusb` has no
-  `1209:0001`): PHY setup or cable. Try another port, photograph the
-  screen.
-- `host detected` without `configured`: enumeration failed; `dmesg` on
-  the PC gives the reason (e.g. `device descriptor read/64, error -71`).
-- `configured` but `usbterm.py` cannot open the device: permissions
+- `waiting for a PC`: the PC saw nothing (`lsusb` has no `1209:0001`):
+  PHY setup or cable. Try another port, photograph the screen.
+- `host seen, not configured`: enumeration failed; `dmesg` on the PC
+  gives the reason (e.g. `device descriptor read/64, error -71`).
+- `connected` but `usbterm.py` cannot open the device: permissions
   (udev rule above, or the `dialout`/`uucp` group).
-- `fuses unreadable: PHY left without its trims`: hekate did not leave
-  the fuses readable; high speed may then fail.
+- `console not running`: usbcon stopped; its reason is at the bottom of
+  the screen (`usbcon: ...`). `fuses unreadable: PHY left without its
+  trims` there means hekate did not leave the fuses readable; high
+  speed may then fail.
 
 ## Driver updates over USB-C (no SD swap)
 
@@ -224,8 +229,12 @@ grants, from a build on the PC:
 types `restart wlan`: init kills the running instance, unpublishes its
 services and starts the file with the driver's grants. Only the console
 shell may ask for it. The kernel, init, the shell and the boot image
-still need `mksd-hw.sh` and a reboot. A 50 KB driver takes a few
-seconds (each 512-character line is echoed back before the next).
+still need a reboot: either `mksd-hw.sh`, or, with the card working,
+`--put build/nxk.bin:/nxk/bl33.bin` together with a `bl31.bin` rebuilt
+for it (`mkbl31.py`): the monitor copies the kernel with the size baked
+into it, and a larger kernel loaded by an older `bl31.bin` loses its
+tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
+5 s (each 512-character line is echoed back before the next).
 
 ## Hardware runs
 
@@ -402,6 +411,31 @@ seconds (each 512-character line is echoed back before the next).
     (after `fs`, then the PCIe bring-up), joins `nxk-test` (WPA2), `net`
     gets `10.133.165.75/24` by DHCP and `nettest ping google.com 5`
     (`172.217.22.46`) answers 5 of 5, 37 to 301 ms, 120 ms on average.
+18. 24/09/2026, Erista, the cleanup up to commit `6c563fb`: kernel log
+    ring, interrupt-driven `console`, single-thread `usbcon`, the home
+    screen. `ktest` 29/29 (the kernel log costs no UART wait; long
+    zeroing lets the other cores in), `stdtest` 17/17 (`files` 133 ms).
+    `bench`: null syscall 239 ns, IPC same core 1598 to 1600 ns, cross
+    core 10.1 to 10.2 us, spawn+wait 92 us; it now pins its own thread
+    (it read 1.6 or 10 us same core, depending on where it ran).
+    `console` used 5 ms of CPU in 71 s (696 ms in the morning, waiting
+    on UART-A byte by byte), `usbcon` 1 thread and 10 pages (2 and 19),
+    and a 2 MB `--put` took 5.3 s instead of 237 s. Kernel reports now
+    reach the USB console, which showed `usb` dying at every boot on an
+    alignment fault reading its registers (exit 139, the zombie of
+    earlier runs). A fresh ttyACM echoes: the history sent the moment
+    the PC opened it came back as keystrokes and ran as commands, hence
+    the 100 ms hold. The SD card was mute on 6 of 8 boots: it answered
+    every command, CMD13 in state 5 (data), yet no data came (lines at
+    1010), with the host at 3.3 V as intended, LDO2 at 3.3 V and the
+    power switch on, as in run 17. The image of the morning failed the
+    same way (control boot), and hekate's 239 ms power-off did not cure
+    it; the card read fine on the PC every time, and in nxk at the first
+    and last boots. `sd` now reads block 0 before publishing and retries
+    at 1.8 V, after a 2 s power cycle, then on a 1-bit bus, reporting
+    each (not exercised yet). A kernel deployed with an older `bl31.bin`
+    panicked (`objtab.rs:57`, index 3759): the monitor copies the size
+    baked into it.
 
 ## Hardware test (once the SD card is back in the PC)
 
