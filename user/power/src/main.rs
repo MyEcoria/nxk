@@ -1,4 +1,5 @@
-//! power: board power, RTC wall-clock sync, TMP451 temperatures, SD rail.
+//! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
+//! PCIe and touchscreen rails.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
 
 #![no_std]
@@ -24,19 +25,29 @@ const LDO_MODE_NORMAL: u8 = 3 << 6;
 /// default, 1.05 V. The Wi-Fi chip hangs off the PCIe UPHY lanes.
 const LDO1_CFG: u8 = 0x25;
 const LDO1_1V05: u8 = ((1_050_000 - 800_000) / 25_000) as u8;
+/// MAX77620 LDO6 (touchscreen, ambient light sensor): 2.9 V, as hekate
+/// `touch_power_on`. Nyx turns it off before chaining to nxk.
+const LDO6_CFG: u8 = 0x2F;
+const LDO6_2V9: u8 = ((2_900_000 - 800_000) / 50_000) as u8;
 
-/// Only 3.3 V: 1.8 V needs the card's CMD11 handshake first.
-fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
-    let v = i2c.read_reg(5, PMIC, LDO2_CFG)?;
+/// A 50 mV-step LDO: voltage, then normal mode (hekate
+/// `max7762x_regulator_set_voltage` then `_enable`), or off.
+fn ldo(i2c: &I2c, cfg: u8, volt: u8, on: bool) -> Result<(), i64> {
+    let v = i2c.read_reg(5, PMIC, cfg)?;
     if on {
-        i2c.write_reg(5, PMIC, LDO2_CFG, (v & !0x3F) | LDO2_3V3)?;
+        i2c.write_reg(5, PMIC, cfg, (v & !0x3F) | volt)?;
         time::sleep_ms(1);
-        i2c.write_reg(5, PMIC, LDO2_CFG, LDO_MODE_NORMAL | LDO2_3V3)?;
+        i2c.write_reg(5, PMIC, cfg, LDO_MODE_NORMAL | volt)?;
     } else {
-        i2c.write_reg(5, PMIC, LDO2_CFG, v & !0xC0)?;
+        i2c.write_reg(5, PMIC, cfg, v & !0xC0)?;
     }
     time::sleep_ms(1);
     Ok(())
+}
+
+/// Only 3.3 V: 1.8 V needs the card's CMD11 handshake first.
+fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
+    ldo(i2c, LDO2_CFG, LDO2_3V3, on)
 }
 
 /// PCIe/XUSB rail at its default voltage: nothing else on the board
@@ -163,6 +174,10 @@ fn main() -> i32 {
                 Err(e) => Msg::error(e),
             },
             proto::PCIE_POWER => match pcie_power(&i2c, rx.msg.mr[0] != 0) {
+                Ok(()) => Msg::new(0, 0, 0),
+                Err(e) => Msg::error(e),
+            },
+            proto::TOUCH_POWER => match ldo(&i2c, LDO6_CFG, LDO6_2V9, rx.msg.mr[0] != 0) {
                 Ok(()) => Msg::new(0, 0, 0),
                 Err(e) => Msg::error(e),
             },
