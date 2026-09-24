@@ -307,8 +307,10 @@ fan 0           stopped (unless the SoC is at 60 C or more)
 fan auto        back to the temperature steps
 ```
 
-The header's FAN square is green while it spins, yellow when forced
-(SoC hot, sensor lost), grey when stopped. `fan` reading 0 rpm while
+On the screen, the header's FAN chip or the fan row of SYSTEM opens
+the FAN panel: AUTO or MANUAL, then -10% / +10%; every boot starts
+in auto. The header's FAN square is green while it spins, yellow when
+forced (SoC hot, sensor lost), grey when stopped. `fan` reading 0 rpm while
 audible points at the tachometer (GPIO S7, bank 4 interrupt); silent
 at 100% points at the 5V rail (GPIO A5) or the PWM pad (V4).
 `./tools/usbterm.py --reload fan` replaces the driver in place.
