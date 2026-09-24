@@ -1,0 +1,1236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nxk screen</title>
+<!-- build/font.bin and build/logo.bin as JS: ./tools/build.sh, then docs/ui/assets.py -->
+<script src="../../build/ui-assets.js"></script>
+<style>
+  :root {
+    --page: #0a1326; --panel: #101e3a; --card: #16294c; --edge: #2b4675;
+    --fg: #d8d8d8; --dim: #808898; --accent: #ffd9a0;
+    --good: #6ad06a; --warn: #f0c040; --bad: #f06050;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--fg);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  code, .mono { font-family: ui-monospace, "DejaVu Sans Mono", monospace; font-size: 12.5px; }
+  code { color: var(--accent); }
+  header.top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px;
+               padding: 14px 20px; border-bottom: 1px solid var(--edge); }
+  header.top h1 { margin: 0; font-size: 18px; color: var(--accent); }
+  header.top p { margin: 0; color: var(--dim); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; padding: 20px; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0, 1fr); padding: 16px; } }
+
+  .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+  .seg { display: inline-flex; border: 1px solid var(--edge); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; }
+  .seg button + button { border-left: 1px solid var(--edge); }
+  .seg button.on { background: var(--accent); color: var(--panel); }
+  button { background: var(--card); color: var(--fg); border: 1px solid var(--edge); border-radius: 6px;
+           padding: 6px 11px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--dim); }
+  select, input[type=text] { background: var(--page); color: var(--fg); border: 1px solid var(--edge);
+           border-radius: 6px; padding: 5px 7px; font: inherit; min-width: 0; width: 100%; }
+
+  .scroll { overflow: auto; }
+  .device { background: #17191e; border-radius: 26px; padding: 22px; width: 100%;
+            box-shadow: 0 10px 40px rgba(0,0,0,.45), inset 0 0 0 2px #262a31; }
+  .real .device { width: max-content; }
+  canvas { display: block; width: 100%; height: auto; image-rendering: pixelated;
+           cursor: crosshair; touch-action: none; border-radius: 3px; }
+  .real canvas { width: 1280px; }
+  .readout { margin-top: 10px; color: var(--dim); }
+
+  aside section { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+                  padding: 12px 14px; margin-bottom: 14px; }
+  aside h2 { margin: 0 0 10px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+  aside p { margin: 0 0 8px; color: var(--dim); }
+  .row { display: grid; grid-template-columns: 104px minmax(0, 1fr); align-items: center; gap: 8px; margin: 6px 0; }
+  .row > span { color: var(--dim); }
+  .inline { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .presets button { font-size: 12px; padding: 4px 8px; }
+  .presets.mono button { font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+  ol.log { margin: 0; padding-left: 20px; max-height: 170px; overflow: auto; }
+  ol.log li { margin: 2px 0; }
+  ol.log time { color: var(--dim); margin-right: 6px; }
+  ol.notes { margin: 0; padding-left: 18px; color: var(--dim); }
+  ol.notes li { margin: 7px 0; }
+  ol.notes b { color: var(--fg); font-weight: 600; }
+  .warnbox { border-color: var(--warn); }
+  .warnbox h2 { color: var(--warn); }
+  .empty { color: var(--dim); font-style: italic; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>nxk screen</h1>
+  <p>The Switch screen at its real resolution, drawn with the <code>display</code> service's primitives and font.
+     Click or drag on the screen to touch it.</p>
+</header>
+
+<main>
+  <section>
+    <div class="bar">
+      <div class="seg" id="view">
+        <button data-view="current">Current screen</button>
+        <button data-view="proposal" class="on">Proposal v2</button>
+      </div>
+      <div class="seg" id="zoom">
+        <button data-zoom="fit" class="on">Fit</button>
+        <button data-zoom="real">1:1</button>
+      </div>
+    </div>
+    <div class="scroll" id="stage">
+      <div class="device"><canvas id="scr" width="1280" height="720"></canvas></div>
+    </div>
+    <div class="readout mono" id="readout">1280 x 720 landscape (720 x 1280 panel, drawn turned)</div>
+  </section>
+
+  <aside>
+    <section class="warnbox" id="missing" hidden>
+      <h2>Assets missing</h2>
+      <p>Without <code>build/ui-assets.js</code> the text shows as blocks. From <code>nxk/</code>:</p>
+      <p class="mono">./tools/build.sh<br>docs/ui/assets.py</p>
+    </section>
+
+    <section>
+      <h2>USB-C terminal</h2>
+      <p>Type as the PC does in <code>usbterm.py</code>; the TERMINAL page mirrors it.</p>
+      <div class="inline"><input type="text" id="cmd" placeholder="nxk command"><button id="type">Send</button></div>
+      <div class="presets mono">
+        <button data-cmd="help">help</button><button data-cmd="cpu">cpu</button><button data-cmd="ps">ps</button>
+        <button data-cmd="mem">mem</button><button data-cmd="wifi status">wifi status</button>
+        <button data-cmd="wifi connect nxk-test hunter22">wifi connect</button>
+        <button data-cmd="ls /bin">ls /bin</button><button data-cmd="cd /nxk">cd /nxk</button>
+        <button data-cmd="ls /nope">ls /nope</button><button data-cmd="date">date</button>
+        <button data-cmd="fbecho hello">fbecho hello</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Simulated state</h2>
+      <label class="row"><span>CPU load</span><select data-sim="loadMode">
+        <option value="idle">idle</option><option value="normal">normal</option><option value="busy">busy</option></select></label>
+      <label class="row"><span>Cores online</span><select data-sim="cores" data-num>
+        <option>4</option><option>3</option><option>2</option><option>1</option></select></label>
+      <label class="row"><span>Temperatures</span><select data-sim="temps">
+        <option value="value">reported</option><option value="unknown">starting</option><option value="missing">no sensor</option></select></label>
+      <label class="row"><span>USB-C console</span><select data-sim="usb">
+        <option value="terminal">terminal open</option><option value="configured">connected, terminal closed</option>
+        <option value="host">host seen</option><option value="waiting">waiting for a PC</option>
+        <option value="missing">not running</option><option value="busy">busy</option></select></label>
+      <label class="inline"><input type="checkbox" data-sim="usbErrors"> USB transfer errors</label>
+      <label class="row"><span>USB-C Ethernet</span><select data-sim="eth">
+        <option value="up">shared by the PC</option><option value="dhcp">waiting for DHCP</option>
+        <option value="nosharing">PC not sharing</option><option value="nopc">no PC</option>
+        <option value="missing">not running</option></select></label>
+      <label class="row"><span>Wi-Fi</span><select data-sim="wifi">
+        <option value="connected">connected</option><option value="connecting">joining</option>
+        <option value="scanning">scanning</option><option value="idle">not connected</option>
+        <option value="down">no adapter</option><option value="missing">no driver</option>
+        <option value="unknown">starting</option></select></label>
+      <label class="row"><span>SD card</span><select data-sim="sd">
+        <option value="value">mounted</option><option value="missing">no card</option><option value="unknown">starting</option></select></label>
+      <div class="inline"><button id="boot">Simulate a boot</button></div>
+    </section>
+
+    <section>
+      <h2>Screen messages</h2>
+      <div class="inline"><input type="text" id="msg" placeholder="fbecho text"><button id="send">Write</button></div>
+      <div class="presets">
+        <button data-msg="sd: no usable card (EIO)">sd failure</button>
+        <button data-msg="usbcon: host stopped answering, waiting for a PC">usbcon</button>
+        <button data-msg="wlan: chip lost (link down, no firmware trap), recovering">wlan</button>
+        <button data-msg="a long line: the quick brown fox jumps over the lazy dog, twice: the quick brown fox jumps over the lazy dog, then stops at the edge of the screen and wraps">long line</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Overlays</h2>
+      <label class="row"><span>Pixel grid</span>
+        <select id="grid"><option value="0">off</option><option value="8">8 px</option>
+          <option value="16">16 px</option><option value="32">32 px</option></select></label>
+      <label class="inline"><input type="checkbox" id="zones"> Touch zones</label>
+    </section>
+
+    <section>
+      <h2>Touch actions</h2>
+      <ol class="log mono" id="actions"><li class="empty">Actions sent by a tap show here, with their message.</li></ol>
+    </section>
+
+    <section>
+      <h2>To implement in Rust</h2>
+      <ol class="notes">
+        <li><b>screen.rs</b>: <code>glyph</code> with a background color, <code>frame</code> (4 fills),
+            centered and right-aligned text. Scales 3 and 4 already work.</li>
+        <li><b>Colors</b>: <code>PANEL</code>, <code>EDGE</code>, <code>PRESS</code>, <code>BLUE</code>,
+            <code>TERM_BG</code>; memory bar in logo palette 3 and 5.</li>
+        <li><b>Pages</b>: header, tab bar, 5 pages. Full redraw on a page change; each second only the visible page's values.</li>
+        <li><b>Touch</b>: <code>display</code> reads <code>input</code> (<code>KIND_TOUCH</code>), turns the raw
+            panel coordinates landscape; a tap is a press and release on the same zone.
+            <code>input</code> has one queue: the shell's <code>events</code> would take touches from the screen.</li>
+        <li><b>USB-C Ethernet</b>: <code>usbcon</code> becomes a composite device, CDC-ACM + a CDC network function
+            (ECM or NCM, to choose); <code>net</code> gets link <code>usb0</code>; one active link, <code>usb0</code> first,
+            <code>wlan0</code> while <code>usb0</code> has no DHCP address; <code>usbcon::STATS</code> reports the network function.</li>
+        <li><b>Terminal</b>: <code>display</code> reads the console traffic (a history of both directions, in
+            <code>usbcon</code> or <code>console</code>, to choose), finds the <code>nxk&gt; </code> prompts, applies the
+            ANSI colors (the banner uses them) and wraps. Mask the passphrase of <code>wifi connect</code>.
+            The directory in the prompt needs the shell to print it; a failed command is recognized by an
+            errno name in its output or a shell marker (to choose).</li>
+        <li><b>Actions</b>, all in <code>abi</code> today: <code>power::REBOOT/OFF</code>, <code>wifi::SCAN/RETRY/DISCONNECT</code>.</li>
+        <li><b>Logs</b>: keep more than 3 lines (<code>MSG_ROWS</code>) and wrap them.</li>
+      </ol>
+    </section>
+  </aside>
+</main>
+
+<script>
+'use strict';
+const W = 1280, H = 720;
+
+// ---- Assets: font = 256 glyphs x 16 rows; logo = w, h, 8 R G B A palette
+// entries, then one palette index per pixel (0: transparent).
+function unb64(s) {
+  const b = atob(s), a = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i);
+  return a;
+}
+const FONT = window.NXK_FONT ? unb64(window.NXK_FONT) : null;
+const LOGO = window.NXK_LOGO ? unb64(window.NXK_LOGO) : null;
+const LOGO_W = LOGO ? LOGO[0] : 64, LOGO_H = LOGO ? LOGO[1] : 25;
+// build/logo.bin's palette when this was written, used without assets.
+const PAL0 = [0, 0xFF0C1A3B, 0xFF13348A, 0xFF1A49C2, 0xFF1F69E8, 0xFF4AA1F7, 0xFFA0D9FF, 0xFFE0F4FF];
+function palette(i) {
+  if (!LOGO) return PAL0[i];
+  const o = 2 + 4 * i;
+  return (LOGO[o] | LOGO[o + 1] << 8 | LOGO[o + 2] << 16 | LOGO[o + 3] << 24) >>> 0;
+}
+
+// ---- Colors: u32 A B G R as in user/display/src/screen.rs (the canvas'
+// R G B A bytes read little-endian), so they paste into Rust unchanged.
+const BG = 0xFF3A1E10, FG = 0xFFD8D8D8, DIM = 0xFF988880;
+const GOOD = 0xFF6AD06A, WARN = 0xFF40C0F0, BAD = 0xFF5060F0;
+const TRACK = 0xFF503020;
+const ACCENT = palette(6);
+// New in the proposal.
+const PANEL = 0xFF4C2916, EDGE = 0xFF75462B, PRESS = 0xFF8A4F2A, BLACK = 0xFF000000;
+const BLUE = 0xFFF0A06C, TERM_BG = 0xFF24130B;
+const MEM_KERNEL = palette(3), MEM_USER = palette(5);
+// xterm-256 colors of the shell banner (38;5;N).
+const XTERM = { 208: 0xFF0087FF, 166: 0xFF005FD7, 130: 0xFF005FAF, 215: 0xFF5FAFFF, 223: 0xFFAFD7FF };
+
+// ---- Screen: the primitives of screen.rs on a landscape image.
+const MAX_COLS = 160;
+const code = c => { const p = c.codePointAt(0); return p < 256 ? p : 63; }; // Latin-1, else '?'
+const tw = (s, scale) => [...s].length * 8 * scale;
+
+class Screen {
+  constructor(canvas) {
+    this.ctx = canvas.getContext('2d');
+    this.img = this.ctx.createImageData(W, H);
+    this.px = new Uint32Array(this.img.data.buffer);
+  }
+  // screen.rs `fill` (clipped here).
+  fill(x, y, w, h, c) {
+    x = Math.floor(x); y = Math.floor(y); w = Math.floor(w); h = Math.floor(h);
+    const x0 = Math.max(0, x), y0 = Math.max(0, y), x1 = Math.min(W, x + w), y1 = Math.min(H, y + h);
+    if (x1 <= x0) return;
+    for (let r = y0; r < y1; r++) this.px.fill(c, r * W + x0, r * W + x1);
+  }
+  clear(c = BG) { this.px.fill(c); }
+  // screen.rs `glyph`: runs of equal pixels, one rectangle each.
+  // NEW: `bg` (Rust always paints BG around the glyph).
+  glyph(x, y, ch, scale, fg, bg = BG) {
+    for (let dy = 0; dy < 16; dy++) {
+      const bits = FONT ? FONT[ch * 16 + dy] : (ch > 32 && dy > 2 && dy < 14 ? 0x7E : 0);
+      let dx = 0;
+      while (dx < 8) {
+        const on = (bits & (0x80 >> dx)) !== 0;
+        let end = dx + 1;
+        while (end < 8 && ((bits & (0x80 >> end)) !== 0) === on) end++;
+        this.fill(x + dx * scale, y + dy * scale, (end - dx) * scale, scale, on ? fg : bg);
+        dx = end;
+      }
+    }
+  }
+  // NEW: text helpers (screen.rs writes text through Line and Grid). Return the width.
+  text(x, y, s, scale, fg, bg = BG) {
+    let k = 0;
+    for (const c of s) this.glyph(x + 8 * scale * k++, y, code(c), scale, fg, bg);
+    return 8 * scale * k;
+  }
+  textR(xr, y, s, scale, fg, bg) { return this.text(xr - tw(s, scale), y, s, scale, fg, bg); }
+  textC(cx, y, s, scale, fg, bg) { return this.text(Math.floor(cx - tw(s, scale) / 2), y, s, scale, fg, bg); }
+  // NEW: outline, 4 fills.
+  frame(x, y, w, h, t, c) {
+    this.fill(x, y, w, t, c); this.fill(x, y + h - t, w, t, c);
+    this.fill(x, y, t, h, c); this.fill(x + w - t, y, t, h, c);
+  }
+  // main.rs `splash`: the logo, `s` times enlarged.
+  logo(x0, y0, s) {
+    if (!LOGO) { this.fill(x0, y0, LOGO_W * s, LOGO_H * s, palette(3)); return; }
+    for (let i = 0; i < LOGO_W * LOGO_H; i++) {
+      const p = LOGO[34 + i];
+      if (p) this.fill(x0 + (i % LOGO_W) * s, y0 + Math.floor(i / LOGO_W) * s, s, s, palette(p));
+    }
+  }
+  show() { this.ctx.putImageData(this.img, 0, 0); }
+}
+
+// ---- Formatting, as screen.rs / stats.rs print it.
+function bytes(n) {
+  for (const [s, unit] of [[30, 'GiB'], [20, 'MiB'], [10, 'KiB']]) {
+    const d = 2 ** s;
+    if (n >= d) return `${Math.floor(n / d)}.${Math.floor((n % d) * 10 / d)} ${unit}`;
+  }
+  return `${n} B`;
+}
+const ipv4 = a => [a >>> 24, a >>> 16 & 255, a >>> 8 & 255, a & 255].join('.');
+const ip = (a, b, c, d) => (a << 24 | b << 16 | c << 8 | d) >>> 0;
+const celsius = m => `${Math.trunc(m / 1000)}.${Math.floor(Math.abs(m % 1000) / 100)}°C`;
+const pad2 = n => String(n).padStart(2, '0');
+const hms = s => `${Math.floor(s / 3600)}:${pad2(Math.floor(s / 60) % 60)}:${pad2(s % 60)}`;
+const utc = t => new Date(t).toISOString().slice(11, 19);
+const loadColor = p => p >= 85 ? BAD : p >= 50 ? WARN : GOOD;
+const rp = (v, n) => String(v).padStart(n), lp = (v, n) => String(v).padEnd(n);
+
+// ---- Simulated system: what sysinfo and the services would answer.
+const PAGE = 4096;
+const sim = {
+  bootAt: Date.now() - 734000,
+  loadMode: 'normal', cores: 4, load: [null, null, null, null], procs: 14,
+  rates: { sys: 0, irq: 0, sw: 0 },
+  mem: { total: 953216, kernel: 2150, user: 10240 }, // pages
+  temps: 'value', chip: 42100, pkg: 38500,
+  usb: 'terminal', usbErrors: false, usbIn: 1843, usbOut: 48213,
+  eth: 'up',
+  wifi: 'connected', wlanPending: false, ssid: 'nxk-test', channel: 6, signal: 52,
+  rx: 1325000, tx: 221000, sockets: 2,
+  sd: 'value', sdTotal: 31_890_000_000, sdFree: 29_420_000_000,
+  msgs: [], partial: '',
+};
+// Links `net` may use; one at a time, usb0 first.
+const LINKS = {
+  usb0: { label: 'USB-C Ethernet', ip: ip(10, 42, 0, 23), prefix: 24, gw: ip(10, 42, 0, 1), dns: ip(10, 42, 0, 1) },
+  wlan0: { label: 'Wi-Fi', ip: ip(192, 168, 43, 117), prefix: 24, gw: ip(192, 168, 43, 1), dns: ip(192, 168, 43, 1) },
+};
+function active() {
+  if (sim.eth === 'up' || sim.eth === 'dhcp') return { name: 'usb0', pending: sim.eth === 'dhcp', ...LINKS.usb0 };
+  if (sim.wifi === 'connected') return { name: 'wlan0', pending: sim.wlanPending, ...LINKS.wlan0 };
+  return null;
+}
+const up = () => Math.floor((Date.now() - sim.bootAt) / 1000);
+const BASE = { idle: [3, 1, 1, 1], normal: [22, 9, 6, 4], busy: [92, 78, 71, 64] };
+
+function tick() {
+  sim.load = sim.load.map((p, k) => {
+    if (k >= sim.cores) return null;
+    const t = BASE[sim.loadMode][k], from = p ?? t;
+    const v = from + (t - from) * 0.4 + (Math.random() - 0.5) * (t < 10 ? 3 : 14);
+    return Math.max(0, Math.min(100, Math.round(v)));
+  });
+  const sum = sim.load.reduce((a, p) => a + (p ?? 0), 0);
+  const j = () => 0.9 + Math.random() * 0.2;
+  sim.rates = { sys: Math.round((800 + sum * 55) * j()), irq: Math.round((310 + sum * 7) * j()),
+                sw: Math.round((540 + sum * 21) * j()) };
+  sim.mem.user = Math.max(6000, sim.mem.user + Math.round((Math.random() - 0.5) * 60));
+  sim.chip += Math.round((Math.random() - 0.5) * 200 + (38000 + sum * 60 - sim.chip) * 0.1);
+  sim.pkg = sim.chip - 3600 + Math.round(Math.random() * 200);
+  if (sim.usb === 'terminal') sim.usbOut += Math.floor(Math.random() * 60);
+  const a = active();
+  if (a && !a.pending) { sim.rx += Math.floor(Math.random() * 3000); sim.tx += Math.floor(Math.random() * 900); }
+  if (sim.wifi === 'connected') sim.signal = Math.max(40, Math.min(80, sim.signal + Math.round((Math.random() - 0.5) * 4)));
+}
+
+function memInfo() {
+  const m = sim.mem, free = m.total - m.kernel - m.user;
+  return { total: m.total * PAGE, kernel: m.kernel * PAGE, used: (m.kernel + m.user) * PAGE,
+           user: m.user * PAGE, free: free * PAGE };
+}
+
+// display WRITE: lines, then the unfinished one.
+function write(text) {
+  for (const ch of text) {
+    if (ch === '\n') {
+      sim.msgs.push(sim.partial);
+      sim.partial = '';
+      if (sim.msgs.length > 200) sim.msgs.shift();
+      if (!(ui.view === 'proposal' && ui.page === 4)) ui.unread++;
+    } else if (ch !== '\r') sim.partial += ch;
+  }
+}
+const allMsgs = () => sim.partial ? [...sim.msgs, sim.partial] : sim.msgs;
+
+// USB-C console, Wi-Fi: texts and colors of stats.rs.
+function usbStatus() {
+  switch (sim.usb) {
+    case 'missing': return ['console not running', DIM];
+    case 'busy': return ['busy', DIM];
+    case 'terminal': return ['terminal open, high speed', GOOD];
+    case 'configured': return ['connected, high speed, terminal closed', WARN];
+    case 'host': return ['host seen, not configured', WARN];
+    default: return ['waiting for a PC', DIM];
+  }
+}
+function wifiStatus() {
+  switch (sim.wifi) {
+    case 'unknown': return [['starting', DIM]];
+    case 'missing': return [['no Wi-Fi driver', DIM]];
+    case 'connected': return [[`connected to ${sim.ssid}`, GOOD], [`, channel ${sim.channel}, -${sim.signal} dBm`, FG]];
+    case 'connecting': return [[`joining ${sim.ssid}`, WARN]];
+    case 'scanning': return [['scanning', WARN]];
+    case 'idle': return [['not connected (wifi connect SSID)', DIM]];
+    default: return [['no adapter (wifi status)', DIM]];
+  }
+}
+
+// ---- The shell behind the USB-C console, simulated with its real output formats.
+const HELP = [
+  '  help            this help', '  progs           boot image programs',
+  '  ls [DIR]        list directory contents (SD card)', '  cd, pwd         current directory',
+  '  cat FILE        print a file', '  echo T > F      write T into F (>>: append)',
+  '  rm, mkdir, rmdir, mv A B, cp A B, stat, df, sync', '  fbecho TEXT     print TEXT on the screen',
+  '  events [N]      show N input events (touchscreen, keyboard)',
+  '  run PROG ARGS.. run PROG (trailing &: background); bare PROG works',
+  '  env             environment variables', '  export NAME=VAL set a variable (passed to spawned programs)',
+  '  unset NAME      remove a variable', '  ps              processes', '  mem             physical memory',
+  '  cpu             per-core statistics', '  uptime          time since boot', '  echo TEXT       print TEXT',
+  '  date            wall-clock time (RTC)', '  sleep MS        wait MS milliseconds',
+  '  temp            chip and package temperatures', '  services        published services',
+  '  poweroff        power off the machine', '  reboot          reboot the machine',
+  '  recv F SIZE CRC receive F as base64 lines (tools/usbterm.py --put)',
+  '  restart DRV [F] replace boot driver DRV by F (default /bin/DRV)'];
+// user/shell/src/main.rs LOGO: a letter picks the color of its `#` cell.
+const BANNER = [
+  '       aaaa   bbbb', '   aaaa           bbbb', ' aa      ddddddd      bb      ff',
+  'aa                     bb     ff', 'aa   dd    fff    aa   bb     fffff   ff  ff  ff  ff',
+  '     dd   fffff   aa          dd  dd   dddd   dd dd', 'bb   dd    fff    aa   cc     aa  aa    aa    aaaa',
+  'bb                     cc     aa  aa   aaaa   aa aa', ' bb      aaaaaaa      cc      bb  bb  bb  bb  bb  bb',
+  '   bbbb           cccc', '       bbbb   cccc'];
+const INK = { a: XTERM[208], b: XTERM[166], c: XTERM[130], d: XTERM[215] };
+const PROGS = ['bench', 'clk', 'console', 'crash', 'display', 'fptest', 'fs', 'hello', 'hello-std', 'i2c', 'init',
+  'input', 'ipcbench', 'ktest', 'net', 'nettest', 'power', 'sd', 'shell', 'stdtest', 'true', 'usb', 'usbcon', 'wifi', 'wlan'];
+// Fake card: directories have size -1.
+const FS = {
+  '/': [['bin', -1], ['bootloader', -1], ['firmware', -1], ['nxk', -1]],
+  '/bin': PROGS.map((p, i) => [p, 38000 + (i * 7919 % 97) * 9100]),
+  '/bootloader': [['payloads', -1], ['hekate_ipl.ini', 1210]],
+  '/bootloader/payloads': [['nxk.bin', 2064384]],
+  '/firmware': [['brcm', -1]],
+  '/firmware/brcm': [['brcmfmac4356-pcie.bin', 614400], ['brcmfmac4356-pcie.clm_blob', 7900], ['brcmfmac4356-pcie.txt', 2100]],
+  '/nxk': [['bl31.bin', 61440], ['bl33.bin', 2064384]],
+};
+const PS = ['init', 'console', 'clk', 'i2c', 'power', 'sd', 'fs', 'display', 'input', 'usb', 'usbcon', 'net', 'wlan', 'shell'];
+const SCAN = [['nxk-test', 6, 52, 'WPA2'], ['maison-2.4', 11, 67, 'WPA2'], ['guest', 1, 74, 'open'],
+              ['printer-direct', 6, 81, 'WPA2'], ['voisin', 11, 86, 'WPA3']];
+const WIFI_MAC = '02:1a:2b:3c:4d:5e', ETH_MAC = '02:4e:58:4b:00:01';
+
+const term = { cwd: '/', entries: [] };
+const out = (t, c = FG) => ({ t: 'out', segs: [[t, c]] });
+function resolve(p) {
+  const parts = [];
+  for (const x of (p.startsWith('/') ? p : `${term.cwd}/${p}`).split('/')) {
+    if (x === '..') parts.pop(); else if (x && x !== '.') parts.push(x);
+  }
+  return '/' + parts.join('/');
+}
+const isFile = p => (FS[p.slice(0, p.lastIndexOf('/')) || '/'] ?? []).some(([n, s]) => s >= 0 && n === p.slice(p.lastIndexOf('/') + 1));
+
+// One command line typed at `at`: its output lines and the error it ended with (null: none).
+function shell(line, at) {
+  const argv = line.trim().split(/\s+/), [cmd, ...args] = argv;
+  const ok = lines => ({ lines, err: null }), fail = (lines, err) => ({ lines, err });
+  switch (cmd) {
+    case 'help': return ok(HELP);
+    case 'echo': return ok([args.join(' ')]);
+    case 'uptime': return ok([`${at - sim.bootAt} ms since boot`]);
+    case 'date': return ok([`${new Date(at).toISOString().slice(0, 10)} ${utc(at)} UTC`]);
+    case 'pwd': return ok([term.cwd]);
+    case 'progs': return ok(PS.map(p => `  ${p}`));
+    case 'temp': {
+      if (sim.temps !== 'value') return fail(['temp: ETIMEDOUT'], 'ETIMEDOUT');
+      const t = m => `${Math.trunc(m / 1000)}.${Math.floor(m % 1000 / 100)}`;
+      return ok([`chip ${t(sim.chip)} C, package ${t(sim.pkg)} C`]);
+    }
+    case 'mem': {
+      const m = sim.mem, free = m.total - m.kernel - m.user;
+      return ok([`  total ${Math.floor(m.total * 4 / 1024)} MiB, free ${Math.floor(free * 4 / 1024)} MiB, ` +
+                 `used ${(m.kernel + m.user) * 4} KiB (of which kernel ${m.kernel * 4} KiB)`]);
+    }
+    case 'cpu': return ok(['  CORE   SWITCHES     SYSCALLS    IRQ      IDLE', ...sim.load.map((p, k) =>
+      `  ${rp(k, 5)}  ${rp(Math.floor(up() * sim.rates.sw / 4 * (1.3 - k * 0.1)), 12)}  ` +
+      `${rp(Math.floor(up() * sim.rates.sys / 4 * (1.3 - k * 0.1)), 10)}  ` +
+      `${rp(Math.floor(up() * sim.rates.irq / 4), 7)}  ${rp(p === null ? 100 : 100 - p, 4)}%`)]);
+    case 'ps': return ok(['  PID  PPID  THR  PAGES  CPU(ms)  STATE   NAME', ...PS.map((n, i) =>
+      `  ${rp(i + 1, 3)}  ${rp(i ? 1 : 0, 4)}  ${rp(1 + i % 3, 3)}  ${rp(40 + (i * 37) % 300, 5)}  ` +
+      `${rp(Math.floor(up() * (1 + (i * 13) % 7) / 3), 7)}  ${lp('alive', 6)}  ${n}`)]);
+    case 'df':
+      if (sim.sd !== 'value') return fail(['df: ENODEV'], 'ENODEV');
+      return ok([`  SD card: ${Math.floor(sim.sdFree / 2 ** 20)} MiB free of ${Math.floor(sim.sdTotal / 2 ** 20)} MiB`]);
+    case 'ls': {
+      const arg = args[0] ?? '.', p = resolve(arg);
+      if (!FS[p]) return fail([`ls ${arg}: ${isFile(p) ? 'ENOTDIR' : 'ENOENT'}`], isFile(p) ? 'ENOTDIR' : 'ENOENT');
+      return ok(FS[p].map(([n, s]) => s < 0 ? `  ${rp('', 10)}  ${n}/` : `  ${rp(s, 10)}  ${n}`));
+    }
+    case 'cd': {
+      const arg = args[0] ?? '/', p = resolve(arg);
+      if (FS[p]) { term.cwd = p; return ok([]); }
+      return isFile(p) ? fail([`cd ${arg}: not a directory`], 'ENOTDIR') : fail([`cd ${arg}: ENOENT`], 'ENOENT');
+    }
+    case 'fbecho': write(`${args.join(' ')}\n`); return ok([]);
+    case 'reboot': later(300, reboot); return ok([]);
+    case 'poweroff': later(300, powerOff); return ok([]);
+    case 'wifi': return wifiCmd(args);
+    default: return fail([`${cmd}: unknown command or program (see 'help' and 'ls')`], 'ENOENT');
+  }
+}
+function wifiCmd([sub, ssid, psk]) {
+  const usage = 'usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status | retry';
+  if (['missing', 'unknown'].includes(sim.wifi)) return { lines: ['wifi: ENOENT'], err: 'ENOENT' };
+  switch (sub) {
+    case 'status': {
+      const name = { connected: 'connected', connecting: 'connecting', scanning: 'scanning', idle: 'idle', down: 'down' }[sim.wifi];
+      const lines = [`state ${name}, MAC ${sim.wifi === 'down' ? '00:00:00:00:00:00' : WIFI_MAC}`];
+      if (sim.wifi === 'connected') lines.push(`network ${sim.ssid}, channel ${sim.channel}, signal -${sim.signal} dBm`);
+      return { lines, err: null };
+    }
+    case 'scan':
+      if (sim.wifi === 'down') return { lines: ['wifi: ENODEV'], err: 'ENODEV' };
+      return { lines: [`${lp('SSID', 20)} ${rp('chan', 4)} ${rp('signal', 7)} ${rp('sec', 6)}  BSSID`, ...SCAN.map(([n, c, d, s], i) =>
+        `${lp(n, 20)} ${rp(c, 4)} ${rp(-d, 4)} dBm ${rp(s, 6)}  02:0${i}:3c:4d:5e:${pad2(10 + i)}`)], err: null };
+    case 'connect': {
+      if (!ssid) return { lines: [usage], err: null };
+      if (sim.wifi === 'down') return { lines: ['wifi: ENODEV'], err: 'ENODEV' };
+      Object.assign(sim, { ssid, wifi: 'connected', wlanPending: false });
+      const a = LINKS.wlan0, lines = [`connected to ${ssid}`];
+      if (active()?.name === 'wlan0') lines.push(`address ${ipv4(a.ip)}/${a.prefix}, gateway ${ipv4(a.gw)}, DNS ${ipv4(a.dns)}`);
+      return { lines, err: null };
+    }
+    case 'disconnect': sim.wifi = 'idle'; return { lines: [], err: null };
+    case 'retry': later(0, retry); return { lines: [`adapter BCM4356, recovering`], err: null };
+    default: return { lines: [usage], err: null };
+  }
+}
+// The passphrase never reaches the screen.
+const mask = line => line.replace(/^(\s*wifi\s+connect\s+\S+\s+)(\S.*)$/, (_, a, p) => a + '*'.repeat(8));
+
+function termType(line, at = Date.now()) {
+  const cwd = term.cwd, r = shell(line, at);
+  term.entries.push({ t: 'cmd', cwd, cmd: mask(line), err: r.err, at });
+  for (const l of r.lines) term.entries.push(out(l));
+  sim.usbIn += line.length + 1;
+  sim.usbOut += 5 + line.length + r.lines.reduce((a, l) => a + l.length + 2, 0);
+  if (term.entries.length > 500) term.entries.splice(0, term.entries.length - 500);
+}
+function termBoot() {
+  term.cwd = '/';
+  term.entries = [out('')];
+  BANNER.forEach((row, i) => {
+    const segs = [];
+    for (const ch of row) {
+      const t = ch === ' ' ? ' ' : '#', c = ch === ' ' ? FG : INK[ch] ?? XTERM[223];
+      const last = segs[segs.length - 1];
+      if (last && last[1] === c) last[0] += t; else segs.push([t, c]);
+    }
+    if (i === BANNER.length - 1) segs.push(['            AArch64 microkernel for Tegra X1', FG]);
+    term.entries.push({ t: 'out', segs });
+  });
+  term.entries.push(out("nxk - shell. Type 'help' for the command list."));
+}
+
+// ---- View 1: the current screen, as main.rs + stats.rs draw it.
+const TAGLINE = 'AArch64 microkernel for Tegra X1';
+const LABEL = 9, CPU_COLS = 17, BAR = 8, MSG_ROWS = 3;
+
+class Line {
+  constructor() { this.cells = []; this.c = FG; }
+  color(c) { this.c = c; return this; }
+  w(s) { for (const ch of s) if (this.cells.length < MAX_COLS) this.cells.push([code(ch), this.c]); return this; }
+  pad(col) { while (this.cells.length < Math.min(col, MAX_COLS)) this.cells.push([32, FG]); return this; }
+}
+function label(name) { const l = new Line(); l.color(ACCENT).w(name).pad(LABEL).color(FG); return l; }
+function gridLine(x0, y, scale, cols, l) {
+  for (let c = 0; c < cols; c++) {
+    const [ch, fg] = l.cells[c] ?? [32, FG];
+    scr.glyph(x0 + c * 8 * scale, y, ch, scale, fg);
+  }
+}
+
+function sysLine() {
+  const l = label('SYSTEM'), cores = sim.load.filter(p => p !== null).length;
+  l.w(`up ${hms(up())}   ${sim.procs} processes   ${cores} cores`);
+  if (sim.temps === 'value') l.w(`   chip ${celsius(sim.chip)}  package ${celsius(sim.pkg)}`);
+  return l;
+}
+function cpuLine() {
+  const l = label('CPU');
+  sim.load.forEach((p, k) => {
+    l.pad(LABEL + k * CPU_COLS).color(FG).w(`${k}`).pad(LABEL + k * CPU_COLS + 2 + BAR);
+    if (p === null) l.color(DIM).w(' off'); else l.w(` ${String(p).padStart(3)}%`);
+  });
+  return l;
+}
+function ratesLine() {
+  const r = sim.rates;
+  return label('LOAD').w(`${r.sys} syscalls/s   ${r.irq} interrupts/s   ${r.sw} context switches/s`);
+}
+function memLine() {
+  const m = memInfo();
+  return label('MEMORY').w(`${bytes(m.used)} used of ${bytes(m.total)}   kernel ${bytes(m.kernel)}   ${bytes(m.free)} free`);
+}
+function usbLine() {
+  const l = label('USB-C'), [t, c] = usbStatus();
+  l.color(c).w(t);
+  if (sim.usb === 'missing' || sim.usb === 'busy') return l;
+  l.pad(LABEL + 36).color(FG).w(`in ${bytes(sim.usbIn)}   out ${bytes(sim.usbOut)}`);
+  if (sim.usbErrors) l.color(BAD).w('   3 errors');
+  return l;
+}
+function netLine() {
+  const l = label('NETWORK'), a = active();
+  if (!a) return l.color(DIM).w('waiting for a link (eth0 or wlan0)');
+  if (a.pending) l.color(WARN).w(`${a.name}: waiting for DHCP`);
+  else l.color(GOOD).w(`${a.name} ${ipv4(a.ip)}/${a.prefix}`);
+  return l.pad(LABEL + 28).color(FG).w(`rx ${bytes(sim.rx)}   tx ${bytes(sim.tx)}   ${sim.sockets} sockets`);
+}
+function wifiLine() {
+  const l = label('WI-FI');
+  for (const [t, c] of wifiStatus()) l.color(c).w(t);
+  return l;
+}
+function diskLine() {
+  const l = label('STORAGE');
+  if (sim.sd === 'unknown') return l.color(DIM).w('starting');
+  if (sim.sd === 'missing') return l.color(DIM).w('no card');
+  return l.w(`SD card, ${bytes(sim.sdFree)} free of ${bytes(sim.sdTotal)}`);
+}
+
+function drawCurrent() {
+  scr.clear();
+  const scale = W >= 1024 ? 2 : 1;
+  const s = Math.max(1, Math.min(Math.floor(W * 40 / 100 / LOGO_W), Math.floor(H / 5 / LOGO_H)));
+  const y0 = 16 * scale;
+  scr.logo(Math.floor((W - LOGO_W * s) / 2), y0, s);
+  const ty = y0 + LOGO_H * s + 8 * scale, cw = 8 * scale;
+  if (TAGLINE.length * cw <= W) scr.text(Math.floor((W - TAGLINE.length * cw) / 2), ty, TAGLINE, scale, ACCENT);
+  const top = ty + 16 * scale * 2, x0 = 16 * scale;
+  const cols = Math.min(Math.floor((W - 2 * x0) / cw), MAX_COLS);
+  [sysLine(), cpuLine(), ratesLine(), memLine(), usbLine(), netLine(), wifiLine(), diskLine()]
+    .forEach((l, r) => gridLine(x0, top + r * 16 * scale, scale, cols, l));
+  // CPU bars in the CPU line's blank cells.
+  const full = BAR * 8 * scale;
+  sim.load.forEach((p, k) => {
+    const x = x0 + (LABEL + k * CPU_COLS + 2) * cw, y = top + 16 * scale + 4 * scale;
+    const filled = p === null ? 0 : Math.floor(full * Math.min(p, 100) / 100);
+    scr.fill(x, y, filled, 8 * scale, p === null ? GOOD : loadColor(p));
+    scr.fill(x + filled, y, full - filled, 8 * scale, TRACK);
+  });
+  const msgY = H - (MSG_ROWS + 1) * 16, mcols = Math.min(Math.floor((W - 2 * x0) / 8), MAX_COLS);
+  const shown = allMsgs().slice(-MSG_ROWS);
+  for (let r = 0; r < MSG_ROWS; r++) {
+    const l = new Line();
+    if (shown[r] !== undefined) l.color(DIM).w(shown[r]);
+    gridLine(x0, msgY + r * 16, 1, mcols, l);
+  }
+}
+
+// ---- View 2: proposal. Header, 5 pages, tab bar; touch zones.
+const HEAD = 64, TABS = 96, M = 16;
+const CY = HEAD + M, CH = H - HEAD - TABS - 2 * M; // content: y 80, 528 high
+const PAGES = ['HOME', 'SYSTEM', 'NETWORK', 'TERMINAL', 'LOGS'];
+const ui = {
+  view: 'proposal', page: 0, pressed: null, down: null, modal: null, toast: null, scan: null,
+  logScale: 1, termScale: 1, unread: 0, off: false, blackUntil: 0, grid: 0, showZones: false,
+};
+let zones = [];
+const zone = (id, x, y, w, h, tap) => zones.push({ id, x, y, w, h, tap });
+const go = page => { ui.page = page; if (page === 4) ui.unread = 0; };
+
+function card(x, y, w, h, title, hot) {
+  scr.fill(x, y, w, h, PANEL);
+  scr.frame(x, y, w, h, 2, hot ? ACCENT : EDGE);
+  if (title) scr.text(x + 16, y + 16, title, 2, ACCENT, PANEL);
+}
+// A tile: a card that opens a page.
+function tile(id, x, y, w, h, title, page) {
+  card(x, y, w, h, title, ui.pressed === id);
+  zone(id, x, y, w, h, () => go(page));
+}
+// No `tap`: drawn disabled, no zone.
+function button(id, x, y, w, h, text, tone, tap) {
+  const bg = tap && ui.pressed === id ? PRESS : PANEL;
+  scr.fill(x, y, w, h, bg);
+  scr.frame(x, y, w, h, 2, tap ? tone ?? DIM : EDGE);
+  scr.textC(x + w / 2, y + Math.floor((h - 32) / 2), text, 2, tap ? tone ?? FG : EDGE, bg);
+  if (tap) zone(id, x, y, w, h, tap);
+}
+// Framed word, right-aligned on `xr`; returns its width.
+function badge(xr, y, text, color) {
+  const w = tw(text, 2) + 24;
+  scr.frame(xr - w, y, w, 40, 2, color);
+  scr.text(xr - w + 12, y + 4, text, 2, color, PANEL);
+  return w;
+}
+function bar(x, y, w, h, pct, color) {
+  const f = Math.floor(w * Math.min(pct, 100) / 100);
+  scr.fill(x, y, f, h, color);
+  scr.fill(x + f, y, w - f, h, TRACK);
+}
+// Memory split: kernel, programs, free.
+function memBar(x, y, w, h, m) {
+  const k = Math.max(2, Math.round(w * m.kernel / m.total)), u = Math.max(2, Math.round(w * m.user / m.total));
+  scr.fill(x, y, k, h, MEM_KERNEL);
+  scr.fill(x + k, y, u, h, MEM_USER);
+  scr.fill(x + k + u, y, w - k - u, h, TRACK);
+}
+// Legend square; the free part (TRACK) outlined to be seen on PANEL.
+function swatch(x, y, c) {
+  scr.fill(x, y, 12, 12, c);
+  if (c === TRACK) scr.frame(x, y, 12, 12, 2, DIM);
+}
+// Label on the left, value on the right of one row.
+function kv(x, xr, y, name, value, color = FG, square) {
+  if (square) { swatch(x, y + 10, square); x += 24; }
+  scr.text(x, y, name, 2, DIM, PANEL);
+  scr.textR(xr, y, value, 2, color, PANEL);
+}
+// Four bars, `x` left, `y` bottom.
+function signalBars(x, y, dbm) {
+  const n = dbm < 55 ? 4 : dbm < 65 ? 3 : dbm < 75 ? 2 : 1;
+  for (let i = 0; i < 4; i++) scr.fill(x + i * 10, y - 8 - i * 6, 6, 8 + i * 6, i < n ? GOOD : TRACK);
+}
+const usbColor = () => sim.usb === 'terminal' ? GOOD : ['configured', 'host'].includes(sim.usb) ? WARN : DIM;
+const ethColor = () => ({ up: GOOD, dhcp: WARN, nosharing: WARN })[sim.eth] ?? DIM;
+const wifiColor = () => ({ connected: GOOD, connecting: WARN, scanning: WARN, down: BAD })[sim.wifi] ?? DIM;
+const sdColor = () => sim.sd === 'value' ? GOOD : DIM;
+const WIFI_SHORT = { unknown: ['starting', DIM], missing: ['no Wi-Fi driver', DIM], connected: ['connected', GOOD],
+  connecting: ['joining', WARN], scanning: ['scanning', WARN], idle: ['not connected', DIM], down: ['no adapter', BAD] };
+const ETH_TEXT = { up: 'shared by the PC', dhcp: 'link up, waiting for DHCP', nosharing: 'no DHCP: sharing off on the PC?',
+  nopc: 'no PC on USB-C', missing: 'not running' };
+const ETH_SHORT = { up: 'shared by the PC', dhcp: 'waiting for DHCP', nosharing: 'no DHCP answer', nopc: 'no PC',
+  missing: 'not running' };
+const USB_SHORT = { terminal: 'open', configured: 'closed', host: 'host seen', waiting: 'no PC', missing: 'not running', busy: 'busy' };
+
+function header() {
+  scr.fill(0, 0, W, HEAD, PANEL);
+  scr.fill(0, HEAD - 2, W, 2, EDGE);
+  scr.logo(M, 7, 2);
+  scr.text(M + LOGO_W * 2 + 16, 24, TAGLINE, 1, DIM, PANEL);
+  let x = W - M;
+  x -= scr.textR(x, 16, `up ${hms(up())}`, 2, FG, PANEL) + 32;
+  const [t, tc] = sim.temps === 'value' ? [celsius(sim.chip), FG] : ['--.-°C', DIM];
+  x -= scr.textR(x, 16, t, 2, tc, PANEL) + 32;
+  for (const [id, name, color, page] of [['c-sd', 'SD', sdColor(), null], ['c-wifi', 'WI-FI', wifiColor(), 2],
+                                         ['c-eth', 'ETH', ethColor(), 2], ['c-usb', 'USB', usbColor(), 3]]) {
+    const w = 20 + tw(name, 2), bx = x - w, bg = ui.pressed === id ? PRESS : PANEL;
+    if (bg !== PANEL) scr.fill(bx - 8, 8, w + 16, HEAD - 18, bg);
+    scr.fill(bx, 26, 12, 12, color);
+    scr.text(bx + 20, 16, name, 2, color === DIM ? DIM : FG, bg);
+    if (page !== null) zone(id, bx - 8, 0, w + 16, HEAD - 2, () => go(page));
+    x = bx - 24;
+  }
+}
+
+function tabBar() {
+  const y = H - TABS, w = W / PAGES.length;
+  PAGES.forEach((name, i) => {
+    const x = i * w, id = `tab${i}`, on = ui.page === i;
+    const bg = ui.pressed === id ? PRESS : on ? PANEL : BG;
+    scr.fill(x, y, w, TABS, bg);
+    scr.fill(x, y, w, on ? 4 : 2, on ? ACCENT : EDGE);
+    if (i && !on && ui.page !== i - 1) scr.fill(x, y + 24, 2, TABS - 48, EDGE);
+    const badgeText = i === 4 && ui.unread ? ` ${Math.min(ui.unread, 99)}` : '';
+    const lx = Math.floor(x + (w - tw(name + badgeText, 2)) / 2);
+    const lw = scr.text(lx, y + 32, name, 2, on ? ACCENT : DIM, bg);
+    if (badgeText) scr.text(lx + lw, y + 32, badgeText, 2, WARN, bg);
+    zone(id, x, y, w, TABS, () => go(i));
+  });
+}
+
+function home() {
+  // Top row: the machine's resources, three tiles; bottom row: connectivity, two.
+  const h = (CH - M) / 2, yT = CY, yB = CY + h + M;
+  const w3 = Math.floor((W - 4 * M) / 3), x1 = M, x2 = 2 * M + w3, x3 = 3 * M + 2 * w3, w3r = W - M - x3;
+  const w = (W - 3 * M) / 2, xL = M, xR = 2 * M + w;
+
+  tile('t-cpu', x1, yT, w3, h, 'CPU', 1);
+  const on = sim.load.filter(p => p !== null);
+  const avg = on.length ? Math.round(on.reduce((a, b) => a + b, 0) / on.length) : 0;
+  scr.text(x1 + 16, yT + 64, `${avg}%`, 4, loadColor(avg), PANEL);
+  scr.text(x1 + 16, yT + 136, 'average', 2, DIM, PANEL);
+  sim.load.forEach((p, k) => {
+    const y = yT + 16 + k * 40;
+    scr.text(x1 + 168, y, `${k}`, 2, p === null ? DIM : FG, PANEL);
+    if (p === null) { scr.fill(x1 + 200, y + 8, 112, 16, TRACK); scr.textR(x1 + w3 - 16, y, 'off', 2, DIM, PANEL); }
+    else { bar(x1 + 200, y + 8, 112, 16, p, loadColor(p)); scr.textR(x1 + w3 - 16, y, `${p}%`, 2, FG, PANEL); }
+  });
+  scr.text(x1 + 16, yT + h - 48, `${on.length} cores   ${sim.procs} processes`, 2, DIM, PANEL);
+
+  tile('t-mem', x2, yT, w3, h, 'MEMORY', 1);
+  const m = memInfo();
+  scr.textR(x2 + w3 - 16, yT + 16, bytes(m.total), 2, DIM, PANEL);
+  const mw = scr.text(x2 + 16, yT + 64, bytes(m.used), 4, FG, PANEL);
+  scr.text(x2 + 32 + mw, yT + 96, 'used', 2, DIM, PANEL);
+  memBar(x2 + 16, yT + 144, w3 - 32, 24, m);
+  kv(x2 + 16, x2 + w3 - 16, yT + 176, 'kernel', bytes(m.kernel), FG, MEM_KERNEL);
+  kv(x2 + 16, x2 + w3 - 16, yT + 208, 'free', bytes(m.free), FG, TRACK);
+
+  card(x3, yT, w3r, h, 'STORAGE');
+  if (sim.sd === 'value') {
+    const used = sim.sdTotal - sim.sdFree, pct = Math.round(used * 100 / sim.sdTotal);
+    scr.textR(x3 + w3r - 16, yT + 16, 'SD card', 2, DIM, PANEL);
+    const fw = scr.text(x3 + 16, yT + 64, bytes(sim.sdFree), 4, FG, PANEL);
+    scr.text(x3 + 32 + fw, yT + 96, 'free', 2, DIM, PANEL);
+    bar(x3 + 16, yT + 144, w3r - 32, 24, pct, pct >= 90 ? BAD : MEM_USER);
+    kv(x3 + 16, x3 + w3r - 16, yT + 176, 'used', `${bytes(used)} (${pct}%)`);
+    kv(x3 + 16, x3 + w3r - 16, yT + 208, 'total', bytes(sim.sdTotal));
+  } else scr.text(x3 + 16, yT + 72, sim.sd === 'missing' ? 'no card' : 'starting', 2, DIM, PANEL);
+
+  tile('t-net', xL, yB, w, h, 'NETWORK', 2);
+  const a = active();
+  if (a) scr.textR(xL + w - 16, yB + 16, a.name, 2, DIM, PANEL);
+  if (a && !a.pending) {
+    const iw = scr.text(xL + 16, yB + 64, ipv4(a.ip), 3, GOOD, PANEL);
+    scr.text(xL + 16 + iw, yB + 80, `/${a.prefix}`, 2, DIM, PANEL);
+  } else scr.text(xL + 16, yB + 72, a ? 'waiting for DHCP' : 'offline', 2, a ? WARN : DIM, PANEL);
+  scr.text(xL + 16, yB + 136, 'Eth', 2, DIM, PANEL);
+  const ec = ethColor();
+  scr.fill(xL + 128, yB + 146, 12, 12, ec);
+  scr.text(xL + 152, yB + 136, ETH_SHORT[sim.eth], 2, ec === DIM ? DIM : FG, PANEL);
+  scr.text(xL + 16, yB + 184, 'Wi-Fi', 2, DIM, PANEL);
+  if (sim.wifi === 'connected') {
+    signalBars(xL + 128, yB + 212, sim.signal);
+    scr.text(xL + 176, yB + 184, `${sim.ssid}  ch ${sim.channel}  -${sim.signal} dBm`, 2, FG, PANEL);
+  } else {
+    const [t, c] = WIFI_SHORT[sim.wifi];
+    scr.text(xL + 128, yB + 184, sim.wifi === 'connecting' ? `${t} ${sim.ssid}` : t, 2, c, PANEL);
+  }
+
+  tile('t-term', xR, yB, w, h, 'TERMINAL', 3);
+  scr.textR(xR + w - 16, yB + 16, USB_SHORT[sim.usb], 2, usbColor(), PANEL);
+  const cmds = term.entries.filter(e => e.t === 'cmd').slice(-3);
+  if (!cmds.length) scr.text(xR + 16, yB + 72, 'no command yet', 2, DIM, PANEL);
+  cmds.forEach((e, i) => {
+    const y = yB + 64 + i * 40;
+    const x = xR + 16 + scr.text(xR + 16, y, '% ', 2, DIM, PANEL);
+    scr.text(x, y, e.cmd.length > 20 ? `${e.cmd.slice(0, 19)}~` : e.cmd, 2, FG, PANEL);
+    scr.textR(xR + w - 16, y, e.err ?? utc(e.at), 2, e.err ? BAD : DIM, PANEL);
+  });
+  if (!['missing', 'busy'].includes(sim.usb)) {
+    scr.text(xR + 16, yB + h - 48, `in ${bytes(sim.usbIn)}   out ${bytes(sim.usbOut)}`, 2, DIM, PANEL);
+  }
+}
+
+function system() {
+  const w = (W - 3 * M) / 2, xL = M, xR = 2 * M + w;
+  card(xL, CY, w, CH, 'PROCESSOR');
+  scr.textR(xL + w - 16, CY + 16, `up ${hms(up())}`, 2, DIM, PANEL);
+  sim.load.forEach((p, k) => {
+    const y = CY + 64 + k * 52;
+    scr.text(xL + 16, y, `CPU${k}`, 2, p === null ? DIM : FG, PANEL);
+    if (p === null) { scr.fill(xL + 104, y + 4, 400, 24, TRACK); scr.textR(xL + w - 16, y, 'off', 2, DIM, PANEL); }
+    else { bar(xL + 104, y + 4, 400, 24, p, loadColor(p)); scr.textR(xL + w - 16, y, `${p}%`, 2, FG, PANEL); }
+  });
+  scr.fill(xL + 16, CY + 288, w - 32, 2, EDGE);
+  scr.text(xL + 16, CY + 304, 'ACTIVITY', 2, ACCENT, PANEL);
+  const r = sim.rates;
+  [['syscalls/s', r.sys], ['interrupts/s', r.irq], ['context switches/s', r.sw], ['processes', sim.procs]]
+    .forEach(([n, v], i) => kv(xL + 16, xL + w - 16, CY + 344 + i * 38, n, `${v}`));
+
+  const m = memInfo();
+  card(xR, CY, w, 256, 'MEMORY');
+  scr.textR(xR + w - 16, CY + 16, bytes(m.total), 2, DIM, PANEL);
+  memBar(xR + 16, CY + 64, w - 32, 32, m);
+  kv(xR + 16, xR + w - 16, CY + 120, 'kernel', bytes(m.kernel), FG, MEM_KERNEL);
+  kv(xR + 16, xR + w - 16, CY + 160, 'programs', bytes(m.user), FG, MEM_USER);
+  kv(xR + 16, xR + w - 16, CY + 200, 'free', bytes(m.free), FG, TRACK);
+
+  const py = CY + 256 + M;
+  card(xR, py, w, 256, 'POWER');
+  if (sim.temps === 'value') {
+    kv(xR + 16, xR + w - 16, py + 64, 'chip temperature', celsius(sim.chip));
+    kv(xR + 16, xR + w - 16, py + 104, 'package temperature', celsius(sim.pkg));
+  } else scr.text(xR + 16, py + 64, sim.temps === 'missing' ? 'no temperature sensor' : 'starting', 2, DIM, PANEL);
+  const bw = (w - 48) / 2, by = py + 256 - 16 - 72;
+  button('reboot', xR + 16, by, bw, 72, 'REBOOT', WARN, () => ask({
+    title: 'Reboot the Switch?', ok: 'REBOOT', tone: WARN,
+    lines: ['It goes back to RCM: inject nxk', 'again from the PC.'], run: reboot }));
+  button('off', xR + 32 + bw, by, bw, 72, 'POWER OFF', BAD, () => ask({
+    title: 'Power off the Switch?', ok: 'POWER OFF', tone: BAD,
+    lines: ['Power on goes to RCM (AutoRCM):', 'inject nxk again from the PC.'], run: powerOff }));
+}
+
+// ACTIVE on the link net uses, STANDBY on a usable other one; returns the width.
+function linkBadge(xr, y, name, usable) {
+  const a = active();
+  if (a?.name === name) return badge(xr, y, 'ACTIVE', GOOD);
+  return usable ? badge(xr, y, 'STANDBY', DIM) : 0;
+}
+
+function network() {
+  const w = (W - 3 * M) / 2, xL = M, xR = 2 * M + w, a = active();
+  card(M, CY, W - 2 * M, 176, 'INTERNET');
+  if (a) {
+    scr.textR(W - 2 * M, CY + 16, `rx ${bytes(sim.rx)}   tx ${bytes(sim.tx)}   ${sim.sockets} sockets`, 2, DIM, PANEL);
+    if (a.pending) scr.text(2 * M, CY + 64, 'waiting for DHCP', 2, WARN, PANEL);
+    else {
+      const iw = scr.text(2 * M, CY + 56, ipv4(a.ip), 3, GOOD, PANEL);
+      scr.text(2 * M + iw, CY + 72, `/${a.prefix}`, 2, DIM, PANEL);
+      scr.text(2 * M, CY + 120, 'online', 2, GOOD, PANEL);
+    }
+    kv(xR + 16, W - 2 * M, CY + 56, 'via', `${a.name}, ${a.label}`);
+    kv(xR + 16, W - 2 * M, CY + 92, 'gateway', a.pending ? '-' : ipv4(a.gw));
+    kv(xR + 16, W - 2 * M, CY + 128, 'DNS', a.pending ? '-' : ipv4(a.dns));
+  } else {
+    scr.text(2 * M, CY + 56, 'offline', 3, DIM, PANEL);
+    scr.text(2 * M, CY + 120, 'no sharing on USB-C, no Wi-Fi network', 2, DIM, PANEL);
+  }
+
+  const y0 = CY + 176 + M, h = CH - 176 - M;
+  card(xL, y0, w, h, 'USB-C ETHERNET');
+  linkBadge(xL + w - 16, y0 + 12, 'usb0', sim.eth === 'up');
+  scr.text(xL + 16, y0 + 64, ETH_TEXT[sim.eth], 2, ethColor(), PANEL);
+  if (sim.eth !== 'missing') {
+    kv(xL + 16, xL + w - 16, y0 + 112, 'interface', 'usb0');
+    kv(xL + 16, xL + w - 16, y0 + 150, 'MAC', ETH_MAC);
+    kv(xL + 16, xL + w - 16, y0 + 188, 'USB', sim.eth === 'nopc' ? '-' : 'high speed, 480 Mb/s');
+  }
+  const hint = { nosharing: ['on the PC: share its connection', '(nmcli: ipv4.method shared)'],
+                 nopc: ['plug the Switch into a PC that', 'shares its connection'] }[sim.eth];
+  if (hint) hint.forEach((t, i) => scr.text(xL + 16, y0 + 240 + i * 36, t, 2, DIM, PANEL));
+
+  card(xR, y0, w, h, 'WI-FI');
+  const bwid = linkBadge(xR + w - 16, y0 + 12, 'wlan0', sim.wifi === 'connected');
+  const by = y0 + h - 16 - 64, bw = (w - 64) / 3;
+  const adapter = !['missing', 'unknown', 'down'].includes(sim.wifi);
+  if (ui.scan) {
+    scr.textR(xR + w - 32 - bwid, y0 + 16, `${ui.scan.length} networks`, 2, DIM, PANEL);
+    ui.scan.slice(0, 5).forEach(([ssid, ch, dbm, sec], i) => {
+      const y = y0 + 60 + i * 36, cur = sim.wifi === 'connected' && ssid === sim.ssid;
+      scr.text(xR + 16, y, ssid.slice(0, 14), 2, cur ? GOOD : FG, PANEL);
+      scr.textR(xR + w - 16, y, `ch ${rp(ch, 2)}  -${dbm} dBm  ${rp(sec, 4)}`, 2, DIM, PANEL);
+    });
+    button('w-back', xR + 16, by, bw, 64, 'BACK', null, () => { ui.scan = null; });
+    button('w-scan', xR + 32 + bw, by, bw, 64, 'SCAN', null, sim.wifi === 'scanning' ? null : scan);
+  } else {
+    if (sim.wifi === 'connected') signalBars(xR + w - 32 - bwid - 36, y0 + 44, sim.signal);
+    const [t, c] = WIFI_SHORT[sim.wifi];
+    scr.text(xR + 16, y0 + 64, t, 2, c, PANEL);
+    if (['connected', 'connecting'].includes(sim.wifi)) scr.text(xR + 16, y0 + 100, sim.ssid, 3, FG, PANEL);
+    if (sim.wifi === 'connected') {
+      kv(xR + 16, xR + w - 16, y0 + 164, 'channel', `${sim.channel}`);
+      kv(xR + 16, xR + w - 16, y0 + 202, 'signal', `-${sim.signal} dBm`);
+    } else if (sim.wifi === 'idle') scr.text(xR + 16, y0 + 112, 'join: wifi connect SSID (shell)', 2, DIM, PANEL);
+    button('w-scan', xR + 16, by, bw, 64, 'SCAN', null, adapter && sim.wifi !== 'scanning' ? scan : null);
+    button('w-retry', xR + 32 + bw, by, bw, 64, 'RETRY', null, sim.wifi === 'missing' ? null : retry);
+    button('w-leave', xR + 48 + 2 * bw, by, bw, 64, 'LEAVE', WARN,
+      ['connected', 'connecting'].includes(sim.wifi) ? () => ask({
+        title: `Leave ${sim.ssid}?`, ok: 'LEAVE', tone: WARN,
+        lines: ['Rejoining needs the shell:', `wifi connect ${sim.ssid} PASSPHRASE`], run: leave }) : null);
+  }
+}
+
+// ---- TERMINAL: the USB-C console in a zsh look (ASCII only).
+const prompt = cwd => [['pc@nxk', GOOD], [' ', FG], [cwd, BLUE], [' % ', FG]];
+
+// Entries as screen rows `cols` wide: segments, right prompt, cursor.
+function termRows(cols, live) {
+  const rows = [];
+  const add = (segs, right, cursor) => {
+    const first = rows.length;
+    let row = [], n = 0;
+    for (const [t, c] of segs) {
+      for (let s = t; s.length;) {
+        if (n === cols) { rows.push({ segs: row }); row = []; n = 0; }
+        const k = Math.min(cols - n, s.length);
+        row.push([s.slice(0, k), c]);
+        n += k;
+        s = s.slice(k);
+      }
+    }
+    rows.push({ segs: row, cursor });
+    // zsh drops the right prompt when it does not fit.
+    if (right) {
+      const used = rows[first].segs.reduce((a, [t]) => a + t.length, 0);
+      if (used + 2 + right.reduce((a, [t]) => a + t.length, 0) <= cols) rows[first].right = right;
+    }
+  };
+  for (const e of term.entries) {
+    if (e.t === 'out') add(e.segs);
+    else add([...prompt(e.cwd), [e.cmd, FG]], e.err ? [[`${e.err}  `, BAD], [utc(e.at), DIM]] : [[utc(e.at), DIM]]);
+  }
+  if (live) add(prompt(term.cwd), null, true);
+  else add([[`-- ${usbStatus()[0]} --`, DIM]]);
+  return rows;
+}
+
+function terminal() {
+  const x = M, y = CY, w = W - 2 * M, h = CH;
+  scr.fill(x, y, w, h, TERM_BG);
+  scr.frame(x, y, w, h, 2, EDGE);
+  scr.fill(x + 2, y + 2, w - 4, 54, PANEL);
+  scr.fill(x + 2, y + 56, w - 4, 2, EDGE);
+  const [ut, uc] = usbStatus();
+  scr.fill(2 * M, y + 22, 12, 12, uc);
+  scr.text(2 * M + 24, y + 12, ut, 2, uc === DIM ? DIM : FG, PANEL);
+  const bx = W - 2 * M - 144;
+  button('t-size', bx, y + 8, 144, 40, ui.termScale === 1 ? 'TEXT x2' : 'TEXT x1', null,
+         () => { ui.termScale = 3 - ui.termScale; });
+  if (!['missing', 'busy'].includes(sim.usb)) {
+    const rx = bx - 16 - scr.textR(bx - 16, y + 12, `in ${bytes(sim.usbIn)}  out ${bytes(sim.usbOut)}`, 2, DIM, PANEL);
+    if (sim.usbErrors) scr.textR(rx - 24, y + 12, '3 errors', 2, BAD, PANEL);
+  }
+  const s = ui.termScale, x0 = 2 * M, y0 = y + 72;
+  const cols = Math.floor((w - 32) / (8 * s)), nrows = Math.floor((h - 72 - 12) / (16 * s));
+  termRows(cols, sim.usb === 'terminal').slice(-nrows).forEach((r, i) => {
+    const ry = y0 + i * 16 * s;
+    let cx = x0;
+    for (const [t, c] of r.segs) cx += scr.text(cx, ry, t, s, c, TERM_BG);
+    if (r.right) {
+      let rx = x0 + cols * 8 * s;
+      for (const [t, c] of [...r.right].reverse()) rx -= scr.textR(rx, ry, t, s, c, TERM_BG);
+    }
+    if (r.cursor && up() % 2 === 0) scr.fill(cx, ry, 8 * s, 16 * s, FG);
+  });
+}
+
+function logs() {
+  ui.unread = 0;
+  card(M, CY, W - 2 * M, CH, 'MESSAGES');
+  const cx = W - 2 * M - 112;
+  button('clear', cx, CY + 8, 112, 48, 'CLEAR', null, allMsgs().length ? () => { sim.msgs = []; sim.partial = ''; } : null);
+  button('size', cx - 16 - 144, CY + 8, 144, 48, ui.logScale === 1 ? 'TEXT x2' : 'TEXT x1', null,
+         () => { ui.logScale = 3 - ui.logScale; });
+  const s = ui.logScale, cols = Math.floor((W - 4 * M) / (8 * s)), rows = Math.floor((CH - 80) / (16 * s));
+  const lines = [];
+  for (const l of allMsgs()) {
+    if (!l) lines.push('');
+    for (let i = 0; i < l.length; i += cols) lines.push(l.slice(i, i + cols));
+  }
+  const shown = lines.slice(-rows);
+  if (!shown.length) scr.text(2 * M, CY + 64, 'no messages', 2, DIM, PANEL);
+  shown.forEach((t, r) => scr.text(2 * M, CY + 64 + r * 16 * s, t, s, FG, PANEL));
+}
+
+function toastBar() {
+  const y = H - TABS - M - 48;
+  scr.fill(M, y, W - 2 * M, 48, PANEL);
+  scr.frame(M, y, W - 2 * M, 48, 2, ACCENT);
+  scr.text(2 * M, y + 8, ui.toast.text, 2, FG, PANEL);
+}
+
+function modal() {
+  const m = ui.modal, x = 240, y = 180, w = 800, h = 320;
+  scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
+  scr.fill(x, y, w, h, PANEL);
+  scr.frame(x, y, w, h, 4, m.tone);
+  scr.text(x + 32, y + 32, m.title, 2, m.tone, PANEL);
+  m.lines.forEach((t, i) => scr.text(x + 32, y + 88 + i * 40, t, 2, FG, PANEL));
+  const bw = (w - 96) / 2, by = y + h - 32 - 72;
+  button('m-no', x + 32, by, bw, 72, 'CANCEL', null, () => { ui.modal = null; });
+  button('m-yes', x + 64 + bw, by, bw, 72, m.ok, m.tone, () => { ui.modal = null; m.run(); });
+}
+
+function drawProposal() {
+  if (ui.off || Date.now() < ui.blackUntil) {
+    scr.clear(BLACK);
+    if (ui.off) zone('wake', 0, 0, W, H, () => { ui.off = false; boot(); });
+    return;
+  }
+  scr.clear();
+  header();
+  [home, system, network, terminal, logs][ui.page]();
+  tabBar();
+  if (ui.toast && Date.now() < ui.toast.until) toastBar();
+  if (ui.modal) { zones = []; modal(); }
+}
+
+// ---- Actions a tap sends, simulated.
+const actions = document.getElementById('actions');
+function act(msg, done) {
+  if (actions.querySelector('.empty')) actions.innerHTML = '';
+  const li = document.createElement('li');
+  li.innerHTML = `<time>${new Date().toLocaleTimeString()}</time>`;
+  li.append(msg);
+  actions.prepend(li);
+  if (done) toast(done);
+}
+function toast(text) {
+  ui.toast = { text, until: Date.now() + 2500 };
+  setTimeout(render, 2600);
+}
+const ask = m => { ui.modal = m; };
+const later = (ms, f) => setTimeout(() => { f(); syncControls(); render(); }, ms);
+
+function scan() {
+  act('wifi::SCAN');
+  const was = sim.wifi;
+  sim.wifi = 'scanning';
+  later(1500, () => { if (sim.wifi === 'scanning') sim.wifi = was; ui.scan = SCAN; });
+}
+function retry() {
+  act('wifi::RETRY');
+  ui.scan = null;
+  sim.wifi = 'connecting';
+  later(2000, () => { sim.wifi = 'connected'; sim.wlanPending = true; });
+  later(3000, () => {
+    sim.wlanPending = false;
+    toast(`wlan: rejoined ${sim.ssid}${active()?.name === 'wlan0' ? `, ${ipv4(LINKS.wlan0.ip)}` : ''}`);
+  });
+}
+function leave() { act('wifi::DISCONNECT'); sim.wifi = 'idle'; }
+function reboot() { act('power::REBOOT'); ui.blackUntil = Date.now() + 1500; later(1500, boot); }
+function powerOff() { act('power::OFF'); ui.off = true; }
+
+let bootGen = 0;
+function boot() {
+  const gen = ++bootGen;
+  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', usb: 'waiting', eth: 'nopc', wifi: 'unknown',
+                       sd: 'unknown', msgs: [], partial: '', usbIn: 0, usbOut: 0, rx: 0, tx: 0 });
+  Object.assign(ui, { page: 0, scan: null, modal: null, unread: 0 });
+  write('display: 720x1280 panel, turned landscape\n');
+  termBoot();
+  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', eth: 'dhcp' }],
+                 [3000, { sd: 'value' }], [3800, { eth: 'up' }], [4000, { wifi: 'idle' }],
+                 [6000, { wifi: 'connecting' }], [9000, { wifi: 'connected' }], [12000, { usb: 'terminal' }]];
+  for (const [t, st] of steps) later(t, () => { if (gen === bootGen) Object.assign(sim, st); });
+  syncControls();
+}
+
+// ---- Rendering, touch, controls.
+const canvas = document.getElementById('scr');
+const scr = new Screen(canvas);
+
+function render() {
+  zones = [];
+  if (ui.view === 'current') drawCurrent(); else drawProposal();
+  scr.show();
+  const c = scr.ctx;
+  if (ui.grid) {
+    c.save();
+    c.strokeStyle = 'rgba(255,255,255,0.13)';
+    c.beginPath();
+    for (let x = ui.grid; x < W; x += ui.grid) { c.moveTo(x + 0.5, 0); c.lineTo(x + 0.5, H); }
+    for (let y = ui.grid; y < H; y += ui.grid) { c.moveTo(0, y + 0.5); c.lineTo(W, y + 0.5); }
+    c.stroke();
+    c.restore();
+  }
+  if (ui.showZones) {
+    c.save();
+    c.strokeStyle = '#ff4fd8';
+    c.setLineDash([6, 4]);
+    for (const z of zones) c.strokeRect(z.x + 0.5, z.y + 0.5, z.w - 1, z.h - 1);
+    c.restore();
+  }
+  if (ui.down) {
+    c.save();
+    c.strokeStyle = 'rgba(255,255,255,0.8)';
+    c.lineWidth = 3;
+    c.beginPath();
+    c.arc(ui.down[0], ui.down[1], 22, 0, 2 * Math.PI);
+    c.stroke();
+    c.restore();
+  }
+}
+
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [Math.floor((e.clientX - r.left) * W / r.width), Math.floor((e.clientY - r.top) * H / r.height)];
+}
+function hit(x, y) {
+  for (let i = zones.length - 1; i >= 0; i--) {
+    const z = zones[i];
+    if (x >= z.x && x < z.x + z.w && y >= z.y && y < z.y + z.h) return z;
+  }
+  return null;
+}
+const readout = document.getElementById('readout');
+canvas.addEventListener('pointermove', e => {
+  const [x, y] = pos(e), z = hit(x, y);
+  readout.textContent = `x ${x}  y ${y}   cell ${Math.floor(x / 8)},${Math.floor(y / 16)} at x1, ` +
+    `${Math.floor(x / 16)},${Math.floor(y / 32)} at x2${z ? `   zone ${z.id}` : ''}`;
+  if (ui.down) { ui.down = [x, y]; render(); }
+});
+canvas.addEventListener('pointerdown', e => {
+  canvas.setPointerCapture(e.pointerId);
+  const [x, y] = pos(e), z = hit(x, y);
+  ui.down = [x, y];
+  ui.pressed = z ? z.id : null;
+  render();
+});
+canvas.addEventListener('pointerup', e => {
+  const [x, y] = pos(e), z = hit(x, y), id = ui.pressed;
+  ui.down = null;
+  ui.pressed = null;
+  if (z && z.id === id) z.tap();
+  syncControls();
+  render();
+});
+canvas.addEventListener('pointercancel', () => { ui.down = null; ui.pressed = null; render(); });
+
+function segmented(id, key, apply) {
+  const el = document.getElementById(id);
+  el.addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    el.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    apply(b.dataset[key]);
+  });
+}
+segmented('view', 'view', v => { ui.view = v; ui.pressed = null; render(); });
+segmented('zoom', 'zoom', z => document.getElementById('stage').classList.toggle('real', z === 'real'));
+document.getElementById('grid').addEventListener('change', e => { ui.grid = +e.target.value; render(); });
+document.getElementById('zones').addEventListener('change', e => { ui.showZones = e.target.checked; render(); });
+
+const simControls = document.querySelectorAll('[data-sim]');
+function syncControls() {
+  simControls.forEach(el => {
+    const v = sim[el.dataset.sim];
+    if (el.type === 'checkbox') el.checked = v; else el.value = String(v);
+  });
+}
+simControls.forEach(el => el.addEventListener('change', () => {
+  const k = el.dataset.sim;
+  sim[k] = el.type === 'checkbox' ? el.checked : 'num' in el.dataset ? +el.value : el.value;
+  bootGen++; // a manual change stops a simulated boot
+  if (k === 'cores' || k === 'loadMode') tick();
+  render();
+}));
+document.getElementById('boot').addEventListener('click', () => { boot(); render(); });
+
+// The PC types a command: only while its terminal is open.
+const cmdInput = document.getElementById('cmd');
+function typeCmd(line) {
+  if (!line.trim()) return;
+  if (sim.usb !== 'terminal') { act(`not sent (USB-C: ${usbStatus()[0]})`); return; }
+  termType(line);
+  syncControls();
+  render();
+}
+document.getElementById('type').addEventListener('click', () => { typeCmd(cmdInput.value); cmdInput.value = ''; });
+cmdInput.addEventListener('keydown', e => { if (e.key === 'Enter') { typeCmd(cmdInput.value); cmdInput.value = ''; } });
+document.querySelectorAll('[data-cmd]').forEach(b => b.addEventListener('click', () => typeCmd(b.dataset.cmd)));
+
+const msgInput = document.getElementById('msg');
+function sendMsg(t) { write(`${t}\n`); render(); }
+document.getElementById('send').addEventListener('click', () => { if (msgInput.value) sendMsg(msgInput.value); msgInput.value = ''; });
+msgInput.addEventListener('keydown', e => { if (e.key === 'Enter' && msgInput.value) { sendMsg(msgInput.value); msgInput.value = ''; } });
+document.querySelectorAll('[data-msg]').forEach(b => b.addEventListener('click', () => sendMsg(b.dataset.msg)));
+
+document.getElementById('missing').hidden = !!FONT;
+write('display: 720x1280 panel, turned landscape\n');
+ui.unread = 0;
+tick();
+termBoot();
+[['ls /bin', 300], ['wifi status', 240], ['cpu', 180], ['ls /nope', 120], ['date', 60]]
+  .forEach(([c, ago]) => termType(c, Date.now() - ago * 1000));
+syncControls();
+render();
+setInterval(() => { tick(); render(); }, 1000);
+</script>
+</body>
+</html>
