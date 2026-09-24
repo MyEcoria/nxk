@@ -16,7 +16,8 @@ Interactive mode edits lines as zsh does: on the PC (Emacs keys, history
 in ~/.local/state/nxk/history with Up/Down prefix search and Ctrl-R,
 syntax highlighting), each typed whole once Enter is pressed. A two-line
 prompt (powerlevel10k "lean") shows the directory, the last status and
-duration, and the time. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
+duration, and the time. `clear` (the client's own) wipes the PC's screen
+and shows the logo again. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
 --raw keeps a plain terminal (keys typed as they come, the shell's echo).
 
 Logs (services, kernel: what the console puts between its LOG marks) are
@@ -373,6 +374,24 @@ def run(link, cmds, timeout, out=sys.stdout, puts=(), logs=True):
 BUILTINS = set("help echo ps mem cpu uptime progs ls cd pwd cat rm mkdir rmdir mv cp stat df "
                "sync fbecho events env export unset date sleep temp services poweroff reboot "
                "recv restart run".split())
+# Commands the client runs itself, never typed on the Switch.
+LOCAL = {"clear", "exit", "logout"}
+# user/shell's banner() (keep in step with its LOGO): each letter is a `#`
+# of its color (xterm 256), the others 223.
+LOGO = [
+    "       aaaa   bbbb",
+    "   aaaa           bbbb",
+    " aa      ddddddd      bb      ff",
+    "aa                     bb     ff",
+    "aa   dd    fff    aa   bb     fffff   ff  ff  ff  ff",
+    "     dd   fffff   aa          dd  dd   dddd   dd dd",
+    "bb   dd    fff    aa   cc     aa  aa    aa    aaaa",
+    "bb                     cc     aa  aa   aaaa   aa aa",
+    " bb      aaaaaaa      cc      bb  bb  bb  bb  bb  bb",
+    "   bbbb           cccc",
+    "       bbbb   cccc",
+]
+LOGO_INK = {"a": 208, "b": 166, "c": 130, "d": 215}
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "nxk")
 HISTORY_MAX = 5000
 LINE_MAX = 1000  # bytes the console keeps per line
@@ -493,6 +512,14 @@ def keys(text):
     return out
 
 
+def banner():
+    """The shell's header: logo, tagline, greeting."""
+    rows = [re.sub(r"(\S)\1*", lambda m: sgr(f"38;5;{LOGO_INK.get(m.group(1), 223)}", "#" * len(m.group(0))), r)
+            for r in LOGO]
+    rows[-1] += "            AArch64 microkernel for Tegra X1"
+    return "\r\n" + "\r\n".join(rows) + "\r\n\r\nnxk - shell. Type 'help' for the command list.\r\n"
+
+
 def duration(t):
     if t < 1:
         return f"{t * 1000:.0f}ms"
@@ -543,7 +570,7 @@ class Zsh:
             self.learned = set(open(self.learned_path, encoding="utf-8").read().split())
         except OSError:
             self.learned = set()
-        self.known = BUILTINS | boot_programs() | self.learned
+        self.known = BUILTINS | LOCAL | boot_programs() | self.learned
         # Line editor: characters, cursor, cursor row below the prompt's
         # second line, kill buffer, last key, Ctrl-R state, pasted lines.
         self.buf, self.cur, self.row = [], 0, 0
@@ -886,6 +913,13 @@ class Zsh:
             return
         self.history.add(line)
         self.hpos = len(self.history.lines)
+        if line.strip() == "clear":
+            # The PC's screen and scrollback only: the shell still waits.
+            self.out("\x1b[H\x1b[2J\x1b[3J" + banner())
+            self.status, self.took = (0, ""), None
+            self.at_prompt, self.drawn = True, False
+            self.activate()
+            return
         self.started_cmd(line)
         self.send(line)
 
