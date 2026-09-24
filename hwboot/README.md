@@ -213,10 +213,39 @@ The USB-C line locates a failure:
   gives the reason (e.g. `device descriptor read/64, error -71`).
 - `connected` but `usbterm.py` cannot open the device: permissions
   (udev rule above, or the `dialout`/`uucp` group).
-- `console not running`: usbcon stopped; its reason is at the bottom of
-  the screen (`usbcon: ...`). `fuses unreadable: PHY left without its
+- `console not running`: usbcon stopped; its reason is on the LOGS
+  page (`usbcon: ...`). `fuses unreadable: PHY left without its
   trims` there means hekate did not leave the fuses readable; high
   speed may then fail.
+
+## Internet over USB-C (usb0)
+
+The same cable carries a network link: `usbcon` is a composite device,
+the console (CDC-ACM) plus a CDC-ECM network function that the PC's
+`cdc_ether` driver binds (macOS has one too, Windows none). On the
+Switch it is link `usb0` (MAC `02:4e:58:4b:00:01`, the PC's end
+`02:4e:58:4b:00:02`); `net` prefers it to Wi-Fi once the PC turns it
+on.
+
+1. With the udev rule (reinstall it if it predates `nxk0`) the PC's
+   interface is `nxk0`, else `enx024e584b0002`.
+2. Share the PC's connection once, as a phone hotspot does
+   (NetworkManager answers DHCP at 10.42.0.1 and routes the Switch):
+   `nmcli connection add type ethernet ifname nxk0 con-name nxk-share
+   ipv4.method shared ipv6.method ignore`.
+3. NETWORK page: USB-C ETHERNET `shared by the PC`, ACTIVE; INTERNET
+   `10.42.0.x` via usb0. In the shell: `nettest ping 10.42.0.1`, then
+   `nettest ping google.com`.
+
+The card locates a failure:
+
+- `no DHCP: sharing off on the PC?`: the link is up but nothing
+  answers DHCP (step 2 missing). After 10 s `net` moves to Wi-Fi if
+  it is joined, until the cable or the PC's link goes down and up.
+- `link not turned on by the PC`: no driver took the network function
+  (`dmesg` on the PC should show `cdc_ether ... register 'cdc_ether'`).
+- `[usbcon] controller reports N endpoints` in the boot log with N
+  below 5: the controller lacks the network endpoints.
 
 ## Driver updates over USB-C (no SD swap)
 
