@@ -1,4 +1,5 @@
-//! sd: SDMMC1 card (SDHCI); 512-byte ADMA2 blocks via `blk` protocol.
+//! sd: SDMMC1 card (SDHCI); 512-byte ADMA2 blocks via `blk` protocol,
+//! straight into the client's buffer.
 //! Powers the slot itself (`board`), then Tegra pad trims and calibration as hekate.
 
 #![no_std]
@@ -66,9 +67,12 @@ const INT_XFER_DONE: u32 = 1 << 1;
 const INT_ERROR: u32 = 1 << 15;
 
 const BLOCK: usize = 512;
-/// DMA buffer: one descriptor page then 256 KiB of data.
-const DESC_BYTES: usize = 4096;
 const MAX_BLOCKS: usize = 512;
+/// Client buffer size (`blk::ATTACH`).
+const CLIENT_LEN: usize = MAX_BLOCKS * BLOCK;
+/// Own DMA page: ADMA2 descriptors, then block 0 for the first read.
+const PAGE: usize = 4096;
+const SCRATCH: usize = 2048;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Rsp {
@@ -196,7 +200,7 @@ impl Card {
             self.regs.r32(PRESENT_STATE),
             self.regs.r32(ADMA_ERROR),
             self.regs.r32(ADMA_ADDRESS),
-            self.dma_pa
+            unsafe { (self.dma.as_ptr() as *const u32).add(1).read_volatile() }
         );
     }
 
@@ -205,7 +209,7 @@ impl Card {
         idx: u8,
         arg: u32,
         rsp: Rsp,
-        data: Option<(usize, bool)>,
+        data: Option<(u64, usize, bool)>,
     ) -> Result<[u32; 4], i64> {
         let busy = rsp == Rsp::R1b || data.is_some();
         let inhibit = if busy { 3 } else { 1 };
@@ -217,8 +221,11 @@ impl Card {
         }
         self.regs.w32(INT_STATUS, 0xFFFF_FFFF);
         let mut mode = 0u16;
-        if let Some((n, read)) = data {
-            self.write_descriptors(n * BLOCK);
+        if let Some((pa, n, read)) = data {
+            self.write_descriptors(pa, n * BLOCK);
+            // Descriptors and buffer (uncached) in memory before the
+            // controller fetches them.
+            unsafe { core::arch::asm!("dsb st", options(nostack, preserves_flags)) };
             self.regs.w32(ADMA_ADDRESS, self.dma_pa as u32);
             self.regs
                 .w8(HOST_CONTROL, (self.regs.r8(HOST_CONTROL) & !0x18) | 0x10); // 32-bit ADMA2
@@ -255,8 +262,8 @@ impl Card {
         Ok(r)
     }
 
-    /// ADMA2 (32-bit) descriptors covering `len` buffer bytes.
-    fn write_descriptors(&self, len: usize) {
+    /// ADMA2 (32-bit) descriptors covering `len` bytes at `pa`.
+    fn write_descriptors(&self, pa: u64, len: usize) {
         let d = self.dma.as_ptr() as *mut u32;
         let mut off = 0;
         let mut k = 0;
@@ -267,8 +274,7 @@ impl Card {
             unsafe {
                 d.add(2 * k)
                     .write_volatile(((n as u32 & 0xFFFF) << 16) | attr);
-                d.add(2 * k + 1)
-                    .write_volatile((self.dma_pa + (DESC_BYTES + off) as u64) as u32);
+                d.add(2 * k + 1).write_volatile((pa + off as u64) as u32);
             }
             off += n;
             k += 1;
@@ -347,7 +353,8 @@ impl Card {
         self.regs.w8(POWER_CONTROL, 0);
     }
 
-    fn transfer(&self, lba: u64, n: usize, read: bool) -> Result<(), i64> {
+    /// `n` blocks between the card and physical address `pa`.
+    fn transfer(&self, lba: u64, n: usize, read: bool, pa: u64) -> Result<(), i64> {
         if n == 0 || n > MAX_BLOCKS || lba + n as u64 > self.blocks {
             return Err(-EINVAL);
         }
@@ -362,7 +369,13 @@ impl Card {
             (false, false) => 24,
             (false, true) => 25,
         };
-        self.command(idx, arg, Rsp::R1, Some((n, read))).map(|_| ())
+        self.command(idx, arg, Rsp::R1, Some((pa, n, read)))
+            .map(|_| ())
+    }
+
+    /// Block 0 into the own page: does data come at all?
+    fn read_first(&self) -> Result<(), i64> {
+        self.transfer(0, 1, true, self.dma_pa + SCRATCH as u64)
     }
 
     /// Host and Tegra pad registers, then the card's state (CMD13), for
@@ -388,9 +401,31 @@ impl Card {
             card
         )
     }
+}
 
-    fn data(&self) -> &mut [u8] {
-        &mut self.dma.as_mut_slice()[DESC_BYTES..]
+/// Client transfer buffer, which the controller reads and writes
+/// directly: contiguous, below 4 GiB, uncached (`blk::ATTACH`).
+struct Client {
+    /// The mapping pins the pages: DMA never lands in freed memory.
+    _map: SharedMemory,
+    pa: u64,
+}
+
+impl Client {
+    fn attach(h: u32) -> Result<Self, i64> {
+        let map = SharedMemory::map(h, CLIENT_LEN, prot::READ).inspect_err(|_| {
+            let _ = sys::handle_close(h);
+        })?;
+        let pa = map.paddr(0)?;
+        for k in 1..CLIENT_LEN / PAGE {
+            if map.paddr(k * PAGE)? != pa + (k * PAGE) as u64 {
+                return Err(-EINVAL);
+            }
+        }
+        if pa + CLIENT_LEN as u64 > 1 << 32 {
+            return Err(-EINVAL);
+        }
+        Ok(Self { _map: map, pa })
     }
 }
 
@@ -421,7 +456,7 @@ fn bring_up(board: &Board) -> Result<(), i64> {
 /// never comes (a card left at 1.8 V, a bad line). Other ways are then
 /// tried, each reported; the first that reads wins.
 fn recover(card: &mut Card, board: &Board) {
-    let Err(e) = card.transfer(0, 1, true) else {
+    let Err(e) = card.read_first() else {
         return;
     };
     println!(
@@ -444,7 +479,7 @@ fn recover(card: &mut Card, board: &Board) {
                 board.io_1v8()?;
             }
             card.init(board, v18, bus4)?;
-            card.transfer(0, 1, true)
+            card.read_first()
         })();
         println!(
             "[sd] retry at {} V, {}-bit bus, {} ms off: {}",
@@ -471,11 +506,7 @@ fn main() -> i32 {
         map(4, board::PMC_PAGE),
     );
     let irq = Irq::new(drv::dev_slot(5)).expect("sd: interrupt");
-    let dma = SharedMemory::new(
-        DESC_BYTES + MAX_BLOCKS * BLOCK,
-        CONTIGUOUS | UNCACHED | DMA32,
-    )
-    .expect("sd: DMA buffer");
+    let dma = SharedMemory::new(PAGE, CONTIGUOUS | UNCACHED | DMA32).expect("sd: DMA page");
     let dma_pa = dma.paddr(0).expect("sd: DMA address");
     let mut card = Card {
         regs,
@@ -506,7 +537,7 @@ fn main() -> i32 {
     }
     recover(&mut card, &board);
     println!(
-        "[sd] {} card of {} MiB ({} blocks), DMA buffer at {:#x}, ready at {} ms",
+        "[sd] {} card of {} MiB ({} blocks), descriptors at {:#x}, ready at {} ms",
         if card.block_addressed {
             "SDHC/SDXC"
         } else {
@@ -518,7 +549,7 @@ fn main() -> i32 {
         time::now_ns() / 1_000_000
     );
     let ep = drv::publish("blk:sd").expect("sd: publish");
-    let mut client: Option<SharedMemory> = None;
+    let mut client: Option<Client> = None;
     let mut failures = 0u32;
     drv::serve(ep, |rx| {
         let m = &rx.msg;
@@ -530,36 +561,31 @@ fn main() -> i32 {
                 r
             }
             blk::ATTACH if m.handles() == 1 => {
-                let h = ipc::received_handle(0);
                 client = None;
-                match SharedMemory::map(h, MAX_BLOCKS * BLOCK, prot::READ | prot::WRITE) {
-                    Ok(s) => {
-                        client = Some(s);
+                match Client::attach(ipc::received_handle(0)) {
+                    Ok(c) => {
+                        client = Some(c);
                         Msg::new(0, 0, 0)
                     }
                     Err(e) => {
-                        let _ = sys::handle_close(h);
+                        println!("[sd] client buffer refused ({})", libnx::abi::err::name(e));
                         Msg::error(e)
                     }
                 }
             }
             op @ (blk::READ | blk::WRITE) => {
                 let (lba, n, off) = (m.mr[0], m.mr[1] as usize, m.mr[2] as usize);
-                let Some(buf) = client.as_ref() else {
+                let Some(c) = client.as_ref() else {
                     return Some(Msg::error(-EINVAL));
                 };
-                let len = n * BLOCK;
-                if off.checked_add(len).is_none_or(|e| e > buf.len()) || n > MAX_BLOCKS {
+                // ADMA2 addresses: 4-byte aligned.
+                if n > MAX_BLOCKS
+                    || off % 4 != 0
+                    || off.checked_add(n * BLOCK).is_none_or(|e| e > CLIENT_LEN)
+                {
                     return Some(Msg::error(-EINVAL));
                 }
-                let r = if op == blk::READ {
-                    card.transfer(lba, n, true).map(|_| {
-                        buf.as_mut_slice()[off..off + len].copy_from_slice(&card.data()[..len])
-                    })
-                } else {
-                    card.data()[..len].copy_from_slice(&buf.as_slice()[off..off + len]);
-                    card.transfer(lba, n, false)
-                };
+                let r = card.transfer(lba, n, op == blk::READ, c.pa + off as u64);
                 match r {
                     Ok(()) => Msg::new(0, 0, 0),
                     Err(e) => {

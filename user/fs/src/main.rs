@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::{EBADF, EEXIST, EINVAL, EISDIR, ENOENT, ENOTDIR};
 use libnx::abi::proto::{blk, fs as proto};
+use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::drv;
 use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
@@ -297,7 +298,9 @@ fn main() -> i32 {
             return 0;
         }
     };
-    let io = SharedMemory::new(IO_SECTORS * SECTOR, 0).expect("fs: buffer");
+    // The card driver's DMA lands straight in it (`blk::ATTACH`).
+    let io =
+        SharedMemory::new(IO_SECTORS * SECTOR, CONTIGUOUS | UNCACHED | DMA32).expect("fs: buffer");
     ipc::set_send_handle(0, io.handle());
     let r = ipc::call(blk, &Msg::new(blk::ATTACH, 0, 1)).expect("fs: buffer attach");
     if r.label() != 0 {

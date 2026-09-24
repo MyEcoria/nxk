@@ -1165,7 +1165,8 @@ pub mod proto {
     pub mod blk {
         /// Reply: word 0 = block size, word 1 = block count.
         pub const INFO: u32 = 1;
-        /// handle 0 = shared memory used as transfer buffer.
+        /// handle 0 = transfer buffer, which the driver's DMA reads and
+        /// writes directly: 256 KiB, `CONTIGUOUS | UNCACHED | DMA32`, `DMA` right.
         pub const ATTACH: u32 = 2;
         /// words: start block, block count, buffer offset.
         pub const READ: u32 = 3;
