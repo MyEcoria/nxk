@@ -1155,6 +1155,9 @@ pub mod proto {
         /// PCIEXCLK reset alone, once `PCIE` is ready: DISABLE holds the
         /// link logic while the AFI is programmed, ENABLE releases it.
         pub const PCIE_LINK: u64 = 25;
+        /// PWM controller (fan on channel 1). Channel 0 dims the Erista
+        /// backlight: a running block is left as is, DISABLE is refused.
+        pub const PWM: u64 = 26;
     }
     /// I2C bus.
     pub mod i2c {
@@ -1184,6 +1187,29 @@ pub mod proto {
         pub const PCIE_POWER: u32 = 6;
         /// word 0 = 1: touchscreen rail (PMIC LDO6) on at 2.9 V; 0: off.
         pub const TOUCH_POWER: u32 = 7;
+    }
+    /// Fan: speed from the SoC temperature, or set by hand.
+    pub mod fan {
+        /// Reply: word 0 = duty (% of full speed), word 1 = `ST_*` bits,
+        /// word 2 = SoC temperature (millidegrees C, `NO_TEMP` if
+        /// unreadable), word 3 = last measured speed (RPM, `NO_RPM`: none).
+        pub const STATUS: u32 = 1;
+        /// word 0 = `AUTO`, or a duty 0..=100 (%) kept until `AUTO`.
+        /// The SoC at `HOT_MC` or an unreadable sensor still overrides it.
+        pub const SET: u32 = 2;
+        /// Count tachometer pulses for 1 s. Reply: word 0 = RPM.
+        pub const MEASURE: u32 = 3;
+        pub const AUTO: u64 = u64::MAX;
+        pub const NO_TEMP: u64 = i64::MIN as u64;
+        pub const NO_RPM: u64 = u64::MAX;
+        /// Duty set by hand.
+        pub const ST_MANUAL: u64 = 1;
+        /// Full speed: the SoC reached `HOT_MC`.
+        pub const ST_HOT: u64 = 2;
+        /// Sensor unreadable: at least hekate's highest step (43%).
+        pub const ST_NO_SENSOR: u64 = 4;
+        /// SoC temperature forcing full speed.
+        pub const HOT_MC: i64 = 60_000;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {
