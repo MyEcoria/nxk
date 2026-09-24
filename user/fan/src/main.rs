@@ -288,6 +288,7 @@ impl Control {
                 st,
                 self.temp.map_or(proto::NO_TEMP, |t| t as u64),
                 self.rpm.unwrap_or(proto::NO_RPM),
+                self.manual.map_or(proto::AUTO, percent),
             ],
         )
     }
