@@ -6,12 +6,13 @@
     nxtest.py -c "ipcbench" --timeout 120
     nxtest.py --usb-cmd "ps"             # type over the USB-C console (usbterm.py host)
     nxtest.py --tap 640,670:home.ppm     # touch the screen at (x, y), then capture it
+    nxtest.py --usb-net share --usb-cmd "nettest ping 10.42.0.1"   # the PC shares its connection
 
 UART-A console is bound to a socket: the script reads everything from the
 first kernel byte and types commands like a user. Exit code 1 if a command
 missed the prompt in time.
 """
-import argparse, bisect, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import argparse, bisect, os, re, shutil, socket, struct, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -117,6 +118,69 @@ def qmp_tap(path, x, y):
     s.close()
 
 
+def checksum(b):
+    if len(b) % 2:
+        b += b"\0"
+    s = sum(struct.unpack(f"!{len(b) // 2}H", b))
+    s = (s >> 16) + (s & 0xFFFF)
+    return ~(s + (s >> 16)) & 0xFFFF
+
+
+def pc_network(link, stop, log, share):
+    """The PC with the USB-C network function on. `share`: it shares its
+    connection (NetworkManager's "shared" mode): DHCP server at 10.42.0.1
+    leasing 10.42.0.23, ARP and ICMP echo answers for 10.42.0.1; else it
+    answers nothing."""
+    me, mac = bytes([10, 42, 0, 1]), bytes.fromhex("024E584B0002")
+    lease = bytes([10, 42, 0, 23])
+    link.net_on()
+    log("[nxtest] USB-C network on, " + ("sharing 10.42.0.0/24" if share else "not shared"))
+
+    def ipv4(dst_mac, src, dst, proto, payload):
+        h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 0, 0, 64, proto, 0, src, dst)
+        h = h[:10] + struct.pack("!H", checksum(h)) + h[12:]
+        link.net_send(dst_mac + mac + b"\x08\x00" + h + payload)
+
+    while not stop.is_set():
+        f = link.net_recv()
+        if not f or not share:
+            time.sleep(0.005)
+            continue
+        src_mac, kind = f[6:12], f[12:14]
+        if kind == b"\x08\x06" and f[20:22] == b"\0\x01" and f[38:42] == me:  # ARP request
+            arp = f[14:20] + b"\0\x02" + mac + me + f[22:28] + f[28:32]
+            link.net_send(src_mac + mac + b"\x08\x06" + arp)
+        elif kind == b"\x08\x00":
+            ip, proto = f[14:34], f[23]
+            body = f[34:14 + struct.unpack("!H", f[16:18])[0]]
+            if proto == 17 and body[2:4] == b"\0\x43":  # DHCP to the server port
+                bootp = body[8:]
+                opts, msg = bootp[240:], None
+                i = 0
+                while i < len(opts) and opts[i] != 255:
+                    if opts[i] == 53:
+                        msg = opts[i + 2]
+                    i += 2 + opts[i + 1] if opts[i] else 1
+                reply = {1: 2, 3: 5}.get(msg)
+                if reply is None:
+                    continue
+                out = bytearray(236)
+                out[0:4] = b"\x02\x01\x06\x00"
+                out[4:8] = bootp[4:8]  # transaction
+                out[16:20], out[20:24] = lease, me
+                out[28:44] = bootp[28:44]  # client hardware address
+                out += b"\x63\x82\x53\x63" + bytes([53, 1, reply, 54, 4]) + me \
+                    + bytes([51, 4, 0, 0, 0x0E, 0x10, 1, 4, 255, 255, 255, 0, 3, 4]) + me \
+                    + bytes([6, 4]) + me + b"\xff"
+                udp = struct.pack("!HHHH", 67, 68, 8 + len(out), 0) + bytes(out)
+                ipv4(b"\xff" * 6, me, b"\xff" * 4, 17, udp)
+                log(f"[nxtest] DHCP {'offer' if reply == 2 else 'ack'}: 10.42.0.23")
+            elif proto == 1 and body[0] == 8 and ip[16:20] == me:  # ping
+                echo = b"\0\0\0\0" + body[4:]
+                echo = echo[:2] + struct.pack("!H", checksum(echo)) + echo[4:]
+                ipv4(src_mac, me, ip[12:16], 1, echo)
+
+
 def screendump(mon, path):
     m = socket.socket(socket.AF_UNIX)
     m.connect(mon)
@@ -145,6 +209,9 @@ def main():
                     help="command typed on the USB-C console (usbcon), the script acting as the PC")
     ap.add_argument("--usb-put", action="append", default=[], metavar="LOCAL:REMOTE",
                     help="file copied to the SD card over the USB-C console, before --usb-cmd")
+    ap.add_argument("--usb-net", choices=("share", "quiet"), default=None,
+                    help="with --usb-cmd: the PC turns the USB-C network on and shares its "
+                         "connection (10.42.0.1), or answers nothing")
     ap.add_argument("--tap", action="append", default=[], metavar="X,Y[:OUT.ppm]",
                     help="touch the screen at landscape (X, Y) after the commands, then capture it")
     a = ap.parse_args()
@@ -223,10 +290,16 @@ def main():
             try:
                 link = usbterm.EmuHost(usb, timeout=a.timeout)
                 print(f"[nxtest] {link.name}")
+                stop = threading.Event()
+                if a.usb_net:
+                    share = a.usb_net == "share"
+                    threading.Thread(target=pc_network, args=(link, stop, print, share), daemon=True).start()
+                    time.sleep(3)  # net looks at its links every 2 s
                 puts = [tuple(p.rsplit(":", 1)) for p in a.usb_put]
                 if not usbterm.run(link, a.usb_cmd, a.timeout, puts=puts):
                     dump_cpus(mon, a.kernel)
                     ok = False
+                stop.set()
                 link.close()
             except (OSError, ConnectionError, TimeoutError, usbterm.Stall) as e:
                 print(f"\n[nxtest] USB console: {e}", file=sys.stderr)

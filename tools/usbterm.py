@@ -16,7 +16,7 @@ Interactive mode: Ctrl-] quits. In the emulator, QEMU needs
 `-chardev socket,id=usbotg,path=SOCK,server=on,wait=off`; this script then
 plays the host side of the bus (enumeration, bulk transfers).
 """
-import argparse, base64, glob, io, os, select, socket, struct, sys, termios, time, tty, zlib
+import argparse, base64, glob, io, os, select, socket, struct, sys, termios, threading, time, tty, zlib
 
 VID, PID = 0x1209, 0x0001
 PROMPT = b"nxk> "
@@ -68,6 +68,8 @@ class EmuHost:
     """
 
     def __init__(self, path, timeout=10.0):
+        # One request at a time: the console and a network thread share it.
+        self.lock = threading.Lock()
         self.sock = socket.socket(socket.AF_UNIX)
         end = time.time() + timeout
         while True:
@@ -92,9 +94,10 @@ class EmuHost:
         return buf
 
     def _req(self, op, ep, length, payload=b""):
-        self.sock.sendall(struct.pack("<cBH", op, ep, length) + payload)
-        st, n = struct.unpack("<cH", self._recv(3))
-        return st, self._recv(n)
+        with self.lock:
+            self.sock.sendall(struct.pack("<cBH", op, ep, length) + payload)
+            st, n = struct.unpack("<cH", self._recv(3))
+            return st, self._recv(n)
 
     def _until(self, what, attempt):
         """Retry `attempt` while the device NAKs."""
@@ -157,18 +160,33 @@ class EmuHost:
         cfg = self.control(0x80, 6, 0x0200, 0, 9)
         cfg = self.control(0x80, 6, 0x0200, 0, struct.unpack_from("<H", cfg, 2)[0])
         self.comm, self.bulk_in, self.bulk_out, self.mps, iface, klass = None, None, None, 64, None, None
+        # CDC-ECM function, if any: control interface, data interface, its
+        # bulk pair (alternate setting 1).
+        self.ecm, self.ecm_data, self.net_in, self.net_out = None, None, None, None
+        sub = None
         p = 0
         while p + 2 <= len(cfg) and cfg[p]:
             if cfg[p + 1] == 4:
-                iface, klass = cfg[p + 2], cfg[p + 5]
-                if klass == 0x02 and self.comm is None:
+                iface, klass, sub = cfg[p + 2], cfg[p + 5], cfg[p + 6]
+                if klass == 0x02 and sub == 0x02 and self.comm is None:
                     self.comm = iface
+                if klass == 0x02 and sub == 0x06:
+                    self.ecm = iface
+                if klass == 0x0A and self.ecm is not None:
+                    self.ecm_data = iface
             elif cfg[p + 1] == 5 and klass == 0x0A and cfg[p + 3] & 3 == 2:
-                addr, self.mps = cfg[p + 2], struct.unpack_from("<H", cfg, p + 4)[0]
-                if addr & 0x80:
-                    self.bulk_in = addr & 0xF
-                else:
-                    self.bulk_out = addr
+                addr = cfg[p + 2]
+                if self.ecm is not None and iface == self.ecm_data:
+                    if addr & 0x80:
+                        self.net_in = addr & 0xF
+                    else:
+                        self.net_out = addr
+                elif self.comm is not None and iface == self.comm + 1:
+                    self.mps = struct.unpack_from("<H", cfg, p + 4)[0]
+                    if addr & 0x80:
+                        self.bulk_in = addr & 0xF
+                    else:
+                        self.bulk_out = addr
             p += cfg[p]
         if None in (self.comm, self.bulk_in, self.bulk_out):
             raise ConnectionError("no CDC-ACM interfaces in the configuration")
@@ -196,6 +214,35 @@ class EmuHost:
     def write(self, data):
         for i in range(0, len(data), self.mps):
             self._out(self.bulk_out, data[i:i + self.mps])
+
+    def net_on(self):
+        """Turn the network function on, as a host driver does."""
+        if self.net_in is None:
+            raise ConnectionError("no CDC-ECM function in the configuration")
+        self.control(0x01, 11, 1, self.ecm_data)  # SET_INTERFACE alt 1
+        self.control(0x21, 0x43, 0x000E, self.ecm)  # packet filter
+
+    def net_send(self, frame):
+        for i in range(0, len(frame), self.mps):
+            self._out(self.net_out, frame[i:i + self.mps])
+        if len(frame) % self.mps == 0:
+            self._out(self.net_out, b"")
+
+    def net_recv(self):
+        """One frame from the device, or None if it has none."""
+        buf = b""
+        while True:
+            st, data = self._req(b"I", self.net_in, self.mps)
+            if st == b"S":
+                raise Stall("network IN")
+            if st != b"D":
+                if not buf:
+                    return None
+                time.sleep(0.001)
+                continue
+            buf += data
+            if len(data) < self.mps:
+                return buf
 
     def close(self):
         self.sock.close()
