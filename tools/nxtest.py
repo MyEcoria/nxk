@@ -5,6 +5,7 @@
     nxtest.py -c "ps" -c "run hello"   # chain commands
     nxtest.py -c "ipcbench" --timeout 120
     nxtest.py --usb-cmd "ps"             # type over the USB-C console (usbterm.py host)
+    nxtest.py --tap 640,670:home.ppm     # touch the screen at (x, y), then capture it
 
 UART-A console is bound to a socket: the script reads everything from the
 first kernel byte and types commands like a user. Exit code 1 if a command
@@ -92,6 +93,38 @@ def dump_cpus(mon, elf):
         print(f"[nxtest] cpu{cpu} EL{el} PC={a:#x} {where}", file=sys.stderr)
 
 
+def qmp_tap(path, x, y):
+    """Press and release the touchscreen at landscape pixel (x, y): QMP
+    absolute pointer events, which tegra_qemu's touch panel turns into
+    STMFTS contact events."""
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(path)
+    s.settimeout(5)
+
+    def cmd(c):
+        s.sendall((__import__("json").dumps(c) + "\n").encode())
+        buf = b""
+        while b'"return"' not in buf and b'"error"' not in buf:
+            buf += s.recv(65536)
+    s.recv(65536)  # greeting
+    cmd({"execute": "qmp_capabilities"})
+    for down in (True, False):
+        cmd({"execute": "input-send-event", "arguments": {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": x * 0x7FFF // 1280}},
+            {"type": "abs", "data": {"axis": "y", "value": y * 0x7FFF // 720}},
+            {"type": "btn", "data": {"button": "left", "down": down}}]}})
+        time.sleep(0.15)
+    s.close()
+
+
+def screendump(mon, path):
+    m = socket.socket(socket.AF_UNIX)
+    m.connect(mon)
+    m.sendall(f"screendump {os.path.abspath(path)}\n".encode())
+    time.sleep(1.5)
+    m.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--cmd", action="append", default=[])
@@ -112,12 +145,15 @@ def main():
                     help="command typed on the USB-C console (usbcon), the script acting as the PC")
     ap.add_argument("--usb-put", action="append", default=[], metavar="LOCAL:REMOTE",
                     help="file copied to the SD card over the USB-C console, before --usb-cmd")
+    ap.add_argument("--tap", action="append", default=[], metavar="X,Y[:OUT.ppm]",
+                    help="touch the screen at landscape (X, Y) after the commands, then capture it")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
     uart = os.path.join(tmp, "uart.sock")
     usb = os.path.join(tmp, "usb.sock")
     mon = os.path.join(tmp, "mon.sock")
+    qmp = os.path.join(tmp, "qmp.sock")
     cmd = [
         QEMU, "-machine", a.machine, "-m", "4G", "-display", "none",
         "-device", f"loader,file={a.kernel}",
@@ -132,6 +168,7 @@ def main():
         "-chardev", f"socket,id=uarta,path={uart},server=on,wait=on",
         "-serial", "chardev:uarta", "-serial", "null", "-serial", "null", "-serial", "null",
         "-monitor", f"unix:{mon},server,nowait",
+        "-qmp", f"unix:{qmp},server,nowait",
     ] + (["-drive", f"if=sd,index=0,format=raw,file={a.sd}"] if a.sd else []) \
       + (["-global", "driver=tegra.xusb,property=slots,value=8"] if a.usb_kbd or a.net is not None else []) \
       + (["-device", "usb-kbd,bus=usb-bus.2"] if a.usb_kbd else []) \
@@ -195,12 +232,17 @@ def main():
                 print(f"\n[nxtest] USB console: {e}", file=sys.stderr)
                 dump_cpus(mon, a.kernel)
                 ok = False
+        for t in a.tap if ok else []:
+            xy, _, shot = t.partition(":")
+            x, y = (int(v) for v in xy.split(","))
+            qmp_tap(qmp, x, y)
+            print(f"[nxtest] tap {x},{y}")
+            if shot:
+                screendump(mon, shot)
+            else:
+                time.sleep(0.5)
         if a.screendump:
-            m = socket.socket(socket.AF_UNIX)
-            m.connect(mon)
-            m.sendall(f"screendump {os.path.abspath(a.screendump)}\n".encode())
-            time.sleep(1.5)
-            m.close()
+            screendump(mon, a.screendump)
     finally:
         try:
             m = socket.socket(socket.AF_UNIX)

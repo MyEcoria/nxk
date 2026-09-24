@@ -1,0 +1,138 @@
+diff --git a/hw/arm/tegra2/ppsb/gpio/gpio.c b/hw/arm/tegra2/ppsb/gpio/gpio.c
+--- a/hw/arm/tegra2/ppsb/gpio/gpio.c
++++ b/hw/arm/tegra2/ppsb/gpio/gpio.c
+@@ -241,6 +241,8 @@
+     return ret;
+ }
+ 
++static void tegra_gpio_update(tegra_gpio *s, int bank);
++
+ static void tegra_gpio_priv_write(void *opaque, hwaddr offset,
+                                   uint64_t value, unsigned size)
+ {
+@@ -333,6 +335,7 @@
+         TRACE_WRITE(s->iomem.addr, offset, 0, value);
+         break;
+     }
++    tegra_gpio_update(s, bank);
+ }
+ 
+ static void tegra_gpio_priv_reset(DeviceState *dev)
+@@ -370,6 +373,39 @@
+     }
+ }
+ 
++/* Level-triggered pins (INT_LVL edge and delta bits clear) at their active
++ * level latch INT_STA; a bank's line is up while an enabled status is. */
++static void tegra_gpio_update(tegra_gpio *s, int bank)
++{
++    int pending = 0;
++
++    for (int port = 0; port < PORTS_NB; port++) {
++        tegra_gpio_port *p = &s->regs[bank * PORTS_NB + port];
++        uint32_t on = p->gpio_cnf.reg32 & p->gpio_int_enb.reg32 & 0xFF;
++        uint32_t lvl = p->gpio_int_lvl.reg32;
++        uint32_t level = on & ~((lvl >> 8) | (lvl >> 16)) & 0xFF;
++        uint32_t active = ~(p->gpio_in.reg32 ^ lvl) & 0xFF;
++
++        p->gpio_int_sta.reg32 |= level & active;
++        pending |= (p->gpio_int_sta.reg32 & on) != 0;
++    }
++    qemu_set_irq(s->irq[bank], pending);
++}
++
++/* Input pin n = (bank * PORTS_NB + port) * 8 + bit, driven by a device. */
++static void tegra_gpio_set_pin(void *opaque, int n, int level)
++{
++    tegra_gpio *s = opaque;
++    tegra_gpio_port *p = &s->regs[n / 8];
++
++    if (level) {
++        p->gpio_in.reg32 |= 1u << (n % 8);
++    } else {
++        p->gpio_in.reg32 &= ~(1u << (n % 8));
++    }
++    tegra_gpio_update(s, n / 8 / PORTS_NB);
++}
++
+ static const MemoryRegionOps tegra_gpio_mem_ops = {
+     .read = tegra_gpio_priv_read,
+     .write = tegra_gpio_priv_write,
+@@ -400,6 +436,7 @@
+ 
+     for (i = 0; i < s->num_banks; i++)
+         sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq[i]);
++    qdev_init_gpio_in(dev, tegra_gpio_set_pin, BANKS_NB * PORTS_NB * 8);
+ }
+ 
+ static void tegra_gpio_class_init(ObjectClass *klass, void *data)
+diff --git a/hw/input/ftm3bd56.c b/hw/input/ftm3bd56.c
+--- a/hw/input/ftm3bd56.c
++++ b/hw/input/ftm3bd56.c
+@@ -14,6 +14,8 @@
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "hw/qdev-core.h"
+ #include "qom/object.h"
+ #include "migration/vmstate.h"
+ #include "ui/console.h"
+@@ -117,6 +119,8 @@
+ struct FTM3BD56State {
+     I2CSlave parent_obj;
+     QemuInputHandlerState *handler;
++    /* Interrupt line (GPIO X1 on the Switch), low while events are queued. */
++    qemu_irq irq;
+     int32_t addr;
+     uint32_t num_args;
+     uint32_t recv_pos;
+@@ -166,6 +170,11 @@
+     }
+ };
+ 
++static void ftm3bd56_update_irq(FTM3BD56State *s)
++{
++    qemu_set_irq(s->irq, s->events_num == 0);
++}
++
+ static void ftm3bd56_write_event(FTM3BD56State *s, uint8_t event, uint8_t status, uint8_t *data)
+ {
+     uint8_t tmpevent[STMFTS_EVENT_SIZE]={};
+@@ -182,6 +191,7 @@
+ 
+     if (s->events_num == 1)
+         s->events_read_pos = (s->events_read_pos + 1) % STMFTS_STACK_DEPTH;
++    ftm3bd56_update_irq(s);
+ }
+ 
+ static void ftm3bd56_update_axis(struct TouchSlot *slot, InputAxis axis, int64_t value, int width, int height)
+@@ -313,6 +323,7 @@
+ 
+     s->handler = qemu_input_handler_register((DeviceState *)s,
+                                              &ftm3bd56_handler);
++    qdev_init_gpio_out(dev, &s->irq, 1);
+ }
+ 
+ static void ftm3bd56_unrealize(DeviceState *dev)
+@@ -433,6 +444,7 @@
+                     if (s->events_num > 1)
+                         s->events_read_pos = (s->events_read_pos + 1) % STMFTS_STACK_DEPTH;
+                     s->events_num--;
++                    ftm3bd56_update_irq(s);
+                 }
+             }
+             return s->events[s->events_read_pos][s->recv_pos++ % STMFTS_EVENT_SIZE];
+diff --git a/hw/arm/tegra2/tegrax1.c b/hw/arm/tegra2/tegrax1.c
+--- a/hw/arm/tegra2/tegrax1.c
++++ b/hw/arm/tegra2/tegrax1.c
+@@ -1142,6 +1142,9 @@
+ 
+     /* TouchPanel */
+     tegra_i2c_touch_panel_dev = i2c_slave_create_simple(tegra_i2c_get_bus(tegra_idc3_dev), "ftm3bd56", 0x49);
++    /* Touch interrupt: GPIO X1, active low (Switch device tree). */
++    qdev_connect_gpio_out(DEVICE(tegra_i2c_touch_panel_dev), 0,
++                          qdev_get_gpio_in(DEVICE(tegra_gpios_dev), 23 * 8 + 1));
+ 
+     /* Tmp451 (Temperature Sensor) */
+     tegra_i2c_tmpsensor_dev = i2c_slave_create_simple(tegra_i2c_get_bus(tegra_idc1_dev), "dummyi2c", 0x4C);
