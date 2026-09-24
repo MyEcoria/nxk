@@ -45,6 +45,9 @@ const HEADER_REP_START: u32 = 1 << 16;
 const HEADER_READ: u32 = 1 << 19;
 /// hekate's packet timeout.
 const PACKET_US: u64 = 200_000;
+/// Bus clock of controllers 1-6 in kHz (clk's source divisors, as
+/// hekate bdk/soc/clock.c: 100 kHz on 1, 4 and 6, 400 kHz on the others).
+const KHZ: [u64; 6] = [100, 400, 400, 100, 400, 100];
 
 /// Controllers 1-6: (mapped page, offset within the page).
 const BUSES: [(usize, usize); 6] = [
@@ -75,10 +78,28 @@ fn init(b: &Mmio) {
     b.w32(INT_STATUS, b.r32(INT_STATUS));
 }
 
-fn run(b: &Mmio, cnfg: u32) -> Result<(), i64> {
+/// Wait for `bytes` (addresses included) to cross the bus: one sleep for
+/// their time, 9 bits each plus start and stop. `poll`'s growing naps
+/// cost an interrupt each, about 10 per touch read (polled at 2 Hz).
+fn on_bus(khz: u64, bytes: usize) {
+    let us = (9 * bytes as u64 + 3) * 1000 / khz;
+    if us > 20 {
+        time::sleep_us(us);
+    }
+}
+
+fn spin_us(us: u64) {
+    let end = time::now_ns() + us * 1000;
+    while time::now_ns() < end {
+        core::hint::spin_loop();
+    }
+}
+
+fn run(b: &Mmio, cnfg: u32, khz: u64, bytes: usize) -> Result<(), i64> {
     b.w32(CNFG, cnfg);
     load_cfg(b);
     b.w32(CNFG, (b.r32(CNFG) & !NORMAL_MODE_GO) | NORMAL_MODE_GO);
+    on_bus(khz, bytes);
     // 8 bytes at 100 kHz: under a millisecond.
     if !b.wait(STATUS, STATUS_BUSY, 0, 100_000) {
         return Err(-ETIMEDOUT);
@@ -89,7 +110,7 @@ fn run(b: &Mmio, cnfg: u32) -> Result<(), i64> {
     Ok(())
 }
 
-fn write(b: &Mmio, addr: u32, data: &[u8]) -> Result<(), i64> {
+fn write(b: &Mmio, khz: u64, addr: u32, data: &[u8]) -> Result<(), i64> {
     let mut w = [0u8; 8];
     w[..data.len()].copy_from_slice(data);
     b.w32(CMD_ADDR0, addr << 1);
@@ -98,14 +119,18 @@ fn write(b: &Mmio, addr: u32, data: &[u8]) -> Result<(), i64> {
     run(
         b,
         ((data.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM,
+        khz,
+        1 + data.len(),
     )
 }
 
-fn read(b: &Mmio, addr: u32, out: &mut [u8]) -> Result<(), i64> {
+fn read(b: &Mmio, khz: u64, addr: u32, out: &mut [u8]) -> Result<(), i64> {
     b.w32(CMD_ADDR0, (addr << 1) | 1);
     run(
         b,
         ((out.len() as u32 - 1) << 1) | DEBOUNCE_CNT_4T | NEW_MASTER_FSM | CMD1_READ,
+        khz,
+        1 + out.len(),
     )?;
     let mut w = [0u8; 8];
     w[..4].copy_from_slice(&b.r32(CMD_DATA1).to_le_bytes());
@@ -116,7 +141,7 @@ fn read(b: &Mmio, addr: u32, out: &mut [u8]) -> Result<(), i64> {
 
 /// Write `data` then read `out`, a repeated start between: packet mode,
 /// both packets queued at once (the TX FIFO holds 8 words).
-fn write_read(b: &Mmio, addr: u32, data: &[u8], out: &mut [u8]) -> Result<(), i64> {
+fn write_read(b: &Mmio, khz: u64, addr: u32, data: &[u8], out: &mut [u8]) -> Result<(), i64> {
     b.w32(CMD_ADDR0, (addr << 1) | 1);
     b.w32(CNFG, DEBOUNCE_CNT_4T | NEW_MASTER_FSM | CMD1_READ);
     b.w32(FIFO_CONTROL, RX_FIFO_FLUSH | TX_FIFO_FLUSH);
@@ -142,6 +167,7 @@ fn write_read(b: &Mmio, addr: u32, data: &[u8], out: &mut [u8]) -> Result<(), i6
             return Err(-ETIMEDOUT);
         }
         packet(out.len(), HEADER_READ);
+        on_bus(khz, 2 + data.len() + out.len());
         for c in out.chunks_mut(4) {
             if !time::poll(PACKET_US, || {
                 failed() || b.r32(FIFO_STATUS) & RX_FIFO_FULL_CNT != 0
@@ -155,8 +181,8 @@ fn write_read(b: &Mmio, addr: u32, data: &[u8], out: &mut [u8]) -> Result<(), i6
         }
         Ok(())
     })();
-    // Let the stop go out, then leave packet mode.
-    time::sleep_us(20);
+    // Let the stop go out (a few bit times), then leave packet mode.
+    spin_us(20);
     b.modify(CNFG, PACKET_MODE_GO | NORMAL_MODE_GO, 0);
     if r.is_ok() && failed() {
         return Err(-EIO);
@@ -206,15 +232,16 @@ fn main() -> i32 {
             b.ready = true;
         }
         let mut out = [0u8; 8];
+        let khz = KHZ[bus - 1];
         let r = (|| {
             if joined {
-                return write_read(&b.regs, addr, &data[..wlen], &mut out[..rlen]);
+                return write_read(&b.regs, khz, addr, &data[..wlen], &mut out[..rlen]);
             }
             if wlen > 0 {
-                write(&b.regs, addr, &data[..wlen])?;
+                write(&b.regs, khz, addr, &data[..wlen])?;
             }
             if rlen > 0 {
-                read(&b.regs, addr, &mut out[..rlen])?;
+                read(&b.regs, khz, addr, &mut out[..rlen])?;
             }
             Ok::<(), i64>(())
         })();
