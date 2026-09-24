@@ -24,6 +24,7 @@ static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
 static FS: Service = Service::optional("fs");
 static ETH0: Service = Service::optional("eth0");
+static USB0: Service = Service::optional("usb0");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -107,6 +108,7 @@ pub struct Net {
 impl Net {
     pub fn link_name(&self) -> &'static str {
         match self.link {
+            net::LINK_USB0 => "usb0",
             net::LINK_ETH0 => "eth0",
             net::LINK_WLAN0 => "wlan0",
             _ => "link",
@@ -115,6 +117,7 @@ impl Net {
 
     pub fn link_label(&self) -> &'static str {
         match self.link {
+            net::LINK_USB0 => "USB-C Ethernet",
             net::LINK_ETH0 => "USB Ethernet",
             net::LINK_WLAN0 => "Wi-Fi",
             _ => "network",
@@ -128,6 +131,10 @@ pub enum Eth {
     Missing,
     /// No PC on the USB-C port.
     NoPc,
+    /// A PC, which did not turn the network function on (no driver).
+    Off,
+    /// A link, but net runs on another: no DHCP answer, not shared.
+    NoSharing,
     Dhcp,
     Up,
 }
@@ -276,20 +283,37 @@ impl Data {
         self.wired(n, force);
     }
 
-    /// The USB Ethernet adapter (host mode), when net runs over it.
+    /// The wired link: the PC's connection over USB-C (usbcon's network
+    /// function, "usb0"), or a USB Ethernet adapter net runs over ("eth0").
     fn wired(&mut self, n: u64, force: bool) {
-        let Now::Value(v) = self.net else {
-            self.eth = Eth::Missing;
-            return;
+        let net = match self.net {
+            Now::Value(v) => Some(v),
+            _ => None,
         };
-        if v.link != net::LINK_ETH0 {
-            self.eth = Eth::Missing;
-            return;
+        let on = |link: u64| net.filter(|v| v.link == link).map(|v| v.addr != 0);
+        let (name, service) = match on(net::LINK_ETH0) {
+            Some(addr) => {
+                self.eth = if addr { Eth::Up } else { Eth::Dhcp };
+                ("eth0", &ETH0)
+            }
+            None => {
+                self.eth = match (self.usb, on(net::LINK_USB0)) {
+                    (Now::Missing, _) => Eth::Missing,
+                    (Now::Busy, _) => self.eth,
+                    (Now::Value(u), _) if u.state & usb::ST_CONFIGURED == 0 => Eth::NoPc,
+                    (Now::Value(u), _) if u.state & usb::ST_NET == 0 => Eth::Off,
+                    (_, Some(true)) => Eth::Up,
+                    (_, Some(false)) => Eth::Dhcp,
+                    (_, None) => Eth::NoSharing,
+                };
+                ("usb0", &USB0)
+            }
+        };
+        if self.eth_name != name {
+            (self.eth_name, self.eth_mac) = (name, 0);
         }
-        self.eth_name = "eth0";
-        self.eth = if v.addr != 0 { Eth::Up } else { Eth::Dhcp };
-        if self.eth_mac == 0 || force || n.is_multiple_of(SLOW) {
-            if let Now::Value(m) = ask(&ETH0, eth::INFO) {
+        if self.eth != Eth::Missing && (self.eth_mac == 0 || force || n.is_multiple_of(SLOW)) {
+            if let Now::Value(m) = ask(service, eth::INFO) {
                 self.eth_mac = m.mr[0] & 0xFFFF_FFFF_FFFF;
             }
         }

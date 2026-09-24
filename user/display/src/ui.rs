@@ -252,6 +252,10 @@ fn eth_text(d: &Data, short: bool) -> (&'static str, u32) {
         Eth::Up => ("connected", GOOD),
         Eth::Dhcp if short => ("waiting for DHCP", WARN),
         Eth::Dhcp => ("link up, waiting for DHCP", WARN),
+        Eth::NoSharing if short => ("no DHCP answer", WARN),
+        Eth::NoSharing => ("no DHCP: sharing off on the PC?", WARN),
+        Eth::Off if short => ("off on the PC", DIM),
+        Eth::Off => ("link not turned on by the PC", DIM),
         Eth::NoPc if short => ("no PC", DIM),
         Eth::NoPc => ("no PC on USB-C", DIM),
         Eth::Missing => ("not running", DIM),
@@ -1047,6 +1051,11 @@ impl Ui {
             kv(s, xl + 16, xl + w - 16, y0 + 188, "USB", speed, None);
         }
         let hint = match d.eth {
+            Eth::NoSharing => Some([
+                "on the PC: share its connection",
+                "(nmcli: ipv4.method shared)",
+            ]),
+            Eth::Off => Some(["the PC has no CDC-ECM driver", "(Linux and macOS have one)"]),
             Eth::NoPc => Some(["plug the Switch into a PC that", "shares its connection"]),
             _ => None,
         };
