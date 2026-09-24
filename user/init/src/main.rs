@@ -31,8 +31,9 @@ struct Driver {
     ro_mmio: &'static [(u64, u64)],
     irqs: &'static [u32],
     sysctl: bool,
-    /// Console terminal handle in `slots::TERMINAL`.
-    terminal: bool,
+    /// Badge of an extra console handle in `slots::TERMINAL` (0: none):
+    /// the terminal driver's or the screen's.
+    console: u64,
     prio: u32,
 }
 
@@ -46,7 +47,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 6,
     },
     Driver {
@@ -56,7 +57,7 @@ const DRIVERS: &[Driver] = &[
         // I2C1..6: SPI 38, 84, 92, 120, 53, 63.
         irqs: &[70, 116, 124, 152, 85, 95],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 6,
     },
     Driver {
@@ -65,7 +66,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[],
         sysctl: true,
-        terminal: false,
+        console: 0,
         prio: 8,
     },
     Driver {
@@ -74,7 +75,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[105],
         sysctl: false,
-        terminal: false,
+        console: con::BADGE_SCREEN,
         prio: 10,
     },
     // Touchscreen (via the i2c service) and events from other drivers.
@@ -86,7 +87,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[119],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 8,
     },
     // Started before `sd`: a driver that stalls the APB bus must not cost
@@ -98,7 +99,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[(0x7000_0000, 0x1000), (0x7000_F000, 0x1000)],
         irqs: &[52],
         sysctl: false,
-        terminal: true,
+        console: con::BADGE_TERMINAL,
         prio: 6,
     },
     // SDMMC1, plus what powers the slot: APB_MISC (pad control, chip
@@ -115,7 +116,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[46],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 6,
     },
     Driver {
@@ -124,7 +125,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 8,
     },
     Driver {
@@ -134,7 +135,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[71],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 6,
     },
     // Wi-Fi: PCIe root complex (ports, PADS, AFI), the 4 KiB
@@ -156,7 +157,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[130],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 6,
     },
     Driver {
@@ -165,7 +166,7 @@ const DRIVERS: &[Driver] = &[
         ro_mmio: &[],
         irqs: &[],
         sysctl: false,
-        terminal: false,
+        console: 0,
         prio: 8,
     },
 ];
@@ -180,8 +181,9 @@ struct Service {
 struct State {
     fs: Bootfs,
     console: u32,
-    /// Console handle with the terminal badge (terminal driver only).
+    /// Console handles with the terminal and screen badges.
     terminal: u32,
+    screen: u32,
     pm_app: u32,
     pm_srv: u32,
     services: Vec<Service>,
@@ -242,6 +244,8 @@ fn main() -> i32 {
         sys::handle_dup(ep_console, SEND | GRANT | DUP, con::BADGE_CLIENT).expect("dup console");
     let console_term =
         sys::handle_dup(ep_console, SEND | GRANT, con::BADGE_TERMINAL).expect("dup console");
+    let console_screen =
+        sys::handle_dup(ep_console, SEND | GRANT, con::BADGE_SCREEN).expect("dup console");
     for h in [ep_console, uart, uart_irq, console_drv] {
         let _ = sys::handle_close(h);
     }
@@ -256,6 +260,7 @@ fn main() -> i32 {
         fs,
         console: console_send,
         terminal: console_term,
+        screen: console_screen,
         pm_app,
         pm_srv,
         services: Vec::new(),
@@ -304,9 +309,14 @@ fn start_driver(st: &State, d: &Driver, elf: &[u8]) -> Result<u32, i64> {
         handle: st.pm_srv,
         slot: slots::PM,
     });
-    if d.terminal {
+    let extra = match d.console {
+        con::BADGE_TERMINAL => st.terminal,
+        con::BADGE_SCREEN => st.screen,
+        _ => 0,
+    };
+    if extra != 0 {
         grants.push(HandleGrant {
-            handle: st.terminal,
+            handle: extra,
             slot: slots::TERMINAL,
         });
     }

@@ -3,7 +3,8 @@
 //! driver (USB) mirrors it: its bytes are typed, it reads all output.
 //! Nothing waits on the UART: output lands in one ring that the TX-empty
 //! interrupt drains to UART-A and the terminal driver reads at its own
-//! pace; the kernel log is drained into it too.
+//! pace; the kernel log is drained into it too. The screen reads the
+//! same ring without taking from it (TERMINAL page).
 
 #![no_std]
 #![no_main]
@@ -214,6 +215,7 @@ impl Console {
     /// One request; `None`: reply deferred (token kept).
     fn request(&mut self, rx: &Received, buf: &mut [u8]) -> Option<Msg> {
         let terminal = rx.badge == proto::BADGE_TERMINAL;
+        let screen = rx.badge == proto::BADGE_SCREEN;
         Some(match rx.msg.label() {
             proto::WRITE => {
                 let n = ipc::unpack(&rx.msg, buf);
@@ -250,7 +252,17 @@ impl Console {
                 self.term_wake();
                 Msg::new(0, 0, 0)
             }
-            proto::INPUT | proto::OUTPUT | proto::ATTACH => Msg::error(-EPERM),
+            proto::TAIL if screen => {
+                let mut pos = rx.msg.mr[0];
+                let max = match rx.msg.mr[1] as usize {
+                    0 => ipc::MAX_BYTES - 8,
+                    n => n.min(ipc::MAX_BYTES - 8),
+                };
+                let chunk = self.out.pending(&mut pos);
+                let n = chunk.len().min(max);
+                ipc::pack_at(0, &[pos + n as u64], &chunk[..n])
+            }
+            proto::INPUT | proto::OUTPUT | proto::ATTACH | proto::TAIL => Msg::error(-EPERM),
             _ => Msg::error(-ENOSYS),
         })
     }

@@ -818,7 +818,8 @@ pub mod slots {
     pub const DRV_MMIO: u32 = 3;
     pub const DRV_IRQ: u32 = 4;
     pub const DRV_KLOG: u32 = 5;
-    /// Terminal driver: console handle with `console::BADGE_TERMINAL`.
+    /// Terminal driver or screen: console handle with
+    /// `console::BADGE_TERMINAL` or `console::BADGE_SCREEN`.
     pub const TERMINAL: u32 = 6;
     /// Other drivers: resources from here (registers, read-only
     /// registers, IRQs, sysctl) in init's driver-table order.
@@ -1064,11 +1065,20 @@ pub mod proto {
         /// Terminal driver only: handle 0 = notification (SIGNAL) the
         /// console signals with word 0's bits once output is pending.
         pub const ATTACH: u32 = 5;
+        /// Screen only (`BADGE_SCREEN`): output from position word 0
+        /// (bytes ever written; the oldest one kept if it is older), at
+        /// most word 1 bytes (0: as many as fit). Reply: word 0 = the
+        /// position after them, then the bytes (see `pack_at`). Never
+        /// waits and takes nothing from the terminal driver.
+        pub const TAIL: u32 = 6;
         /// Badge of the console handle init gives a terminal driver.
         pub const BADGE_TERMINAL: u64 = 1;
         /// Badge of all other console handles: a badged handle cannot
         /// be re-minted, so holders cannot forge `BADGE_TERMINAL`.
         pub const BADGE_CLIENT: u64 = 2;
+        /// Badge of the console handle init gives the screen (`display`):
+        /// what the PC typed is in the output (echo), passphrases included.
+        pub const BADGE_SCREEN: u64 = 3;
     }
     pub mod pm {
         /// Spawn: bytes = argc, envc, flags, 0 (u32 each) then the
