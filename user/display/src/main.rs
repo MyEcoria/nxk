@@ -39,16 +39,18 @@ use ui::{Action, ScanNet, Ui};
 const DC: u64 = 0x5420_0000;
 /// Statistics refresh period.
 const REFRESH_NS: u64 = 1_000_000_000;
-/// Console read period while the TERMINAL page is shown, and else: a
-/// quiet core stays quiet (ktest's tickless test), the ring holds 16 KiB.
+/// Console read period while the TERMINAL or LOGS page is shown, and
+/// else: a quiet core stays quiet (ktest's tickless test), the ring
+/// holds 16 KiB.
 const TAIL_NS: u64 = 200_000_000;
 const TAIL_IDLE_NS: u64 = 5_000_000_000;
 /// Cursor blink half-period.
 const BLINK_NS: u64 = 500_000_000;
 /// Longest wait on the console.
 const CALL_NS: u64 = 20_000_000;
-/// Lines written to the screen kept for the LOGS page.
-const MSG_LINES: usize = 64;
+/// Log lines kept for the LOGS page: the console's logs (services, the
+/// kernel) and text written to the screen.
+const MSG_LINES: usize = 256;
 
 /// Notification bits: touches queued, an action finished.
 const EV_TOUCH: u64 = 1;
@@ -88,7 +90,7 @@ fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
 }
 
-/// Lines written to the screen, the latest last.
+/// Log lines, the latest last.
 pub struct Messages {
     lines: VecDeque<String>,
     /// Unfinished last line, bytes pending (UTF-8).
@@ -352,8 +354,16 @@ fn main() -> i32 {
             let terminal = ui.page == ui::TERMINAL;
             if now >= next_tail {
                 dirty |= read_console(&mut term, &mut tail, &mut tail_buf);
+                let logs = term.take_logs();
+                if !logs.is_empty() {
+                    let lines = msgs.write(&logs);
+                    if ui.page != ui::LOGS {
+                        ui.unread += lines;
+                    }
+                    dirty = true;
+                }
                 // Idle reads half a refresh off the statistics' calls.
-                next_tail = if terminal {
+                next_tail = if terminal || ui.page == ui::LOGS {
                     now + TAIL_NS
                 } else {
                     next_refresh + TAIL_IDLE_NS - REFRESH_NS / 2
@@ -411,7 +421,7 @@ fn main() -> i32 {
                     let page = ui.page;
                     let action = ui.touch(code, x, y);
                     if ui.page != page {
-                        next_tail = 0; // the TERMINAL page shows up to date
+                        next_tail = 0; // TERMINAL and LOGS show up to date
                     }
                     match action {
                         Some(Action::ClearLogs) => msgs.clear(),

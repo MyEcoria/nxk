@@ -2,6 +2,7 @@
 //! echo of what the PC typed) read as a terminal would: CR, LF,
 //! backspace, SGR colors, and the shell's marks (OSC 7 directory, OSC
 //! 133 prompt, command, status) to draw its prompts in a zsh look.
+//! Logs (between the console's LOG marks) are set aside for LOGS.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -9,6 +10,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use libnx::abi::proto::console::{LOG_END, LOG_START};
 use libnx::time;
 
 use crate::screen::{BAD, BLUE, DIM, FG, GOOD};
@@ -90,6 +92,14 @@ pub struct Term {
     cwd: String,
     /// Bytes of an unfinished UTF-8 character.
     utf8: Vec<u8>,
+    /// Inside a log, and the logs read since `take_logs`.
+    log: bool,
+    logs: Vec<u8>,
+}
+
+/// Body of an OSC mark (between `ESC ]` and BEL).
+fn osc_body(mark: &[u8]) -> &[u8] {
+    &mark[2..mark.len() - 1]
 }
 
 /// Write `v` at `col` (overwriting, as a terminal does) and move on.
@@ -201,6 +211,22 @@ impl Term {
             esc: Seq::Text,
             cwd: "/".into(),
             utf8: Vec::new(),
+            log: false,
+            logs: Vec::new(),
+        }
+    }
+
+    /// Log bytes read since the last call.
+    pub fn take_logs(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.logs)
+    }
+
+    /// A byte outside escape sequences: the terminal's, or a log's.
+    fn text(&mut self, b: u8) {
+        if self.log && b != 0x1B {
+            self.logs.push(b);
+        } else {
+            self.byte(b);
         }
     }
 
@@ -208,7 +234,7 @@ impl Term {
     pub fn feed(&mut self, data: &[u8]) {
         for &b in data {
             match core::mem::replace(&mut self.esc, Seq::Text) {
-                Seq::Text => self.byte(b),
+                Seq::Text => self.text(b),
                 Seq::Start => match b {
                     b'[' => self.esc = Seq::Csi(Vec::new()),
                     b']' => self.esc = Seq::Osc(Vec::new()),
@@ -216,7 +242,7 @@ impl Term {
                 },
                 Seq::Csi(mut p) => {
                     if (0x40..=0x7E).contains(&b) {
-                        if b == b'm' {
+                        if b == b'm' && !self.log {
                             self.sgr(&p);
                         }
                     } else if p.len() < MAX_ESC {
@@ -237,7 +263,7 @@ impl Term {
                 Seq::OscEnd(p) => {
                     self.osc(&p);
                     if b != b'\\' {
-                        self.byte(b);
+                        self.text(b);
                     }
                 }
             }
@@ -354,6 +380,13 @@ impl Term {
     }
 
     fn osc(&mut self, p: &[u8]) {
+        if p == osc_body(LOG_START) || p == osc_body(LOG_END) {
+            self.log = p == osc_body(LOG_START);
+            return;
+        }
+        if self.log {
+            return;
+        }
         let s = core::str::from_utf8(p).unwrap_or("");
         if let Some(url) = s.strip_prefix("7;file://") {
             // Host, then the path.
