@@ -19,6 +19,9 @@ prompt (powerlevel10k "lean") shows the directory, the last status and
 duration, and the time. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
 --raw keeps a plain terminal (keys typed as they come, the shell's echo).
 
+Logs (services, kernel: what the console puts between its LOG marks) are
+left out but with --logs (dimmed when interactive) or --reload.
+
 In the emulator, QEMU needs
 `-chardev socket,id=usbotg,path=SOCK,server=on,wait=off`; this script then
 plays the host side of the bus (enumeration, bulk transfers).
@@ -30,6 +33,8 @@ PROMPT = b"nxk> "
 QUIT = 0x1D  # Ctrl-]
 # base64 characters per typed line: the console keeps at most 1000.
 PUT_LINE = 512
+# nxk_abi console::LOG_START / LOG_END: a log comes between them.
+LOG_START, LOG_END = b"\x1b]7700;log\x07", b"\x1b]7700;end\x07"
 
 
 class Stall(Exception):
@@ -270,15 +275,42 @@ def find_tty():
     return None
 
 
-def read_until(link, marker, timeout, out):
-    """Output until `marker` shows up (or `timeout`): (text, found)."""
+class Logs:
+    """Console output with its logs (between the LOG marks) kept or left
+    out, the marks removed."""
+
+    def __init__(self, keep):
+        self.keep, self.inside, self.carry = keep, False, b""
+
+    def __call__(self, data):
+        buf, self.carry, out = self.carry + data, b"", []
+        while buf:
+            found = [(buf.find(m), m) for m in (LOG_START, LOG_END)]
+            k, mark = min(((i, m) for i, m in found if i >= 0), default=(-1, b""))
+            if k < 0:
+                e = buf.rfind(b"\x1b")
+                if e >= 0 and any(m.startswith(buf[e:]) for m in (LOG_START, LOG_END)):
+                    buf, self.carry = buf[:e], buf[e:]  # a mark cut in two
+                k = len(buf)
+            if buf[:k] and (self.keep or not self.inside):
+                out.append(buf[:k])
+            if mark and k < len(buf):
+                self.inside = mark == LOG_START
+                k += len(mark)
+            buf = buf[k:]
+        return b"".join(out)
+
+
+def read_until(link, marker, timeout, out, shown=None):
+    """Output until `marker` shows up (or `timeout`): (text, found).
+    `shown`: what of each piece goes to `out` (a `Logs`)."""
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
         data = link.read(min(0.2, max(0.0, end - time.time())))
         if data:
             buf += data
-            out.write(data.decode("utf-8", "replace"))
+            out.write((shown(data) if shown else data).decode("utf-8", "replace"))
             out.flush()
             if marker in buf:
                 return buf, True
@@ -316,11 +348,13 @@ def put(link, local, remote, timeout):
     return ok and bool(verdict) and f"recv: {remote} (" in verdict[-1]
 
 
-def run(link, cmds, timeout, out=sys.stdout, puts=()):
-    """Type each command, print its output up to the next prompt."""
+def run(link, cmds, timeout, out=sys.stdout, puts=(), logs=True):
+    """Type each command, print its output up to the next prompt (the
+    logs too if `logs`)."""
+    shown = Logs(logs)
     drain(link)
     link.write(b"\r")
-    if not read_until(link, PROMPT, timeout, out)[1]:
+    if not read_until(link, PROMPT, timeout, out, shown)[1]:
         print("\n[usbterm] no nxk prompt", file=sys.stderr)
         return False
     for local, remote in puts:
@@ -328,7 +362,7 @@ def run(link, cmds, timeout, out=sys.stdout, puts=()):
             return False
     for c in cmds:
         link.write(c.encode() + b"\r")
-        if not read_until(link, PROMPT, timeout, out)[1]:
+        if not read_until(link, PROMPT, timeout, out, shown)[1]:
             print(f"\n[usbterm] '{c}' missed the prompt in {timeout} s", file=sys.stderr)
             return False
     out.write("\n")
@@ -501,8 +535,8 @@ class Zsh:
     status) drive the prompt drawn here; its `nxk> ` and echo are hidden.
     While a command runs, keys go through as typed (programs read lines)."""
 
-    def __init__(self, link):
-        self.link = link
+    def __init__(self, link, logs=False):
+        self.link, self.logs, self.in_log = link, logs, False
         self.history = History(os.path.join(STATE, "history"))
         self.learned_path = os.path.join(STATE, "commands")
         try:
@@ -678,7 +712,11 @@ class Zsh:
             start = e + 1
 
     def osc(self, body):
-        if body.startswith("7;"):
+        if f"\x1b]{body}\x07".encode() in (LOG_START, LOG_END):
+            self.in_log = body.endswith("log")
+        elif self.in_log:
+            pass
+        elif body.startswith("7;"):
             m = re.match(r"7;file://[^/]*(/.*)", body)
             self.cwd = m.group(1) if m else self.cwd
         elif body == "133;A":
@@ -713,9 +751,11 @@ class Zsh:
             self.text(f"\x1b]{body}\x07".encode())
 
     def text(self, data):
-        if not data or self.in_prompt:
+        if not data or self.in_prompt or self.in_log and not self.logs:
             return
-        if self.word and len(self.cmd_out) < 8192:
+        if self.in_log:
+            data = f"\x1b[{DIM}m".encode() + data + b"\x1b[0m"
+        elif self.word and len(self.cmd_out) < 8192:
             self.cmd_out += data
         if self.editing:
             if not self.pending:
@@ -1086,12 +1126,12 @@ class Zsh:
             print(("" if self.bol else "\r\n") + "[usbterm] bye", file=sys.stderr)
 
 
-def interactive(link, raw=False):
+def interactive(link, raw=False, logs=False):
     """zsh-style terminal, or the plain one (`raw`, or not a terminal)."""
     if raw or not (os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())):
         passthrough(link)
     else:
-        Zsh(link).run()
+        Zsh(link, logs).run()
 
 
 def passthrough(link):
@@ -1130,6 +1170,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=30, help="per-command timeout (s)")
     ap.add_argument("--raw", action="store_true",
                     help="plain terminal: keys typed as they come, the shell's own prompt and echo")
+    ap.add_argument("--logs", action="store_true",
+                    help="show the logs (services, kernel) too; --reload implies it")
     ap.add_argument("--put", action="append", default=[], metavar="LOCAL:REMOTE",
                     help="copy a file to the Switch's card first (repeatable)")
     ap.add_argument("--reload", action="append", default=[], metavar="DRIVER",
@@ -1157,8 +1199,8 @@ def main():
     try:
         if cmds or puts:
             print(f"[usbterm] {link.name}", file=sys.stderr)
-            sys.exit(0 if run(link, cmds, a.timeout, puts=puts) else 1)
-        interactive(link, a.raw)
+            sys.exit(0 if run(link, cmds, a.timeout, puts=puts, logs=a.logs or bool(a.reload)) else 1)
+        interactive(link, a.raw, a.logs)
     except (ConnectionError, TimeoutError, Stall) as e:
         sys.exit(f"\n[usbterm] {e}")
     finally:
