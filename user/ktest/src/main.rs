@@ -492,33 +492,61 @@ fn t_affinity() -> R {
 }
 
 fn t_priority() -> R {
+    // The spinning low thread must not run past a deadline of the high
+    // one on their core, beyond what the timer interrupt itself was late
+    // (kernel stat). Only continuous running counts: an emulator host
+    // stalling the core delays both, which is no scheduling fault.
+    const STEP: u64 = 50_000;
+    const SLEEP: u64 = 2 * MS;
     let stop = Arc::new(AtomicBool::new(false));
-    let s = stop.clone();
+    let deadline = Arc::new(AtomicU64::new(0));
+    let overrun = Arc::new(AtomicU64::new(0));
+    let (s, d, o) = (stop.clone(), deadline.clone(), overrun.clone());
+    let before = cpus();
     let low = thread::spawn_on(Some(2), 25, move || {
+        let (mut prev, mut run, mut cur, mut ran) = (time::now_ns(), 0, 0, 0);
         while !s.load(Ordering::Relaxed) {
+            // Clock first: a stale reading never meets a newer deadline.
+            let now = time::now_ns();
+            let dl = d.load(Ordering::Acquire);
+            if dl != cur {
+                (cur, ran) = (dl, 0);
+            }
+            if now - prev >= STEP {
+                run = now;
+            }
+            // The kernel's deadline follows the user's by the sleep call's
+            // entry, at most the start of this run plus the sleep.
+            if dl != 0 && prev > dl.max(run + SLEEP) && now - prev < STEP {
+                ran += now - prev;
+                o.fetch_add(now - prev, Ordering::Relaxed);
+                if ran > 50 * MS {
+                    break; // never preempted: free the core, report
+                }
+            }
+            prev = now;
             core::hint::spin_loop();
         }
     })
     .map_err(|e| format!("thread {}", e))?;
-    let worst = Arc::new(AtomicU64::new(0));
-    let wr = worst.clone();
     let high = thread::spawn_on(Some(2), 5, move || {
         for _ in 0..10 {
-            let t0 = time::now_ns();
-            time::sleep_ms(2);
-            let late = (time::now_ns() - t0).saturating_sub(2 * MS);
-            wr.fetch_max(late, Ordering::Relaxed);
+            deadline.store(time::now_ns() + SLEEP, Ordering::Release);
+            sys::sleep_ns(SLEEP);
         }
+        deadline.store(0, Ordering::Release);
     })
     .map_err(|e| format!("thread {}", e))?;
     high.join();
     stop.store(true, Ordering::Relaxed);
     low.join();
-    let w = worst.load(Ordering::Relaxed);
-    if w > 5 * MS {
+    let late = cpus()[2].timer_late_ns - before[2].timer_late_ns;
+    let over = overrun.load(Ordering::Relaxed);
+    if over > late + MS {
         return Err(format!(
-            "max lateness of high-priority thread: {} us",
-            w / 1000
+            "low-priority thread ran {} us past high-priority deadlines (timer late {} us)",
+            over / 1000,
+            late / 1000
         ));
     }
     Ok(())
