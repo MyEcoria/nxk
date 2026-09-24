@@ -107,16 +107,22 @@ fn t_klog() -> R {
         EBADF,
     )?;
     // A log line costs a copy into the kernel's ring, never a wait on
-    // the UART (87 us per byte at 115200 baud).
-    let line = b"ktest: kernel log line, no UART wait\n";
-    let t0 = time::now_ns();
-    sys::debug_write(line);
-    let dt = time::now_ns() - t0;
-    if dt > MS {
+    // the UART (87 us per byte at 115200 baud: 5.6 ms for this line).
+    // Best of 3: an emulator host can stall any single call.
+    let line = b"ktest: kernel log line, copied to a ring, no UART wait .........\n";
+    let best = (0..3)
+        .map(|_| {
+            let t0 = time::now_ns();
+            sys::debug_write(line);
+            time::now_ns() - t0
+        })
+        .min()
+        .unwrap_or(0);
+    if best > 2 * MS {
         return Err(format!(
             "debug_write of {} bytes took {} us",
             line.len(),
-            dt / 1000
+            best / 1000
         ));
     }
     Ok(())
@@ -649,16 +655,27 @@ fn cpus() -> [CpuInfo; 4] {
 
 fn t_tickless() -> R {
     let me = sys::getcpu() as usize;
+    let worst = |a: &[CpuInfo; 4], b: &[CpuInfo; 4]| {
+        (0..4)
+            .filter(|&k| k != me && a[k].online != 0)
+            .map(|k| b[k].irqs - a[k].irqs)
+            .max()
+            .unwrap_or(0)
+    };
+    // Earlier output may still drain to UART-A (a FIFO refill every
+    // 1.4 ms on the console's core): wait up to 3 s for quiet cores. A
+    // periodic tick never goes quiet, and still fails below.
+    for _ in 0..30 {
+        let a = cpus();
+        time::sleep_ms(100);
+        if worst(&a, &cpus()) <= 5 {
+            break;
+        }
+    }
     let a = cpus();
     time::sleep_ms(300);
     let b = cpus();
-    let mut worst = 0;
-    for k in 0..4 {
-        if k == me || a[k].online == 0 {
-            continue;
-        }
-        worst = worst.max(b[k].irqs - a[k].irqs);
-    }
+    let worst = worst(&a, &b);
     // With a 100 Hz tick, an idle core would get 30.
     if worst > 5 {
         let detail: Vec<String> = (0..4)
