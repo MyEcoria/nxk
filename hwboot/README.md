@@ -218,7 +218,9 @@ quotes and `>` yellow), and a two-line prompt gives the directory, the
 last status (`✘ 2 ENOENT`), its duration and the time. Messages that
 come while a line is edited print above the prompt; keys typed while a
 command runs reach it as typed, and whatever was left unsent comes back
-in the next prompt. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
+in the next prompt. `clear` is the client's own: it wipes the PC's
+screen and scrollback, nothing reaches the Switch, and shows the logo
+header again. Ctrl-D on an empty line, `exit` or Ctrl-] quits;
 `--raw` is the plain terminal (the shell's `nxk> ` and echo). Logs are
 left out, as on the TERMINAL page: `--logs` shows them (dimmed), and
 `--reload` does too, to see the driver start.
@@ -553,7 +555,9 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     with the touch panel still polled (run 22: 28/29). The SD card was
     mute this boot, as in runs 18 and 19: the card answers (CMD13, state
     4) but its first read times out and the three retries fail with EIO,
-    LDO2 at 3.3 V; `fs` finds no volume, so `stdtest` was not run.
+    LDO2 at 3.3 V; `fs` finds no volume, so `stdtest` was not run. The
+    same commits written to the card from the PC then worked (storage,
+    TERMINAL page): the mute card came with the image sent over USB-C.
 
 ## Hardware test (once the SD card is back in the PC)
 
