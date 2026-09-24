@@ -240,8 +240,8 @@ All in EL0, started by `init` with only their capabilities.
 | `display` | screen (window A), home screen: the logo, then statistics refreshed every second (uptime, processes, cores, temperatures, per-core load bars, syscall/interrupt/switch rates, memory, USB-C console state and traffic, network address and traffic, Wi-Fi, SD card) from `sysinfo` and the services' `STATS`, each asked with a 20 ms cap; the last lines written to it (driver failures, `fbecho`) at the bottom (Terminus font; a portrait panel is drawn turned) | emulator; **Erista**: takes over the 720x1280 panel hekate left on; own panel init missing |
 | `input` | touchscreen (FTM3BD56), USB keyboard | emulator; polled only when someone reads |
 | `usb` | xHCI: HID keyboard, CDC-ECM network card | emulator; the real xHCI needs an NVIDIA firmware; stops if `clk` does not report it powered |
-| `net` | TCP/IP (smoltcp): DHCP, DNS, TCP, UDP, ICMP echo (`nettest ping HOST`), traffic counters (`STATS`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
-| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again) | the chip sometimes stops answering a few minutes after a join (hardware run 16, cause unknown): `wlan` reports it in `wifi status` and `restart wlan` brings it back. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
+| `net` | TCP/IP (smoltcp): DHCP (retried every 2 s, started over when the Wi-Fi link drops), DNS, TCP, UDP, ICMP echo (`nettest ping HOST`), traffic counters (`STATS`); **Erista**: over Wi-Fi, `nettest ping google.com` answered | |
+| `wlan` | Wi-Fi station: Tegra PCIe root complex (rail, UPHY lanes, AFI windows, link, BAR assignment) and BCM4356 identification, firmware boot (TCM download, NVRAM, shared area), msgbuf control and data rings (RX buffers, a TX flow ring) driven by the chip's interrupt (PCIe2 mailbox, legacy INTx), scans, joins of open and WPA2-Personal networks (CCMP, our own supplicant: 4-way and group key handshakes, keys handed to the firmware); publishes the link as `wlan0` once associated (`net` takes it when there is no `eth0`: DHCP, DNS, TCP) and its control as `wifi` (`wifi status` names the step where bring-up stopped, `wifi retry` runs it again or resets a running chip; `wifi connect` returns once `net` has its DHCP address) | the chip still resets itself at times, joined or idle (hardware runs 16, 20, 21, cause unknown): `wlan` checks it every second, reports the loss in `wifi status` and brings it back by itself, rejoining the last network. WPA (TKIP), WPA/WPA2 mixed, WPA3-only and networks requiring management frame protection are refused with `EOPNOTSUPP`. Without a PCIe device (emulator) a simulated adapter answers, so `wifi` and the `net` attach are still exercised |
 
 The `fs` and `net` services attach each open file or socket to the
 process that opened it: another process cannot use it, and the ones of a
@@ -296,10 +296,15 @@ program that vanished without closing them (crash) are reclaimed.
   `wsec_key`. Their known-answer and handshake tests run on the PC:
   `rustc --edition 2021 --test user/wlan/hosttest.rs -o T && ./T`.
   Data frames use the RX and TX rings, drained on the chip's interrupt
-  (a 500 ms poll stays as a safety net). The chip still stops answering
-  at times, a few minutes after a join (`wifi status`: `chip
-  unreachable`, with the link and the chip's config space as they are
-  then); `restart wlan` brings it back. Its firmware
+  (a 500 ms poll stays as a safety net). The chip still resets itself
+  at times, joined or idle, with no trap or assert from its firmware
+  (hardware runs 16, 20, 21): `wlan` checks it every second (crash
+  flags, a bus reading all ones, memory decoding off), reports the loss
+  (`wifi status`: link, config space, module pins, the firmware's last
+  console lines) and brings it back by itself (module reset under
+  PERST#, link, firmware, then the last network with the passphrase it
+  keeps), retrying after 2 s, then up to every minute; `wifi retry`
+  does the same by hand. Its firmware
   and calibration data are proprietary and never in the repository:
   they are extracted from the console's own
   system titles with `hwboot/nxfw-extract.py` into `firmware/` (git

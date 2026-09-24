@@ -467,6 +467,20 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     first ping, 3 s after the join, found no address: ENETUNREACH)
     `nettest ping google.com 5` got 5 of 5 (172.217.22.46, 66 to 253 ms,
     109 ms on average), 3 of 3 again 2.5 minutes after the join.
+21. 24/09/2026, Erista, the Wi-Fi fixes (`2988255` to `63545b5`):
+    `wifi connect nxk-test` (WPA2) now returns with the DHCP address
+    (10.133.165.75/24) and `nettest ping google.com 5` answers 5 of 5
+    at once (124 ms on average). `wifi retry` resets the chip on demand:
+    report, module reset, firmware up in 194 ms, rejoin by itself, 5 of
+    5 pings (55 ms). A loss of its own came 52 s later, caught within a
+    second: the PCIe link down at the root port (DL_ACTIVE and DL_UP
+    clear), the config space reading all ones, WIFI_EN, WIFI_RST and
+    PERST# held high by the Tegra, no trap or assert in the shared area
+    and nothing new on the firmware console. `wlan` brought it back and
+    rejoined, and the next 11 minutes (pings every 30 s) had no loss.
+    So the chip resets itself (a watchdog or a supply dip, not the
+    host): runs 16 and 20 looked later, once the link had retrained
+    and the config space was back to its reset values.
 
 ## Hardware test (once the SD card is back in the PC)
 
