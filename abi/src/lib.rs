@@ -1079,6 +1079,14 @@ pub mod proto {
         /// Badge of the console handle init gives the screen (`display`):
         /// what the PC typed is in the output (echo), passphrases included.
         pub const BADGE_SCREEN: u64 = 3;
+        /// Badge of the console shell's handle, which the programs it
+        /// starts inherit: their output is the session, not a log.
+        pub const BADGE_SESSION: u64 = 4;
+        /// In the output, each write of another client and each piece of
+        /// the kernel log comes between these marks (private OSC 7700,
+        /// which terminals ignore): readers tell logs from the session.
+        pub const LOG_START: &[u8] = b"\x1b]7700;log\x07";
+        pub const LOG_END: &[u8] = b"\x1b]7700;end\x07";
     }
     pub mod pm {
         /// Spawn: bytes = argc, envc, flags, 0 (u32 each) then the
