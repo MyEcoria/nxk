@@ -19,7 +19,9 @@ fn result(key: &str, v: u64, unit: &str) {
 }
 
 fn main() -> i32 {
+    // Pinned: "same core" and "cross core" are measured from `me`.
     let me = sys::getcpu() as u8;
+    let _ = thread::set_current_affinity(Some(me));
     result("null_syscall_ns", null_syscall(), "ns");
     result("ipc_same_core_ns", round_trip(me, me, 8), "ns");
     result("ipc_cross_core_ns", round_trip(me, (me + 1) % 4, 8), "ns");
