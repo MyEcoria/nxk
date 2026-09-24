@@ -452,6 +452,22 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     on the PC; a Realtek reader (0bda:0177) timed out on every write,
     the ChipsBnk one formatted the second card.
 
+20. 24/09/2026, Erista, commit `f2804ee`, the Switch's microSD connector
+    reseated (it was loose: the cause of run 19): the card comes up on 4
+    bits (`sd` ready at 766 ms, no retry), `fs` mounts it and `wlan`
+    loads its firmware from it. `ktest` 29/29, `stdtest` 17/17 (`files`
+    133 ms), 9996 KiB of memory in use after the mount. The direct DMA
+    of `sd` holds: a 2 MB `--put` (3.8 s, 5.3 s in run 18), a `cp` of it
+    on the Switch (over 1 MB read back from the card) and `/bin/wlan`
+    from `--reload` are all byte-identical on the PC. The Wi-Fi chip
+    reset itself about 3 minutes after boot, idle and before any join
+    (config space back to its reset values, command 0x00100000, BAR0
+    0x4, the link still up); `--reload wlan` brought it back, `wifi
+    connect nxk-test` (WPA2) joined, and once DHCP had answered (the
+    first ping, 3 s after the join, found no address: ENETUNREACH)
+    `nettest ping google.com 5` got 5 of 5 (172.217.22.46, 66 to 253 ms,
+    109 ms on average), 3 of 3 again 2.5 minutes after the join.
+
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
