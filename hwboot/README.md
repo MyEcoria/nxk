@@ -530,6 +530,18 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     So the chip resets itself (a watchdog or a supply dip, not the
     host): runs 16 and 20 looked later, once the link had retrained
     and the config space was back to its reset values.
+22. 24/09/2026, Erista, commit `5644725` (touch panel power-up): `input`
+    now finds the controller, `[input] touch controller 0x3670, firmware
+    0x0100`, and touches arrive (`events`: down, move and up with
+    coordinates) but only polled: `touch interrupt stuck low, polling
+    instead`. GPIO X1 reads low with no event pending, with the pad as
+    found (pull-down, `0x54`) as with a pull-up (`0x58`), no pad in deep
+    power-down (`IO_DPD_STATUS` 0), and even with the controller held in
+    reset (J7 low): the controller does not drive it. Atmosphère's GPIO
+    table names X1 `TpIrq`, yet Horizon's initial pinmux leaves that
+    pad's input off (`pinmux_initial_pad_config_icosa.inc`). `stdtest`
+    17/17; `ktest` 28/29, `tickless idle cores` failing (13 interrupts
+    on core 0 in 300 ms), likely the polling. The RTC reads 2000-01-15.
 
 ## Hardware test (once the SD card is back in the PC)
 
