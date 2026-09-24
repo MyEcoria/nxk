@@ -9,14 +9,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use libnx::abi::err;
-use libnx::abi::proto::wifi as proto;
+use libnx::abi::proto::{net, wifi as proto};
 use libnx::ipc::{self, Msg};
-use libnx::{env, ns, println};
+use libnx::{env, ns, println, time};
 
 libnx::entry!(main);
 
 /// Connecting and scanning outlast the default reply wait.
 const CALL_TIMEOUT: u64 = 20_000_000_000;
+/// After a join, how long DHCP gets to give `net` an address.
+const ADDRESS_WAIT_NS: u64 = 10_000_000_000;
 
 /// The service publishes itself once the adapter is looked at, which
 /// takes a moment at boot.
@@ -96,7 +98,48 @@ fn connect(ssid: &str, psk: &str) -> Result<(), i64> {
     // Word 0 is the timeout the service may use; 0 means its default.
     call(&ipc::pack_at(proto::CONNECT, &[0], &data))?;
     println!("connected to {}", ssid);
+    address();
     Ok(())
+}
+
+/// Once joined, the address DHCP gives `net` over Wi-Fi: the network is
+/// usable when this returns. Nothing to wait for if `net` runs over a
+/// wired link.
+fn address() {
+    let end = time::now_ns() + ADDRESS_WAIT_NS;
+    let ask = |ep: u32, label: u32| {
+        ipc::call_timeout(ep, &Msg::new(label, 0, 0), 1_000_000_000).and_then(ipc::checked)
+    };
+    let Ok(ep) = ns::wait_for_timeout("net", ADDRESS_WAIT_NS) else {
+        return;
+    };
+    match ask(ep, net::STATS) {
+        Ok(r) if ipc::header(&r, 5) == net::LINK_WLAN0 => {}
+        _ => return,
+    }
+    let ip = |v: u64| {
+        let b = (v as u32).to_be_bytes();
+        alloc::format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    };
+    while time::now_ns() < end {
+        if let Ok(r) = ask(ep, net::INFO) {
+            if ipc::header(&r, 0) != 0 {
+                println!(
+                    "address {}/{}, gateway {}, DNS {}",
+                    ip(ipc::header(&r, 0)),
+                    ipc::header(&r, 1),
+                    ip(ipc::header(&r, 2)),
+                    ip(ipc::header(&r, 3))
+                );
+                return;
+            }
+        }
+        time::sleep_ms(100);
+    }
+    println!(
+        "no address from DHCP after {} s",
+        ADDRESS_WAIT_NS / 1_000_000_000
+    );
 }
 
 /// One line on what the adapter is, or why there is none.
