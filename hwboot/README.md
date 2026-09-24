@@ -436,6 +436,21 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     each (not exercised yet). A kernel deployed with an older `bl31.bin`
     panicked (`objtab.rs:57`, index 3759): the monitor copies the size
     baked into it.
+19. 24/09/2026, Erista, commits `f80c073` to `e1b9bb1`: `usb` now stops
+    cleanly, `[usb] xHCI registers unusable (CAPLENGTH 0xff, HCIVERSION
+    0xffff, HCSPARAMS1 0xffffffff)` with no exit 139; `ktest` 29/29 three
+    times, priority preemption now judged against the timer lateness.
+    The SD card sent no data on all 4 boots (first read into `sd`'s own
+    page, DAT lines idle high; the retries then fail with EIO and CMD13
+    stops answering), so `fs` found no volume, `stdtest` and the direct
+    DMA of `sd` went untested. hekate explains it: "SD Card Issues
+    Warning", the card initialized in 1-bit mode (microSD page: initial
+    bus HS25 1bit, 3 init fails, no read/write errors after), with this
+    64 GB SanDisk and with a second card: the Switch's slot carries DAT0
+    only (DAT1-3 contact), so the 4-bit bus `sd` uses never gets data,
+    which likely explains the mute card of run 18 too. Both cards work
+    on the PC; a Realtek reader (0bda:0177) timed out on every write,
+    the ChipsBnk one formatted the second card.
 
 ## Hardware test (once the SD card is back in the PC)
 

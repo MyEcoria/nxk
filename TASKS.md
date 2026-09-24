@@ -3,61 +3,33 @@
 Planned work, not started. Each entry says what is known; per
 `AGENTS.md` section 7, propose the options before coding any of them.
 
-## 1. `usb`: alignment fault at every boot on the Switch
+## 1. `sd`: fall back to a 1-bit bus like hekate
 
-Since kernel reports reach the USB-C console (hardware run 18), every
-boot on the Erista shows the `usb` (xHCI host) service dying:
+The Erista's microSD slot carries DAT0 only (hardware run 19): hekate
+warns "SD Card Issues Warning" and runs the card in 1-bit mode (initial
+bus HS25 1bit, 3 init fails, then no read/write errors), with two
+different cards that both work in 4-bit on the PC. `sd` always starts on
+a 4-bit bus, so its first read gets no data (DAT lines idle high, card
+in state 4, ADMA stopped after the first descriptor fetch).
 
-```text
-[nxk] 'usb' (pid 11, thread 11) : data fault at 0x40083650ff (read, alignment), pc 0x15b2713000 (+0x3000), sp 0x7fea2cf660, lr +0x2d0c -> process killed
-[nxk] process 11 'usb' exited (code 139)
-```
+`recover()` in `user/sd/src/main.rs` then retries at 1.8 V, after a 2 s
+power cycle, and last on a 1-bit bus after a 239 ms power cycle: all
+three fail with EIO and the card stops answering CMD13, although hekate
+succeeds in 1-bit. Why the power-cycled re-inits fail is not known.
 
-The address is in the MMIO window and ends in `0xff`: an unaligned
-32-bit read of device memory, probably a register offset computed from
-a value read back as all ones (hekate's L4T path leaves the xHCI
-unpowered; `controller_ready()` in `user/usb/src/main.rs` asks
-`libnx::clk` for the `XUSB_HOST` status first). It is the zombie `usb`
-of earlier runs. The emulator does not reproduce it.
+Options discussed: after the first data timeout, switch the card and
+host to 1-bit in place (ACMD6 with width 0, HOST_CONTROL bit 1 clear,
+read again, no power cycle), keeping the other retries behind it with
+1.8 V last; or reorder the retries (3.3 V 1-bit right after the
+failure). At 25 MHz a 1-bit bus gives about 3 MB/s.
 
-To do: find the faulting access (`pc +0x3000` in the `usb` binary),
-explain why it happens on hardware, and make `usb` either stop cleanly
-with a clear message or work.
+## 2. `sd`: check the direct DMA on the Switch
 
-## 2. `ktest` "priority preemption" fails in the emulator only
-
-In `tegra_qemu`, `./tools/nxtest.py -c ktest` fails "priority
-preemption" in about two runs of three (e.g. `max lateness of
-high-priority thread: 8198 us`); it passes on the Switch, and it failed
-the same way before the 2026-09-24 cleanup (commit `0f23868`).
-
-Instrumenting `t_priority` showed only the first iteration is late:
-8 to 10 ms, once 19 ms, i.e. one or two 10 ms quanta (`SLICE_NS`); the
-nine others are 40 to 140 us late. Setup: a priority-25 thread spinning
-pinned to core 2, a priority-5 thread pinned to core 2 sleeping 2 ms ten
-times. QEMU runs MTTCG (its round-robin kick period is 100 ms, not the
-cause).
-
-To do: find whether the first deadline armed on that core is programmed
-late (`timer::reprogram` and its `timer_cval` cache, `sched::arm`, the
-quantum logic in `exit_to_user`) or whether it is a `tegra_qemu` timer
-or GIC artefact, and fix the right side (nxk preferred).
-
-## 3. `sd`: DMA straight into the client's buffer
-
-Today `sd` programs ADMA2 into its own 256 KiB uncached DMA buffer, then
-copies each block to or from the buffer `fs` attached (`blk::ATTACH`).
-Programming ADMA2 directly on the client's physically contiguous buffer
-saves those 256 KiB of uncached RAM and one `memcpy` per block: a real
-performance gain for every card access.
-
-What it involves: `fs` creates its I/O buffer contiguous and below
-4 GiB (today `SharedMemory::new(256 KiB, 0)`), hands `sd` a handle with
-the `DMA` right (`shm_paddr`), and `sd` keeps only its 4 KiB descriptor
-page. To decide then: an uncached client buffer (slower CPU copies into
-the `fs` cache) or a cached one with cache maintenance around each
-transfer.
-
-Risk: it changes the hardware DMA path, so it must be tested on the
-real Switch (reads and writes, `stdtest` `files`, a large `--put`), not
-only in the emulator.
+Since commit `e1b9bb1`, `sd` programs ADMA2 straight on the buffer `fs`
+attaches (contiguous, uncached, below 4 GiB), keeping one page for its
+descriptors and the first read. Tested in the emulator only: ktest,
+stdtest, a 2 MB `--usb-put` then a cold-boot `cp`, both files
+byte-identical on the image, 512 KiB less memory. On the Switch it
+waits for a card that reads (task 1): run `stdtest` (`files`), a 2 MB
+`--put` with `sync`, then after a reboot `cp` it and compare both files
+on the PC, and `mem` after the mount.
