@@ -4,7 +4,7 @@
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{eth, fs, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{eth, fan, fs, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::{sys, time};
@@ -25,6 +25,7 @@ static POWER: Service = Service::optional("power");
 static FS: Service = Service::optional("fs");
 static ETH0: Service = Service::optional("eth0");
 static USB0: Service = Service::optional("usb0");
+static FAN: Service = Service::optional("fan");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -65,6 +66,16 @@ impl<T> Seen<T> {
             _ => {}
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct Fan {
+    /// Duty, % of full speed.
+    pub percent: u64,
+    /// `fan::ST_*` bits.
+    pub state: u64,
+    /// Last speed measured (RPM).
+    pub rpm: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -148,6 +159,8 @@ pub struct Data {
     pub procs: u64,
     pub mem: Option<MemInfo>,
     pub temps: Seen<(i64, i64)>,
+    /// Asked every refresh; busy while it measures its speed (1 s).
+    pub fan: Seen<Fan>,
     pub wifi: Seen<Wifi>,
     /// Card: free and total bytes.
     pub disk: Seen<(u64, u64)>,
@@ -183,6 +196,7 @@ impl Data {
             procs: 0,
             mem: None,
             temps: Seen::Unknown,
+            fan: Seen::Unknown,
             wifi: Seen::Unknown,
             disk: Seen::Unknown,
             usb: Now::Missing,
@@ -238,6 +252,11 @@ impl Data {
 
         self.temps.poll(&POWER, power::TEMPERATURE, n, force, |m| {
             (m.mr[0] as i64, m.mr[1] as i64)
+        });
+        self.fan.poll(&FAN, fan::STATUS, n, true, |m| Fan {
+            percent: m.mr[0],
+            state: m.mr[1],
+            rpm: (m.mr[3] != fan::NO_RPM).then_some(m.mr[3]),
         });
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {

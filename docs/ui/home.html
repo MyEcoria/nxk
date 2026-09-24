@@ -119,6 +119,10 @@
         <option>4</option><option>3</option><option>2</option><option>1</option></select></label>
       <label class="row"><span>Temperatures</span><select data-sim="temps">
         <option value="value">reported</option><option value="unknown">starting</option><option value="missing">no sensor</option></select></label>
+      <label class="row"><span>Fan</span><select data-sim="fan">
+        <option value="auto">auto</option><option value="manual">set by hand</option>
+        <option value="hot">SoC hot (full speed)</option><option value="nosensor">no temperature</option>
+        <option value="missing">no fan control</option><option value="unknown">starting</option></select></label>
       <label class="row"><span>USB-C console</span><select data-sim="usb">
         <option value="terminal">terminal open</option><option value="configured">connected, terminal closed</option>
         <option value="host">host seen</option><option value="waiting">waiting for a PC</option>
@@ -306,6 +310,7 @@ const sim = {
   rates: { sys: 0, irq: 0, sw: 0 },
   mem: { total: 953216, kernel: 2150, user: 10240 }, // pages
   temps: 'value', chip: 42100, pkg: 38500,
+  fan: 'auto', fanManual: 60,
   usb: 'terminal', usbErrors: false, usbIn: 1843, usbOut: 48213,
   eth: 'up',
   wifi: 'connected', wlanPending: false, ssid: 'nxk-test', channel: 6, signal: 52,
@@ -324,6 +329,17 @@ function active() {
   return null;
 }
 const up = () => Math.floor((Date.now() - sim.bootAt) / 1000);
+// user/fan: Nyx's steps (%) on the SoC (package) temperature, full speed when hot.
+const NYX_STEPS = [[52, 43], [47, 32], [42, 22]];
+function fanNow() {
+  if (sim.fan === 'missing' || sim.fan === 'unknown') return null;
+  const c = Math.trunc(sim.pkg / 1000);
+  const pct = sim.fan === 'hot' ? 100 : sim.fan === 'nosensor' ? 43 : sim.fan === 'manual' ? sim.fanManual
+    : NYX_STEPS.find(([t]) => c >= t)?.[1] ?? 0;
+  const mode = { hot: ['hot', WARN], nosensor: ['no sensor', WARN], manual: ['manual', FG] }[sim.fan] ?? ['auto', FG];
+  // Roughly linear: 960 RPM at the lowest duty, 11000 at the highest.
+  return { pct, mode, rpm: pct ? Math.round(960 + 10040 * (pct - 0.4) / 99.6) : 0 };
+}
 const BASE = { idle: [3, 1, 1, 1], normal: [22, 9, 6, 4], busy: [92, 78, 71, 64] };
 
 function tick() {
@@ -400,7 +416,8 @@ const HELP = [
   '  unset NAME      remove a variable', '  ps              processes', '  mem             physical memory',
   '  cpu             per-core statistics', '  uptime          time since boot', '  echo TEXT       print TEXT',
   '  date            wall-clock time (RTC)', '  sleep MS        wait MS milliseconds',
-  '  temp            chip and package temperatures', '  services        published services',
+  '  temp            chip and package temperatures',
+  '  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand', '  services        published services',
   '  poweroff        power off the machine', '  reboot          reboot the machine',
   '  recv F SIZE CRC receive F as base64 lines (tools/usbterm.py --put)',
   '  restart DRV [F] replace boot driver DRV by F (default /bin/DRV)'];
@@ -412,7 +429,7 @@ const BANNER = [
   'bb                     cc     aa  aa   aaaa   aa aa', ' bb      aaaaaaa      cc      bb  bb  bb  bb  bb  bb',
   '   bbbb           cccc', '       bbbb   cccc'];
 const INK = { a: XTERM[208], b: XTERM[166], c: XTERM[130], d: XTERM[215] };
-const PROGS = ['bench', 'clk', 'console', 'crash', 'display', 'fptest', 'fs', 'hello', 'hello-std', 'i2c', 'init',
+const PROGS = ['bench', 'clk', 'console', 'crash', 'display', 'fan', 'fptest', 'fs', 'hello', 'hello-std', 'i2c', 'init',
   'input', 'ipcbench', 'ktest', 'net', 'nettest', 'power', 'sd', 'shell', 'stdtest', 'true', 'usb', 'usbcon', 'wifi', 'wlan'];
 // Fake card: directories have size -1.
 const FS = {
@@ -424,7 +441,7 @@ const FS = {
   '/firmware/brcm': [['brcmfmac4356-pcie.bin', 614400], ['brcmfmac4356-pcie.clm_blob', 7900], ['brcmfmac4356-pcie.txt', 2100]],
   '/nxk': [['bl31.bin', 61440], ['bl33.bin', 2064384]],
 };
-const PS = ['init', 'console', 'clk', 'i2c', 'power', 'sd', 'fs', 'display', 'input', 'usb', 'usbcon', 'net', 'wlan', 'shell'];
+const PS = ['init', 'console', 'clk', 'i2c', 'power', 'fan', 'sd', 'fs', 'display', 'input', 'usb', 'usbcon', 'net', 'wlan', 'shell'];
 const SCAN = [['nxk-test', 6, 52, 'WPA2'], ['maison-2.4', 11, 67, 'WPA2'], ['guest', 1, 74, 'open'],
               ['printer-direct', 6, 81, 'WPA2'], ['voisin', 11, 86, 'WPA3']];
 const WIFI_MAC = '02:1a:2b:3c:4d:5e', ETH_MAC = '02:4e:58:4b:00:01';
@@ -455,6 +472,19 @@ function shell(line, at) {
       if (sim.temps !== 'value') return fail(['temp: ETIMEDOUT'], 'ETIMEDOUT');
       const t = m => `${Math.trunc(m / 1000)}.${Math.floor(m % 1000 / 100)}`;
       return ok([`chip ${t(sim.chip)} C, package ${t(sim.pkg)} C`]);
+    }
+    case 'fan': {
+      if (args.length && args[0] !== 'auto' && !(/^\d+$/.test(args[0]) && +args[0] <= 100))
+        return fail(['usage: fan [auto|0-100]'], 'EINVAL');
+      if (!fanNow()) return fail(['service fan missing'], 'ENOENT');
+      if (args[0] === 'auto') sim.fan = 'auto';
+      else if (args.length) Object.assign(sim, { fan: 'manual', fanManual: +args[0] });
+      syncControls();
+      const f = fanNow(), t = Math.trunc(sim.pkg / 1000), d = Math.floor(sim.pkg % 1000 / 100);
+      const mode = { hot: 'full speed: SoC hot', nosensor: 'no temperature: safe speed', manual: 'manual' }[sim.fan] ?? 'auto';
+      const soc = sim.fan === 'nosensor' ? '' : `, SoC ${t}.${d} C`;
+      // A bare `fan` measures the speed (1 s); a change reports it 3 s later.
+      return ok([`fan ${f.pct}% (${mode})${soc}${args.length ? '' : `, ${f.rpm} rpm`}`]);
     }
     case 'mem': {
       const m = sim.mem, free = m.total - m.kernel - m.user;
@@ -707,6 +737,7 @@ const usbColor = () => sim.usb === 'terminal' ? GOOD : ['configured', 'host'].in
 const ethColor = () => ({ up: GOOD, dhcp: WARN, nosharing: WARN })[sim.eth] ?? DIM;
 const wifiColor = () => ({ connected: GOOD, connecting: WARN, scanning: WARN, down: BAD })[sim.wifi] ?? DIM;
 const sdColor = () => sim.sd === 'value' ? GOOD : DIM;
+const fanColor = () => { const f = fanNow(); return !f ? DIM : f.mode[1] === WARN ? WARN : f.pct ? GOOD : DIM; };
 const WIFI_SHORT = { unknown: ['starting', DIM], missing: ['no Wi-Fi driver', DIM], connected: ['connected', GOOD],
   connecting: ['joining', WARN], scanning: ['scanning', WARN], idle: ['not connected', DIM], down: ['no adapter', BAD] };
 const ETH_TEXT = { up: 'shared by the PC', dhcp: 'link up, waiting for DHCP', nosharing: 'no DHCP: sharing off on the PC?',
@@ -724,7 +755,8 @@ function header() {
   x -= scr.textR(x, 16, `up ${hms(up())}`, 2, FG, PANEL) + 32;
   const [t, tc] = sim.temps === 'value' ? [celsius(sim.chip), FG] : ['--.-°C', DIM];
   x -= scr.textR(x, 16, t, 2, tc, PANEL) + 32;
-  for (const [id, name, color, page] of [['c-sd', 'SD', sdColor(), null], ['c-wifi', 'WI-FI', wifiColor(), 2],
+  for (const [id, name, color, page] of [['c-fan', 'FAN', fanColor(), 1], ['c-sd', 'SD', sdColor(), null],
+                                         ['c-wifi', 'WI-FI', wifiColor(), 2],
                                          ['c-eth', 'ETH', ethColor(), 2], ['c-usb', 'USB', usbColor(), 3]]) {
     const w = 20 + tw(name, 2), bx = x - w, bg = ui.pressed === id ? PRESS : PANEL;
     if (bg !== PANEL) scr.fill(bx - 8, 8, w + 16, HEAD - 18, bg);
@@ -852,14 +884,18 @@ function system() {
   const py = CY + 256 + M;
   card(xR, py, w, 256, 'POWER');
   if (sim.temps === 'value') {
-    kv(xR + 16, xR + w - 16, py + 64, 'chip temperature', celsius(sim.chip));
-    kv(xR + 16, xR + w - 16, py + 104, 'package temperature', celsius(sim.pkg));
-  } else scr.text(xR + 16, py + 64, sim.temps === 'missing' ? 'no temperature sensor' : 'starting', 2, DIM, PANEL);
-  const bw = (w - 48) / 2, by = py + 256 - 16 - 72;
-  button('reboot', xR + 16, by, bw, 72, 'REBOOT', WARN, () => ask({
+    kv(xR + 16, xR + w - 16, py + 60, 'chip temperature', celsius(sim.chip));
+    kv(xR + 16, xR + w - 16, py + 98, 'package temperature', celsius(sim.pkg));
+  } else scr.text(xR + 16, py + 60, sim.temps === 'missing' ? 'no temperature sensor' : 'starting', 2, DIM, PANEL);
+  const f = fanNow();
+  const [ft, fc] = f ? [`${f.mode[0]}: ${f.pct ? `${f.pct}%, ${f.rpm} rpm` : 'off'}`, f.mode[1]]
+    : [sim.fan === 'missing' ? 'no fan control' : 'starting', DIM];
+  kv(xR + 16, xR + w - 16, py + 136, 'fan', ft, fc);
+  const bw = (w - 48) / 2, bh = 64, by = py + 256 - 16 - bh;
+  button('reboot', xR + 16, by, bw, bh, 'REBOOT', WARN, () => ask({
     title: 'Reboot the Switch?', ok: 'REBOOT', tone: WARN,
     lines: ['It goes back to RCM: inject nxk', 'again from the PC.'], run: reboot }));
-  button('off', xR + 32 + bw, by, bw, 72, 'POWER OFF', BAD, () => ask({
+  button('off', xR + 32 + bw, by, bw, bh, 'POWER OFF', BAD, () => ask({
     title: 'Power off the Switch?', ok: 'POWER OFF', tone: BAD,
     lines: ['Power on goes to RCM (AutoRCM):', 'inject nxk again from the PC.'], run: powerOff }));
 }
@@ -1089,12 +1125,12 @@ function powerOff() { act('power::OFF'); ui.off = true; }
 let bootGen = 0;
 function boot() {
   const gen = ++bootGen;
-  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', usb: 'waiting', eth: 'nopc', wifi: 'unknown',
+  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', usb: 'waiting', eth: 'nopc', wifi: 'unknown',
                        sd: 'unknown', msgs: [], partial: '', usbIn: 0, usbOut: 0, rx: 0, tx: 0 });
   Object.assign(ui, { page: 0, scan: null, modal: null, unread: 0 });
   write('display: 720x1280 panel, turned landscape\n');
   termBoot();
-  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', eth: 'dhcp' }],
+  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', eth: 'dhcp' }],
                  [3000, { sd: 'value' }], [3800, { eth: 'up' }], [4000, { wifi: 'idle' }],
                  [6000, { wifi: 'connecting' }], [9000, { wifi: 'connected' }], [12000, { usb: 'terminal' }]];
   for (const [t, st] of steps) later(t, () => { if (gen === bootGen) Object.assign(sim, st); });

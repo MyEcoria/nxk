@@ -8,13 +8,13 @@ use alloc::vec::Vec;
 
 use libnx::abi::layout::PAGE_SIZE;
 use libnx::abi::proto::input::{TOUCH_DOWN, TOUCH_UP};
-use libnx::abi::proto::{power, usbcon as usb, wifi};
+use libnx::abi::proto::{fan, power, usbcon as usb, wifi};
 
 use crate::screen::{
     self, accent, palette, width, Bytes, Celsius, Hms, Ipv4, Screen, BAD, BG, DIM, EDGE, FG, GOOD,
     PANEL, PRESS, TERM_BG, TRACK, WARN,
 };
-use crate::stats::{Data, Eth, Now, Seen};
+use crate::stats::{Data, Eth, Fan, Now, Seen};
 use crate::term::Term;
 use crate::Messages;
 
@@ -32,8 +32,14 @@ const SYSTEM: usize = 1;
 const NETWORK: usize = 2;
 pub const TERMINAL: usize = 3;
 pub const LOGS: usize = 4;
-/// Header chips (SD, Wi-Fi, Ethernet, USB) and the page each opens.
-const CHIP_PAGES: [Option<usize>; 4] = [None, Some(NETWORK), Some(NETWORK), Some(TERMINAL)];
+/// Header chips (fan, SD, Wi-Fi, Ethernet, USB) and the page each opens.
+const CHIP_PAGES: [Option<usize>; 5] = [
+    Some(SYSTEM),
+    None,
+    Some(NETWORK),
+    Some(NETWORK),
+    Some(TERMINAL),
+];
 const TAGLINE: &str = "AArch64 microkernel for Tegra X1";
 const TOAST_NS: u64 = 2_500_000_000;
 
@@ -262,6 +268,34 @@ fn eth_text(d: &Data, short: bool) -> (&'static str, u32) {
     }
 }
 
+/// Fan state: its mode and value, and the color it shows in.
+fn fan_text(f: &Fan) -> (String, u32) {
+    let (mode, c) = if f.state & fan::ST_HOT != 0 {
+        ("hot", WARN)
+    } else if f.state & fan::ST_NO_SENSOR != 0 {
+        ("no sensor", WARN)
+    } else if f.state & fan::ST_MANUAL != 0 {
+        ("manual", FG)
+    } else {
+        ("auto", FG)
+    };
+    let text = match (f.percent, f.rpm) {
+        (0, _) => format!("{}: off", mode),
+        (p, Some(rpm)) => format!("{}: {}%, {} rpm", mode, p, rpm),
+        (p, None) => format!("{}: {}%", mode, p),
+    };
+    (text, c)
+}
+
+/// Header square: spinning, forced (hot, no sensor), or off/missing.
+fn fan_color(d: &Data) -> u32 {
+    match d.fan {
+        Seen::Value(f) if f.state & (fan::ST_HOT | fan::ST_NO_SENSOR) != 0 => WARN,
+        Seen::Value(f) if f.percent > 0 => GOOD,
+        _ => DIM,
+    }
+}
+
 fn wifi_connected(d: &Data) -> Option<crate::stats::Wifi> {
     match d.wifi {
         Seen::Value(w) if w.state == wifi::ST_CONNECTED => Some(w),
@@ -486,6 +520,7 @@ impl Ui {
         x -= s.text_r(x, 16, &t, 2, c, PANEL) + 32;
         let usb_c = usb_short(d).1;
         let colors = [
+            fan_color(d),
             if matches!(d.disk, Seen::Value(_)) {
                 GOOD
             } else {
@@ -495,7 +530,7 @@ impl Ui {
             eth_text(d, true).1,
             usb_c,
         ];
-        for (k, name) in ["SD", "WI-FI", "ETH", "USB"].iter().enumerate() {
+        for (k, name) in ["FAN", "SD", "WI-FI", "ETH", "USB"].iter().enumerate() {
             let w = 20 + width(name, 2);
             let bx = x - w;
             let bg = if self.pressed == Some(Id::Chip(k)) {
@@ -896,7 +931,7 @@ impl Ui {
                     s,
                     xr + 16,
                     xr + w - 16,
-                    py + 64,
+                    py + 60,
                     "chip temperature",
                     &format!("{}", Celsius(chip)),
                     None,
@@ -905,27 +940,35 @@ impl Ui {
                     s,
                     xr + 16,
                     xr + w - 16,
-                    py + 104,
+                    py + 98,
                     "package temperature",
                     &format!("{}", Celsius(package)),
                     None,
                 );
             }
             Seen::Missing => {
-                s.text(xr + 16, py + 64, "no temperature sensor", 2, DIM, PANEL);
+                s.text(xr + 16, py + 60, "no temperature sensor", 2, DIM, PANEL);
             }
             Seen::Unknown => {
-                s.text(xr + 16, py + 64, "starting", 2, DIM, PANEL);
+                s.text(xr + 16, py + 60, "starting", 2, DIM, PANEL);
             }
         }
-        let (bw, by) = ((w - 48) / 2, py + 256 - 16 - 72);
+        s.text(xr + 16, py + 136, "fan", 2, DIM, PANEL);
+        let (t, c) = match d.fan {
+            Seen::Value(f) => fan_text(&f),
+            Seen::Missing => ("no fan control".into(), DIM),
+            Seen::Unknown => ("starting".into(), DIM),
+        };
+        s.text_r(xr + w - 16, py + 136, &t, 2, c, PANEL);
+        let (bw, bh) = ((w - 48) / 2, 64);
+        let by = py + 256 - 16 - bh;
         self.button(
             s,
             Id::Reboot,
             xr + 16,
             by,
             bw,
-            72,
+            bh,
             "REBOOT",
             Some(WARN),
             true,
@@ -936,7 +979,7 @@ impl Ui {
             xr + 32 + bw,
             by,
             bw,
-            72,
+            bh,
             "POWER OFF",
             Some(BAD),
             true,
