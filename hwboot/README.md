@@ -172,10 +172,15 @@ order:
    panel, turned landscape` is the first. Service logs and the shell
    go to UART-A and the USB-C console, which the TERMINAL page mirrors.
 5. Tap the tabs: each opens its page at once. `[input] touchscreen
-   ready (interrupt on GPIO X1)` in the boot log means the controller
-   is read on its interrupt line; `touch interrupt stuck low, polling
-   instead` means the line never went back high (then taps still work,
-   up to 0.5 s late).
+   3670 ready (interrupt on GPIO X1)` in the boot log means `input`
+   powered the controller up (hekate leaves it off: PMIC LDO6, reset on
+   GPIO J7), reset it and reads it on its interrupt line; 3670 is the
+   chip ID hekate expects. `touchscreen missing (no answer on I2C3)`:
+   no answer after the power-up (`touch rail:` before it names a PMIC
+   failure); `reset not acknowledged`: no ready event after the reset,
+   sensing turned on anyway; `touch interrupt stuck low, polling
+   instead`: the line never went back high (then taps still work, up
+   to 0.5 s late).
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
