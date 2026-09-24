@@ -369,7 +369,15 @@ fn main() -> i32 {
         println!("[usb] xHCI controller unpowered ({})", why);
         return 0;
     }
-    let regs = Mmio::map(drv::dev_slot(0), XHCI_BASE, 0x4000).expect("usb: registers");
+    let regs =
+        Mmio::map(drv::dev_slot(0), XHCI_BASE, xhci::REGS_LEN as u64).expect("usb: registers");
+    if let Err(why) = xhci::check(&regs) {
+        println!(
+            "[usb] xHCI registers unusable ({}): no FPCI BAR0 or XUSB firmware",
+            why
+        );
+        return 0;
+    }
     let irq = Irq::new(drv::dev_slot(1)).expect("usb: interrupt");
     let mut hc = match Xhci::new(regs, irq) {
         Ok(h) => h,

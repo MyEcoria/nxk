@@ -2,6 +2,8 @@
 //! contexts, control, interrupt and bulk transfers.
 
 use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
 
@@ -12,6 +14,9 @@ use libnx::mem::SharedMemory;
 use libnx::time;
 
 pub type Res<T> = Result<T, i64>;
+
+/// Register window mapped for the controller.
+pub const REGS_LEN: usize = 0x4000;
 
 // TRB types.
 const TRB_NORMAL: u32 = 1;
@@ -186,6 +191,30 @@ pub struct EpSpec {
 /// DCI (context index) of a USB endpoint.
 pub fn dci(address: u8) -> usize {
     (address as usize & 0xF) * 2 + usize::from(address & 0x80 != 0)
+}
+
+/// Capability registers sane, before any write: the Tegra xHCI reads all
+/// ones until its FPCI bridge (BAR0) is set and the XUSB firmware runs.
+pub fn check(regs: &Mmio) -> Result<(), String> {
+    let (cap, hcs1) = (regs.r32(0), regs.r32(0x04));
+    let (caplen, version) = ((cap & 0xFF) as usize, cap >> 16);
+    let (ports, slots) = ((hcs1 >> 24) as usize, (hcs1 & 0xFF).min(16) as usize);
+    let db = (regs.r32(0x14) & !3) as usize;
+    let rt = (regs.r32(0x18) & !0x1F) as usize;
+    let sane = (0x20..0x400).contains(&caplen)
+        && caplen % 4 == 0
+        && (0x0096..=0x0120).contains(&version)
+        && ports > 0
+        && caplen + 0x400 + 0x10 * ports <= REGS_LEN
+        && db + 4 * (slots + 1) <= REGS_LEN
+        && rt + 0x40 <= REGS_LEN;
+    if sane {
+        return Ok(());
+    }
+    Err(format!(
+        "CAPLENGTH {:#x}, HCIVERSION {:#x}, HCSPARAMS1 {:#x}",
+        caplen, version, hcs1
+    ))
 }
 
 pub struct Xhci {
