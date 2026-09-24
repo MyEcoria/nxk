@@ -171,11 +171,15 @@ order:
    LOGS page, whose tab counts the unread ones; `display: 720x1280
    panel, turned landscape` is the first. Service logs and the shell
    go to UART-A and the USB-C console, which the TERMINAL page mirrors.
-5. Tap the tabs: each opens its page at once. `[input] touchscreen
-   ready (interrupt on GPIO X1)` in the boot log means the controller
-   is read on its interrupt line; `touch interrupt stuck low, polling
-   instead` means the line never went back high (then taps still work,
-   up to 0.5 s late).
+5. Tap the tabs: each opens its page at once. Nyx powers the panel
+   off before chaining to nxk, so `input` powers it up again (reset pin
+   J7, LDO6, then a system reset). `[input] touch controller 0x3670,
+   firmware ...` then `[input] touchscreen ready (interrupt on GPIO
+   X1)` in the boot log mean the controller answered and is read on its
+   interrupt line; `touchscreen missing (...)` (also on the LOGS page)
+   means it did not answer, the errno says at which step; `touch
+   interrupt stuck low, polling instead` means the line never went back
+   high (then taps still work, up to 0.5 s late).
 
 Photograph the screen wherever it stops: the last line locates the
 failure. If the logo stays on after the line clears (1 without 2), the
