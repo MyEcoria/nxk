@@ -1192,10 +1192,12 @@ pub mod proto {
     pub mod fan {
         /// Reply: word 0 = duty (% of full speed), word 1 = `ST_*` bits,
         /// word 2 = SoC temperature (millidegrees C, `NO_TEMP` if
-        /// unreadable), word 3 = last measured speed (RPM, `NO_RPM`: none).
+        /// unreadable), word 3 = last measured speed (RPM, `NO_RPM`: none),
+        /// word 4 = duty set by hand (%, `AUTO`: none).
         pub const STATUS: u32 = 1;
         /// word 0 = `AUTO`, or a duty 0..=100 (%) kept until `AUTO`.
         /// The SoC at `HOT_MC` or an unreadable sensor still overrides it.
+        /// Reply: as `STATUS`.
         pub const SET: u32 = 2;
         /// Count tachometer pulses for 1 s. Reply: word 0 = RPM.
         pub const MEASURE: u32 = 3;
