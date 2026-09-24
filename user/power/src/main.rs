@@ -1,4 +1,5 @@
-//! power: board power, RTC wall-clock sync, TMP451 temperatures, SD rail.
+//! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
+//! PCIe and touchscreen rails.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
 
 #![no_std]
@@ -25,18 +26,28 @@ const LDO_MODE_NORMAL: u8 = 3 << 6;
 const LDO1_CFG: u8 = 0x25;
 const LDO1_1V05: u8 = ((1_050_000 - 800_000) / 25_000) as u8;
 
-/// Only 3.3 V: 1.8 V needs the card's CMD11 handshake first.
-fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
-    let v = i2c.read_reg(5, PMIC, LDO2_CFG)?;
+/// MAX77620 LDO6 (touchscreen AVDD/DVDD, hekate bdk/input/touch.c):
+/// 2.9 V, also the top of its range in hekate's regulator table.
+const LDO6_CFG: u8 = 0x2F;
+const LDO6_2V9: u8 = ((2_900_000 - 800_000) / 50_000) as u8;
+
+/// A 50 mV-step LDO at `sel`: voltage first, then the power mode.
+fn ldo_power(i2c: &I2c, cfg: u8, sel: u8, on: bool) -> Result<(), i64> {
+    let v = i2c.read_reg(5, PMIC, cfg)?;
     if on {
-        i2c.write_reg(5, PMIC, LDO2_CFG, (v & !0x3F) | LDO2_3V3)?;
+        i2c.write_reg(5, PMIC, cfg, (v & !0x3F) | sel)?;
         time::sleep_ms(1);
-        i2c.write_reg(5, PMIC, LDO2_CFG, LDO_MODE_NORMAL | LDO2_3V3)?;
+        i2c.write_reg(5, PMIC, cfg, LDO_MODE_NORMAL | sel)?;
     } else {
-        i2c.write_reg(5, PMIC, LDO2_CFG, v & !0xC0)?;
+        i2c.write_reg(5, PMIC, cfg, v & !0xC0)?;
     }
     time::sleep_ms(1);
     Ok(())
+}
+
+/// Only 3.3 V: 1.8 V needs the card's CMD11 handshake first.
+fn sd_power(i2c: &I2c, on: bool) -> Result<(), i64> {
+    ldo_power(i2c, LDO2_CFG, LDO2_3V3, on)
 }
 
 /// PCIe/XUSB rail at its default voltage: nothing else on the board
@@ -163,6 +174,10 @@ fn main() -> i32 {
                 Err(e) => Msg::error(e),
             },
             proto::PCIE_POWER => match pcie_power(&i2c, rx.msg.mr[0] != 0) {
+                Ok(()) => Msg::new(0, 0, 0),
+                Err(e) => Msg::error(e),
+            },
+            proto::TOUCH_POWER => match ldo_power(&i2c, LDO6_CFG, LDO6_2V9, rx.msg.mr[0] != 0) {
                 Ok(()) => Msg::new(0, 0, 0),
                 Err(e) => Msg::error(e),
             },

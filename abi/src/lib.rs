@@ -1174,6 +1174,8 @@ pub mod proto {
         /// word 0 = 1: PCIe/XUSB rail (PMIC LDO1) on at 1.05 V; 0: off.
         /// Powers the UPHY lanes the Wi-Fi chip sits on.
         pub const PCIE_POWER: u32 = 6;
+        /// word 0 = 1: touchscreen rail (PMIC LDO6) on at 2.9 V; 0: off.
+        pub const TOUCH_POWER: u32 = 7;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {
