@@ -169,6 +169,9 @@ enum Needs {
     /// PCIe partition ungated and PLLE locked: the reference clock of
     /// the UPHY lanes the Wi-Fi chip sits on.
     Pcie,
+    /// In use by an earlier stage (PWM0 dims the Erista backlight): a
+    /// running block is never reset nor stopped.
+    Shared,
 }
 
 /// One device: its clocks in enable order plus PMC partitions that must
@@ -285,6 +288,15 @@ const PCIE: [Clock; 2] = [
 ];
 /// PCIEXCLK (bank U bit 10): a reset line without a gate of its own.
 const PCIEXCLK_RESET: u32 = 1 << 10;
+/// hekate `_clock_pwm`: CLK_M (19.2 MHz) / 3 = 6.4 MHz, 25 kHz PWM.
+const PWM: [Clock; 1] = [Clock {
+    bank: &L,
+    bit: 17,
+    source: 0x110,
+    keep: 0,
+    src: (6 << 29) | 4,
+    reset: true,
+}];
 
 /// Fuse controller (bank H bit 7): status only, for readers of fuses.
 const FUSE: [Clock; 1] = [Clock {
@@ -301,6 +313,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::USBD => Needs::UsbPlls,
         proto::FUSE => Needs::FuseVisible,
         proto::PCIE => Needs::Pcie,
+        proto::PWM => Needs::Shared,
         _ => Needs::Nothing,
     };
     let (clocks, parts): (&'static [Clock], u32) = match dev {
@@ -317,6 +330,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::USB2_TRK => (&USB2_TRK, 0),
         proto::FUSE => (&FUSE, 0),
         proto::PCIE => (&PCIE, PART_PCIE),
+        proto::PWM => (&PWM, 0),
         _ => return None,
     };
     Some(Device {
@@ -350,7 +364,7 @@ fn status(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> u64 {
         st |= proto::ST_OUT_OF_RESET;
     }
     let extra = match d.needs {
-        Needs::Nothing => true,
+        Needs::Nothing | Needs::Shared => true,
         Needs::UsbPlls => car.r32(PLLU_BASE) & (PLL_ENABLE | PLL_LOCK) == PLL_ENABLE | PLL_LOCK,
         Needs::FuseVisible => car.r32(MISC_CLK_ENB) & FUSE_VISIBLE != 0,
         Needs::Pcie => car.r32(PLLE_MISC) & PLLE_MISC_LOCK != 0,
@@ -595,6 +609,9 @@ fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
         // A reset would lose the sensed fuses: status only.
         return EINVAL;
     }
+    if d.needs == Needs::Shared && status(car, pmc, d) == proto::ST_READY {
+        return 0;
+    }
     if d.needs == Needs::UsbPlls {
         let r = usb_plls(car, pmc);
         if r != 0 {
@@ -654,7 +671,7 @@ fn main() -> i32 {
         let mut st = 0;
         let r = match (rx.msg.label(), table(rx.msg.mr[0])) {
             (proto::ENABLE, Some(d)) => enable(&car, pmc.as_ref(), &d),
-            (proto::DISABLE, Some(d)) if d.needs != Needs::FuseVisible => {
+            (proto::DISABLE, Some(d)) if !matches!(d.needs, Needs::FuseVisible | Needs::Shared) => {
                 disable(&car, &d);
                 0
             }
