@@ -545,6 +545,15 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
     pad's input off (`pinmux_initial_pad_config_icosa.inc`). `stdtest`
     17/17; `ktest` 28/29, `tickless idle cores` failing (13 interrupts
     on core 0 in 300 ms), likely the polling. The RTC reads 2000-01-15.
+23. 24/09/2026, Erista, commits `f892d5c` to `b4e698e`, installed over
+    USB-C (`--put` of `bl33.bin` and its `bl31.bin`, the old ones kept
+    as `.old`): the console marks every log (35 at boot) and `usbterm`
+    shows the session alone, the banner and the prompt. With `i2c`
+    sleeping once per transfer, `ktest` passes 29/29 four times in a row
+    with the touch panel still polled (run 22: 28/29). The SD card was
+    mute this boot, as in runs 18 and 19: the card answers (CMD13, state
+    4) but its first read times out and the three retries fail with EIO,
+    LDO2 at 3.3 V; `fs` finds no volume, so `stdtest` was not run.
 
 ## Hardware test (once the SD card is back in the PC)
 
