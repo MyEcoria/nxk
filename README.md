@@ -247,7 +247,7 @@ All in EL0, started by `init` with only their capabilities.
 | `usbcon` | USB-C port as a composite USB device (1209:0001) on the Erista OTG controller: a serial console (CDC-ACM), the terminal of a PC (`tools/usbterm.py`), and a network function (CDC-ECM) published as link `usb0`, over which the PC may share its connection (`hwboot/README.md`, "Internet over USB-C"). One thread: console output is pulled into the DMA buffer when the IN endpoint is free, 100 ms after the PC opens the terminal (its tty echoes until it is raw); frames queued each way, the carrier given by the host's choice of the data interface's alternate setting; traffic counters and state for the screen (`STATS`) | emulator (virtual host: console, network with DHCP and ping via `nxtest.py --usb-net`); **Erista**: the way in to the shell; network to validate; Mariko has no such controller (stops) |
 | `clk` | clocks and resets (CAR), USB2 PLLs, power-partition state (PMC); the PWM block is never reset nor stopped once running (channel 0 dims the Erista backlight) | emulator |
 | `i2c` | six I2C buses; a write and a read joined by a repeated start on request (`REPEATED_START`, packet mode) | emulator |
-| `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451, started again as hekate's `tmp451_init`: Nyx shuts it down, freezing its last reading; Mariko's -12.5 C offset), SD, PCIe and touchscreen rails (LDO2, LDO1, LDO6) | emulator |
+| `power` | power off and reboot (MAX77620 PMIC), real-time clock, temperatures (TMP451, started again as hekate's `tmp451_init`: Nyx shuts it down, freezing its last reading; Mariko's -12.5 C offset), SD, PCIe and touchscreen rails (LDO2, LDO1, LDO6), the charger's input status (BQ24193 power good: battery or external power) | emulator; **Erista**: charger read on USB power |
 | `fan` | the fan as hekate's `bdk/thermal/fan.c` drives it: PWM channel 1 (inverted duty, 236 steps), pad V4, the battery's 5V regulator (GPIO A5, also the Joy-Con rails' source: a Joy-Con driver will have to share it; Erista's USB VBUS source, CC4, kept off). Every 2 s from the SoC temperature (`power`, TMP451 remote): Nyx's steps (off up to 39 C, 22% from 42 C, 32% from 47 C, 43% from 52 C), full speed from 60 C until below 57 C; `SET` puts a duty by hand, still overridden when hot; a sensor lost for 3 readings gives at least 43%. Speed from the tachometer (GPIO S7, two pulses a turn) counted on the GPIO bank 4 interrupt (SPI 55) for 1 s: on `MEASURE`, 3 s after each change, then every minute. Nyx stops the fan before chaining to nxk | emulator (no PWM output nor tachometer there: 0 rpm); **Erista**: to validate |
 | `sd` | SD card (SDHCI, ADMA2 straight into `fs`'s uncached, contiguous buffer: no bounce copy), slot power cycle (239 ms off, as hekate) then power-up (pads, GPIOs, PMC I/O power, PMIC LDO2): a card hekate left in 1.8 V signaling starts over at 3.3 V. Block 0 is read before publishing; a card that answers commands but sends no data is reported (host, pads, rails, CMD13 state) and retried: first on a 1-bit bus in place (ACMD6, card kept powered: a slot that carries DAT0 alone, a loose connector, `hwboot/README.md` runs 19 and 20), then after a 2 s power cycle, on a 1-bit bus after a 239 ms one, last at 1.8 V; the ready line gives the bus width; **Erista**: 64 GB card read and written | 3.3 V default speed; the 1-bit fallback (about 3 MB/s at 25 MHz) not yet run on hardware |
 | `fs` | FAT32 (long names), write-back cache with readahead | emulator |
@@ -274,7 +274,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 76.8 MHz) | GPU 3D and clock steps, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU 3D, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
@@ -333,19 +333,30 @@ program that vanished without closing them (crash) are reclaimed.
 - GPU (GM20B): `gpu` powers it only when asked (`gpu on`, or a 2D or
   compute request): its rail (the MAX77621 at 0x1C, NVIDIA's voltage
   for 76.8 MHz plus 25 mV), clocks and clamps through `clk`, the GPCPLL
-  in noise-aware mode at a fixed 76.8 MHz, then NVIDIA's secure boot:
+  in noise-aware mode at 76.8 MHz, then NVIDIA's secure boot:
   the ACR loader from linux-firmware runs on the PMU, copies FECS into
   the GPU firmware carveout hekate's L4T entry locks, and starts it;
   GPCCS, the golden context and one channel follow nouveau's GM20B code.
   It runs 2D fills and copies on surfaces clients attach, three
   hand-assembled SM 5.3 kernels (fill, copy, SAXPY) and an FFMA
-  benchmark (`gpu test`, `gpu bench`). Its firmware is NVIDIA's
+  benchmark (`gpu test`, `gpu bench`). `gpu clock` moves it among
+  sys-clk's steps (76.8 to 921.6 MHz, 76.8 MHz apart) while it runs, as
+  nouveau's `gm20b_clk_prog` does: the rail at NVIDIA's voltage for the
+  step (`gm20b_na_cvb_coef`, the GPU speedo, plus 25 mV) raised first
+  and lowered last, a safe PLL while the noise-aware detector moves,
+  then an NDIV slide. Each change is measured (SM cycles against the
+  CPU's clock; more than 5% off goes back to 76.8 MHz). sys-clk's caps
+  apply from `power`'s charger status: 460.8 MHz on battery, 768 MHz on
+  input power; 844.8 and 921.6 MHz need `force` (the official charger
+  and the dock are not told from a PC port yet). Above 76.8 MHz the SoC
+  reaching 80 C sends it back there. `gpu sweep` benchmarks each step,
+  `bench full` loads the CPU and the GPU together. Its firmware is NVIDIA's
   redistributable set (`tools/gm20b-fw.sh` copies it from the PC's
   `/lib/firmware`), kept out of the repository like the Wi-Fi blobs.
-  Runs on an Erista Switch (`gpu test` 5/5, `gpu bench` 30.4 GFLOP/s;
-  `hwboot/README.md`, "GPU" and run 26), though a few power-ups fail
-  at stage 8 and need a second `gpu on`; Erista only (Mariko's GPU
-  rail is on a MAX77812); no 3D, no clock steps.
+  Runs on an Erista Switch (`gpu test` 5/5 at every step, `gpu bench`
+  30.4 GFLOP/s at 76.8 MHz to 365.8 at 921.6; `hwboot/README.md`, "GPU"
+  and runs 26 and 27); Erista only (Mariko's GPU rail is on a
+  MAX77812); no 3D.
   The emulator's GPU model runs the whole power-up with
   `tools/tegra_qemu-gpu.patch` but renders and computes nothing:
   `gpu test` fails there by design.

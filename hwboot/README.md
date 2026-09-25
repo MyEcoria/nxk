@@ -383,8 +383,23 @@ Then at the shell:
 gpu             gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo NNNN (ID 3)
 gpu test        2D fill and copy, fill / copy / SAXPY kernels: 5/5 ok
 gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
+gpu clock 768   [gpu] GPU 76800 -> 768000 kHz at 987 mV, measured 768292 kHz
+gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
+bench full      CPU burn and GPU FFMA together, 30 s
 gpu off         clamps, reset, clocks and rail off
 ```
+
+`gpu clock` takes sys-clk's steps (76, 153, ... 921) while the GPU runs,
+or keeps one for the next power-up. The rail follows NVIDIA's voltage
+for the step and this chip's GPU speedo, plus 25 mV (868.75 mV up to
+537.6 MHz, 1068.75 mV at 921.6 MHz with speedo 2081), raised before the
+PLL moves and lowered after. Each change is measured (SM cycle counter
+against the CPU's clock); more than 5% off goes back to 76.8 MHz with
+EIO. Caps as sys-clk's on an Erista, from the charger (BQ24193 power
+good): 460.8 MHz on battery, 768 MHz on input power; `force` goes past
+them (844.8 and 921.6 MHz: official charger or dock, which nxk does not
+tell from a PC port yet). The cap follows the power source every 2 s,
+and at a SoC of 80 C the clock goes back to 76.8 MHz.
 
 A failed power-up says where (`gpu failed at stage N (NAME): ERRNO`)
 and leaves the GPU off; the `[gpu]` lines before it tell which step
@@ -703,6 +718,21 @@ the new one finds the GPU on and powers it down first.
     bundles`, a DISPATCH `INJECTED_BUNDLE_ERROR` (0x404000 = 0x80000001,
     exception 0x1, GR engine busy, every unit idle) at a different
     bundle each time; the next `gpu on` works.
+27. 25/09/2026, Erista, the GPU clock steps, `power`, `gpu` and `bench`
+    over USB-C, the shell as `/bin/sh2`: stage 8 fixed (FE's go-idle
+    timeout kept off through the bundles, as nvgpu does: 33 power-ups,
+    none failed). `gpu clock` went through every step: measured 153.7,
+    537.8, 614.6 (900 mV), 691.4 (943.75 mV), 768.2 (987.5 mV), 845.1
+    (1031.25 mV, forced) and 921.9 MHz (1068.75 mV, forced), `gpu test`
+    5/5 at each, and back to 76.8 MHz with the rail at 868.75 mV again.
+    `gpu bench` scales with the clock: 60.9 GFLOP/s at 153.6 MHz, 335.5
+    at 844.8, 365.8 at 921.6, and `gpu sweep` holds 77.4 to 77.5% of
+    peak at every step up to the 768 MHz cap. The charger reads power
+    good on the PC's USB port (cap 768 MHz); 844 without `force` is
+    refused. `bench full` at 998 MHz (CPU) and 768 MHz (GPU): 31.7 +
+    304.4 = 336.2 GFLOP/s, SoC at most 49.6 C after 30 s, fan 32%.
+    Not exercised: the battery cap (the USB-C console needs the cable)
+    and the 80 C fallback (the SoC stayed under 50 C).
 
 ## Hardware test (once the SD card is back in the PC)
 
