@@ -1,7 +1,8 @@
 //! clk: device clocks/resets (CAR); values from hekate (bdk/soc/clock.c).
 //! Also reports PMC power-partition status (STATUS), and brings up the
 //! USB2 PLLs and wake detectors (PMC USB_AO) for the OTG device
-//! controller (hekate bdk/usb/usbd.c).
+//! controller (hekate bdk/usb/usbd.c), and unclamps the GPU (PMC
+//! GPU_RG_CNTRL) once its rail is on.
 
 #![no_std]
 #![no_main]
@@ -146,6 +147,13 @@ const PLLE_SS_COEFF: u32 = 0x25 | (1 << 16) | (0x14 << 24);
 /// Fuse registers visible (CFG_ALL_VISIBLE), set by hekate at boot.
 const MISC_CLK_ENB: usize = 0x48;
 const FUSE_VISIBLE: u32 = 1 << 28;
+/// PLLP_OUT5, upper half of PLLP_OUTC: divider 408 MHz * 2 / (2 + 2) =
+/// 204 MHz with override, enable and reset-release bits (Linux
+/// clk-tegra-periph.c `PLL_OUT(5, PLLP_OUTC, 24, 0, 16)`).
+const PLLP_OUTC: usize = 0x67C;
+const PLLP_OUT5: u32 = (2 << 24) | (1 << 18) | (1 << 17) | (1 << 16);
+/// PMC GPU_RG_CNTRL: bit 0 clamps the GPU rail's outputs.
+const PMC_GPU_RG_CNTRL: usize = 0x400 + 0x2D4;
 
 /// One clock: bank, bit, source register (0: none) with bits to keep
 /// and the value to set; `reset`: it also has a reset line.
@@ -172,6 +180,8 @@ enum Needs {
     /// In use by an earlier stage (PWM0 dims the Erista backlight): a
     /// running block is never reset nor stopped.
     Shared,
+    /// GPU rail unclamped (its own sequence, `gpu_up`).
+    Gpu,
 }
 
 /// One device: its clocks in enable order plus PMC partitions that must
@@ -298,6 +308,27 @@ const PWM: [Clock; 1] = [Clock {
     reset: true,
 }];
 
+/// GM20B (Linux tegra210.dtsi gpu@57000000): the GPU gate with its
+/// reset (X 24), then PLLG_REF (X 29), the GPCPLL's reference.
+const GPU: [Clock; 2] = [
+    Clock {
+        bank: &X,
+        bit: 24,
+        source: 0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+    Clock {
+        bank: &X,
+        bit: 29,
+        source: 0,
+        keep: 0,
+        src: 0,
+        reset: false,
+    },
+];
+
 /// Fuse controller (bank H bit 7): status only, for readers of fuses.
 const FUSE: [Clock; 1] = [Clock {
     bank: &H,
@@ -314,6 +345,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::FUSE => Needs::FuseVisible,
         proto::PCIE => Needs::Pcie,
         proto::PWM => Needs::Shared,
+        proto::GPU => Needs::Gpu,
         _ => Needs::Nothing,
     };
     let (clocks, parts): (&'static [Clock], u32) = match dev {
@@ -331,6 +363,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::FUSE => (&FUSE, 0),
         proto::PCIE => (&PCIE, PART_PCIE),
         proto::PWM => (&PWM, 0),
+        proto::GPU => (&GPU, 0),
         _ => return None,
     };
     Some(Device {
@@ -368,6 +401,7 @@ fn status(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> u64 {
         Needs::UsbPlls => car.r32(PLLU_BASE) & (PLL_ENABLE | PLL_LOCK) == PLL_ENABLE | PLL_LOCK,
         Needs::FuseVisible => car.r32(MISC_CLK_ENB) & FUSE_VISIBLE != 0,
         Needs::Pcie => car.r32(PLLE_MISC) & PLLE_MISC_LOCK != 0,
+        Needs::Gpu => pmc.is_some_and(|p| p.r32(PMC_GPU_RG_CNTRL) & 1 == 0),
     };
     if powered(pmc, d.parts) && extra {
         st |= proto::ST_POWERED;
@@ -541,6 +575,43 @@ fn pcie_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
     0
 }
 
+/// GPU, its rail already on. Order from NVIDIA's railgate code (Linux
+/// `nvkm_device_tegra_power_up`): clocks running with the reset held,
+/// clamps off, then the reset released, 10 us apart.
+fn gpu_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
+    let Some(pmc) = pmc else {
+        return ENODEV;
+    };
+    car.w32(PLLP_OUTC, (car.r32(PLLP_OUTC) & 0xFFFF) | PLLP_OUT5);
+    for c in GPU.iter() {
+        if c.reset {
+            car.w32(c.bank.rst_set, 1 << c.bit);
+        }
+        car.w32(c.bank.enb_set, 1 << c.bit);
+    }
+    time::sleep_us(10);
+    pmc.w32(PMC_GPU_RG_CNTRL, 0);
+    let _ = pmc.r32(PMC_GPU_RG_CNTRL);
+    time::sleep_us(10);
+    car.w32(X.rst_set + CLR, 1 << GPU[0].bit);
+    let _ = car.r32(X.rst);
+    time::sleep_us(10);
+    0
+}
+
+/// Reverse of `gpu_up`: clamps on, reset, clocks off; the rail may go
+/// off afterwards.
+fn gpu_down(car: &Mmio, pmc: Option<&Mmio>) {
+    if let Some(pmc) = pmc {
+        pmc.w32(PMC_GPU_RG_CNTRL, 1);
+        let _ = pmc.r32(PMC_GPU_RG_CNTRL);
+        time::sleep_us(10);
+    }
+    car.w32(X.rst_set, 1 << GPU[0].bit);
+    time::sleep_us(10);
+    disable(car, table(proto::GPU).as_ref().unwrap());
+}
+
 /// PEX bias and REFCLK pads out of deep power-down, as Linux's pinctrl
 /// default state for the root complex does. Only requested if needed.
 fn pex_pads_on(pmc: &Mmio) {
@@ -585,6 +656,21 @@ fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
             return 0;
         }
         let r = pcie_up(car, pmc);
+        if r != 0 {
+            return r;
+        }
+        return if status(car, pmc, d) == proto::ST_READY {
+            0
+        } else {
+            EIO
+        };
+    }
+    if d.needs == Needs::Gpu {
+        // Up already: a reset would lose the loaded falcons.
+        if status(car, pmc, d) == proto::ST_READY {
+            return 0;
+        }
+        let r = gpu_up(car, pmc);
         if r != 0 {
             return r;
         }
@@ -671,6 +757,10 @@ fn main() -> i32 {
         let mut st = 0;
         let r = match (rx.msg.label(), table(rx.msg.mr[0])) {
             (proto::ENABLE, Some(d)) => enable(&car, pmc.as_ref(), &d),
+            (proto::DISABLE, Some(d)) if d.needs == Needs::Gpu => {
+                gpu_down(&car, pmc.as_ref());
+                0
+            }
             (proto::DISABLE, Some(d)) if !matches!(d.needs, Needs::FuseVisible | Needs::Shared) => {
                 disable(&car, &d);
                 0
