@@ -190,6 +190,19 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 6,
     },
+    // GPU: BAR0 (priv registers), the start of BAR1 (the channel's
+    // USERD); fuses (SKU, GPU speedo, PLL calibration) and APB_MISC
+    // (chip revision) read-only. IRQs: SPI 157 (stall), 158 (nonstall).
+    // Rail through i2c, clocks and clamps through clk.
+    Driver {
+        name: "gpu",
+        mmio: &[(0x5700_0000, 0x100_0000), (0x5800_0000, 0x10_0000)],
+        ro_mmio: &[(0x7000_F000, 0x1000), (0x7000_0000, 0x1000)],
+        irqs: &[189, 190],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
     Driver {
         name: "net",
         mmio: &[],
