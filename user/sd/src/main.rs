@@ -347,6 +347,28 @@ impl Card {
         self.set_clock(25_000)
     }
 
+    /// Card and host down to a 1-bit bus, card kept powered and selected:
+    /// a slot whose DAT1-3 contacts are loose still reads on DAT0.
+    fn bus_1bit(&self) -> Result<(), i64> {
+        let state = self.command(13, self.rca << 16, Rsp::R1, None)?[0] >> 9 & 0xF;
+        // ACMD6 needs the transfer state: stop a card still sending (5)
+        // or receiving (6) the failed block.
+        if state == 5 || state == 6 {
+            self.command(12, 0, Rsp::R1b, None)?;
+        }
+        self.app_command(6, 0, Rsp::R1)?;
+        self.regs.w8(HOST_CONTROL, self.regs.r8(HOST_CONTROL) & !2);
+        Ok(())
+    }
+
+    fn bus_width(&self) -> u32 {
+        if self.regs.r8(HOST_CONTROL) & 2 != 0 {
+            4
+        } else {
+            1
+        }
+    }
+
     /// SD clock and bus power off before the slot loses power.
     fn stop(&self) {
         self.regs.w16(CLOCK_CONTROL, 0);
@@ -465,8 +487,21 @@ fn recover(card: &mut Card, board: &Board) {
         card.describe()
     );
     println!("[sd] slot: {}", board.describe());
+    // DAT0 alone reaching the card (hardware run 19): 1 bit in place,
+    // since the power-cycled re-inits below failed there.
+    let r = card.bus_1bit().and_then(|()| card.read_first());
+    println!(
+        "[sd] retry on a 1-bit bus in place: {}",
+        match r {
+            Ok(()) => "block 0 read",
+            Err(e) => libnx::abi::err::name(e),
+        }
+    );
+    if r.is_ok() {
+        return;
+    }
     // (1.8 V signaling, 4-bit bus, power-off ms before: none).
-    let tries: [(bool, bool, u64); 3] = [(true, true, 0), (false, true, 2000), (false, false, 239)];
+    let tries: [(bool, bool, u64); 3] = [(false, true, 2000), (false, false, 239), (true, true, 0)];
     for (v18, bus4, off_ms) in tries {
         let r = (|| {
             if off_ms != 0 {
@@ -537,7 +572,7 @@ fn main() -> i32 {
     }
     recover(&mut card, &board);
     println!(
-        "[sd] {} card of {} MiB ({} blocks), descriptors at {:#x}, ready at {} ms",
+        "[sd] {} card of {} MiB ({} blocks), {}-bit bus, descriptors at {:#x}, ready at {} ms",
         if card.block_addressed {
             "SDHC/SDXC"
         } else {
@@ -545,6 +580,7 @@ fn main() -> i32 {
         },
         card.blocks / 2048,
         card.blocks,
+        card.bus_width(),
         card.dma_pa,
         time::now_ns() / 1_000_000
     );
