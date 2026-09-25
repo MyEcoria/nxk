@@ -1161,6 +1161,11 @@ pub mod proto {
         /// PWM controller (fan on channel 1). Channel 0 dims the Erista
         /// backlight: a running block is left as is, DISABLE is refused.
         pub const PWM: u64 = 26;
+        /// GM20B GPU: GPU and PLLG_REF clocks, PLLP_OUT5 at 204 MHz, the
+        /// rail clamps (PMC GPU_RG_CNTRL) removed with the reset held.
+        /// ENABLE needs the GPU rail on (`gpu` does it first); DISABLE
+        /// clamps, resets and stops it before the rail goes off.
+        pub const GPU: u64 = 27;
     }
     /// I2C bus.
     pub mod i2c {
@@ -1237,6 +1242,80 @@ pub mod proto {
         /// Not an Erista Switch (or fuses unreadable): `BOOT` only.
         pub const ST_UNSUPPORTED: u64 = 2;
         pub const HOT_MC: i64 = 80_000;
+    }
+    /// GM20B GPU (`gpu`): off until POWER or a 2D / compute request
+    /// without `IF_ON`. Requests are synchronous: the reply comes once
+    /// the GPU is done. Coordinates and sizes pack as `x | y << 32`.
+    pub mod gpu {
+        /// Reply: word 0 = state (`OFF`, `ON`, `FAILED`) | stage << 8
+        /// (`STAGE_*` reached or failed in), word 1 = GPU clock (kHz, 0:
+        /// PLL bypassed), word 2 = rail (µV), word 3 = chip ID (BOOT_0),
+        /// word 4 = GPU speedo | speedo ID << 32, word 5 = last error
+        /// (negated errno) or 0.
+        pub const STATUS: u32 = 1;
+        /// word 0 = 1: power up (secure boot, contexts); 0: power down.
+        /// Reply: as `STATUS`.
+        pub const POWER: u32 = 2;
+        /// handle 0 = surface memory (shm, `DMA` right), words:
+        /// width | height << 32, pitch (bytes), format (`FMT_*`).
+        /// Reply: word 0 = surface ID.
+        pub const ATTACH: u32 = 3;
+        /// word 0 = surface ID.
+        pub const DETACH: u32 = 4;
+        /// 2D solid rectangle. words: surface, x | y << 32,
+        /// width | height << 32, color (surface format), flags.
+        pub const FILL: u32 = 5;
+        /// 2D copy, same size, overlap allowed. words: destination |
+        /// source << 32, destination x | y << 32, source x | y << 32,
+        /// width | height << 32, flags.
+        pub const COPY: u32 = 6;
+        /// Built-in compute kernel on 32-bit elements. handle 0 = x,
+        /// handle 1 = y (`K_COPY`, `K_SAXPY`), shm with the `DMA` right;
+        /// words: kernel (`K_*`), count, value (u32 or f32 bits), flags.
+        /// Reply: word 0 = GPU time (ns).
+        pub const COMPUTE: u32 = 7;
+        /// Self-test on the service's own buffers (2D fill and copy,
+        /// the three kernels), checked by the CPU. Reply: word 0 = tests
+        /// passed (bit `T_*`), word 1 = tests run, word 2 = GPU time (ns).
+        pub const TEST: u32 = 8;
+        /// word 0 = milliseconds of FFMA on every SM. Reply: word 0 =
+        /// floating-point operations done, word 1 = GPU time (ns).
+        pub const BENCH: u32 = 9;
+
+        pub const OFF: u64 = 0;
+        pub const ON: u64 = 1;
+        pub const FAILED: u64 = 2;
+        /// Power-up stages, in order.
+        pub const STAGE_RAIL: u64 = 1;
+        pub const STAGE_CLOCKS: u64 = 2;
+        pub const STAGE_PLL: u64 = 3;
+        pub const STAGE_MMU: u64 = 4;
+        pub const STAGE_FIRMWARE: u64 = 5;
+        pub const STAGE_ACR: u64 = 6;
+        pub const STAGE_FECS: u64 = 7;
+        pub const STAGE_CONTEXT: u64 = 8;
+        pub const STAGE_CHANNEL: u64 = 9;
+        pub const STAGE_READY: u64 = 10;
+
+        /// Surface formats (Fermi 2D numbering).
+        pub const FMT_A8R8G8B8: u64 = 0xCF;
+        pub const FMT_A8B8G8R8: u64 = 0xD5;
+        /// Flag: fail with EAGAIN rather than power the GPU on.
+        pub const IF_ON: u64 = 1;
+
+        /// x[i] = value.
+        pub const K_FILL: u64 = 1;
+        /// y[i] = x[i].
+        pub const K_COPY: u64 = 2;
+        /// y[i] = value * x[i] + y[i] (f32).
+        pub const K_SAXPY: u64 = 3;
+
+        /// `TEST` bits.
+        pub const T_FILL2D: u64 = 1;
+        pub const T_COPY2D: u64 = 2;
+        pub const T_KFILL: u64 = 4;
+        pub const T_KCOPY: u64 = 8;
+        pub const T_KSAXPY: u64 = 16;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {
