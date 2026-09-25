@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::layout::PAGE_SIZE;
 use libnx::abi::proto::input::{TOUCH_DOWN, TOUCH_UP};
-use libnx::abi::proto::{cpufreq, fan, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, fan, gpu, power, usbcon as usb, wifi};
 
 use crate::screen::{
     self, accent, palette, width, Bytes, Celsius, Hms, Ipv4, Screen, BAD, BG, DIM, EDGE, FG, GOOD,
@@ -353,6 +353,39 @@ fn cpu_text(c: &Cpu) -> (String, u32) {
         (format!("boot: {} MHz{}", mhz(c.khz), rail), FG)
     } else {
         (format!("{} MHz{}", mhz(c.khz), rail), FG)
+    }
+}
+
+/// The GPU row: off, its clock and rail, or where power-up failed.
+fn gpu_text(g: &Seen<crate::stats::Gpu>) -> (String, u32) {
+    const STAGES: [&str; 11] = [
+        "",
+        "rail",
+        "clocks",
+        "PLL",
+        "MMU",
+        "firmware",
+        "secure boot",
+        "FECS",
+        "context",
+        "channel",
+        "ready",
+    ];
+    match g {
+        Seen::Value(g) if g.state == gpu::ON => {
+            let clock = match g.khz {
+                0 => "bypass clock".into(),
+                k => format!("{}.{} MHz", k / 1000, k % 1000 / 100),
+            };
+            (format!("{}, {} mV", clock, g.uv / 1000), GOOD)
+        }
+        Seen::Value(g) if g.state == gpu::FAILED => (
+            format!("failed: {}", STAGES.get(g.stage as usize).unwrap_or(&"?")),
+            BAD,
+        ),
+        Seen::Value(_) => ("off".into(), DIM),
+        Seen::Missing => ("no GPU service".into(), DIM),
+        Seen::Unknown => ("starting".into(), DIM),
     }
 }
 
@@ -1025,8 +1058,11 @@ impl Ui {
         s.text_r(xl + w - 48, fy, &t, 2, c, bg);
         s.text_r(xl + w - 16, fy, ">", 2, DIM, bg);
         self.zone(Id::CpuOpen, xl + 8, fy - 8, w - 16, 48);
-        s.fill(xl + 16, CY + 292, w - 32, 2, EDGE);
-        s.text(xl + 16, CY + 304, "ACTIVITY", 2, accent(), PANEL);
+        let (t, c) = gpu_text(&d.gpu);
+        s.text(xl + 16, CY + 294, "gpu", 2, DIM, PANEL);
+        s.text_r(xl + w - 48, CY + 294, &t, 2, c, PANEL);
+        s.fill(xl + 16, CY + 334, w - 32, 2, EDGE);
+        s.text(xl + 16, CY + 344, "ACTIVITY", 2, accent(), PANEL);
         let rows = [
             ("syscalls/s", d.rates[0]),
             ("interrupts/s", d.rates[1]),
@@ -1038,7 +1074,7 @@ impl Ui {
                 s,
                 xl + 16,
                 xl + w - 16,
-                CY + 344 + i * 38,
+                CY + 380 + i * 36,
                 n,
                 &format!("{}", v),
                 None,

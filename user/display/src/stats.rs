@@ -4,7 +4,7 @@
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{cpufreq, eth, fan, fs, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, eth, fan, fs, gpu, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::{sys, time};
@@ -27,6 +27,7 @@ static ETH0: Service = Service::optional("eth0");
 static USB0: Service = Service::optional("usb0");
 static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
+static GPU: Service = Service::optional("gpu");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -124,6 +125,30 @@ impl Cpu {
     }
 }
 
+/// The GPU as `gpu::STATUS` reports it.
+#[derive(Clone, Copy)]
+pub struct Gpu {
+    /// `gpu::OFF`, `ON`, `FAILED`.
+    pub state: u64,
+    /// `gpu::STAGE_*` reached or failed in.
+    pub stage: u64,
+    /// GPC clock (kHz, 0: PLL bypassed).
+    pub khz: u64,
+    /// Rail (µV).
+    pub uv: u64,
+}
+
+impl Gpu {
+    pub fn from_reply(m: &Msg) -> Self {
+        Self {
+            state: m.mr[0] & 0xFF,
+            stage: m.mr[0] >> 8,
+            khz: m.mr[1],
+            uv: m.mr[2],
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Wifi {
     pub state: u64,
@@ -208,6 +233,8 @@ pub struct Data {
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
+    /// Busy while it powers up or runs a batch.
+    pub gpu: Seen<Gpu>,
     pub wifi: Seen<Wifi>,
     /// Card: free and total bytes.
     pub disk: Seen<(u64, u64)>,
@@ -245,6 +272,7 @@ impl Data {
             temps: Seen::Unknown,
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
+            gpu: Seen::Unknown,
             wifi: Seen::Unknown,
             disk: Seen::Unknown,
             usb: Now::Missing,
@@ -304,6 +332,7 @@ impl Data {
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
+        self.gpu.poll(&GPU, gpu::STATUS, n, force, Gpu::from_reply);
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {
                 state: m.mr[0],

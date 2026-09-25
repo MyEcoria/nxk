@@ -316,6 +316,7 @@ const sim = {
   temps: 'value', chip: 42100, pkg: 38500,
   fan: 'auto', fanManual: 60,
   cpu: 'value', cpuStep: 0, // step (MHz), 0: the loader's clock
+  gpu: 'off', gpuStage: 0, // off, on, failed (at gpuStage)
   usb: 'terminal', usbErrors: false, usbIn: 1843, usbOut: 48213,
   eth: 'up',
   wifi: 'connected', wlanPending: false, ssid: 'nxk-test', channel: 6, signal: 52,
@@ -523,6 +524,18 @@ function shell(line, at) {
       return ok([`${clock}${mode}, rail ${n.mv} mV, speedo ${n.speedo}`,
                  ...(n.hot ? ['back to the boot clock: the SoC reached 80 C'] : []),
                  `steps: ${CPU_STEPS.filter((m, i) => cpuRuns(i)).join(' ')}; ${over} and up need more than 1225 mV here`]);
+    }
+    case 'gpu': {
+      const req = args.join(' ');
+      if (!['', 'on', 'off', 'test'].includes(req) && !/^bench( \d+)?$/.test(req))
+        return fail(['usage: gpu [on|off|test|bench [MS]]'], 'EINVAL');
+      if (req === 'off') sim.gpu = 'off';
+      else if (req) sim.gpu = 'on';
+      if (req === 'test') return ok(['  2D fill       ok', '  2D copy       ok', '  fill kernel   ok',
+        '  copy kernel   ok', '  saxpy kernel  ok', 'gpu test: 5/5 passed, GPU time 1830 us']);
+      if (req.startsWith('bench')) return ok(['gpu bench: 38.95 GFLOP/s (38950 MFLOP in 1000 ms)']);
+      if (sim.gpu === 'failed') return fail([`gpu failed at stage ${sim.gpuStage} (${GPU_STAGES[sim.gpuStage]}): EIO`], 'EIO');
+      return ok([sim.gpu === 'on' ? 'gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo 2034 (ID 3)' : 'gpu off']);
     }
     case 'mem': {
       const m = sim.mem, free = m.total - m.kernel - m.user;
@@ -917,11 +930,14 @@ function system() {
   scr.textR(xL + w - 48, cy, ct, 2, cc, cbg);
   scr.textR(xL + w - 16, cy, '>', 2, DIM, cbg);
   zone('s-cpu', xL + 8, cy - 8, w - 16, 48, () => { ui.cpuPanel = true; });
-  scr.fill(xL + 16, CY + 292, w - 32, 2, EDGE);
-  scr.text(xL + 16, CY + 304, 'ACTIVITY', 2, ACCENT, PANEL);
+  const [gt, gc] = gpuText();
+  scr.text(xL + 16, CY + 294, 'gpu', 2, DIM, PANEL);
+  scr.textR(xL + w - 48, CY + 294, gt, 2, gc, PANEL);
+  scr.fill(xL + 16, CY + 334, w - 32, 2, EDGE);
+  scr.text(xL + 16, CY + 344, 'ACTIVITY', 2, ACCENT, PANEL);
   const r = sim.rates;
   [['syscalls/s', r.sys], ['interrupts/s', r.irq], ['context switches/s', r.sw], ['processes', sim.procs]]
-    .forEach(([n, v], i) => kv(xL + 16, xL + w - 16, CY + 344 + i * 38, n, `${v}`));
+    .forEach(([n, v], i) => kv(xL + 16, xL + w - 16, CY + 380 + i * 36, n, `${v}`));
 
   const m = memInfo();
   card(xR, CY, w, 256, 'MEMORY');
@@ -1157,6 +1173,16 @@ function fanPanel() {
   const cw = 240;
   button('f-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.fanPanel = false; });
 }
+// GPU row (user/display ui.rs gpu_text): off, clock and rail, or the stage
+// power-up failed in.
+const GPU_STAGES = ['', 'rail', 'clocks', 'PLL', 'MMU', 'firmware', 'secure boot', 'FECS', 'context',
+  'channel', 'ready'];
+function gpuText() {
+  if (sim.gpu === 'on') return ['76.8 MHz, 868 mV', GOOD];
+  if (sim.gpu === 'failed') return [`failed: ${GPU_STAGES[sim.gpuStage]}`, BAD];
+  return ['off', DIM];
+}
+
 // CPU panel (user/display ui.rs cpu_panel): sys-clk's steps, those over the
 // rail's maximum greyed out, or the loader's clock (BOOT).
 const mhz = khz => `${Math.round(khz / 1000)}`;
