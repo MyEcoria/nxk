@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
-use libnx::abi::proto::{fan, pm, power};
+use libnx::abi::proto::{cpufreq, fan, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
@@ -187,6 +187,7 @@ fn command(line: &str) {
         "sleep" => time::sleep_ms(argv.get(1).and_then(|v| v.parse().ok()).unwrap_or(1000)),
         "temp" => temp(),
         "fan" => fan_cmd(argv.get(1).copied()),
+        "cpufreq" => cpufreq_cmd(argv.get(1).copied()),
         "services" => {
             let mut buf = [0u8; 512];
             let n = ns::services(&mut buf);
@@ -224,6 +225,7 @@ fn help() {
     println!("  sleep MS        wait MS milliseconds");
     println!("  temp            chip and package temperatures");
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
+    println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
@@ -668,6 +670,77 @@ fn fan_cmd(arg: Option<&str>) {
         }
         Err(e) => {
             println!("fan: {}", err::name(e));
+            fail(e);
+        }
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `cpufreq`: CPU clock, rail and the steps this chip runs;
+/// `cpufreq MHZ` or `cpufreq boot` sets it.
+fn cpufreq_cmd(arg: Option<&str>) {
+    let set = match arg {
+        None => None,
+        Some("boot") => Some(cpufreq::BOOT),
+        Some(s) => match s.parse::<u64>() {
+            Ok(m) if cpufreq::STEPS_MHZ.contains(&m) => Some(m),
+            _ => {
+                print!("usage: cpufreq [boot|MHZ], MHZ one of");
+                cpufreq::STEPS_MHZ.iter().for_each(|m| print!(" {}", m));
+                println!();
+                fail(-err::EINVAL);
+                return;
+            }
+        },
+    };
+    let Some(h) = service("cpufreq") else { return };
+    let r = match set {
+        Some(w) => ipc::call(h, &Msg::from_words(cpufreq::SET, &[w])),
+        None => ipc::call(h, &Msg::new(cpufreq::STATUS, 0, 0)),
+    };
+    match r.and_then(ipc::checked) {
+        Ok(m) => {
+            let (khz, uv, speedo, st, allowed, step) =
+                (m.mr[0], m.mr[1], m.mr[2], m.mr[3], m.mr[4], m.mr[5]);
+            match khz {
+                0 => print!("cpu ? MHz"),
+                k => print!("cpu {}.{} MHz", k / 1000, k % 1000 / 100),
+            }
+            match step {
+                cpufreq::BOOT => print!(" (boot clock)"),
+                s => print!(" (step {})", s),
+            }
+            if uv != 0 {
+                print!(", rail {} mV", uv / 1000);
+            }
+            if st & cpufreq::ST_UNSUPPORTED != 0 {
+                println!(", boot clock only on this console");
+                return;
+            }
+            println!(", speedo {}", speedo);
+            if st & cpufreq::ST_HOT != 0 {
+                println!("back to the boot clock: the SoC reached 80 C");
+            }
+            print!("steps:");
+            let mut over = None;
+            for (i, s) in cpufreq::STEPS_MHZ.iter().enumerate() {
+                if allowed & 1 << i != 0 {
+                    print!(" {}", s);
+                } else {
+                    over = over.or(Some(*s));
+                }
+            }
+            match over {
+                Some(s) => println!("; {} and up need more than 1225 mV here", s),
+                None => println!(),
+            }
+        }
+        Err(e) => {
+            match -e {
+                err::ERANGE => println!("cpufreq: this step needs more than 1225 mV on this chip"),
+                err::ENODEV => println!("cpufreq: boot clock only on this console"),
+                _ => println!("cpufreq: {}", err::name(e)),
+            }
             fail(e);
         }
     }
