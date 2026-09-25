@@ -643,6 +643,13 @@ fn main() -> i32 {
         boot0: 0,
         dev: None,
     };
+    // Left on by an instance replaced in place (`usbterm.py --reload`):
+    // clamped, reset, stopped and its rail off, like power-down.
+    if libnx::clk::ready(clk::GPU) {
+        let _ = libnx::clk::disable(clk::GPU);
+        power::rail_off(&g.i2c);
+        println!("[gpu] found on: powered down");
+    }
     let ep = drv::publish("gpu").expect("gpu: publish");
     println!("[gpu] GPU service ready (off)");
     drv::serve(ep, |rx| {
