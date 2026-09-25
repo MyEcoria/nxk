@@ -316,6 +316,30 @@ audible points at the tachometer (GPIO S7, bank 4 interrupt); silent
 at 100% points at the 5V rail (GPIO A5) or the PWM pad (V4).
 `./tools/usbterm.py --reload fan` replaces the driver in place.
 
+## CPU clock
+
+`cpufreq` moves the CPU between sys-clk's steps on PLLX and sets the
+CPU rail (MAX77621) to NVIDIA's PLL-source voltage for this chip's
+speedo; steps needing more than 1225 mV are refused (the DFLL would be
+needed). Every boot stays at hekate's 998.4 MHz, 950 mV. Expected in
+the boot log: `[cpufreq] ready: 998 MHz, 950 mV, speedo NNNN, steps up
+to NNNN MHz`; `[cpufreq] boot clock only: WHY` otherwise. At the shell:
+
+```text
+cpufreq         clock, rail, speedo and the steps this chip runs
+cpufreq 1224    a step (rail raised first): cpu 1219.2 MHz, rail ~1.2 V
+bench burn 60   GFLOP/s scale with the clock; no crash, no fault
+cpufreq boot    back to 998.4 MHz, 950 mV
+```
+
+Check each step with `bench burn` (a wrong voltage shows as a hang, a
+fault or a GFLOP/s off the clock ratio). Above the boot clock the
+service returns to it when the SoC reaches 80 C (`[cpufreq] SoC at
+NN.N C: back to the boot clock`). A hang during a change: reboot, the
+boot clock is back. `./tools/usbterm.py --reload cpufreq` replaces the
+driver in place (it restarts at the boot clock only after `cpufreq
+boot`: the loader's values are read when it starts).
+
 ## Hardware runs
 
 1. 22/09/2026, Erista, before the screen console: stage 1 with nothing
