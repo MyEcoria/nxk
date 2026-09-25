@@ -153,12 +153,42 @@ fn mmio(r: &Regs, list: impl Iterator<Item = (u32, u32)>) {
 }
 
 /// Idle: disabled, or not busy (`gf100_gr_wait_idle`; the FIFO's context
-/// switch flag is not tracked here: one channel).
-fn wait_idle(r: &Regs) -> Result<()> {
-    r.until(2_000_000, "GR busy", || {
+/// switch flag is not tracked here: one channel). A timeout reports the
+/// status and activity registers nvgpu's GR dump starts with.
+fn wait_idle(r: &Regs, what: &'static str) -> Result<()> {
+    let res = r.until(2_000_000, what, || {
         r.rd(0x400700);
         r.rd(0x200) & 0x1000 == 0 || r.rd(0x40060C) & 1 == 0
-    })
+    });
+    if res.is_err() {
+        println!(
+            "[gpu] {}: status {:#x} {:#x} {:#x}, engine {:#x}, activity {:#x} {:#x} {:#x} {:#x}, GPC {:#x}, BE {:#x}, FE power {:#x}, FECS mailbox {:#x}, interrupts GR {:#x} exception {:#x} FECS {:#x} MC {:#x}, FIFO engine {:#x}, FE ESR {:#x} info {:#x}, trapped {:#x} {:#x} {:#x}",
+            what,
+            r.rd(0x400700),
+            r.rd(0x400604),
+            r.rd(0x400608),
+            r.rd(0x40060C),
+            r.rd(0x400380),
+            r.rd(0x400384),
+            r.rd(0x400388),
+            r.rd(0x400390),
+            r.rd(0x502C80),
+            r.rd(0x410200),
+            r.rd(0x404170),
+            r.rd(0x409800),
+            r.rd(0x400100),
+            r.rd(0x400108),
+            r.rd(0x409C18),
+            r.rd(0x100),
+            r.rd(0x2640),
+            r.rd(0x404000),
+            r.rd(0x4041B0),
+            r.rd(0x400704),
+            r.rd(0x400708),
+            r.rd(0x40070C)
+        );
+    }
+    res
 }
 
 /// Bundles through the ICMD interface (`gf100_gr_icmd`).
@@ -172,7 +202,7 @@ fn icmd(r: &Regs, list: impl Iterator<Item = (u32, u32)>) -> Result<()> {
         }
         r.wr(0x400200, a);
         if a & 0xFFFF == 0xE100 {
-            wait_idle(r)?;
+            wait_idle(r, "GR busy in the bundles")?;
         }
         r.wait(0x400700, 4, 0, 2_000_000, "GR bundle")?;
     }
@@ -218,7 +248,7 @@ pub fn init(r: &Regs, t: &Topo, gpccs_inst: &[u8], gpccs_data: &[u8], n: &Nets) 
     mmio(r, fw::av(&n.nonctx));
     r.wait(0x40910C, 6, 0, 2_000_000, "FECS scrub")?;
     r.wait(0x41A10C, 6, 0, 2_000_000, "GPCCS scrub")?;
-    wait_idle(r)?;
+    wait_idle(r, "GR busy after the registers")?;
 
     // MMU debug buffers and mode for the GPCs (`gm20b_gr_init_gpc_mmu`,
     // secure boot: no bypass).
@@ -518,7 +548,7 @@ pub fn golden(
 
     // gm20b_grctx_generate_main, registers written directly.
     mmio(r, fw::aiv(&n.ctx));
-    wait_idle(r)?;
+    wait_idle(r, "GR busy after the context registers")?;
     let idle_timeout = r.mask(0x404154, 0xFFFF_FFFF, 0);
     let mut direct = |a: u32, v: u32| r.wr(a, v);
     attrib_cb(g, &mut direct);
@@ -542,11 +572,11 @@ pub fn golden(
     }
     r.wr(0x4041C4, mask);
     smid_config(r, t);
-    wait_idle(r)?;
+    wait_idle(r, "GR busy after the SM IDs")?;
     r.wr(0x404154, idle_timeout);
-    wait_idle(r)?;
+    wait_idle(r, "GR busy after the idle timeout")?;
     mthd(r, fw::av(&n.method));
-    wait_idle(r)?;
+    wait_idle(r, "GR busy after the methods")?;
     icmd(r, fw::av(&n.bundle))?;
     let mut direct = |a: u32, v: u32| r.wr(a, v);
     pagepool(g, &mut direct);
