@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
-use libnx::abi::proto::{cpufreq, fan, pm, power};
+use libnx::abi::proto::{cpufreq, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::{console, env, ns, print, println, process, sys, time};
@@ -188,6 +188,7 @@ fn command(line: &str) {
         "temp" => temp(),
         "fan" => fan_cmd(argv.get(1).copied()),
         "cpufreq" => cpufreq_cmd(argv.get(1).copied()),
+        "gpu" => gpu_cmd(&argv),
         "services" => {
             let mut buf = [0u8; 512];
             let n = ns::services(&mut buf);
@@ -226,6 +227,9 @@ fn help() {
     println!("  temp            chip and package temperatures");
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
+    println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
+    println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels");
+    println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
@@ -741,6 +745,115 @@ fn cpufreq_cmd(arg: Option<&str>) {
                 err::ENODEV => println!("cpufreq: boot clock only on this console"),
                 _ => println!("cpufreq: {}", err::name(e)),
             }
+            fail(e);
+        }
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// Power-up stages (`gpu::STAGE_*`).
+const GPU_STAGES: [&str; 11] = [
+    "",
+    "rail",
+    "clocks",
+    "PLL",
+    "MMU",
+    "firmware",
+    "secure boot",
+    "FECS",
+    "context",
+    "channel",
+    "ready",
+];
+
+/// `gpu`: state, clock, rail and chip; `gpu on|off`; `gpu test`: the
+/// 2D and compute self-test; `gpu bench [MS]`: FFMA throughput.
+fn gpu_cmd(argv: &[&str]) {
+    let req = match (argv.get(1).copied(), argv.get(2).map(|s| s.parse::<u64>())) {
+        (None, _) => Msg::new(gpu::STATUS, 0, 0),
+        (Some("on"), None) => Msg::from_words(gpu::POWER, &[1]),
+        (Some("off"), None) => Msg::from_words(gpu::POWER, &[0]),
+        (Some("test"), None) => Msg::new(gpu::TEST, 0, 0),
+        (Some("bench"), None) => Msg::from_words(gpu::BENCH, &[1000]),
+        (Some("bench"), Some(Ok(ms))) if (1..=10_000).contains(&ms) => {
+            Msg::from_words(gpu::BENCH, &[ms])
+        }
+        _ => {
+            println!("usage: gpu [on|off|test|bench [MS]]");
+            fail(-err::EINVAL);
+            return;
+        }
+    };
+    let Some(h) = service("gpu") else { return };
+    match ipc::call(h, &req).and_then(ipc::checked) {
+        Ok(m) if req.label() == gpu::TEST => {
+            let (pass, run, ns) = (m.mr[0], m.mr[1], m.mr[2]);
+            for (bit, name) in [
+                (gpu::T_FILL2D, "2D fill"),
+                (gpu::T_COPY2D, "2D copy"),
+                (gpu::T_KFILL, "fill kernel"),
+                (gpu::T_KCOPY, "copy kernel"),
+                (gpu::T_KSAXPY, "saxpy kernel"),
+            ] {
+                let r = match (pass & bit != 0, run & bit != 0) {
+                    (true, _) => "ok",
+                    (false, true) => "FAILED",
+                    _ => "not run",
+                };
+                println!("  {:<13} {}", name, r);
+            }
+            println!(
+                "gpu test: {}/{} passed, GPU time {} us",
+                pass.count_ones(),
+                run.count_ones(),
+                ns / 1000
+            );
+            if pass != run {
+                fail(-err::EIO);
+            }
+        }
+        Ok(m) if req.label() == gpu::BENCH => {
+            let (flops, ns) = (m.mr[0], m.mr[1].max(1));
+            let mflops = flops * 1000 / ns;
+            println!(
+                "gpu bench: {}.{:02} GFLOP/s ({} MFLOP in {} ms)",
+                mflops / 1000,
+                mflops % 1000 / 10,
+                flops / 1_000_000,
+                ns / 1_000_000
+            );
+        }
+        Ok(m) => {
+            let (state, stage) = (m.mr[0] & 0xFF, (m.mr[0] >> 8) as usize);
+            let (khz, uv, id, speedo) = (m.mr[1], m.mr[2], m.mr[3], m.mr[4]);
+            let name = GPU_STAGES.get(stage).copied().unwrap_or("?");
+            match state {
+                gpu::ON => {
+                    print!("gpu on: chip {:#x}", id);
+                    match khz {
+                        0 => print!(", bypass clock"),
+                        k => print!(", {}.{} MHz", k / 1000, k % 1000 / 100),
+                    }
+                    print!(", rail {} mV", uv / 1000);
+                    match speedo >> 32 {
+                        0xFF => println!(),
+                        i => println!(", speedo {} (ID {})", speedo as u32 as i32, i),
+                    }
+                }
+                gpu::FAILED => {
+                    println!(
+                        "gpu failed at stage {} ({}): {}",
+                        stage,
+                        name,
+                        err::name(m.mr[5] as i64)
+                    );
+                    fail(m.mr[5] as i64);
+                }
+                _ => println!("gpu off"),
+            }
+        }
+        Err(e) => {
+            println!("gpu: {}", err::name(e));
             fail(e);
         }
     }
