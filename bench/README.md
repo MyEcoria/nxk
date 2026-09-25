@@ -60,6 +60,15 @@ python3 bench/run_l4t.py --dir <directory> --until "RESULT END" --log l4t-1.log
 python3 bench/compare.py --nxk nxk-*.log --l4t l4t-*.log --md bench/RESULTS.md
 ```
 
+## Load test
+
+`bench burn [SECONDS]` (60 by default) is not part of the comparison:
+one thread per core runs NEON multiply-adds at the lowest priority, so
+the shell and the services still answer. Every 10 s it prints the SoC
+temperature and the fan (duty, rpm), then the rate reached
+(`RESULT burn_mflops`). It stops early at a SoC of 85 C. Run it with
+a trailing `&` to keep the shell, e.g. to watch `cpu` (0% idle).
+
 ## Limits
 
 - **Emulation.** QEMU dynamically translates instructions: a kernel

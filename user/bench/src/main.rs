@@ -1,14 +1,22 @@
 //! nxk benchmarks, aligned with `lbench` (Linux side): same loads, same
 //! clock (CNTVCT_EL0), same `RESULT <key> <value> <unit>` keys.
+//! `bench burn [SECONDS]` loads every core at 100% instead.
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+use core::arch::aarch64::{float32x4_t, vdupq_n_f32, vfmaq_f32};
+use core::hint::black_box;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use libnx::abi::info::{self, MemInfo, ProcInfo};
+use libnx::abi::proto::fan;
+use libnx::abi::thread::MAX_PRIO;
 use libnx::ipc::{self, Msg};
-use libnx::{println, process, sys, thread, time};
+use libnx::{env, ns, println, process, sys, thread, time};
 
 libnx::entry!(main);
 
@@ -19,6 +27,15 @@ fn result(key: &str, v: u64, unit: &str) {
 }
 
 fn main() -> i32 {
+    let args: Vec<&str> = env::args().collect();
+    match args.get(1).copied() {
+        None => {}
+        Some("burn") => match args.get(2).map_or(Ok(60), |s| s.parse()) {
+            Ok(secs) => return burn(secs),
+            Err(_) => return usage(),
+        },
+        Some(_) => return usage(),
+    }
     // Pinned: "same core" and "cross core" are measured from `me`.
     let me = sys::getcpu() as u8;
     let _ = thread::set_current_affinity(Some(me));
@@ -34,6 +51,111 @@ fn main() -> i32 {
     memory();
     println!("RESULT END");
     0
+}
+
+fn usage() -> i32 {
+    println!("usage: bench [burn [SECONDS]]");
+    1
+}
+
+const CORES: usize = 4;
+/// Burn stops early at this SoC temperature (millidegrees C).
+const BURN_HOT_MC: i64 = 85_000;
+/// Independent FMA chains per core: enough to fill both A57 FP pipes.
+const CHAINS: usize = 12;
+const CHUNK: u64 = 1 << 20;
+static STOP: AtomicBool = AtomicBool::new(false);
+static ITERS: [AtomicU64; CORES] = [const { AtomicU64::new(0) }; CORES];
+
+/// NEON multiply-adds on one core until `STOP`. Accumulators saturate
+/// near 1.0: no overflow, no denormal slow path.
+fn spin(core: usize) {
+    let (x, y) = (black_box(1e-4f32), black_box(1e-4f32));
+    // SAFETY: NEON is part of the aarch64 base target.
+    let (x, y) = unsafe { (vdupq_n_f32(x), vdupq_n_f32(y)) };
+    let mut acc: [float32x4_t; CHAINS] = [x; CHAINS];
+    while !STOP.load(Ordering::Relaxed) {
+        for _ in 0..CHUNK {
+            for a in acc.iter_mut() {
+                *a = unsafe { vfmaq_f32(*a, x, y) };
+            }
+        }
+        ITERS[core].fetch_add(CHUNK, Ordering::Relaxed);
+    }
+    black_box(acc);
+}
+
+/// Every core at 100% for `secs` s, at the lowest priority so services
+/// and the shell still run; SoC temperature and fan every 10 s.
+fn burn(secs: u64) -> i32 {
+    let fan = ns::Service::optional("fan");
+    println!("burn: {} cores for {} s", CORES, secs);
+    let workers: Vec<_> = (0..CORES)
+        .map(|c| thread::spawn_on(Some(c as u8), MAX_PRIO, move || spin(c)).expect("thread"))
+        .collect();
+    let t0 = time::ticks();
+    let mut hottest = None;
+    let mut hot = false;
+    let mut shown = 0;
+    loop {
+        time::sleep_ms(1000);
+        let s = time::ticks_to_ns(time::ticks() - t0) / 1_000_000_000;
+        let st = fan.call(&Msg::new(fan::STATUS, 0, 0)).ok();
+        let temp = st.as_ref().map(|m| m.mr[2]).filter(|&t| t != fan::NO_TEMP);
+        if let Some(t) = temp {
+            hottest = Some(hottest.unwrap_or(i64::MIN).max(t as i64));
+            hot = t as i64 >= BURN_HOT_MC;
+        }
+        if hot || s >= secs {
+            break;
+        }
+        if s / 10 > shown {
+            shown = s / 10;
+            match (&st, temp) {
+                (Some(m), Some(t)) => {
+                    let rpm = match m.mr[3] {
+                        fan::NO_RPM => 0,
+                        r => r,
+                    };
+                    println!(
+                        "burn: {} s, SoC {} C, fan {}% {} rpm",
+                        s,
+                        milli(t as i64),
+                        m.mr[0],
+                        rpm
+                    );
+                }
+                _ => println!("burn: {} s", s),
+            }
+        }
+    }
+    STOP.store(true, Ordering::Relaxed);
+    for w in workers {
+        w.join();
+    }
+    let ns = time::ticks_to_ns(time::ticks() - t0).max(1);
+    let iters: u64 = ITERS.iter().map(|i| i.load(Ordering::Relaxed)).sum();
+    // Per iteration: CHAINS vector FMAs of 4 lanes, 2 flops each.
+    let mflops = iters * CHAINS as u64 * 8 * 1000 / ns;
+    let t = hottest.map_or("?".into(), |t| alloc::format!("{} C", milli(t)));
+    if hot {
+        println!("burn: stopped, SoC at {} C or more", milli(BURN_HOT_MC));
+    }
+    println!(
+        "burn: {} s on {} cores, {}.{} GFLOP/s, SoC max {}",
+        ns / 1_000_000_000,
+        CORES,
+        mflops / 1000,
+        mflops % 1000 / 100,
+        t
+    );
+    result("burn_mflops", mflops, "MFLOP/s");
+    i32::from(hot)
+}
+
+/// Millidegrees as "NN.N".
+fn milli(t: i64) -> alloc::string::String {
+    alloc::format!("{}.{}", t / 1000, (t % 1000).abs() / 100)
 }
 
 fn null_syscall() -> u64 {

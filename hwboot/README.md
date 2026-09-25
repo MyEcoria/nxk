@@ -305,6 +305,7 @@ fan             duty, mode, SoC temperature, speed measured over 1 s
 fan 100         full speed by hand: audible, about 11000 rpm
 fan 0           stopped (unless the SoC is at 60 C or more)
 fan auto        back to the temperature steps
+bench burn 300  all 4 cores at 100% for 5 min: SoC and fan every 10 s
 ```
 
 On the screen, the header's FAN chip or the fan row of SYSTEM opens
