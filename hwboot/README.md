@@ -620,6 +620,17 @@ boot`: the loader's values are read when it starts).
     the cores lost their clock. The switch now opens it, goes through
     CCLKG_BURST_POLICY (0x368) as they do, and checks the CPU really
     slowed down before turning PLLX off.
+25. 25/09/2026, Erista, commit `3ca3fea` (no SD card: `fs` exits, as
+    expected): CPU speedo 2079, steps up to 1224 MHz. Each change logs
+    the clock measured against PLLP, matching PLLX: 1020 -> 1018 MHz at
+    1118 mV, 1122 -> 1114 MHz at 1168 mV, 1224 -> 1220 MHz at 1218 mV,
+    `boot` -> 998 MHz at 950 mV. `bench burn` scales with the clock:
+    31.6 GFLOP/s at 998 MHz (one vector FMA per cycle and core), 32.2,
+    35.3, then 38.7 at 1219 MHz for 60 s without a fault, SoC at most
+    42.4 C; `bench` at 1219 MHz: `compute_ms` 131 (160), null syscall
+    196 ns (240). The fan followed Nyx's steps by itself: 22%, 3180 rpm
+    from 42 C. `ktest` gives 28/29 now and then at either clock: the
+    tickless test sees 35-57 interrupts on core 1 in 300 ms.
 
 ## Hardware test (once the SD card is back in the PC)
 
