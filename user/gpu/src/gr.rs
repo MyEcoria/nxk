@@ -61,14 +61,18 @@ pub fn topology(r: &Regs) -> Result<Topo> {
         tile_row_offset: 0,
     };
     for g in 0..gpc_nr {
-        let n = r.rd(gpc(g, 0x2608)) as usize;
+        // FS_GPC: TPC count in bits 4:0, ZCULL count in 20:16 (nouveau's
+        // u8 drops it); PES TPC mask in bits 7:0.
+        let fs = r.rd(gpc(g, 0x2608));
+        let n = (fs & 0x1F) as usize;
         if n == 0 || n > TPC_MAX {
+            println!("[gpu] GPC {} FS_GPC {:#x}", g, fs);
             return Err((ENODEV, "no texture processing cluster"));
         }
         t.tpc_nr[g] = n;
         t.tpc_max = t.tpc_max.max(n);
         t.tpc_total += n;
-        let m = r.rd(gpc(g, 0x0C30));
+        let m = r.rd(gpc(g, 0x0C30)) & 0xFF;
         if m != 0 {
             t.ppc_mask[g] = 1;
             t.ppc_tpc_nr[g] = m.count_ones() as usize;
