@@ -332,8 +332,13 @@ bench burn 60   GFLOP/s scale with the clock; no crash, no fault
 cpufreq boot    back to 998.4 MHz, 950 mV
 ```
 
-Check each step with `bench burn` (a wrong voltage shows as a hang, a
-fault or a GFLOP/s off the clock ratio). Above the boot clock the
+Each change logs `[cpufreq] PLLX NNNN MHz, measured NNNN MHz`: the
+CPU's real speed, from a timed loop against PLLP's 408 MHz. PLLX is
+only turned off once that loop shows the CPU slowed down to PLLP;
+otherwise `CPU not slowed by PLLP (A -> B ticks): PLLX kept, no
+change` and EIO, the rail back where it was. Check each step with
+`bench burn` (a wrong voltage shows as a hang, a fault or a GFLOP/s off
+the clock ratio). Above the boot clock the
 service returns to it when the SoC reaches 80 C (`[cpufreq] SoC at
 NN.N C: back to the boot clock`). A hang during a change: reboot, the
 boot clock is back. `./tools/usbterm.py --reload cpufreq` replaces the
@@ -608,6 +613,13 @@ boot`: the loader's values are read when it starts).
     LDO2 at 3.3 V; `fs` finds no volume, so `stdtest` was not run. The
     same commits written to the card from the PC then worked (storage,
     TERMINAL page): the mute card came with the image sent over USB-C.
+24. 25/09/2026, Erista, commits `26a6121` to `ed037a8` (`cpufreq`, CPU
+    panel): tapping 1122 MHz froze the console at once. PLLP reaches the
+    CPU through a branch (CLK_OUT_ENB_Y bit 31, PLLP_OUT_CPU) that Linux
+    and Atmosphère's warmboot open before selecting PLLP; with it off
+    the cores lost their clock. The switch now opens it, goes through
+    CCLKG_BURST_POLICY (0x368) as they do, and checks the CPU really
+    slowed down before turning PLLX off.
 
 ## Hardware test (once the SD card is back in the PC)
 
