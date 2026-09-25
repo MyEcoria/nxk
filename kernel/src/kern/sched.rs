@@ -368,8 +368,8 @@ pub fn arm(i: u16, deadline: u64) {
     }
 }
 
-/// Remove `i`'s deadline. The timer may keep the old date: it fires once
-/// for nothing, then reprograms.
+/// Remove `i`'s deadline. The nearest one leaves the timer on its date:
+/// the core reprograms at its next kernel exit instead of waking for it.
 pub fn disarm(i: u16) {
     let t = thread::get(i);
     if !t.timed {
@@ -387,6 +387,7 @@ pub fn disarm(i: u16) {
     );
     if t.tq_prev == NIL {
         c.tmo_head = t.tq_next;
+        c.timer_dirty = true;
     } else {
         thread::get(t.tq_prev).tq_next = t.tq_next;
     }
