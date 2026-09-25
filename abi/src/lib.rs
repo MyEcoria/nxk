@@ -1195,6 +1195,14 @@ pub mod proto {
         pub const PCIE_POWER: u32 = 6;
         /// word 0 = 1: touchscreen rail (PMIC LDO6) on at 2.9 V; 0: off.
         pub const TOUCH_POWER: u32 = 7;
+        /// Reply: word 0 = `SUPPLY_*`, word 1 = the charger's status
+        /// register (BQ24193 REG08: VBUS_STAT bits 7:6, power good bit 2).
+        pub const SUPPLY: u32 = 8;
+        /// No input power: the charger's power good is clear.
+        pub const SUPPLY_BATTERY: u64 = 0;
+        /// Input power on the USB-C port: a PC, a charger or the dock,
+        /// not told apart (that takes the USB-PD controller).
+        pub const SUPPLY_EXTERNAL: u64 = 1;
     }
     /// Fan: speed from the SoC temperature, or set by hand.
     pub mod fan {
@@ -1283,6 +1291,35 @@ pub mod proto {
         /// word 0 = milliseconds of FFMA on every SM. Reply: word 0 =
         /// floating-point operations done, word 1 = GPU time (ns).
         pub const BENCH: u32 = 9;
+        /// word 0 = a `STEPS_KHZ` value (0: report only), word 1 =
+        /// `CLOCK_FORCE` to go past the power source's cap. Set at once
+        /// when on (checked by a measurement), at power-up when off.
+        /// ERANGE: not a step, or above the cap without `CLOCK_FORCE`;
+        /// ENODEV: not an Erista Switch (`STEPS_KHZ[0]` only); EIO: the
+        /// clock measured after the change was off (back to the lowest
+        /// step). Reply: word 0 = step set (kHz), word 1 = rail (µV, 0:
+        /// off), word 2 = cap (kHz), word 3 = supply (`power::SUPPLY_*`,
+        /// `NO_SUPPLY`: unreadable), word 4 = clock measured after the
+        /// last change (kHz, 0: not measured), word 5 = `CK_*` bits.
+        pub const CLOCK: u32 = 10;
+        pub const CLOCK_FORCE: u64 = 1;
+        /// sys-clk's GPU steps (kHz), the GPCPLL at each exactly.
+        pub const STEPS_KHZ: [u64; 12] = [
+            76_800, 153_600, 230_400, 307_200, 384_000, 460_800, 537_600, 614_400, 691_200,
+            768_000, 844_800, 921_600,
+        ];
+        /// sys-clk's Erista caps: on battery, then on input power; the
+        /// steps above need `CLOCK_FORCE` (official charger or dock).
+        pub const CAP_BATTERY_KHZ: u64 = 460_800;
+        pub const CAP_EXTERNAL_KHZ: u64 = 768_000;
+        pub const NO_SUPPLY: u64 = u64::MAX;
+        /// Back to `STEPS_KHZ[0]`: the SoC reached `HOT_MC`.
+        pub const CK_HOT: u64 = 1;
+        /// Lowered to the cap: the power source changed.
+        pub const CK_CAPPED: u64 = 2;
+        /// Set with `CLOCK_FORCE`: no cap applies.
+        pub const CK_FORCED: u64 = 4;
+        pub const HOT_MC: i64 = 80_000;
 
         pub const OFF: u64 = 0;
         pub const ON: u64 = 1;
