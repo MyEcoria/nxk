@@ -32,10 +32,16 @@ fn alu() -> Sched {
     Sched::stall(6)
 }
 
+/// Sets barrier `sb`, waited on by the next instruction: a barrier arms a
+/// cycle after issue, so with stall 1 that wait passes on a stale register.
+fn sets(sb: u8) -> Sched {
+    Sched::stall(2).wr(sb)
+}
+
 /// R0 = global thread index; threads past `CB_COUNT` exit.
 fn index(a: &mut Asm) {
     a.emit(s2r(0, SR_TID_X), Sched::stall(1).wr(SB_TID).wait(0x3F));
-    a.emit(s2r(1, SR_CTAID_X), Sched::stall(1).wr(SB_CTA));
+    a.emit(s2r(1, SR_CTAID_X), sets(SB_CTA));
     a.emit(
         shl(1, 1, BLOCK_SHIFT),
         alu().wait(1 << SB_TID | 1 << SB_CTA),
@@ -69,7 +75,7 @@ pub fn copy() -> Vec<u64> {
     index(&mut a);
     address(&mut a, 4, CB_X);
     address(&mut a, 6, CB_Y);
-    a.emit(ldg(3, 4), Sched::stall(1).wr(SB_X));
+    a.emit(ldg(3, 4), sets(SB_X));
     a.emit(stg(6, 3), Sched::stall(1).wait(1 << SB_X));
     a.emit(exit(), Sched::stall(15));
     a.finish()
@@ -82,7 +88,7 @@ pub fn saxpy() -> Vec<u64> {
     address(&mut a, 4, CB_X);
     address(&mut a, 6, CB_Y);
     a.emit(ldg(3, 4), Sched::stall(1).wr(SB_X));
-    a.emit(ldg(8, 6), Sched::stall(1).wr(SB_Y));
+    a.emit(ldg(8, 6), sets(SB_Y));
     a.emit(ffma_c(8, 3, CB_VALUE, 8), alu().wait(1 << SB_X | 1 << SB_Y));
     a.emit(stg(6, 8), Sched::stall(1));
     a.emit(exit(), Sched::stall(15));
