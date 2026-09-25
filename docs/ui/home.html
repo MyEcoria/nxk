@@ -123,6 +123,10 @@
         <option value="auto">auto</option><option value="manual">set by hand</option>
         <option value="hot">SoC hot (full speed)</option><option value="nosensor">no temperature</option>
         <option value="missing">no fan control</option><option value="unknown">starting</option></select></label>
+      <label class="row"><span>CPU clock</span><select data-sim="cpu">
+        <option value="value">speedo 2100 (1224 MHz max)</option><option value="hot">SoC hot: back to boot</option>
+        <option value="unsupported">boot clock only</option>
+        <option value="missing">no clock control</option><option value="unknown">starting</option></select></label>
       <label class="row"><span>USB-C console</span><select data-sim="usb">
         <option value="terminal">terminal open</option><option value="configured">connected, terminal closed</option>
         <option value="host">host seen</option><option value="waiting">waiting for a PC</option>
@@ -311,6 +315,7 @@ const sim = {
   mem: { total: 953216, kernel: 2150, user: 10240 }, // pages
   temps: 'value', chip: 42100, pkg: 38500,
   fan: 'auto', fanManual: 60,
+  cpu: 'value', cpuStep: 0, // step (MHz), 0: the loader's clock
   usb: 'terminal', usbErrors: false, usbIn: 1843, usbOut: 48213,
   eth: 'up',
   wifi: 'connected', wlanPending: false, ssid: 'nxk-test', channel: 6, signal: 52,
@@ -339,6 +344,19 @@ function fanNow() {
   const mode = { hot: ['hot', WARN], nosensor: ['no sensor', WARN], manual: ['manual', FG] }[sim.fan] ?? ['auto', FG];
   // Roughly linear: 960 RPM at the lowest duty, 11000 at the highest.
   return { pct, mode, rpm: pct ? Math.round(960 + 10040 * (pct - 0.4) / 99.6) : 0 };
+}
+// user/cpufreq: sys-clk's steps on PLLX; rail (mV) and PLLX output (kHz) at
+// speedo 2100 (user/cpufreq/src/dvfs.rs tests). Over 1225 mV: refused.
+const CPU_STEPS = [612, 714, 816, 918, 1020, 1122, 1224, 1326, 1428, 1581, 1683, 1785];
+const CPU_MV = [950, 950, 950, 950, 1118, 1162, 1212, 1275, 1331, 1475, 1731, 1731];
+const CPU_KHZ = [609600, 710400, 816000, 915200, 1017600, 1113600, 1219200, 1324800, 1420800, 1574400, 1670400,
+  1766400];
+const cpuRuns = i => CPU_MV[i] <= 1225;
+function cpuNow() {
+  if (sim.cpu === 'missing' || sim.cpu === 'unknown') return null;
+  const i = CPU_STEPS.indexOf(sim.cpuStep);
+  return { khz: i < 0 ? 998400 : CPU_KHZ[i], mv: i < 0 ? 950 : CPU_MV[i], step: i < 0 ? 0 : sim.cpuStep,
+           unsupported: sim.cpu === 'unsupported', hot: sim.cpu === 'hot', speedo: 2100 };
 }
 const BASE = { idle: [3, 1, 1, 1], normal: [22, 9, 6, 4], busy: [92, 78, 71, 64] };
 
@@ -417,7 +435,8 @@ const HELP = [
   '  cpu             per-core statistics', '  uptime          time since boot', '  echo TEXT       print TEXT',
   '  date            wall-clock time (RTC)', '  sleep MS        wait MS milliseconds',
   '  temp            chip and package temperatures',
-  '  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand', '  services        published services',
+  '  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand',
+  '  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot', '  services        published services',
   '  poweroff        power off the machine', '  reboot          reboot the machine',
   '  recv F SIZE CRC receive F as base64 lines (tools/usbterm.py --put)',
   '  restart DRV [F] replace boot driver DRV by F (default /bin/DRV)'];
@@ -429,7 +448,7 @@ const BANNER = [
   'bb                     cc     aa  aa   aaaa   aa aa', ' bb      aaaaaaa      cc      bb  bb  bb  bb  bb  bb',
   '   bbbb           cccc', '       bbbb   cccc'];
 const INK = { a: XTERM[208], b: XTERM[166], c: XTERM[130], d: XTERM[215] };
-const PROGS = ['bench', 'clk', 'console', 'crash', 'display', 'fan', 'fptest', 'fs', 'hello', 'hello-std', 'i2c', 'init',
+const PROGS = ['bench', 'clk', 'console', 'cpufreq', 'crash', 'display', 'fan', 'fptest', 'fs', 'hello', 'hello-std', 'i2c', 'init',
   'input', 'ipcbench', 'ktest', 'net', 'nettest', 'power', 'sd', 'shell', 'stdtest', 'true', 'usb', 'usbcon', 'wifi', 'wlan'];
 // Fake card: directories have size -1.
 const FS = {
@@ -441,7 +460,7 @@ const FS = {
   '/firmware/brcm': [['brcmfmac4356-pcie.bin', 614400], ['brcmfmac4356-pcie.clm_blob', 7900], ['brcmfmac4356-pcie.txt', 2100]],
   '/nxk': [['bl31.bin', 61440], ['bl33.bin', 2064384]],
 };
-const PS = ['init', 'console', 'clk', 'i2c', 'power', 'fan', 'sd', 'fs', 'display', 'input', 'usb', 'usbcon', 'net', 'wlan', 'shell'];
+const PS = ['init', 'console', 'clk', 'i2c', 'power', 'fan', 'cpufreq', 'sd', 'fs', 'display', 'input', 'usb', 'usbcon', 'net', 'wlan', 'shell'];
 const SCAN = [['nxk-test', 6, 52, 'WPA2'], ['maison-2.4', 11, 67, 'WPA2'], ['guest', 1, 74, 'open'],
               ['printer-direct', 6, 81, 'WPA2'], ['voisin', 11, 86, 'WPA3']];
 const WIFI_MAC = '02:1a:2b:3c:4d:5e', ETH_MAC = '02:4e:58:4b:00:01';
@@ -485,6 +504,25 @@ function shell(line, at) {
       const soc = sim.fan === 'nosensor' ? '' : `, SoC ${t}.${d} C`;
       // A bare `fan` measures the speed (1 s); a change reports it 3 s later.
       return ok([`fan ${f.pct}% (${mode})${soc}${args.length ? '' : `, ${f.rpm} rpm`}`]);
+    }
+    case 'cpufreq': {
+      const set = args[0] === 'boot' ? 0 : args.length ? +args[0] : null;
+      if (set !== null && set !== 0 && !CPU_STEPS.includes(set))
+        return fail([`usage: cpufreq [boot|MHZ], MHZ one of ${CPU_STEPS.join(' ')}`], 'EINVAL');
+      const c = cpuNow();
+      if (!c) return fail(['service cpufreq missing'], 'ENOENT');
+      if (set !== null && set !== 0 && c.unsupported) return fail(['cpufreq: boot clock only on this console'], 'ENODEV');
+      if (set !== null && set !== 0 && !cpuRuns(CPU_STEPS.indexOf(set)))
+        return fail(['cpufreq: this step needs more than 1225 mV on this chip'], 'ERANGE');
+      if (set !== null) Object.assign(sim, { cpuStep: set, cpu: c.unsupported ? sim.cpu : 'value' });
+      syncControls();
+      const n = cpuNow(), clock = `cpu ${Math.trunc(n.khz / 1000)}.${Math.floor(n.khz % 1000 / 100)} MHz`;
+      const mode = n.step ? ` (step ${n.step})` : ' (boot clock)';
+      if (n.unsupported) return ok([`${clock}${mode}, rail ${n.mv} mV, boot clock only on this console`]);
+      const over = CPU_STEPS.find((m, i) => !cpuRuns(i));
+      return ok([`${clock}${mode}, rail ${n.mv} mV, speedo ${n.speedo}`,
+                 ...(n.hot ? ['back to the boot clock: the SoC reached 80 C'] : []),
+                 `steps: ${CPU_STEPS.filter((m, i) => cpuRuns(i)).join(' ')}; ${over} and up need more than 1225 mV here`]);
     }
     case 'mem': {
       const m = sim.mem, free = m.total - m.kernel - m.user;
@@ -673,7 +711,8 @@ const HEAD = 64, TABS = 96, M = 16;
 const CY = HEAD + M, CH = H - HEAD - TABS - 2 * M; // content: y 80, 528 high
 const PAGES = ['HOME', 'SYSTEM', 'NETWORK', 'TERMINAL', 'LOGS'];
 const ui = {
-  view: 'proposal', page: 0, pressed: null, down: null, modal: null, fanPanel: false, toast: null, scan: null,
+  view: 'proposal', page: 0, pressed: null, down: null, modal: null, fanPanel: false, cpuPanel: false, toast: null,
+  scan: null,
   logScale: 1, termScale: 1, unread: 0, off: false, blackUntil: 0, grid: 0, showZones: false,
 };
 let zones = [];
@@ -865,12 +904,20 @@ function system() {
   card(xL, CY, w, CH, 'PROCESSOR');
   scr.textR(xL + w - 16, CY + 16, `up ${hms(up())}`, 2, DIM, PANEL);
   sim.load.forEach((p, k) => {
-    const y = CY + 64 + k * 52;
+    const y = CY + 64 + k * 44;
     scr.text(xL + 16, y, `CPU${k}`, 2, p === null ? DIM : FG, PANEL);
     if (p === null) { scr.fill(xL + 104, y + 4, 400, 24, TRACK); scr.textR(xL + w - 16, y, 'off', 2, DIM, PANEL); }
     else { bar(xL + 104, y + 4, 400, 24, p, loadColor(p)); scr.textR(xL + w - 16, y, `${p}%`, 2, FG, PANEL); }
   });
-  scr.fill(xL + 16, CY + 288, w - 32, 2, EDGE);
+  // The clock row opens the CPU panel.
+  const c = cpuNow(), [ct, cc] = c ? cpuText(c) : [sim.cpu === 'missing' ? 'no clock control' : 'starting', DIM];
+  const cy = CY + 246, cbg = ui.pressed === 's-cpu' ? PRESS : PANEL;
+  scr.fill(xL + 8, cy - 8, w - 16, 48, cbg);
+  scr.text(xL + 16, cy, 'clock', 2, DIM, cbg);
+  scr.textR(xL + w - 48, cy, ct, 2, cc, cbg);
+  scr.textR(xL + w - 16, cy, '>', 2, DIM, cbg);
+  zone('s-cpu', xL + 8, cy - 8, w - 16, 48, () => { ui.cpuPanel = true; });
+  scr.fill(xL + 16, CY + 292, w - 32, 2, EDGE);
   scr.text(xL + 16, CY + 304, 'ACTIVITY', 2, ACCENT, PANEL);
   const r = sim.rates;
   [['syscalls/s', r.sys], ['interrupts/s', r.irq], ['context switches/s', r.sw], ['processes', sim.procs]]
@@ -1110,6 +1157,53 @@ function fanPanel() {
   const cw = 240;
   button('f-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.fanPanel = false; });
 }
+// CPU panel (user/display ui.rs cpu_panel): sys-clk's steps, those over the
+// rail's maximum greyed out, or the loader's clock (BOOT).
+const mhz = khz => `${Math.round(khz / 1000)}`;
+function cpuText(c) {
+  const rail = `, ${c.mv} mV`;
+  if (c.unsupported) return [`${mhz(c.khz)} MHz, boot only`, DIM];
+  if (c.hot) return [`hot: ${mhz(c.khz)} MHz${rail}`, WARN];
+  return [`${c.step ? '' : 'boot: '}${mhz(c.khz)} MHz${rail}`, FG];
+}
+function setCpu(step) {
+  act(`cpufreq::SET ${step || 'BOOT'}`);
+  Object.assign(sim, { cpuStep: step, cpu: 'value' });
+  syncControls();
+}
+function cpuPanel() {
+  const x = 240, y = 96, w = 800, h = 528, bh = 72;
+  scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
+  scr.fill(x, y, w, h, PANEL);
+  scr.frame(x, y, w, h, 4, ACCENT);
+  scr.text(x + 32, y + 32, 'CPU CLOCK', 2, ACCENT, PANEL);
+  const c = cpuNow();
+  if (c && !c.unsupported) {
+    const [t, tone] = cpuText(c);
+    scr.textR(x + w - 32, y + 32, t, 2, tone, PANEL);
+    const cols = 6, gap = 16, bw = Math.floor((w - 64 - (cols - 1) * gap) / cols);
+    let top = 0;
+    CPU_STEPS.forEach((m, i) => {
+      const bx = x + 32 + (i % cols) * (bw + gap), by = y + 96 + Math.floor(i / cols) * (bh + gap);
+      if (cpuRuns(i)) top = m;
+      const set = c.step === m;
+      button(`c-${m}`, bx, by, bw, bh, `${m}`, set ? ACCENT : null, cpuRuns(i) ? () => { if (!set) setCpu(m); } : null);
+      if (set) scr.fill(bx + 16, by + bh - 12, bw - 32, 4, ACCENT);
+    });
+    const by = y + 96 + 2 * (bh + gap), boot = !c.step;
+    button('c-boot', x + 32, by, 240, bh, 'BOOT', boot ? ACCENT : null, () => { if (!boot) setCpu(0); });
+    if (boot) scr.fill(x + 48, by + bh - 12, 208, 4, ACCENT);
+    scr.text(x + 296, by + 20, "the loader's clock", 2, DIM, PANEL);
+    const [note, nc] = c.hot ? ['SoC hot: back to BOOT', WARN] : ['Back to BOOT at 80°C', DIM];
+    scr.text(x + 32, y + 368, note, 2, nc, PANEL);
+    scr.text(x + 32, y + 408, `speedo ${c.speedo}: ${top} MHz max`, 2, DIM, PANEL);
+  } else if (c) {
+    scr.text(x + 32, y + 96, `${mhz(c.khz)} MHz`, 2, FG, PANEL);
+    scr.text(x + 32, y + 144, 'Boot clock only on this console', 2, DIM, PANEL);
+  } else scr.text(x + 32, y + 96, sim.cpu === 'missing' ? 'no clock control' : 'starting', 2, DIM, PANEL);
+  const cw = 240;
+  button('c-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.cpuPanel = false; });
+}
 function modal() {
   const m = ui.modal, x = 240, y = 180, w = 800, h = 320;
   scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
@@ -1134,6 +1228,7 @@ function drawProposal() {
   tabBar();
   if (ui.toast && Date.now() < ui.toast.until) toastBar();
   if (ui.fanPanel) { zones = []; fanPanel(); }
+  if (ui.cpuPanel) { zones = []; cpuPanel(); }
   if (ui.modal) { zones = []; modal(); }
 }
 
@@ -1177,12 +1272,12 @@ function powerOff() { act('power::OFF'); ui.off = true; }
 let bootGen = 0;
 function boot() {
   const gen = ++bootGen;
-  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', usb: 'waiting', eth: 'nopc', wifi: 'unknown',
+  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', cpu: 'unknown', cpuStep: 0, usb: 'waiting', eth: 'nopc', wifi: 'unknown',
                        sd: 'unknown', msgs: [], partial: '', usbIn: 0, usbOut: 0, rx: 0, tx: 0 });
-  Object.assign(ui, { page: 0, scan: null, modal: null, fanPanel: false, unread: 0 });
+  Object.assign(ui, { page: 0, scan: null, modal: null, fanPanel: false, cpuPanel: false, unread: 0 });
   write('display: 720x1280 panel, turned landscape\n');
   termBoot();
-  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', eth: 'dhcp' }],
+  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', cpu: 'value', eth: 'dhcp' }],
                  [3000, { sd: 'value' }], [3800, { eth: 'up' }], [4000, { wifi: 'idle' }],
                  [6000, { wifi: 'connecting' }], [9000, { wifi: 'connected' }], [12000, { usb: 'terminal' }]];
   for (const [t, st] of steps) later(t, () => { if (gen === bootGen) Object.assign(sim, st); });
