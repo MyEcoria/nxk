@@ -548,7 +548,7 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         N,
     );
     ns += g.run(p, BATCH_TIMEOUT_US)?;
-    if (0..N as usize).all(|i| x.r32(i * 4) == 0xA5A5_0001) {
+    if check("fill kernel", &x, N, |_| 0xA5A5_0001) {
         pass |= proto::T_KFILL;
     }
     for i in 0..N as usize {
@@ -559,7 +559,7 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     d.compute
         .dispatch(&mut p, Kernel::Copy, &engine::args(xv, yv, N, 0, 0), N);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
-    if (0..N as usize).all(|i| y.r32(i * 4) == i as u32) {
+    if check("copy kernel", &y, N, |i| i as u32) {
         pass |= proto::T_KCOPY;
     }
     for i in 0..N as usize {
@@ -575,7 +575,7 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         N,
     );
     ns += g.run(p, BATCH_TIMEOUT_US)?;
-    if (0..N as usize).all(|i| f32::from_bits(y.r32(i * 4)) == 2.0 * i as f32 + 1.0) {
+    if check("saxpy kernel", &y, N, |i| (2.0 * i as f32 + 1.0).to_bits()) {
         pass |= proto::T_KSAXPY;
     }
 
@@ -586,6 +586,25 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     let _ = mmu::invalidate(&regs, &d.vm);
     let all = proto::T_FILL2D | proto::T_COPY2D | proto::T_KFILL | proto::T_KCOPY | proto::T_KSAXPY;
     Ok((pass, all, ns))
+}
+
+/// `n` words of `m` against `want`; the first wrong one reported.
+fn check(name: &str, m: &Dma, n: u32, want: impl Fn(usize) -> u32) -> bool {
+    let bad: Vec<usize> = (0..n as usize)
+        .filter(|&i| m.r32(i * 4) != want(i))
+        .collect();
+    if let Some(&i) = bad.first() {
+        println!(
+            "[gpu] {}: {} of {} words wrong, first [{}] {:#x}, expected {:#x}",
+            name,
+            bad.len(),
+            n,
+            i,
+            m.r32(i * 4),
+            want(i)
+        );
+    }
+    bad.is_empty()
 }
 
 /// FFMA on every SM for about `ms`: floating-point operations and time.
