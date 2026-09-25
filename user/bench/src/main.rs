@@ -1,6 +1,7 @@
 //! nxk benchmarks, aligned with `lbench` (Linux side): same loads, same
 //! clock (CNTVCT_EL0), same `RESULT <key> <value> <unit>` keys.
-//! `bench burn [SECONDS]` loads every core at 100% instead.
+//! `bench burn [SECONDS]` loads every core at 100% instead; `bench full
+//! [SECONDS]` the GPU too, FFMA on both SMs through the `gpu` service.
 
 #![no_std]
 #![no_main]
@@ -10,10 +11,11 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::arch::aarch64::{float32x4_t, vdupq_n_f32, vfmaq_f32};
 use core::hint::black_box;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
+use libnx::abi::err;
 use libnx::abi::info::{self, MemInfo, ProcInfo};
-use libnx::abi::proto::fan;
+use libnx::abi::proto::{cpufreq, fan, gpu};
 use libnx::abi::thread::MAX_PRIO;
 use libnx::ipc::{self, Msg};
 use libnx::{env, ns, println, process, sys, thread, time};
@@ -32,6 +34,10 @@ fn main() -> i32 {
         None => {}
         Some("burn") => match args.get(2).map_or(Ok(60), |s| s.parse()) {
             Ok(secs) => return burn(secs),
+            Err(_) => return usage(),
+        },
+        Some("full") => match args.get(2).map_or(Ok(30), |s| s.parse()) {
+            Ok(secs) => return full(secs),
             Err(_) => return usage(),
         },
         Some(_) => return usage(),
@@ -54,7 +60,7 @@ fn main() -> i32 {
 }
 
 fn usage() -> i32 {
-    println!("usage: bench [burn [SECONDS]]");
+    println!("usage: bench [burn [SECONDS]|full [SECONDS]]");
     1
 }
 
@@ -66,6 +72,11 @@ const CHAINS: usize = 12;
 const CHUNK: u64 = 1 << 20;
 static STOP: AtomicBool = AtomicBool::new(false);
 static ITERS: [AtomicU64; CORES] = [const { AtomicU64::new(0) }; CORES];
+/// `full`'s GPU share: FFMA done, and the error that stopped it.
+static GPU_FLOPS: AtomicU64 = AtomicU64::new(0);
+static GPU_ERR: AtomicI64 = AtomicI64::new(0);
+static GPU: ns::Service = ns::Service::optional("gpu");
+static CPUFREQ: ns::Service = ns::Service::optional("cpufreq");
 
 /// NEON multiply-adds on one core until `STOP`. Accumulators saturate
 /// near 1.0: no overflow, no denormal slow path.
@@ -85,11 +96,19 @@ fn spin(core: usize) {
     black_box(acc);
 }
 
+/// What a run of `load` measured.
+struct Load {
+    ns: u64,
+    cpu_mflops: u64,
+    hottest: Option<i64>,
+    hot: bool,
+}
+
 /// Every core at 100% for `secs` s, at the lowest priority so services
-/// and the shell still run; SoC temperature and fan every 10 s.
-fn burn(secs: u64) -> i32 {
+/// and the shell still run; SoC temperature and fan every 10 s, and an
+/// early stop at `BURN_HOT_MC`.
+fn load(tag: &str, secs: u64) -> Load {
     let fan = ns::Service::optional("fan");
-    println!("burn: {} cores for {} s", CORES, secs);
     let workers: Vec<_> = (0..CORES)
         .map(|c| thread::spawn_on(Some(c as u8), MAX_PRIO, move || spin(c)).expect("thread"))
         .collect();
@@ -118,14 +137,15 @@ fn burn(secs: u64) -> i32 {
                         r => r,
                     };
                     println!(
-                        "burn: {} s, SoC {} C, fan {}% {} rpm",
+                        "{}: {} s, SoC {} C, fan {}% {} rpm",
+                        tag,
                         s,
                         milli(t as i64),
                         m.mr[0],
                         rpm
                     );
                 }
-                _ => println!("burn: {} s", s),
+                _ => println!("{}: {} s", tag, s),
             }
         }
     }
@@ -135,22 +155,110 @@ fn burn(secs: u64) -> i32 {
     }
     let ns = time::ticks_to_ns(time::ticks() - t0).max(1);
     let iters: u64 = ITERS.iter().map(|i| i.load(Ordering::Relaxed)).sum();
-    // Per iteration: CHAINS vector FMAs of 4 lanes, 2 flops each.
-    let mflops = iters * CHAINS as u64 * 8 * 1000 / ns;
-    let t = hottest.map_or("?".into(), |t| alloc::format!("{} C", milli(t)));
     if hot {
-        println!("burn: stopped, SoC at {} C or more", milli(BURN_HOT_MC));
+        println!("{}: stopped, SoC at {} C or more", tag, milli(BURN_HOT_MC));
+    }
+    Load {
+        ns,
+        // Per iteration: CHAINS vector FMAs of 4 lanes, 2 flops each.
+        cpu_mflops: iters * CHAINS as u64 * 8 * 1000 / ns,
+        hottest,
+        hot,
+    }
+}
+
+fn hottest(l: &Load) -> alloc::string::String {
+    l.hottest
+        .map_or("?".into(), |t| alloc::format!("{} C", milli(t)))
+}
+
+/// MFLOP/s as "N.N GFLOP/s".
+fn gflops(mflops: u64) -> alloc::string::String {
+    alloc::format!("{}.{} GFLOP/s", mflops / 1000, mflops % 1000 / 100)
+}
+
+fn burn(secs: u64) -> i32 {
+    println!("burn: {} cores for {} s", CORES, secs);
+    let l = load("burn", secs);
+    println!(
+        "burn: {} s on {} cores, {}, SoC max {}",
+        l.ns / 1_000_000_000,
+        CORES,
+        gflops(l.cpu_mflops),
+        hottest(&l)
+    );
+    result("burn_mflops", l.cpu_mflops, "MFLOP/s");
+    i32::from(l.hot)
+}
+
+/// GPU clock step and CPU clock as "GPU N MHz, CPU N MHz".
+fn clocks() -> alloc::string::String {
+    let g = GPU
+        .call(&Msg::from_words(gpu::CLOCK, &[0, 0]))
+        .and_then(ipc::checked)
+        .map_or("?".into(), |m| {
+            alloc::format!("{}.{}", m.mr[0] / 1000, m.mr[0] % 1000 / 100)
+        });
+    let c = CPUFREQ
+        .call(&Msg::new(cpufreq::STATUS, 0, 0))
+        .and_then(ipc::checked)
+        .ok()
+        .filter(|m| m.mr[0] != 0)
+        .map_or("?".into(), |m| alloc::format!("{}", m.mr[0] / 1000));
+    alloc::format!("GPU {} MHz, CPU {} MHz", g, c)
+}
+
+/// FFMA on both SMs, 1 s at a time, until `STOP`.
+fn gpu_load() {
+    while !STOP.load(Ordering::Relaxed) {
+        match GPU
+            .call(&Msg::from_words(gpu::BENCH, &[1000]))
+            .and_then(ipc::checked)
+        {
+            Ok(m) => {
+                GPU_FLOPS.fetch_add(m.mr[0], Ordering::Relaxed);
+            }
+            Err(e) => {
+                GPU_ERR.store(e, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+/// `burn` with the GPU loaded as well, at the clocks set (`cpufreq`,
+/// `gpu clock`): CPU, GPU and total throughput. The GPU's share counts
+/// every second of the run, its gaps between batches included.
+fn full(secs: u64) -> i32 {
+    println!(
+        "full: {} cores and the GPU for {} s ({})",
+        CORES,
+        secs,
+        clocks()
+    );
+    let t0 = time::ticks();
+    let g = thread::spawn_on(None, 0, gpu_load).expect("thread");
+    let l = load("full", secs);
+    g.join();
+    let ns = time::ticks_to_ns(time::ticks() - t0).max(1);
+    let gpu_mflops = GPU_FLOPS.load(Ordering::Relaxed) * 1000 / ns;
+    match GPU_ERR.load(Ordering::Relaxed) {
+        0 => {}
+        e => println!("full: GPU stopped: {}", err::name(e)),
     }
     println!(
-        "burn: {} s on {} cores, {}.{} GFLOP/s, SoC max {}",
-        ns / 1_000_000_000,
-        CORES,
-        mflops / 1000,
-        mflops % 1000 / 100,
-        t
+        "full: {} s, CPU {}, GPU {}, total {}, SoC max {} ({} at the end)",
+        l.ns / 1_000_000_000,
+        gflops(l.cpu_mflops),
+        gflops(gpu_mflops),
+        gflops(l.cpu_mflops + gpu_mflops),
+        hottest(&l),
+        clocks()
     );
-    result("burn_mflops", mflops, "MFLOP/s");
-    i32::from(hot)
+    result("full_cpu_mflops", l.cpu_mflops, "MFLOP/s");
+    result("full_gpu_mflops", gpu_mflops, "MFLOP/s");
+    result("full_total_mflops", l.cpu_mflops + gpu_mflops, "MFLOP/s");
+    i32::from(l.hot || GPU_ERR.load(Ordering::Relaxed) != 0)
 }
 
 /// Millidegrees as "NN.N".

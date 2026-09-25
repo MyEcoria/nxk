@@ -69,6 +69,14 @@ temperature and the fan (duty, rpm), then the rate reached
 (`RESULT burn_mflops`). It stops early at a SoC of 85 C. Run it with
 a trailing `&` to keep the shell, e.g. to watch `cpu` (0% idle).
 
+`bench full [SECONDS]` (30 by default) runs the same load with the GPU
+busy too: a thread asks `gpu` for 1 s of FFMA on both SMs at a time, at
+the clocks set (`cpufreq`, `gpu clock`). It prints the same 10 s lines,
+then CPU, GPU and total rates over the whole run (`RESULT
+full_cpu_mflops`, `full_gpu_mflops`, `full_total_mflops`), and stops at
+85 C too. On an Erista at 998 MHz (CPU) and 768 MHz (GPU): 31.7 +
+304.4 = 336.2 GFLOP/s, SoC at most 49.6 C after 30 s.
+
 ## Limits
 
 - **Emulation.** QEMU dynamically translates instructions: a kernel
