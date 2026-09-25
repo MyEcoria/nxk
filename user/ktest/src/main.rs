@@ -682,45 +682,32 @@ fn cpus() -> [CpuInfo; 4] {
 }
 
 fn t_tickless() -> R {
-    let me = sys::getcpu() as usize;
-    let worst = |a: &[CpuInfo; 4], b: &[CpuInfo; 4]| {
-        (0..4)
-            .filter(|&k| k != me && a[k].online != 0)
-            .map(|k| b[k].irqs - a[k].irqs)
-            .max()
-            .unwrap_or(0)
-    };
-    // Earlier output may still drain to UART-A (a FIFO refill every
-    // 1.4 ms on the console's core): wait up to 3 s for quiet cores. A
-    // periodic tick never goes quiet, and still fails below.
-    for _ in 0..30 {
-        let a = cpus();
-        time::sleep_ms(100);
-        if worst(&a, &cpus()) <= 5 {
-            break;
-        }
-    }
+    // Services wake cores for their own work (IPC replies, I2C sleeps,
+    // polling): only interrupts that leave a core idle betray a tick.
     let a = cpus();
     time::sleep_ms(300);
     let b = cpus();
-    let worst = worst(&a, &b);
+    let worst = (0..4)
+        .filter(|&k| a[k].online != 0)
+        .map(|k| b[k].empty_wakeups - a[k].empty_wakeups)
+        .max()
+        .unwrap_or(0);
     // With a 100 Hz tick, an idle core would get 30.
     if worst > 5 {
         let detail: Vec<String> = (0..4)
             .map(|k| {
                 format!(
-                    "c{} irq+{} cs+{} busy {} us",
+                    "c{} empty+{} irq+{} busy {} us",
                     k,
+                    b[k].empty_wakeups - a[k].empty_wakeups,
                     b[k].irqs - a[k].irqs,
-                    b[k].switches - a[k].switches,
                     (b[k].busy_ns - a[k].busy_ns) / 1000
                 )
             })
             .collect();
         return Err(format!(
-            "{} interrupts on an idle core in 300 ms (me: c{}; {})",
+            "{} wake-ups for nothing on a core in 300 ms ({})",
             worst,
-            me,
             detail.join(", ")
         ));
     }

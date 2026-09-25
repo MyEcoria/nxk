@@ -206,8 +206,9 @@ writer disappears.
 core; the timer is programmed for the next deadline (wakeup, or end of
 quantum only if a thread of the same priority is waiting). Balancing
 toward idle cores, migration, adjustable affinity and priority. A core
-with no work gets no periodic interrupt (services do not wake up on
-their own either).
+with no work gets no periodic interrupt: `ktest` counts the interrupts
+that leave a core idle (`sysinfo`), not the ones services cause by
+polling (statistics each second, the fan's temperature every 2 s).
 
 **Memory**: buddy allocator (4 KiB–4 MiB); pages zeroed with `DC ZVA`;
 ASID-tagged address spaces; on-first-access anonymous pages and stacks
