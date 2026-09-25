@@ -371,7 +371,7 @@ first fenced batch). Expected at `gpu on`:
 [gpu] GPCPLL M 1 N 36 PL 9: 76800 kHz (DFS coeff NN, ext cal NN)
 [gpu] WPR 0xNNNNNNNN-0xNNNNNNNN, FECS image 23808 bytes
 [gpu] ACR loader: production keys, IMEM NN KiB, mailbox 0x0 0xN, NNN us
-[gpu] 1 GPC, 2 TPC, 1 LTC
+[gpu] 1 GPC, 2 TPC, 2 LTC
 [gpu] FECS up: context NNNNNN bytes, zcull NNN, perfmon NNN
 [gpu] golden context NNNNNN bytes, N PBDMA, runlist 0
 [gpu] ready in NNN ms
@@ -391,6 +391,9 @@ and leaves the GPU off; the `[gpu]` lines before it tell which step
 answered what. The ACR loader's mailbox 0 must read 0: another value
 is its error code, and a missing `WPR` range (0x0-0x20000) means the
 carveout was not set up (not booted through hekate's L4T entry). A
+GR idle wait that times out names its step and prints GR's status,
+activity, interrupt, DISPATCH error and trapped method registers; a
+self-test kernel with a wrong result logs its first wrong word. A
 batch that never finishes prints `[gpu] batch N not done` with the
 engine status and the MC, FIFO, PBDMA and GR interrupt registers, and
 powers the GPU down too. The SYSTEM page's gpu row follows the same
@@ -683,6 +686,23 @@ the new one finds the GPU on and powers it down first.
     196 ns (240). The fan followed Nyx's steps by itself: 22%, 3180 rpm
     from 42 C. `ktest` gives 28/29 now and then at either clock: the
     tickless test sees 35-57 interrupts on core 1 in 300 ms.
+26. 25/09/2026, Erista, commits `1557dcf` to `7cc248a`, the GPU
+    firmware sent with `--put` and `gpu` with `--reload`: **the GPU
+    runs**. The first `gpu on` stopped at stage 7, `no texture
+    processing cluster`: GPC 0's FS_GPC also holds the ZCULL count in
+    bits 20:16 (nouveau's u8 drops it, the emulator returned the bare
+    count). Masked, power-up takes 37 ms: rail 868 mV (GPU speedo
+    2081), GPCPLL at 76.8 MHz, WPR 0xffd00000-0xffd40000, ACR mailbox 0,
+    1 GPC, 2 TPC, 2 LTC, context 79872 bytes. `gpu test` then gave 4/5:
+    the copy kernel stored what R3 held in the previous launch (the
+    fill value, then each earlier copy's data, through any GPU address),
+    its LDG setting with stall 1 the barrier the next STG waited on,
+    while a barrier arms a cycle after issue. With stall 2: 5/5 in 15
+    runs, `gpu bench` 30.4 GFLOP/s (77% of the 39.3 peak), chip 37 C.
+    Still open: 1 to 4 power-ups in 10 fail at stage 8, `GR busy in the
+    bundles`, a DISPATCH `INJECTED_BUNDLE_ERROR` (0x404000 = 0x80000001,
+    exception 0x1, GR engine busy, every unit idle) at a different
+    bundle each time; the next `gpu on` works.
 
 ## Hardware test (once the SD card is back in the PC)
 

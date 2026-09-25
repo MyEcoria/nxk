@@ -342,8 +342,10 @@ program that vanished without closing them (crash) are reclaimed.
   benchmark (`gpu test`, `gpu bench`). Its firmware is NVIDIA's
   redistributable set (`tools/gm20b-fw.sh` copies it from the PC's
   `/lib/firmware`), kept out of the repository like the Wi-Fi blobs.
-  Not validated on a Switch yet (`hwboot/README.md`, "GPU"); Erista
-  only (Mariko's GPU rail is on a MAX77812); no 3D, no clock steps.
+  Runs on an Erista Switch (`gpu test` 5/5, `gpu bench` 30.4 GFLOP/s;
+  `hwboot/README.md`, "GPU" and run 26), though a few power-ups fail
+  at stage 8 and need a second `gpu on`; Erista only (Mariko's GPU
+  rail is on a MAX77812); no 3D, no clock steps.
   The emulator's GPU model runs the whole power-up with
   `tools/tegra_qemu-gpu.patch` but renders and computes nothing:
   `gpu test` fails there by design.
