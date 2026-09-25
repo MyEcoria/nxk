@@ -1,0 +1,8 @@
+[package]
+name = "gpu"
+version = "0.1.0"
+edition = "2021"
+description = "GM20B GPU: power-up, secure boot of FECS, 2D engine, compute kernels"
+
+[dependencies]
+libnx = { path = "../libnx" }
