@@ -8,13 +8,13 @@ use alloc::vec::Vec;
 
 use libnx::abi::layout::PAGE_SIZE;
 use libnx::abi::proto::input::{TOUCH_DOWN, TOUCH_UP};
-use libnx::abi::proto::{fan, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, fan, power, usbcon as usb, wifi};
 
 use crate::screen::{
     self, accent, palette, width, Bytes, Celsius, Hms, Ipv4, Screen, BAD, BG, DIM, EDGE, FG, GOOD,
     PANEL, PRESS, TERM_BG, TRACK, WARN,
 };
-use crate::stats::{Data, Eth, Fan, Now, Seen};
+use crate::stats::{Cpu, Data, Eth, Fan, Now, Seen};
 use crate::term::Term;
 use crate::Messages;
 
@@ -74,6 +74,11 @@ enum Id {
     FanDown,
     FanUp,
     FanClose,
+    CpuOpen,
+    /// A step of `cpufreq::STEPS_MHZ`, by index.
+    CpuStep(usize),
+    CpuBoot,
+    CpuClose,
 }
 
 /// What a tap asks the service to do.
@@ -86,6 +91,8 @@ pub enum Action {
     ClearLogs,
     /// `fan::SET`: `fan::AUTO` or a duty (%).
     Fan(u64),
+    /// `cpufreq::SET`: a step (MHz) or `cpufreq::BOOT`.
+    Cpu(u64),
 }
 
 struct Zone {
@@ -135,6 +142,11 @@ pub struct Ui {
     /// Fan requests in flight, and the last one (`fan::AUTO` or %).
     fan_sent: u32,
     fan_last: u64,
+    /// The CPU panel is open.
+    cpu_panel: bool,
+    cpu: Seen<Cpu>,
+    /// A clock change is running: the steps wait for it.
+    cpu_sent: bool,
     zones: Vec<Zone>,
 }
 
@@ -319,6 +331,31 @@ fn fan_color(d: &Data) -> u32 {
     }
 }
 
+/// Clock in whole MHz ("?" unknown).
+fn mhz(khz: u64) -> String {
+    match khz {
+        0 => "?".into(),
+        k => format!("{}", (k + 500) / 1000),
+    }
+}
+
+/// CPU clock and rail, and the color they show in.
+fn cpu_text(c: &Cpu) -> (String, u32) {
+    let rail = match c.uv {
+        0 => String::new(),
+        uv => format!(", {} mV", uv / 1000),
+    };
+    if c.state & cpufreq::ST_UNSUPPORTED != 0 {
+        (format!("{} MHz, boot only", mhz(c.khz)), DIM)
+    } else if c.state & cpufreq::ST_HOT != 0 {
+        (format!("hot: {} MHz{}", mhz(c.khz), rail), WARN)
+    } else if c.step == cpufreq::BOOT {
+        (format!("boot: {} MHz{}", mhz(c.khz), rail), FG)
+    } else {
+        (format!("{} MHz{}", mhz(c.khz), rail), FG)
+    }
+}
+
 fn wifi_connected(d: &Data) -> Option<crate::stats::Wifi> {
     match d.wifi {
         Seen::Value(w) if w.state == wifi::ST_CONNECTED => Some(w),
@@ -343,6 +380,9 @@ impl Ui {
             fan: Seen::Unknown,
             fan_sent: 0,
             fan_last: fan::AUTO,
+            cpu_panel: false,
+            cpu: Seen::Unknown,
+            cpu_sent: false,
             zones: Vec::new(),
         }
     }
@@ -350,6 +390,18 @@ impl Ui {
     /// A fan request came back.
     pub fn fan_done(&mut self) {
         self.fan_sent = self.fan_sent.saturating_sub(1);
+    }
+
+    fn cpu_step(&self) -> Option<u64> {
+        match self.cpu {
+            Seen::Value(c) => Some(c.step),
+            _ => None,
+        }
+    }
+
+    /// A clock change came back.
+    pub fn cpu_done(&mut self) {
+        self.cpu_sent = false;
     }
 
     /// Duty set by hand (%) as the FAN panel shows it, none in auto:
@@ -446,6 +498,20 @@ impl Ui {
                     return self.fan_set(q);
                 }
             }
+            Id::CpuOpen => self.cpu_panel = true,
+            Id::CpuClose => self.cpu_panel = false,
+            Id::CpuStep(_) | Id::CpuBoot if self.cpu_sent => {}
+            // Already there.
+            Id::CpuStep(i) if self.cpu_step() == Some(cpufreq::STEPS_MHZ[i]) => {}
+            Id::CpuBoot if self.cpu_step() == Some(cpufreq::BOOT) => {}
+            Id::CpuStep(i) => {
+                self.cpu_sent = true;
+                return Some(Action::Cpu(cpufreq::STEPS_MHZ[i]));
+            }
+            Id::CpuBoot => {
+                self.cpu_sent = true;
+                return Some(Action::Cpu(cpufreq::BOOT));
+            }
             Id::Reboot => {
                 self.modal = Some(Modal {
                     title: "Reboot the Switch?".into(),
@@ -524,9 +590,14 @@ impl Ui {
             s.text(2 * M, y + 8, t, 2, FG, PANEL);
         }
         self.fan = d.fan;
+        self.cpu = d.cpu;
         if self.fan_panel {
             self.zones.clear();
             self.fan_panel(s);
+        }
+        if self.cpu_panel {
+            self.zones.clear();
+            self.cpu_panel(s);
         }
         if self.modal.is_some() {
             self.zones.clear();
@@ -917,7 +988,7 @@ impl Ui {
             PANEL,
         );
         for (k, p) in d.load.iter().enumerate() {
-            let y = CY + 64 + k * 52;
+            let y = CY + 64 + k * 44;
             s.text(
                 xl + 16,
                 y,
@@ -937,7 +1008,24 @@ impl Ui {
                 }
             }
         }
-        s.fill(xl + 16, CY + 288, w - 32, 2, EDGE);
+        // The clock row opens the CPU panel.
+        let fy = CY + 246;
+        let bg = if self.pressed == Some(Id::CpuOpen) {
+            PRESS
+        } else {
+            PANEL
+        };
+        s.fill(xl + 8, fy - 8, w - 16, 48, bg);
+        s.text(xl + 16, fy, "clock", 2, DIM, bg);
+        let (t, c) = match d.cpu {
+            Seen::Value(c) => cpu_text(&c),
+            Seen::Missing => ("no clock control".into(), DIM),
+            Seen::Unknown => ("starting".into(), DIM),
+        };
+        s.text_r(xl + w - 48, fy, &t, 2, c, bg);
+        s.text_r(xl + w - 16, fy, ">", 2, DIM, bg);
+        self.zone(Id::CpuOpen, xl + 8, fy - 8, w - 16, 48);
+        s.fill(xl + 16, CY + 292, w - 32, 2, EDGE);
         s.text(xl + 16, CY + 304, "ACTIVITY", 2, accent(), PANEL);
         let rows = [
             ("syscalls/s", d.rates[0]),
@@ -1514,6 +1602,108 @@ impl Ui {
         self.button(
             s,
             Id::FanClose,
+            x + w - 32 - cw,
+            y + h - 32 - bh,
+            cw,
+            bh,
+            "CLOSE",
+            None,
+            true,
+        );
+    }
+
+    /// CPU panel: sys-clk's steps, those needing more than the rail's
+    /// maximum on this chip greyed out, or the loader's clock (BOOT).
+    fn cpu_panel(&mut self, s: &mut Screen) {
+        let (x, y, w, h) = (240, 96, 800, 528);
+        s.fill(x - 8, y - 8, w + 16, h + 16, BG);
+        s.fill(x, y, w, h, PANEL);
+        s.frame(x, y, w, h, 4, accent());
+        s.text(x + 32, y + 32, "CPU CLOCK", 2, accent(), PANEL);
+        let bh = 72;
+        match self.cpu {
+            Seen::Value(c) if c.state & cpufreq::ST_UNSUPPORTED == 0 => {
+                let (t, tone) = cpu_text(&c);
+                s.text_r(x + w - 32, y + 32, &t, 2, tone, PANEL);
+                let (cols, gap) = (6, 16);
+                let bw = (w - 64 - (cols - 1) * gap) / cols;
+                let mut top = 0;
+                for (i, &m) in cpufreq::STEPS_MHZ.iter().enumerate() {
+                    let (bx, by) = (
+                        x + 32 + (i % cols) * (bw + gap),
+                        y + 96 + (i / cols) * (bh + gap),
+                    );
+                    let runs = c.allowed & 1 << i != 0;
+                    if runs {
+                        top = m;
+                    }
+                    let set = c.step == m;
+                    let label = format!("{}", m);
+                    let on = runs && !self.cpu_sent;
+                    self.button(
+                        s,
+                        Id::CpuStep(i),
+                        bx,
+                        by,
+                        bw,
+                        bh,
+                        &label,
+                        set.then(accent),
+                        on,
+                    );
+                    if set {
+                        s.fill(bx + 16, by + bh - 12, bw - 32, 4, accent());
+                    }
+                }
+                let by = y + 96 + 2 * (bh + gap);
+                let boot = c.step == cpufreq::BOOT;
+                self.button(
+                    s,
+                    Id::CpuBoot,
+                    x + 32,
+                    by,
+                    240,
+                    bh,
+                    "BOOT",
+                    boot.then(accent),
+                    !self.cpu_sent,
+                );
+                if boot {
+                    s.fill(x + 48, by + bh - 12, 208, 4, accent());
+                }
+                s.text(x + 296, by + 20, "the loader's clock", 2, DIM, PANEL);
+                let (note, nc) = if c.state & cpufreq::ST_HOT != 0 {
+                    ("SoC hot: back to BOOT", WARN)
+                } else {
+                    ("Back to BOOT at 80\u{b0}C", DIM)
+                };
+                s.text(x + 32, y + 368, note, 2, nc, PANEL);
+                let limit = format!("speedo {}: {} MHz max", c.speedo, top);
+                s.text(x + 32, y + 408, &limit, 2, DIM, PANEL);
+            }
+            Seen::Value(c) => {
+                s.text(x + 32, y + 96, &format!("{} MHz", mhz(c.khz)), 2, FG, PANEL);
+                s.text(
+                    x + 32,
+                    y + 144,
+                    "Boot clock only on this console",
+                    2,
+                    DIM,
+                    PANEL,
+                );
+            }
+            Seen::Missing | Seen::Unknown => {
+                let t = match self.cpu {
+                    Seen::Missing => "no clock control",
+                    _ => "starting",
+                };
+                s.text(x + 32, y + 96, t, 2, DIM, PANEL);
+            }
+        }
+        let cw = 240;
+        self.button(
+            s,
+            Id::CpuClose,
             x + w - 32 - cw,
             y + h - 32 - bh,
             cw,

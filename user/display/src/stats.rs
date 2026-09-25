@@ -4,7 +4,7 @@
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{eth, fan, fs, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, eth, fan, fs, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::{sys, time};
@@ -26,6 +26,7 @@ static FS: Service = Service::optional("fs");
 static ETH0: Service = Service::optional("eth0");
 static USB0: Service = Service::optional("usb0");
 static FAN: Service = Service::optional("fan");
+static CPUFREQ: Service = Service::optional("cpufreq");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -91,6 +92,34 @@ impl Fan {
             rpm: (m.mr[3] != fan::NO_RPM).then_some(m.mr[3]),
             manual: (m.mr[4] != fan::AUTO).then_some(m.mr[4]),
             temp: (m.mr[2] != fan::NO_TEMP).then_some(m.mr[2] as i64),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Cpu {
+    pub khz: u64,
+    /// CPU rail (µV, 0: unreadable).
+    pub uv: u64,
+    pub speedo: u64,
+    /// `cpufreq::ST_*` bits.
+    pub state: u64,
+    /// Steps this chip runs (bit i: `cpufreq::STEPS_MHZ[i]`).
+    pub allowed: u64,
+    /// Step set (MHz), `cpufreq::BOOT`.
+    pub step: u64,
+}
+
+impl Cpu {
+    /// A `cpufreq::STATUS` (or `SET`) reply.
+    pub fn from_reply(m: &Msg) -> Self {
+        Self {
+            khz: m.mr[0],
+            uv: m.mr[1],
+            speedo: m.mr[2],
+            state: m.mr[3],
+            allowed: m.mr[4],
+            step: m.mr[5],
         }
     }
 }
@@ -178,6 +207,7 @@ pub struct Data {
     pub temps: Seen<(i64, i64)>,
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
+    pub cpu: Seen<Cpu>,
     pub wifi: Seen<Wifi>,
     /// Card: free and total bytes.
     pub disk: Seen<(u64, u64)>,
@@ -214,6 +244,7 @@ impl Data {
             mem: None,
             temps: Seen::Unknown,
             fan: Seen::Unknown,
+            cpu: Seen::Unknown,
             wifi: Seen::Unknown,
             disk: Seen::Unknown,
             usb: Now::Missing,
@@ -271,6 +302,8 @@ impl Data {
             (m.mr[0] as i64, m.mr[1] as i64)
         });
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
+        self.cpu
+            .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {
                 state: m.mr[0],

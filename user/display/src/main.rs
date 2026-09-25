@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use libnx::abi::err::EINVAL;
-use libnx::abi::proto::{console as con, display as proto, fan, input, wifi};
+use libnx::abi::proto::{console as con, cpufreq, display as proto, fan, input, wifi};
 use libnx::abi::rights::{DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
@@ -86,6 +86,7 @@ static INPUT: Service = Service::new("input", 0);
 static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
 static FAN: Service = Service::optional("fan");
+static CPUFREQ: Service = Service::optional("cpufreq");
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -150,6 +151,8 @@ enum Done {
     Power(i64),
     /// The fan's state after a `SET`.
     Fan(Result<stats::Fan, i64>),
+    /// The CPU clock after a `SET`.
+    Cpu(Result<stats::Cpu, i64>),
 }
 
 struct Worker {
@@ -214,6 +217,11 @@ fn work(w: &Worker, notif: u32) -> ! {
             Action::Fan(v) => Done::Fan(
                 FAN.call(&Msg::from_words(fan::SET, &[v]))
                     .map(|m| stats::Fan::from_reply(&m)),
+            ),
+            Action::Cpu(v) => Done::Cpu(
+                CPUFREQ
+                    .call(&Msg::from_words(cpufreq::SET, &[v]))
+                    .map(|m| stats::Cpu::from_reply(&m)),
             ),
             Action::ClearLogs => continue,
         };
@@ -445,7 +453,7 @@ fn main() -> i32 {
                 let batch: Vec<Done> = worker.done.lock().drain(..).collect();
                 let now = time::now_ns();
                 for d in batch {
-                    if !matches!(d, Done::Fan(_)) {
+                    if !matches!(d, Done::Fan(_) | Done::Cpu(_)) {
                         ui.busy = false;
                     }
                     match d {
@@ -456,6 +464,14 @@ fn main() -> i32 {
                                 Err(e) => {
                                     ui.toast(format!("fan: {}", libnx::abi::err::name(e)), now)
                                 }
+                            }
+                        }
+                        Done::Cpu(r) => {
+                            ui.cpu_done();
+                            match r {
+                                Ok(c) => data.cpu = stats::Seen::Value(c),
+                                Err(e) => ui
+                                    .toast(format!("cpu clock: {}", libnx::abi::err::name(e)), now),
                             }
                         }
                         Done::Scan(Ok(nets)) => ui.scan = Some(nets),
