@@ -1246,6 +1246,8 @@ pub mod proto {
     /// GM20B GPU (`gpu`): off until POWER or a 2D / compute request
     /// without `IF_ON`. Requests are synchronous: the reply comes once
     /// the GPU is done. Coordinates and sizes pack as `x | y << 32`.
+    /// Client memory must be `shm::UNCACHED`: the GPU does not snoop the
+    /// CPU's caches.
     pub mod gpu {
         /// Reply: word 0 = state (`OFF`, `ON`, `FAILED`) | stage << 8
         /// (`STAGE_*` reached or failed in), word 1 = GPU clock (kHz, 0:
