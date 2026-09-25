@@ -87,6 +87,18 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 8,
     },
+    // CAR (the CPU clock and PLLX registers only; clk never touches
+    // them); APB_MISC (chip revision) and fuses (SKU, CPU speedo)
+    // read-only. The CPU regulator goes through the i2c service.
+    Driver {
+        name: "cpufreq",
+        mmio: &[(0x6000_6000, 0x1000)],
+        ro_mmio: &[(0x7000_0000, 0x1000), (0x7000_F000, 0x1000)],
+        irqs: &[],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
     Driver {
         name: "display",
         mmio: &[(0x5420_0000, 0x40000)],

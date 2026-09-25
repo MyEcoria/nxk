@@ -42,6 +42,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpufreq"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+]
+
+[[package]]
 name = "crash"
 version = "0.1.0"
 dependencies = [
