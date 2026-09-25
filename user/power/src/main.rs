@@ -1,5 +1,5 @@
 //! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
-//! PCIe and touchscreen rails.
+//! PCIe and touchscreen rails, the charger's input status.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
 //! The TMP451 is started again as hekate's `tmp451_init` does.
 
@@ -16,6 +16,11 @@ use libnx::{println, sys, time};
 const PMIC: u8 = 0x3C;
 const RTC: u8 = 0x68;
 const TMP451: u8 = 0x4C;
+/// Battery charger on I2C1 (hekate bdk/power/bq24193.h): status
+/// register, power good (input present).
+const BQ24193: u8 = 0x6B;
+const BQ24193_STATUS: u8 = 0x08;
+const BQ24193_PG: u8 = 1 << 2;
 /// TMP451 registers (hekate bdk/thermal/tmp451.h): configuration and
 /// conversion rate are written at 0x09, 0x0A, read back at 0x03, 0x04.
 const TMP451_CONFIG: u8 = 0x09;
@@ -224,6 +229,16 @@ fn main() -> i32 {
             },
             proto::TOUCH_POWER => match ldo(&i2c, LDO6_CFG, LDO6_2V9, rx.msg.mr[0] != 0) {
                 Ok(()) => Msg::new(0, 0, 0),
+                Err(e) => Msg::error(e),
+            },
+            proto::SUPPLY => match i2c.read_reg(1, BQ24193, BQ24193_STATUS) {
+                Ok(st) => {
+                    let src = match st & BQ24193_PG {
+                        0 => proto::SUPPLY_BATTERY,
+                        _ => proto::SUPPLY_EXTERNAL,
+                    };
+                    Msg::from_words(0, &[src, st as u64])
+                }
                 Err(e) => Msg::error(e),
             },
             _ => Msg::error(-EINVAL),
