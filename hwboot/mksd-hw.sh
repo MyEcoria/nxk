@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Populate a mounted FAT32 microSD for Switch bring-up (hekate + /bin userland).
 # Usage: ./mksd-hw.sh /mount/point [firmware-dir]
-# firmware-dir: Wi-Fi blobs copied to /firmware/brcm (brcmfmac4356-pcie.*).
+# firmware-dir: Wi-Fi blobs copied to /firmware/brcm (brcmfmac4356-pcie.*),
+# its nvidia/ tree (GPU, tools/gm20b-fw.sh) to /firmware/nvidia.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -53,11 +54,16 @@ for prog in hello-std stdtest; do
 done
 printf 'Welcome to nxk: this file comes from the SD card (FAT32).\n' > "$sd/motd-nxk.txt"
 
-# Wi-Fi firmware and calibration data: proprietary, never in the repo.
+# Wi-Fi firmware and calibration data, GPU firmware: never in the repo.
 if [ -n "$fw" ]; then
     mkdir -p "$sd/firmware/brcm"
-    cp "$fw"/* "$sd/firmware/brcm/"
-    echo "[mksd-hw] Wi-Fi firmware -> $sd/firmware/brcm ($(ls "$fw" | wc -l) files)"
+    find "$fw" -maxdepth 1 -type f -exec cp {} "$sd/firmware/brcm/" \;
+    echo "[mksd-hw] Wi-Fi firmware -> $sd/firmware/brcm ($(find "$fw" -maxdepth 1 -type f | wc -l) files)"
+    if [ -d "$fw/nvidia" ]; then
+        mkdir -p "$sd/firmware"
+        cp -r "$fw/nvidia" "$sd/firmware/"
+        echo "[mksd-hw] GPU firmware -> $sd/firmware/nvidia ($(find "$fw/nvidia" -type f | wc -l) files)"
+    fi
 fi
 
 echo "[mksd-hw] nxk L4T entry -> $sd"

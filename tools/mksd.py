@@ -4,7 +4,8 @@ files copied inside (without mounting).
 
     mksd.py -o build/sd.img                   # 128 MiB, programs in /bin
     mksd.py -o sd.img --size 256 --add file:/dir/name
-    mksd.py -o sd.img --firmware build/firmware  # Wi-Fi blobs -> /firmware/brcm
+    mksd.py -o sd.img --firmware firmware    # Wi-Fi blobs -> /firmware/brcm,
+                                             # nvidia/ (GPU) -> /firmware/nvidia
 
 Uses mkfs.fat (dosfstools) and pyfatfs (~/.cache/tegra_qemu/fsvenv env).
 """
@@ -30,7 +31,8 @@ ap.add_argument("-o", required=True)
 ap.add_argument("--size", type=int, default=128, help="size in MiB (power of 2 for QEMU)")
 ap.add_argument("--add", action="append", default=[], help="SOURCE:DESTINATION")
 ap.add_argument("--no-bin", action="store_true", help="skip copying programs to /bin")
-ap.add_argument("--firmware", help="directory copied to /firmware/brcm (Wi-Fi blobs)")
+ap.add_argument("--firmware", help="its files go to /firmware/brcm (Wi-Fi blobs), "
+                "its nvidia/ tree to /firmware/nvidia (GPU, tools/gm20b-fw.sh)")
 a = ap.parse_args()
 
 size = a.size << 20
@@ -70,12 +72,17 @@ put("/etc/motd", "Welcome to nxk: this file comes from the SD card (FAT32).\n".e
 put("/Documents/Read me.txt",
     "Long name and spaces: FAT32 LFN entries.\n".encode())
 put("/Documents/Data/numbers.txt", "".join(f"{i}\n" for i in range(1000)).encode())
-# Wi-Fi firmware and calibration data: proprietary, never in the repo.
+# Wi-Fi firmware and calibration data, GPU firmware: never in the repo.
 if a.firmware:
     for name in sorted(os.listdir(a.firmware)):
         src = os.path.join(a.firmware, name)
         if os.path.isfile(src):
             put("/firmware/brcm/" + name, open(src, "rb").read())
+    nv = os.path.join(a.firmware, "nvidia")
+    for d, _, names in os.walk(nv):
+        for name in sorted(names):
+            src = os.path.join(d, name)
+            put("/firmware/nvidia/" + os.path.relpath(src, nv), open(src, "rb").read())
 for spec in a.add:
     src, dst = spec.split(":", 1)
     put(dst, open(src, "rb").read())
