@@ -573,11 +573,14 @@ pub fn golden(
     r.wr(0x4041C4, mask);
     smid_config(r, t);
     wait_idle(r, "GR busy after the SM IDs")?;
+    // Bundles before methods, FE's go-idle timeout off until they are all
+    // in (nvgpu `gk20a_init_sw_bundle`): with it on, an injection landing
+    // as FE goes idle fails with DISPATCH INJECTED_BUNDLE_ERROR.
+    icmd(r, fw::av(&n.bundle))?;
     r.wr(0x404154, idle_timeout);
     wait_idle(r, "GR busy after the idle timeout")?;
     mthd(r, fw::av(&n.method));
     wait_idle(r, "GR busy after the methods")?;
-    icmd(r, fw::av(&n.bundle))?;
     let mut direct = |a: u32, v: u32| r.wr(a, v);
     pagepool(g, &mut direct);
     bundle(g, &mut direct);
