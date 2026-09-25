@@ -26,6 +26,8 @@ sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-
 sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 ./mksd-hw.sh /mount/point  # populate the FAT32 microSD (needs it mounted)
 ./mksd-hw.sh /mount/point ~/brcm  # ... plus Wi-Fi blobs -> /firmware/brcm
+../tools/gm20b-fw.sh              # GPU firmware from linux-firmware -> firmware/nvidia
+./mksd-hw.sh /mount/point ../firmware  # Wi-Fi blobs and firmware/nvidia -> /firmware
 ```
 
 `mksd-hw.sh` rebuilds nxk, writes `build/nxk.bin` (ELF→raw via llvm-objcopy),
@@ -33,7 +35,10 @@ installs hekate + `hekate_ipl.ini` + `bootloader/payloads/nxk.bin` (marker)
 and the `/bin` userland on the card. A second argument (or `NXK_FIRMWARE`)
 copies a directory of Wi-Fi blobs to `/firmware/brcm`, where `wlan` looks
 for `brcmfmac4356-pcie.bin` and `brcmfmac4356-pcie.txt`: proprietary files
-that are never part of the repository.
+that are never part of the repository. Its `nvidia/` subdirectory, which
+`tools/gm20b-fw.sh` fills from the PC's `/lib/firmware/nvidia/gm20b`
+(NVIDIA's redistributable GPU firmware, the set nouveau loads), goes to
+`/firmware/nvidia` for `gpu`.
 
 ## Wi-Fi firmware (extracted from the console)
 
@@ -344,6 +349,53 @@ NN.N C: back to the boot clock`). A hang during a change: reboot, the
 boot clock is back. `./tools/usbterm.py --reload cpufreq` replaces the
 driver in place (it restarts at the boot clock only after `cpufreq
 boot`: the loader's values are read when it starts).
+
+## GPU
+
+`gpu` leaves the GM20B off until asked (`gpu on`, or a 2D or compute
+request); a boot changes nothing. Its firmware must be on the card
+(`tools/gm20b-fw.sh`, then `mksd-hw.sh /mount/point firmware`,
+"Prepare"). Power-up goes through these stages, the ones `gpu` names
+on a failure: rail (MAX77621 at 0x1C on I2C5, its EN pin on the PMIC's
+GPIO6, NVIDIA's voltage for 76.8 MHz plus 25 mV: 868.75 mV on an
+Erista), clocks (`clk`: GPU and PLLG_REF gates, PLLP_OUT5 at 204 MHz,
+clamps off with the reset held, then the chip ID), PLL (GPCPLL in
+noise-aware mode at 76.8 MHz), MMU (GMMU, BAR1), firmware (files
+read), secure boot (NVIDIA's ACR loader on the PMU copies FECS into the
+GPU firmware carveout hekate's L4T entry locked), FECS (GR init, GPCCS
+loaded, both started), context (golden image) and channel (runlist,
+first fenced batch). Expected at `gpu on`:
+
+```text
+[gpu] rail 868 mV (GPU speedo NNNN, ID 3)
+[gpu] GPCPLL M 1 N 36 PL 9: 76800 kHz (DFS coeff NN, ext cal NN)
+[gpu] WPR 0xNNNNNNNN-0xNNNNNNNN, FECS image 23808 bytes
+[gpu] ACR loader: production keys, IMEM NN KiB, mailbox 0x0 0xN, NNN us
+[gpu] 1 GPC, 2 TPC, 1 LTC
+[gpu] FECS up: context NNNNNN bytes, zcull NNN, perfmon NNN
+[gpu] golden context NNNNNN bytes, N PBDMA, runlist 0
+[gpu] ready in NNN ms
+```
+
+Then at the shell:
+
+```text
+gpu             gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo NNNN (ID 3)
+gpu test        2D fill and copy, fill / copy / SAXPY kernels: 5/5 ok
+gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
+gpu off         clamps, reset, clocks and rail off
+```
+
+A failed power-up says where (`gpu failed at stage N (NAME): ERRNO`)
+and leaves the GPU off; the `[gpu]` lines before it tell which step
+answered what. The ACR loader's mailbox 0 must read 0: another value
+is its error code, and a missing `WPR` range (0x0-0x20000) means the
+carveout was not set up (not booted through hekate's L4T entry). A
+batch that never finishes prints `[gpu] batch N not done` with the
+engine status and the MC, FIFO, PBDMA and GR interrupt registers, and
+powers the GPU down too. The SYSTEM page's gpu row follows the same
+states. `./tools/usbterm.py --reload gpu` replaces the driver in place;
+the new one finds the GPU on and powers it down first.
 
 ## Hardware runs
 

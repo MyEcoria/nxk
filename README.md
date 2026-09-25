@@ -28,7 +28,7 @@ like any other.
 ```
 EL0  Rust programs (std) · shell
      services: fs (FAT32) · net (TCP/IP) · display · input · power
-     drivers : console (UART) · usbcon (USB-C) · sd · usb (xHCI) · i2c · clk
+     drivers : console (UART) · usbcon (USB-C) · sd · usb (xHCI) · i2c · clk · gpu
      init: process manager and name service
      ─────────── ported std · libnx (no_std) ───────────
      ─────────── svc #0: 53 system calls ───────────
@@ -77,7 +77,11 @@ rebuild it. QEMU exposes the bus on chardev `usbotg`, where
 `tools/usbterm.py --emu SOCKET` plays the PC's USB host. `--tap` needs
 the touch panel's interrupt line, wired to GPIO X1 as on the Switch:
 `git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-touch-irq.patch`
-(after the OTG patch).
+(after the OTG patch). `gpu on` gets past the GPU's secure boot only with
+GM20B's unit counts in the emulator's GPU model:
+`git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-gpu.patch`; the GPU
+firmware goes on the image with `tools/gm20b-fw.sh` then
+`tools/mksd.py -o build/sd.img --firmware firmware`.
 
 Build directories live in `~/.cache/nxk/`: the project is synced and
 does not have to carry build artifacts.
@@ -270,7 +274,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet) | GPU, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 76.8 MHz) | GPU 3D and clock steps, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
@@ -326,7 +330,24 @@ program that vanished without closing them (crash) are reclaimed.
   CAL0 on the eMMC, which nxk cannot read. None of the PCIe path runs
   in the emulator, which has no root complex to model: there a
   simulated adapter answers `wifi` instead.
-- GPU, audio, Joy-Con and frequency scaling are not done (the last one
+- GPU (GM20B): `gpu` powers it only when asked (`gpu on`, or a 2D or
+  compute request): its rail (the MAX77621 at 0x1C, NVIDIA's voltage
+  for 76.8 MHz plus 25 mV), clocks and clamps through `clk`, the GPCPLL
+  in noise-aware mode at a fixed 76.8 MHz, then NVIDIA's secure boot:
+  the ACR loader from linux-firmware runs on the PMU, copies FECS into
+  the GPU firmware carveout hekate's L4T entry locks, and starts it;
+  GPCCS, the golden context and one channel follow nouveau's GM20B code.
+  It runs 2D fills and copies on surfaces clients attach, three
+  hand-assembled SM 5.3 kernels (fill, copy, SAXPY) and an FFMA
+  benchmark (`gpu test`, `gpu bench`). Its firmware is NVIDIA's
+  redistributable set (`tools/gm20b-fw.sh` copies it from the PC's
+  `/lib/firmware`), kept out of the repository like the Wi-Fi blobs.
+  Not validated on a Switch yet (`hwboot/README.md`, "GPU"); Erista
+  only (Mariko's GPU rail is on a MAX77812); no 3D, no clock steps.
+  The emulator's GPU model runs the whole power-up with
+  `tools/tegra_qemu-gpu.patch` but renders and computes nothing:
+  `gpu test` fails there by design.
+- Audio, Joy-Con and frequency scaling are not done (the last one
   risks damaging hardware).
 - A pipe has no buffer: the writer waits until a reader takes its data.
   `output()` reads both outputs in parallel for this reason.
