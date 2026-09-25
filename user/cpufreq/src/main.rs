@@ -18,10 +18,11 @@ use libnx::ns::Service;
 use libnx::{println, time};
 
 const CAR: u64 = 0x6000_6000;
-/// CPU clock sources, 4 bits per CPU state (run in bits 7:4): 8 =
-/// PLLX_OUT0_LJ as hekate sets it, 4 = PLLP_OUT0 (408 MHz), where the
-/// CPU waits while PLLX relocks (hekate bdk/soc/ccplex.c).
-const CCLK_BURST_POLICY: usize = 0x20;
+/// The G cluster's clock sources, 4 bits per CPU state (run in bits
+/// 7:4): 8 = PLLX_OUT0_LJ (hekate's setting), 4 = PLLP_OUT0, where the CPU
+/// waits while PLLX relocks. CCLKG, as Linux and Atmosphère's warmboot
+/// switch a running CPU (hekate writes the 0x20 alias before starting it).
+const CCLKG_BURST_POLICY: usize = 0x368;
 const CCLK_SOURCES: u32 = 0xFFFF;
 const CCLK_PLLX: u32 = 0x8888;
 const CCLK_PLLP: u32 = 0x4444;
@@ -32,6 +33,14 @@ const PLL_ENABLE: u32 = 1 << 30;
 const PLL_LOCK: u32 = 1 << 27;
 const PLLX_DIVIDERS: u32 = 0x1F << 20 | 0xFF << 8 | 0xFF;
 const PLLX_MISC_LOCK_ENABLE: u32 = 1 << 18;
+/// PLLP reaches the CPU only through this branch: selecting PLLP with it
+/// off stops every core (Linux clk-super.c, Atmosphère warmboot).
+const CLK_OUT_ENB_Y: usize = 0x298;
+const CLK_ENB_Y_SET: usize = 0x29C;
+const PLLP_OUT_CPU: u32 = 1 << 31;
+const PLLP_KHZ: u64 = 408_000;
+/// Steps of `probe`'s countdown: about 20 µs at 1 GHz.
+const PROBE_LOOPS: u64 = 20_000;
 
 const APB_MISC: u64 = 0x7000_0000;
 const GP_HIDREV: usize = 0x804;
@@ -72,9 +81,9 @@ struct Cpu {
 
 impl Cpu {
     fn clock_khz(&self) -> u64 {
-        match (self.car.r32(CCLK_BURST_POLICY) >> 4) & 0xF {
+        match (self.car.r32(CCLKG_BURST_POLICY) >> 4) & 0xF {
             8 => Pll::from_base(self.car.r32(PLLX_BASE)).khz(),
-            4 => 408_000,
+            4 => PLLP_KHZ,
             _ => 0,
         }
     }
@@ -111,24 +120,60 @@ impl Cpu {
         locked
     }
 
-    /// PLLX relocked at `pll` while the CPU runs from PLLP. A failed lock
-    /// goes back to the old dividers, or stays on PLLP (408 MHz, safe at
-    /// any rail voltage).
+    /// PLLX relocked at `pll` while the CPU runs from PLLP. PLLX is only
+    /// turned off once the CPU measurably slowed down to PLLP. A failed
+    /// lock goes back to the old dividers, or stays on PLLP (408 MHz,
+    /// safe at any rail voltage).
     fn set_pll(&self, pll: Pll) -> Result<(), i64> {
         let car = &self.car;
         let old = Pll::from_base(car.r32(PLLX_BASE));
-        let policy = car.r32(CCLK_BURST_POLICY) & !CCLK_SOURCES;
-        car.w32(CCLK_BURST_POLICY, policy | CCLK_PLLP);
-        let _ = car.r32(CCLK_BURST_POLICY);
+        let khz = old.khz();
+        // Under 1.3x PLLP the probe cannot tell the two clocks apart.
+        if khz * 10 < PLLP_KHZ * 13 {
+            return Err(-EIO);
+        }
+        car.w32(CLK_ENB_Y_SET, PLLP_OUT_CPU);
         time::sleep_us(2);
+        if car.r32(CLK_OUT_ENB_Y) & PLLP_OUT_CPU == 0 {
+            println!("[cpufreq] PLLP branch to the CPU stays off: no change");
+            return Err(-EIO);
+        }
+        let policy = car.r32(CCLKG_BURST_POLICY) & !CCLK_SOURCES;
+        let fast = probe();
+        car.w32(CCLKG_BURST_POLICY, policy | CCLK_PLLP);
+        let _ = car.r32(CCLKG_BURST_POLICY);
+        time::sleep_us(2);
+        let slow = probe();
+        // At least half the expected slowdown (khz / 408 MHz).
+        if slow * 2 * PLLP_KHZ < fast * (khz + PLLP_KHZ) {
+            car.w32(CCLKG_BURST_POLICY, policy | CCLK_PLLX);
+            println!(
+                "[cpufreq] CPU not slowed by PLLP ({} -> {} ticks): PLLX kept, no change",
+                fast, slow
+            );
+            return Err(-EIO);
+        }
         let r = if self.relock(pll) {
             Ok(())
         } else if self.relock(old) {
             Err(-EIO)
         } else {
+            println!("[cpufreq] PLLX does not lock: CPU left on PLLP");
             return Err(-EIO);
         };
-        car.w32(CCLK_BURST_POLICY, policy | CCLK_PLLX);
+        car.w32(CCLKG_BURST_POLICY, policy | CCLK_PLLX);
+        time::sleep_us(2);
+        let now = Pll::from_base(car.r32(PLLX_BASE)).khz();
+        println!(
+            "[cpufreq] PLLX {} MHz, measured {} MHz{}",
+            now / 1000,
+            PLLP_KHZ * slow / probe().max(1) / 1000,
+            if r.is_ok() {
+                ""
+            } else {
+                " (new dividers did not lock)"
+            }
+        );
         r
     }
 
@@ -139,7 +184,13 @@ impl Cpu {
         if code > now {
             self.set_rail(code)?;
         }
-        self.set_pll(pll)?;
+        // The clock is still one the old rail ran.
+        if let Err(e) = self.set_pll(pll) {
+            if code > now {
+                let _ = self.set_rail(now);
+            }
+            return Err(e);
+        }
         if code < now {
             self.set_rail(code)?;
         }
@@ -212,6 +263,27 @@ impl Cpu {
     }
 }
 
+/// Counter ticks of a dependent countdown, which scale with the CPU
+/// clock: fewest of 5 runs, as an interrupt only lengthens one.
+fn probe() -> u64 {
+    (0..5)
+        .map(|_| {
+            let t0 = time::ticks();
+            // SAFETY: registers only.
+            unsafe {
+                core::arch::asm!(
+                    "1: subs {n}, {n}, #1",
+                    "b.ne 1b",
+                    n = inout(reg) PROBE_LOOPS => _,
+                    options(nomem, nostack),
+                );
+            }
+            time::ticks() - t0
+        })
+        .min()
+        .unwrap_or(0)
+}
+
 /// CPU speedo value, or why this console keeps the boot clock.
 fn chip(car: &Mmio, i2c: &I2c) -> Result<u32, &'static str> {
     let misc = Mmio::map(drv::dev_slot(1), APB_MISC, 0x1000).map_err(|_| "no APB_MISC")?;
@@ -234,7 +306,13 @@ fn chip(car: &Mmio, i2c: &I2c) -> Result<u32, &'static str> {
     let spare = |b: usize| fuse.r32(FUSE_SPARE_BIT + 4 * b) & 1;
     let rev = spare(4) << 2 | spare(3) << 1 | spare(2);
     let speedo = dvfs::speedo(rev, fuse.r32(FUSE_CPU_SPEEDO_0)).ok_or("CPU speedo not fused")?;
-    if (car.r32(CCLK_BURST_POLICY) >> 4) & 0xF != 8 || car.r32(PLLX_BASE) & PLL_ENABLE == 0 {
+    let cclkg = car.r32(CCLKG_BURST_POLICY);
+    if (cclkg >> 4) & 0xF != 8 || car.r32(PLLX_BASE) & PLL_ENABLE == 0 {
+        println!(
+            "[cpufreq] CCLKG {:#010x}, PLLX {:#010x}",
+            cclkg,
+            car.r32(PLLX_BASE)
+        );
         return Err("CPU not on PLLX");
     }
     match i2c.read_reg(5, MAX77621, VOUT) {
