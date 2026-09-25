@@ -230,6 +230,10 @@ fn help() {
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
     println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels");
     println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
+    println!(
+        "  gpu clock [MHZ] [force]  GPU clock, cap; MHZ: a sys-clk step (force: past the cap)"
+    );
+    println!("  gpu sweep [force]  gpu bench for 1 s at each step up to the cap");
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
@@ -766,9 +770,153 @@ const GPU_STAGES: [&str; 11] = [
     "ready",
 ];
 
+/// FFMA throughput of the GM20B per clock cycle: 2 SMs of 128 lanes.
+const GPU_FLOPS_PER_CYCLE: u64 = 2 * 128 * 2;
+
+/// kHz as "N.N MHz".
+fn mhz(khz: u64) -> String {
+    alloc::format!("{}.{} MHz", khz / 1000, khz % 1000 / 100)
+}
+
+/// A `CLOCK` request: `khz` (0: report) with `force`.
+fn gpu_clock_call(h: u32, khz: u64, force: bool) -> Result<Msg, i64> {
+    let flags = if force { gpu::CLOCK_FORCE } else { 0 };
+    ipc::call(h, &Msg::from_words(gpu::CLOCK, &[khz, flags])).and_then(ipc::checked)
+}
+
+fn gpu_clock_error(e: i64) {
+    match -e {
+        err::ERANGE => println!("gpu clock: not a step, or above the cap (add force)"),
+        err::ENODEV => println!("gpu clock: 76.8 MHz only on this console"),
+        err::EIO => println!("gpu clock: measured off its step, back to 76.8 MHz"),
+        _ => println!("gpu clock: {}", err::name(e)),
+    }
+    fail(e);
+}
+
+/// `gpu clock [MHZ] [force]`: the step set, its rail, the measured clock
+/// and the power source's cap; MHZ as sys-clk writes it (76, 153, ... 921).
+fn gpu_clock(argv: &[&str]) {
+    let force = argv.last() == Some(&"force");
+    let khz = match argv
+        .get(2)
+        .filter(|a| **a != "force")
+        .map(|a| a.parse::<u64>())
+    {
+        None => Some(0),
+        Some(Ok(m)) => gpu::STEPS_KHZ.iter().copied().find(|k| k / 1000 == m),
+        Some(Err(_)) => None,
+    };
+    let Some(khz) = khz else {
+        print!("gpu clock: steps (MHz):");
+        for k in gpu::STEPS_KHZ {
+            print!(" {}", k / 1000);
+        }
+        println!();
+        fail(-err::EINVAL);
+        return;
+    };
+    let Some(h) = service("gpu") else { return };
+    match gpu_clock_call(h, khz, force) {
+        Ok(m) => {
+            let (step, uv, cap, supply, measured, ck) =
+                (m.mr[0], m.mr[1], m.mr[2], m.mr[3], m.mr[4], m.mr[5]);
+            print!("gpu clock: {}", mhz(step));
+            match uv {
+                0 => print!(" (GPU off: set at power-up)"),
+                u => print!(", rail {} mV", u / 1000),
+            }
+            if measured != 0 {
+                print!(", measured {}", mhz(measured));
+            }
+            let source = match supply {
+                power::SUPPLY_BATTERY => "battery",
+                power::SUPPLY_EXTERNAL => "external power",
+                _ => "charger unreadable",
+            };
+            if ck & gpu::CK_FORCED != 0 {
+                println!("; no cap (force), on {}", source);
+            } else {
+                println!("; cap {} on {}", mhz(cap), source);
+            }
+            if ck & gpu::CK_HOT != 0 {
+                println!("gpu clock: back to the lowest step, the SoC reached 80 C");
+            }
+            if ck & gpu::CK_CAPPED != 0 {
+                println!("gpu clock: lowered to the cap, the power source changed");
+            }
+        }
+        Err(e) => gpu_clock_error(e),
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `gpu sweep [force]`: `gpu bench` for 1 s at each step up to the cap
+/// (all with force), then back to the step set before.
+fn gpu_sweep(argv: &[&str]) {
+    let force = argv.get(2) == Some(&"force");
+    let Some(h) = service("gpu") else { return };
+    let before = match gpu_clock_call(h, 0, false) {
+        Ok(m) => m,
+        Err(e) => {
+            gpu_clock_error(e);
+            let _ = sys::handle_close(h);
+            return;
+        }
+    };
+    let top = if force {
+        *gpu::STEPS_KHZ.last().unwrap()
+    } else {
+        before.mr[2]
+    };
+    println!("gpu sweep: 1 s of FFMA per step, up to {}", mhz(top));
+    println!("     MHz     mV  measured  GFLOP/s  of peak");
+    for khz in gpu::STEPS_KHZ.iter().copied().filter(|&k| k <= top) {
+        let m = match gpu_clock_call(h, khz, force) {
+            Ok(m) => m,
+            Err(e) => {
+                gpu_clock_error(e);
+                break;
+            }
+        };
+        let b = match ipc::call(h, &Msg::from_words(gpu::BENCH, &[1000])).and_then(ipc::checked) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("gpu sweep: bench at {}: {}", mhz(khz), err::name(e));
+                fail(e);
+                break;
+            }
+        };
+        let mflops = b.mr[0] * 1000 / b.mr[1].max(1);
+        let peak = GPU_FLOPS_PER_CYCLE * khz / 1000;
+        println!(
+            "  {:>6}  {:>5}  {:>8}  {:>4}.{:02}  {:>5}.{}%",
+            alloc::format!("{}.{}", khz / 1000, khz % 1000 / 100),
+            m.mr[1] / 1000,
+            alloc::format!("{}.{}", m.mr[4] / 1000, m.mr[4] % 1000 / 100),
+            mflops / 1000,
+            mflops % 1000 / 10,
+            mflops * 100 / peak.max(1),
+            mflops * 1000 / peak.max(1) % 10
+        );
+    }
+    let was_forced = before.mr[5] & gpu::CK_FORCED != 0;
+    match gpu_clock_call(h, before.mr[0], was_forced) {
+        Ok(_) => println!("gpu sweep: back to {}", mhz(before.mr[0])),
+        Err(e) => gpu_clock_error(e),
+    }
+    let _ = sys::handle_close(h);
+}
+
 /// `gpu`: state, clock, rail and chip; `gpu on|off`; `gpu test`: the
-/// 2D and compute self-test; `gpu bench [MS]`: FFMA throughput.
+/// 2D and compute self-test; `gpu bench [MS]`: FFMA throughput;
+/// `gpu clock`, `gpu sweep`: sys-clk's steps.
 fn gpu_cmd(argv: &[&str]) {
+    match argv.get(1).copied() {
+        Some("clock") => return gpu_clock(argv),
+        Some("sweep") => return gpu_sweep(argv),
+        _ => {}
+    }
     let req = match (argv.get(1).copied(), argv.get(2).map(|s| s.parse::<u64>())) {
         (None, _) => Msg::new(gpu::STATUS, 0, 0),
         (Some("on"), None) => Msg::from_words(gpu::POWER, &[1]),
@@ -779,7 +927,7 @@ fn gpu_cmd(argv: &[&str]) {
             Msg::from_words(gpu::BENCH, &[ms])
         }
         _ => {
-            println!("usage: gpu [on|off|test|bench [MS]]");
+            println!("usage: gpu [on|off|test|bench [MS]|clock [MHZ] [force]|sweep [force]]");
             fail(-err::EINVAL);
             return;
         }
