@@ -114,6 +114,7 @@ pub enum Kernel {
     Copy = 1,
     Saxpy = 2,
     Burn = 3,
+    Clock = 4,
 }
 
 /// Kernel code and the per-launch argument page (constant buffer 0,
@@ -121,7 +122,7 @@ pub enum Kernel {
 pub struct Compute {
     _code: Dma,
     code_va: u64,
-    offsets: [u32; 4],
+    offsets: [u32; 5],
     args: Dma,
     args_va: u64,
 }
@@ -135,9 +136,10 @@ impl Compute {
             kernels::copy(),
             kernels::saxpy(),
             kernels::burn(),
+            kernels::clock(),
         ];
         let mut words: Vec<u64> = Vec::new();
-        let mut offsets = [0u32; 4];
+        let mut offsets = [0u32; 5];
         for (k, prog) in programs.iter().enumerate() {
             offsets[k] = (words.len() * 8) as u32;
             words.extend_from_slice(prog);

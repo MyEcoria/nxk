@@ -2,8 +2,9 @@
 //!
 //! Rail: on the Erista a MAX77621 at 0x1C on I2C5, its EN pin driven by
 //! the MAX77620's GPIO6 (hekate bdk/power/max7762x.c: the same part and
-//! sequence as the CPU rail). Clock: the GPCPLL in noise-aware mode at
-//! 76.8 MHz, as nouveau's gm20b clock code does for speedo ID 1 and up.
+//! sequence as the CPU rail). Clock: the GPCPLL in noise-aware mode,
+//! 76.8 MHz at power-up then sys-clk's steps, as nouveau's gm20b clock
+//! code does for speedo ID 1 and up.
 
 use libnx::abi::err::{EIO, ENODEV};
 use libnx::drv::Mmio;
@@ -87,6 +88,26 @@ pub fn rail_on(i2c: &I2c, uv: u32) -> Result<()> {
     io(i2c.write_reg(5, MAX77621_GPU, VOUT, VOUT_ENABLE | code))?;
     time::sleep_ms(1);
     Ok(())
+}
+
+/// Rail moved to `uv` while on (hekate `max7762x_regulator_set_voltage`):
+/// VOUT, VOUT_DVS, 1 ms for the 12.5 mV/µs ramp, checked by reading back.
+pub fn rail_set(i2c: &I2c, uv: u32) -> Result<()> {
+    if uv > pll::MAX_UV {
+        return Err((EIO, "GPU rail above its maximum"));
+    }
+    let code = pll::rail_code(uv);
+    let v = i2c
+        .read_reg(5, MAX77621_GPU, VOUT)
+        .map_err(|e| (-e, "GPU regulator"))?;
+    let v = (v & VOUT_ENABLE) | code;
+    io(i2c.write_reg(5, MAX77621_GPU, VOUT, v))?;
+    io(i2c.write_reg(5, MAX77621_GPU, VOUT_DVS, VOUT_ENABLE | v))?;
+    time::sleep_ms(1);
+    match rail_uv(i2c) {
+        u if u == pll::rail_step(code) => Ok(()),
+        _ => Err((EIO, "GPU rail did not take the voltage")),
+    }
 }
 
 /// Rail off, EN pin low (hekate `_ccplex_disable_power`).
@@ -212,6 +233,71 @@ pub fn clock(r: &Regs, c: &Chip, uv: u32) -> Result<Option<Clock>> {
         cal,
         d,
     }))
+}
+
+impl Clock {
+    /// `khz` with the rail at `uv` (`gm20b_clk_prog` inside the voltage
+    /// steps `nvkm_cstate_prog` takes around it): rail up first, a PLL
+    /// below both clocks while the detector moves to the new voltage,
+    /// the new PLL, rail down last. The GPU must be idle.
+    pub fn set(&mut self, r: &Regs, i2c: &I2c, khz: u32, uv: u32, safe_fmax: u32) -> Result<()> {
+        let new = pll::calc(khz);
+        let (old_uv, uv) = (self.uv, uv as i32);
+        if uv > old_uv {
+            rail_set(i2c, uv as u32)?;
+        }
+        if uv != old_uv {
+            if self.khz > safe_fmax {
+                let base = if uv > old_uv { self.mnp } else { new };
+                let safe = pll::safe_pll(base, safe_fmax);
+                program_mnp_slide(r, safe, self.uv, self.cal, self.d)?;
+                self.mnp = safe;
+                self.khz = safe.khz();
+            }
+            let d = pll::det_coeff(uv, self.cal);
+            program_coeff(r, 0);
+            program_ext_cal(r, d.ext_cal);
+            program_coeff(r, d.coeff);
+            program_detection(r, d);
+            self.uv = uv;
+            self.d = d;
+        }
+        program_mnp_slide(r, new, self.uv, self.cal, self.d)?;
+        self.mnp = new;
+        self.khz = new.khz();
+        if uv < old_uv {
+            rail_set(i2c, uv as u32)?;
+        }
+        Ok(())
+    }
+}
+
+/// A slide when M and PL stay; otherwise down to NDIV_LO, reprogrammed
+/// there and up (`gm20b_pllg_program_mnp_slide`).
+fn program_mnp_slide(r: &Regs, p: Mnp, uv: i32, cal: Calib, d: pll::Dvfs) -> Result<()> {
+    if r.rd(CFG) & CFG_ENABLE != 0 {
+        let cur = Mnp::from_coeff(r.rd(COEFF));
+        if p.m == cur.m && p.pl == cur.pl {
+            return slide(r, p.n, uv, cal, d);
+        }
+        slide(r, cur.n_lo(), uv, cal, d)?;
+    }
+    program(r, Mnp { n: p.n_lo(), ..p }, uv, cal, d)?;
+    slide(r, p.n, uv, cal, d)
+}
+
+/// `gm20b_dvfs_program_dfs_detection`: coefficient and maximum
+/// detection, then the calibration.
+fn program_detection(r: &Regs, d: pll::Dvfs) {
+    r.mask(BCAST_DVFS2, 0, DFS_EXT_STROBE);
+    r.mask(
+        DVFS0,
+        0x7F | 0x7F << 8,
+        d.coeff | (d.det_max as u32 & 0x7F) << 8,
+    );
+    time::sleep_us(1);
+    r.mask(BCAST_DVFS2, DFS_EXT_STROBE, 0);
+    program_ext_cal(r, d.ext_cal);
 }
 
 /// `gm20b_dvfs_program_coeff`.

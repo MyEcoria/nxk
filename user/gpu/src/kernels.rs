@@ -95,6 +95,28 @@ pub fn saxpy() -> Vec<u64> {
     a.finish()
 }
 
+/// Thread 0 only: y[0] = SM cycle counter, a countdown of `CB_LOOPS`
+/// steps, y[1] = the counter again. Its cycles against the CPU's clock
+/// measure the GPC clock.
+pub fn clock() -> Vec<u64> {
+    let mut a = Asm::new();
+    index(&mut a);
+    address(&mut a, 6, CB_Y);
+    a.emit(iadd32i(8, 6, 4), alu());
+    a.emit(iadd32i(9, 7, 0), alu());
+    a.emit(mov_c(10, CB_LOOPS), alu());
+    a.emit(s2r(3, SR_CLOCKLO), sets(SB_X));
+    a.emit(stg(6, 3), Sched::stall(1).wait(1 << SB_X));
+    let top = a.label();
+    a.emit(iadd32i(10, 10, -1), alu());
+    a.emit(isetp_r(0, 10, RZ, Cmp::Ne, false), Sched::stall(13));
+    a.bra(top, 0, false, Sched::stall(15));
+    a.emit(s2r(4, SR_CLOCKLO), sets(SB_Y));
+    a.emit(stg(8, 4), Sched::stall(1).wait(1 << SB_Y));
+    a.emit(exit(), Sched::stall(15));
+    a.finish()
+}
+
 /// `CB_LOOPS` times `BURN_FFMA` FFMA per thread, on eight independent
 /// chains (x = x * 0.9999 + 0.0001 stays near 1): FFMA throughput.
 pub fn burn() -> Vec<u64> {

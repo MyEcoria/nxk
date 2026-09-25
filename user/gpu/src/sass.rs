@@ -18,6 +18,8 @@ pub const PT: u8 = 7;
 /// Special registers (S2R).
 pub const SR_TID_X: u8 = 0x21;
 pub const SR_CTAID_X: u8 = 0x25;
+/// SM cycle counter, low word (Mesa nak_private.h `NAK_SV_CLOCK_LO`).
+pub const SR_CLOCKLO: u8 = 0x50;
 
 /// Scheduling of one instruction: stall cycles before the next issue,
 /// scoreboard released when its result is written (`wr`) or its sources

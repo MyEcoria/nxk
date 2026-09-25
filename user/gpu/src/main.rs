@@ -3,7 +3,9 @@
 //! at a fixed low clock, MMU and BAR1, NVIDIA's secure boot of FECS
 //! through the PMU (firmware from linux-firmware, on the SD card), GR
 //! init and golden context, one channel. Then 2D fills and copies,
-//! built-in compute kernels, a self-test and an FFMA benchmark.
+//! built-in compute kernels, a self-test and an FFMA benchmark, and
+//! sys-clk's clock steps with its power-source caps (back to the lowest
+//! step when the SoC reaches `HOT_MC`).
 
 #![no_std]
 #![no_main]
@@ -27,11 +29,12 @@ mod sass;
 
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EAGAIN, EINVAL, ENODEV};
-use libnx::abi::proto::{clk, gpu as proto};
+use libnx::abi::err::{EAGAIN, EINVAL, EIO, ENODEV, ERANGE, ETIMEDOUT};
+use libnx::abi::proto::{clk, gpu as proto, power as psu};
 use libnx::drv::{self, Mmio};
 use libnx::i2c::I2c;
-use libnx::ipc::{self, Msg};
+use libnx::ipc::{self, Msg, Received};
+use libnx::ns::Service;
 use libnx::{fs, println, sys, time};
 
 use engine::{Compute, Kernel, Surface};
@@ -55,6 +58,12 @@ const FIRST_VA: u64 = fifo::BAR1_SIZE;
 const DEFAULT_UV: u32 = 950_000 + pll::MARGIN_UV;
 const MAX_SURFACES: usize = 16;
 const BATCH_TIMEOUT_US: u64 = 2_000_000;
+/// SoC temperature and power source, checked this often while above the
+/// lowest step.
+const CHECK_NS: u64 = 2_000_000_000;
+/// Farthest a measured clock may be from its step (1/20: 5%).
+const MEASURE_TOLERANCE: u32 = 20;
+static POWER: Service = Service::optional("power");
 
 /// Everything that exists while the GPU is on.
 struct Dev {
@@ -83,6 +92,13 @@ struct Gpu {
     clock: Option<power::Clock>,
     boot0: u32,
     dev: Option<Dev>,
+    /// Step asked for (kHz), kept across power cycles.
+    target: u32,
+    forced: bool,
+    /// Clock measured after the last change (kHz, 0: not measured).
+    measured: u32,
+    /// `CK_*` bits.
+    ck: u64,
 }
 
 fn read(name: &str) -> Result<Vec<u8>> {
@@ -124,6 +140,14 @@ impl Gpu {
                 self.state = proto::ON;
                 self.stage = proto::STAGE_READY;
                 println!("[gpu] ready in {} ms", (time::now_ns() - t0) / 1_000_000);
+                // Up at the lowest step, then the one asked for.
+                let (cap, _) = self.cap();
+                if !self.forced && self.target > cap {
+                    self.target = cap;
+                }
+                if self.target != pll::GPC_KHZ {
+                    let _ = self.change(self.target);
+                }
             }
             Err((e, what)) => {
                 drv::report(
@@ -159,7 +183,7 @@ impl Gpu {
             self.chip = power::chip(self.fuse.as_ref());
         }
         self.rail = match self.chip.speedo_id {
-            Some(id) => pll::rail_uv(self.chip.speedo, id),
+            Some(id) => pll::rail_uv(pll::GPC_KHZ, self.chip.speedo, id).unwrap_or(DEFAULT_UV),
             None => pll::rail_step(pll::rail_code(DEFAULT_UV)),
         };
         power::rail_on(&self.i2c, self.rail)?;
@@ -278,7 +302,7 @@ impl Gpu {
         chan.schedule(&r)?;
         let mut p = Push::default();
         compute.setup(&mut p);
-        chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US)?;
+        chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US, false)?;
         self.dev = Some(Dev {
             vm,
             _bar1_inst: bar1_inst,
@@ -330,9 +354,13 @@ impl Gpu {
     /// Run a batch and wait for it. A GPU that does not finish is reset
     /// (powered down): nothing keeps running on it.
     fn run(&mut self, p: Push, timeout_us: u64) -> core::result::Result<u64, i64> {
+        self.run_with(p, timeout_us, false)
+    }
+
+    fn run_with(&mut self, p: Push, timeout_us: u64, spin: bool) -> core::result::Result<u64, i64> {
         let d = self.dev.as_mut().ok_or(-ENODEV)?;
         let t0 = time::now_ns();
-        if let Err((e, what)) = d.chan.run(&self.regs, &self.bar1, p, timeout_us) {
+        if let Err((e, what)) = d.chan.run(&self.regs, &self.bar1, p, timeout_us, spin) {
             drv::report("gpu", &alloc::format!("{}: powering the GPU down", what));
             self.power_down();
             self.state = proto::FAILED;
@@ -341,6 +369,176 @@ impl Gpu {
             return Err(-e);
         }
         Ok(time::now_ns() - t0)
+    }
+
+    /// Cap of the power source (sys-clk's Erista caps) and the source;
+    /// an unreadable charger counts as the battery.
+    fn cap(&self) -> (u32, u64) {
+        match POWER.call(&Msg::new(psu::SUPPLY, 0, 0)) {
+            Ok(m) if m.mr[0] == psu::SUPPLY_EXTERNAL => {
+                (proto::CAP_EXTERNAL_KHZ as u32, psu::SUPPLY_EXTERNAL)
+            }
+            Ok(m) => (proto::CAP_BATTERY_KHZ as u32, m.mr[0]),
+            Err(_) => (proto::CAP_BATTERY_KHZ as u32, proto::NO_SUPPLY),
+        }
+    }
+
+    /// `CLOCK`: `khz` a step within the cap unless `force`.
+    fn set_clock(&mut self, khz: u32, force: bool) -> core::result::Result<(), i64> {
+        if !proto::STEPS_KHZ.contains(&(khz as u64)) {
+            return Err(-ERANGE);
+        }
+        if self.chip.speedo_id.is_none() && libnx::clk::ready(clk::FUSE) {
+            self.chip = power::chip(self.fuse.as_ref());
+        }
+        let Some(id) = self.chip.speedo_id else {
+            return if khz == pll::GPC_KHZ {
+                Ok(())
+            } else {
+                Err(-ENODEV)
+            };
+        };
+        pll::rail_uv(khz, self.chip.speedo, id).ok_or(-ERANGE)?;
+        let (cap, _) = self.cap();
+        if khz > cap && !force {
+            return Err(-ERANGE);
+        }
+        self.target = khz;
+        self.forced = force;
+        self.ck = if force { proto::CK_FORCED } else { 0 };
+        if self.state == proto::ON {
+            self.change(khz)?;
+        }
+        Ok(())
+    }
+
+    /// The running GPU to `khz`, then measured: off by more than 5%, back
+    /// to the lowest step. A change that fails midway powers it down.
+    fn change(&mut self, khz: u32) -> core::result::Result<(), i64> {
+        let Some(id) = self.chip.speedo_id else {
+            return Ok(());
+        };
+        let speedo = self.chip.speedo;
+        let uv = pll::rail_uv(khz, speedo, id).ok_or(-ERANGE)?;
+        let safe = pll::safe_fmax_khz(speedo, id);
+        let Some(c) = self.clock.as_mut() else {
+            return Err(-ENODEV);
+        };
+        let from = c.khz;
+        if let Err((e, what)) = c.set(&self.regs, &self.i2c, khz, uv, safe) {
+            drv::report("gpu", &alloc::format!("{}: powering the GPU down", what));
+            self.power_down();
+            self.state = proto::FAILED;
+            self.stage = proto::STAGE_READY;
+            self.err = -e;
+            return Err(-e);
+        }
+        self.rail = uv;
+        let m = self.measure(khz)?;
+        self.measured = m;
+        println!(
+            "[gpu] GPU {} -> {} kHz at {} mV, measured {} kHz",
+            from,
+            khz,
+            uv / 1000,
+            m
+        );
+        if m != 0 && m.abs_diff(khz) * MEASURE_TOLERANCE > khz && khz != pll::GPC_KHZ {
+            println!("[gpu] clock off its step: back to {} kHz", pll::GPC_KHZ);
+            self.target = pll::GPC_KHZ;
+            self.change(pll::GPC_KHZ)?;
+            return Err(-EIO);
+        }
+        Ok(())
+    }
+
+    /// GPC clock from thread 0's SM cycles over two countdowns, about
+    /// 10 and 20 ms at `khz`, against the CPU's time watching their
+    /// fences without sleeping: launch costs cancel. 0 if nothing ran.
+    fn measure(&mut self, khz: u32) -> core::result::Result<u32, i64> {
+        let e = |(e, _): (i64, &str)| -e;
+        let regs = self.regs;
+        let d = self.dev.as_mut().ok_or(-ENODEV)?;
+        let y = Dma::new(4096).map_err(e)?;
+        let yv = d.vm.map(&y, false).map_err(e)?;
+        mmu::invalidate(&regs, &d.vm).map_err(e)?;
+        // A countdown step takes 34 cycles (6 + 13 + 15 stalls).
+        let loops = (khz / 34 * 10).max(1000);
+        let mut runs = [(0u64, 0u64); 2];
+        for (k, run) in runs.iter_mut().enumerate() {
+            let d = self.dev.as_mut().ok_or(-ENODEV)?;
+            let mut p = Push::default();
+            let n = loops << k;
+            d.compute
+                .dispatch(&mut p, Kernel::Clock, &engine::args(0, yv, 1, 0, n), 1);
+            let ns = self.run_with(p, BATCH_TIMEOUT_US, true)?;
+            *run = (y.r32(4).wrapping_sub(y.r32(0)) as u64, ns);
+        }
+        let d = self.dev.as_mut().ok_or(-ENODEV)?;
+        let _ = d.vm.unmap(yv, y.len() as u64);
+        let _ = mmu::invalidate(&regs, &d.vm);
+        let [(c1, t1), (c2, t2)] = runs;
+        if c2 <= c1 || t2 <= t1 {
+            return Ok(0);
+        }
+        Ok(((c2 - c1) * 1_000_000 / (t2 - t1)) as u32)
+    }
+
+    /// Above the lowest step: back to it at `HOT_MC`, down to the cap if
+    /// the power source changed (unless forced).
+    fn check(&mut self) {
+        if self.state != proto::ON || self.target == pll::GPC_KHZ {
+            return;
+        }
+        if let Ok(m) = POWER.call(&Msg::new(psu::TEMPERATURE, 0, 0)) {
+            let t = m.mr[1] as i64;
+            if t >= proto::HOT_MC {
+                println!(
+                    "[gpu] SoC at {}.{} C: back to {} kHz",
+                    t / 1000,
+                    t % 1000 / 100,
+                    pll::GPC_KHZ
+                );
+                self.target = pll::GPC_KHZ;
+                self.ck |= proto::CK_HOT;
+                let _ = self.change(pll::GPC_KHZ);
+                return;
+            }
+        }
+        let (cap, supply) = self.cap();
+        if !self.forced && self.target > cap {
+            println!(
+                "[gpu] power source {}: down to its cap, {} kHz",
+                if supply == psu::SUPPLY_EXTERNAL {
+                    "external"
+                } else {
+                    "battery"
+                },
+                cap
+            );
+            self.target = cap;
+            self.ck |= proto::CK_CAPPED;
+            let _ = self.change(cap);
+        }
+    }
+
+    fn clock_status(&self) -> Msg {
+        let (cap, supply) = self.cap();
+        Msg::from_words(
+            0,
+            &[
+                self.target as u64,
+                power::rail_uv(&self.i2c) as u64,
+                if self.forced {
+                    *proto::STEPS_KHZ.last().unwrap()
+                } else {
+                    cap as u64
+                },
+                supply,
+                self.measured as u64,
+                self.ck,
+            ],
+        )
     }
 }
 
@@ -661,6 +859,10 @@ fn main() -> i32 {
         clock: None,
         boot0: 0,
         dev: None,
+        target: pll::GPC_KHZ,
+        forced: false,
+        measured: 0,
+        ck: 0,
     };
     // Left on by an instance replaced in place (`usbterm.py --reload`):
     // clamped, reset, stopped and its rail off, like power-down.
@@ -671,52 +873,78 @@ fn main() -> i32 {
     }
     let ep = drv::publish("gpu").expect("gpu: publish");
     println!("[gpu] GPU service ready (off)");
-    drv::serve(ep, |rx| {
-        let m = &rx.msg;
-        Some(match m.label() {
-            proto::STATUS => g.status(),
-            proto::POWER => {
-                match m.mr[0] {
-                    0 => {
-                        if g.state != proto::OFF {
-                            g.power_down();
-                        }
-                        g.err = 0;
+    let mut next = time::now_ns() + CHECK_NS;
+    loop {
+        let wait = next.saturating_sub(time::now_ns()).max(1);
+        match ipc::recv_timeout(ep, wait) {
+            Ok(rx) => {
+                let _ = ipc::reply(&handle(&mut g, &rx));
+            }
+            Err(e) if e != -ETIMEDOUT => time::sleep_ms(10),
+            Err(_) => {}
+        }
+        if time::now_ns() >= next {
+            g.check();
+            next = time::now_ns() + CHECK_NS;
+        }
+    }
+}
+
+fn handle(g: &mut Gpu, rx: &Received) -> Msg {
+    let m = &rx.msg;
+    match m.label() {
+        proto::STATUS => g.status(),
+        proto::POWER => {
+            match m.mr[0] {
+                0 => {
+                    if g.state != proto::OFF {
+                        g.power_down();
                     }
-                    _ => {
-                        let _ = g.power_on();
-                    }
+                    g.err = 0;
                 }
-                g.status()
+                _ => {
+                    let _ = g.power_on();
+                }
             }
-            proto::ATTACH if m.handles() == 1 => reply(attach(&mut g, m)),
-            proto::DETACH => {
-                let regs = g.regs;
-                reply(match g.dev.as_mut() {
-                    Some(d) => match d.surfaces.get_mut(m.mr[0] as usize).and_then(|s| s.take()) {
-                        Some((s, h)) => {
-                            let _ = d.vm.unmap(s.va, s.bytes());
-                            let _ = mmu::invalidate(&regs, &d.vm);
-                            let _ = sys::handle_close(h);
-                            Ok(0)
-                        }
-                        None => Err(-EINVAL),
-                    },
+            g.status()
+        }
+        proto::ATTACH if m.handles() == 1 => reply(attach(g, m)),
+        proto::DETACH => {
+            let regs = g.regs;
+            reply(match g.dev.as_mut() {
+                Some(d) => match d.surfaces.get_mut(m.mr[0] as usize).and_then(|s| s.take()) {
+                    Some((s, h)) => {
+                        let _ = d.vm.unmap(s.va, s.bytes());
+                        let _ = mmu::invalidate(&regs, &d.vm);
+                        let _ = sys::handle_close(h);
+                        Ok(0)
+                    }
                     None => Err(-EINVAL),
-                })
+                },
+                None => Err(-EINVAL),
+            })
+        }
+        proto::FILL => reply(fill(g, m)),
+        proto::COPY => reply(copy(g, m)),
+        proto::COMPUTE => reply(compute(g, m)),
+        proto::TEST => match test(g) {
+            Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
+            Err(e) => Msg::error(e),
+        },
+        proto::BENCH => match bench(g, m.mr[0].clamp(1, 10_000)) {
+            Ok((flops, ns)) => Msg::from_words(0, &[flops, ns]),
+            Err(e) => Msg::error(e),
+        },
+        proto::CLOCK => {
+            let r = match m.mr[0] {
+                0 => Ok(()),
+                k => g.set_clock(k as u32, m.mr[1] & proto::CLOCK_FORCE != 0),
+            };
+            match r {
+                Ok(()) => g.clock_status(),
+                Err(e) => Msg::error(e),
             }
-            proto::FILL => reply(fill(&mut g, m)),
-            proto::COPY => reply(copy(&mut g, m)),
-            proto::COMPUTE => reply(compute(&mut g, m)),
-            proto::TEST => match test(&mut g) {
-                Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
-                Err(e) => Msg::error(e),
-            },
-            proto::BENCH => match bench(&mut g, m.mr[0].clamp(1, 10_000)) {
-                Ok((flops, ns)) => Msg::from_words(0, &[flops, ns]),
-                Err(e) => Msg::error(e),
-            },
-            _ => Msg::error(-EINVAL),
-        })
-    })
+        }
+        _ => Msg::error(-EINVAL),
+    }
 }

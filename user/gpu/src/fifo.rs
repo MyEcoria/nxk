@@ -171,8 +171,16 @@ impl Chan {
         r.wr(c, 0);
     }
 
-    /// Run `p` and a fence behind it; wait up to `timeout_us`.
-    pub fn run(&mut self, r: &Regs, bar1: &Mmio, mut p: Push, timeout_us: u64) -> Result<()> {
+    /// Run `p` and a fence behind it; wait up to `timeout_us`. `spin`:
+    /// watch the fence without sleeping, to time the batch closely.
+    pub fn run(
+        &mut self,
+        r: &Regs,
+        bar1: &Mmio,
+        mut p: Push,
+        timeout_us: u64,
+        spin: bool,
+    ) -> Result<()> {
         self.seq = self.seq.wrapping_add(1);
         // Idle channel first, then the graphics engine's semaphore
         // (SET_REPORT_SEMAPHORE_A-D, release, one word, flushed).
@@ -207,7 +215,21 @@ impl Chan {
         let t0 = time::now_ns();
         let seq = self.seq;
         let sem = &self.sem;
-        if !time::poll(timeout_us, || sem.r32(0) == seq) {
+        let done = if spin {
+            let end = t0 + timeout_us * 1000;
+            loop {
+                if sem.r32(0) == seq {
+                    break true;
+                }
+                if time::now_ns() > end {
+                    break sem.r32(0) == seq;
+                }
+                core::hint::spin_loop();
+            }
+        } else {
+            time::poll(timeout_us, || sem.r32(0) == seq)
+        };
+        if !done {
             // Engine status, then MC, FIFO, PBDMA 0 and GR interrupts.
             println!(
                 "[gpu] batch {} not done after {} ms: GP_GET {} PUT {}, semaphore {}, engine {:#x}, interrupts MC {:#x} FIFO {:#x} PBDMA {:#x} GR {:#x}",

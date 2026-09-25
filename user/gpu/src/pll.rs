@@ -18,7 +18,7 @@ const MAX_PL: u32 = 31;
 /// NA mode runs at the highest update rate: M fixed to REF / MAX_U.
 const NA_M: u32 = REF_KHZ.div_ceil(MAX_U);
 
-/// Only clock this driver sets: nouveau's lowest GM20B pstate.
+/// Power-up clock: nouveau's lowest GM20B pstate, sys-clk's first step.
 pub const GPC_KHZ: u32 = 76_800;
 
 /// PLL coefficients: VCO = REF * N / M, GPC clock = VCO / PL / 2.
@@ -204,18 +204,35 @@ pub fn gpu_speedo_id(sku: u32) -> Option<usize> {
     (sku == 0x83).then_some(3)
 }
 
-/// `gm20b_na_cvb_coef` at 76.8 MHz and `speedo_to_vmin`.
-const NA_CVB: [i64; 6] = [814_294, 8_144, -940, 808, -21_583, 226];
+/// `gm20b_na_cvb_coef` up to 921.6 MHz (sys-clk's steps): c0 per clock,
+/// c1-c5 shared. And `speedo_to_vmin`.
+const NA_CVB_C0: [(u32, i64); 12] = [
+    (76_800, 814_294),
+    (153_600, 856_185),
+    (230_400, 898_077),
+    (307_200, 939_968),
+    (384_000, 981_860),
+    (460_800, 1_023_751),
+    (537_600, 1_065_642),
+    (614_400, 1_107_534),
+    (691_200, 1_149_425),
+    (768_000, 1_191_317),
+    (844_800, 1_233_208),
+    (921_600, 1_275_100),
+];
+const NA_CVB: [i64; 5] = [8_144, -940, 808, -21_583, 226];
 const SPEEDO_VMIN: [u32; 5] = [950_000, 840_000, 818_750, 840_000, 810_000];
-/// Added to NVIDIA's voltage for this clock.
+/// Added to NVIDIA's voltage for each clock.
 pub const MARGIN_UV: u32 = 25_000;
+/// Highest rail voltage nouveau asks the GPU regulator for.
+pub const MAX_UV: u32 = 1_200_000;
 /// MAX77621 VOUT code 0 and step (hekate bdk/power/max7762x.c).
 pub const RAIL_BASE_UV: u32 = 606_250;
 pub const RAIL_STEP_UV: u32 = 6_250;
 
 /// `gk20a_volt_calc_voltage`: CVB at -10 C, rounded up to the mV.
-fn cvb_uv(speedo: i32) -> u32 {
-    let [c0, c1, c2, c3, c4, c5] = NA_CVB;
+fn cvb_uv(c0: i64, speedo: i32) -> u32 {
+    let [c1, c2, c3, c4, c5] = NA_CVB;
     let s = speedo as i64;
     let t = -10;
     let mut mv = div_round_closest(c2 * s, 100);
@@ -225,11 +242,54 @@ fn cvb_uv(speedo: i32) -> u32 {
     (uv.max(0) as u32).div_ceil(1000) * 1000
 }
 
-/// Rail voltage (µV, on the regulator's grid) for `GPC_KHZ`: NVIDIA's
-/// (CVB, at least the speedo's Vmin) plus `MARGIN_UV`.
-pub fn rail_uv(speedo: i32, speedo_id: usize) -> u32 {
-    let uv = cvb_uv(speedo).max(SPEEDO_VMIN[speedo_id]) + MARGIN_UV;
-    rail_step(rail_code(uv))
+/// NVIDIA's voltage for `khz` (a step of the table): CVB, at least the
+/// speedo's Vmin (`gk20a_volt_ctor`).
+fn nvidia_uv(khz: u32, speedo: i32, speedo_id: usize) -> Option<u32> {
+    let &(_, c0) = NA_CVB_C0.iter().find(|&&(k, _)| k == khz)?;
+    Some(cvb_uv(c0, speedo).max(SPEEDO_VMIN[speedo_id]))
+}
+
+/// Rail voltage (µV, on the regulator's grid) for `khz`: NVIDIA's plus
+/// `MARGIN_UV`. `None`: not a step, or above `MAX_UV`.
+pub fn rail_uv(khz: u32, speedo: i32, speedo_id: usize) -> Option<u32> {
+    let uv = rail_step(rail_code(nvidia_uv(khz, speedo, speedo_id)? + MARGIN_UV));
+    (uv <= MAX_UV).then_some(uv)
+}
+
+/// 90% of the fastest step at the lowest voltage (`gm20b_clk_init_safe_fmax`):
+/// safe at any voltage in range with DFS coefficient 0.
+pub fn safe_fmax_khz(speedo: i32, speedo_id: usize) -> u32 {
+    let uv = |k| nvidia_uv(k, speedo, speedo_id).unwrap_or(u32::MAX);
+    let vmin = NA_CVB_C0.iter().map(|&(k, _)| uv(k)).min().unwrap_or(0);
+    let fmax = NA_CVB_C0
+        .iter()
+        .filter(|&&(k, _)| uv(k) == vmin)
+        .map(|&(k, _)| k)
+        .max()
+        .unwrap_or(GPC_KHZ);
+    fmax * (100 - 10) / 100
+}
+
+/// PLL below both clocks of a change while the detector moves to the
+/// new voltage (`gm20b_dvfs_calc_safe_pll`, in kHz throughout: nouveau
+/// divides by the reference in Hz there, always taking the VCO-min
+/// branch). Under VCO min: NDIV at the minimum, PL raised.
+pub fn safe_pll(p: Mnp, safe_fmax_khz: u32) -> Mnp {
+    let mut rate = p.khz();
+    if rate > safe_fmax_khz {
+        rate = rate * (100 - 10) / 100;
+    }
+    let rate = rate * 2;
+    let n_min = (p.m * MIN_VCO).div_ceil(REF_KHZ);
+    let mut s = Mnp {
+        n: p.m * rate / REF_KHZ,
+        ..p
+    };
+    if s.n < n_min {
+        s.pl = (n_min * REF_KHZ).div_ceil(p.m * rate);
+        s.n = n_min;
+    }
+    s
 }
 
 /// VOUT code for `uv`, rounded up to the grid.
@@ -311,12 +371,44 @@ mod tests {
     }
 
     #[test]
+    fn steps() {
+        // Every step at its exact frequency, within the PLL's ranges.
+        for &(khz, _) in NA_CVB_C0.iter() {
+            let p = calc(khz);
+            assert_eq!(p.khz(), khz, "{khz} kHz");
+            let vco = REF_KHZ * p.n / p.m;
+            assert!((MIN_VCO..=MAX_VCO).contains(&vco), "{khz} kHz: VCO {vco}");
+        }
+        // Above VCO min at PL 1: 90%, a straight NDIV slide.
+        let safe = safe_pll(calc(768_000), 483_840);
+        assert_eq!(safe, Mnp { m: 1, n: 36, pl: 1 });
+        assert!(safe.khz() <= 768_000 * 9 / 10);
+        // Under VCO min: NDIV at its minimum, PL raised, below the clock.
+        let safe = safe_pll(calc(460_800), 483_840);
+        assert_eq!((safe.n, safe.pl, safe.khz()), (34, 2, 326_400));
+        let safe = safe_pll(Mnp { m: 1, n: 34, pl: 1 }, 483_840);
+        assert_eq!((safe.n, safe.pl), (34, 2));
+        assert!(safe.khz() <= 652_800 * 9 / 10);
+    }
+
+    #[test]
     fn voltage() {
         // Speedo ID 3 (Erista): Vmin 840 mV dominates, + 25 mV, on the grid.
         for s in [1_900, 2_000, 2_100, 2_300] {
-            assert_eq!(rail_uv(s, 3), 868_750, "speedo {s}");
+            assert_eq!(rail_uv(GPC_KHZ, s, 3), Some(868_750), "speedo {s}");
         }
-        assert!(cvb_uv(2_000) < 700_000);
+        assert!(cvb_uv(NA_CVB_C0[0].1, 2_000) < 700_000);
+        // The Switch run 26's chip (speedo 2081): Vmin up to 537.6 MHz,
+        // then NVIDIA's curve, 1043 mV at 921.6 MHz.
+        let rails: [u32; 12] = [
+            868_750, 868_750, 868_750, 868_750, 868_750, 868_750, 868_750, 900_000, 943_750,
+            987_500, 1_031_250, 1_068_750,
+        ];
+        for (&(khz, _), uv) in NA_CVB_C0.iter().zip(rails) {
+            assert_eq!(rail_uv(khz, 2_081, 3), Some(uv), "{khz} kHz");
+        }
+        assert_eq!(rail_uv(998_400, 2_081, 3), None);
+        assert_eq!(safe_fmax_khz(2_081, 3), 483_840);
         assert_eq!(rail_code(868_750), 42);
         assert_eq!(gpu_speedo(3, 2_000), 2_000);
         assert_eq!(gpu_speedo(2, 2_000), (-1662 + 21640) / 10);
