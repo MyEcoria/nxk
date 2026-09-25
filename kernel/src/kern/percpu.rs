@@ -18,6 +18,7 @@ pub struct CpuStats {
     pub idle_time: u64,
     pub busy_time: u64,
     pub timer_late: u64,
+    pub empty_wakeups: u64,
 }
 
 #[repr(C, align(64))]
@@ -93,6 +94,7 @@ impl PerCpu {
                 idle_time: 0,
                 busy_time: 0,
                 timer_late: 0,
+                empty_wakeups: 0,
             },
             polling: AtomicBool::new(false),
             wake: AtomicBool::new(false),

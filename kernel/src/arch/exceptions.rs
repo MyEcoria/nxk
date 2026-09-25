@@ -69,7 +69,9 @@ extern "C" fn nxk_el0_trap(_frame: u64, kind: u64) -> ! {
                 _ => fault::user_fault(cur, esr, sysreg_read!("far_el1")),
             }
         }
-        KIND_IRQ => irq::handle(),
+        KIND_IRQ => {
+            irq::handle();
+        }
         _ => fault::user_fault(cur, sysreg_read!("esr_el1"), 0),
     }
     sched::exit_to_user()
@@ -80,7 +82,7 @@ extern "C" fn nxk_el1_trap(frame: &mut KFrame, kind: u64) {
     if kind == KIND_IRQ {
         // Idle core: an interrupt may have readied a thread.
         bkl::acquire();
-        irq::handle();
+        let device = irq::handle();
         if cfg!(feature = "trace-sched") {
             crate::kprintln!(
                 "[s{}] idle irq, work {}",
@@ -92,6 +94,9 @@ extern "C" fn nxk_el1_trap(frame: &mut KFrame, kind: u64) {
             sched::exit_to_user();
         }
         let c = percpu::this();
+        if !device {
+            c.stats.empty_wakeups += 1;
+        }
         if c.timer_dirty {
             crate::arch::timer::reprogram(c);
         }

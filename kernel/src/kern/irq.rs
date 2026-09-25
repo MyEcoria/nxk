@@ -94,9 +94,11 @@ pub fn forget_notification(notif: u16) {
     }
 }
 
-/// Handle all pending interrupts on this core.
-pub fn handle() {
+/// Handle all pending interrupts on this core; true if a device line
+/// fired.
+pub fn handle() -> bool {
     percpu::this().stats.irqs += 1;
+    let mut device = false;
     loop {
         let iar = gic::ack();
         let id = iar & 0x3FF;
@@ -109,11 +111,15 @@ pub fn handle() {
         match id {
             gic::IRQ_TIMER => timer::on_irq(),
             gic::SGI_RESCHEDULE => percpu::this().need_resched = true,
-            32.. => route(id),
+            32.. => {
+                device = true;
+                route(id);
+            }
             _ => {}
         }
         gic::eoi(iar);
     }
+    device
 }
 
 fn route(id: u32) {

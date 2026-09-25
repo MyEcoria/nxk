@@ -996,6 +996,9 @@ pub mod info {
         /// Timer interrupts past their deadline, summed: the platform's
         /// delivery latency (an emulator host can stall it).
         pub timer_late_ns: u64,
+        /// Timer or IPI interrupts that found the core idle and left it
+        /// idle: wake-ups for nothing (a periodic tick shows here).
+        pub empty_wakeups: u64,
     }
 }
 

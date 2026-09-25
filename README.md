@@ -170,7 +170,7 @@ calls take a timeout (ns; 0 = unbounded).
 | Processes | `process_spawn` (static-PIE ELF, arguments, environment), `process_wait`, `process_kill` |
 | IPC | `endpoint_create` (pipe option), `ipc_call`, `ipc_send`, `ipc_recv`, `ipc_reply`, `ipc_reply_recv`, `ipc_reply_to` |
 | Notifications, IRQ | `notify_create`, `notify_signal`, `notify_wait`, `notify_bind`, `irq_get`, `irq_bind`, `irq_ack` |
-| Inspection, debugging | `sysinfo` (processes, memory, cores with their timer-interrupt lateness), `klog_read`, `klog_bind` (kernel log, console only), `debug_attach`, `debug_regs`, `debug_mem`, `debug_threads`, `debug_stop` |
+| Inspection, debugging | `sysinfo` (processes, memory, cores with their timer-interrupt lateness and wake-ups for nothing), `klog_read`, `klog_bind` (kernel log, console only), `debug_attach`, `debug_regs`, `debug_mem`, `debug_threads`, `debug_stop` |
 
 Time is read with no system call: the kernel opens `CNTVCT_EL0` to EL0
 (like the Linux vDSO).
