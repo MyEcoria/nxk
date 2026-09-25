@@ -1,0 +1,34 @@
+diff --git a/hw/arm/tegra2/ahb/gpu/gpu.c b/hw/arm/tegra2/ahb/gpu/gpu.c
+index 2f05a5331a..cda8615fbb 100644
+--- a/hw/arm/tegra2/ahb/gpu/gpu.c
++++ b/hw/arm/tegra2/ahb/gpu/gpu.c
+@@ -517,6 +517,7 @@ static void tegra_gpu_priv_write(void *opaque, hwaddr offset,
+         else if (offset == 0x10A100 && (value & BIT(1))) {
+             s->regs[offset>>2] |= BIT(4);
+             s->regs[0x10A040>>2] = 0;
++            s->regs[0x409100>>2] |= BIT(6); // the secure loader leaves FECS light-secure (CPUCTL_ALIAS_EN)
+         }
+         else if (offset == 0x137014 && (value & BIT(30)))
+             s->regs[offset>>2] |= BIT(31);
+@@ -555,6 +556,8 @@ static void tegra_gpu_priv_write(void *opaque, hwaddr offset,
+                 s->regs[(0x409800+(1*4))>>2] = 0x1; // gr_fecs_ctxsw_mailbox(1) = gr_fecs_ctxsw_mailbox_value_pass_v
+             }
+         }
++        else if (offset == 0x404170) // FE power mode: the request completes at once
++            s->regs[offset>>2] &= ~BIT(4);
+         else if ((offset == 0x409A10 || offset == 0x409B00) && (value & 0x1F))
+             s->regs[offset>>2] &= ~0x1F;
+         else if ((s->regs[0x2254>>2] & 0x10000000)) { // fifo_bar1_base fifo_bar1_base_valid_true_f
+@@ -591,6 +594,12 @@ static void tegra_gpu_priv_reset(DeviceState *dev)
+     s->regs[0x22430>>2] = 0x1;
+     s->regs[0x22434>>2] = 0x1;
+     s->regs[0x22438>>2] = 0x1;
++
++    // GM20B's units: 1 GPC of 2 TPCs on one PPC, 1 LTC (nouveau gf100_gr_oneinit).
++    s->regs[0x409604>>2] = 0x1;
++    s->regs[0x502608>>2] = 0x2;
++    s->regs[0x500c30>>2] = 0x3;
++    s->regs[0x12006c>>2] = 0x1;
+ }
+ 
+ static const MemoryRegionOps tegra_gpu_mem_ops = {
