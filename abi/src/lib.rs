@@ -1213,6 +1213,28 @@ pub mod proto {
         /// SoC temperature forcing full speed.
         pub const HOT_MC: i64 = 60_000;
     }
+    /// CPU clock: PLLX at sys-clk's steps, the CPU rail at NVIDIA's
+    /// PLL-source voltage for the chip's speedo (Erista only).
+    pub mod cpufreq {
+        /// Reply: word 0 = CPU clock (kHz), word 1 = CPU rail (µV, 0:
+        /// unreadable), word 2 = CPU speedo (0: unknown), word 3 = `ST_*`
+        /// bits, word 4 = steps this chip runs (bit i: `STEPS_MHZ[i]`),
+        /// word 5 = step set (MHz, `BOOT`: the loader's setting).
+        pub const STATUS: u32 = 1;
+        /// word 0 = a `STEPS_MHZ` value, or `BOOT`. ERANGE: the step needs
+        /// more than the rail's maximum on this chip. Reply: as `STATUS`.
+        pub const SET: u32 = 2;
+        pub const BOOT: u64 = 0;
+        /// sys-clk's CPU steps (MHz); PLLX lands at or just below each.
+        pub const STEPS_MHZ: [u64; 12] = [
+            612, 714, 816, 918, 1020, 1122, 1224, 1326, 1428, 1581, 1683, 1785,
+        ];
+        /// Back to `BOOT`: the SoC reached `HOT_MC` above the boot clock.
+        pub const ST_HOT: u64 = 1;
+        /// Not an Erista Switch (or fuses unreadable): `BOOT` only.
+        pub const ST_UNSUPPORTED: u64 = 2;
+        pub const HOT_MC: i64 = 80_000;
+    }
     /// Block device (SD card, eMMC).
     pub mod blk {
         /// Reply: word 0 = block size, word 1 = block count.
