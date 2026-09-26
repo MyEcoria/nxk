@@ -1320,6 +1320,35 @@ pub mod proto {
         /// Set with `CLOCK_FORCE`: no cap applies.
         pub const CK_FORCED: u64 = 4;
         pub const HOT_MC: i64 = 80_000;
+        /// word 0 = instance of the page already mapped (0: none). Reply:
+        /// word 0 = this instance (`S_INSTANCE`); handle 0 = the stats
+        /// page, read-only, unless word 0 named it already.
+        pub const STATS: u32 = 11;
+        /// Stats page: `STATS_WORDS` u64 words, kept current by the
+        /// service even while a batch runs. Written under `S_SEQ`: odd
+        /// while it changes; a read is good if it saw one even value.
+        pub const S_SEQ: usize = 0;
+        /// Service start (`clock`, ns): another value is a restart.
+        pub const S_INSTANCE: usize = 1;
+        /// Time (ns) with a batch in flight since the service started,
+        /// plus now - `S_SINCE_NS` while one runs (`S_SINCE_NS` != 0).
+        pub const S_BUSY_NS: usize = 2;
+        pub const S_SINCE_NS: usize = 3;
+        /// As `STATUS` words 0 and 1: state | stage << 8, clock (kHz).
+        pub const S_STATE: usize = 4;
+        pub const S_KHZ: usize = 5;
+        /// Rail set (µV, 0: off).
+        pub const S_UV: usize = 6;
+        /// As `CLOCK` words 0 and 3-5: step set, supply, measured, `CK_*`.
+        pub const S_STEP: usize = 7;
+        pub const S_SUPPLY: usize = 8;
+        pub const S_MEASURED: usize = 9;
+        pub const S_CK: usize = 10;
+        /// The power source's cap (kHz), also with `CK_FORCED`.
+        pub const S_CAP: usize = 11;
+        /// Steps this chip runs (bit i: `STEPS_KHZ[i]`), 0: fuses unread.
+        pub const S_STEPS: usize = 12;
+        pub const STATS_WORDS: usize = 13;
 
         pub const OFF: u64 = 0;
         pub const ON: u64 = 1;
