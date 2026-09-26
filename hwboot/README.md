@@ -386,6 +386,7 @@ gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
 gpu clock 768   [gpu] GPU 76800 -> 768000 kHz at 987 mV, measured 768292 kHz
 gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
 bench full      CPU burn and GPU FFMA together, 30 s
+gpu load        gpu load: N% over 1000 ms (NNN ms busy since the service started)
 gpu off         clamps, reset, clocks and rail off
 ```
 
@@ -411,9 +412,16 @@ activity, interrupt, DISPATCH error and trapped method registers; a
 self-test kernel with a wrong result logs its first wrong word. A
 batch that never finishes prints `[gpu] batch N not done` with the
 engine status and the MC, FIFO, PBDMA and GR interrupt registers, and
-powers the GPU down too. The SYSTEM page's gpu row follows the same
-states. `./tools/usbterm.py --reload gpu` replaces the driver in place;
-the new one finds the GPU on and powers it down first.
+powers the GPU down too. The SYSTEM page's gpu clock row follows the
+same states, and its GPU row shows the share of each second with a
+batch in flight: `run bench full 30 &` then `gpu load` should give 97%
+or more, and the GPU row the same. The gpu clock row opens the GPU
+panel: a step within the cap applies at once, one past it (yellow)
+asks first, then goes with `force`; each change shows in `[gpu] GPU
+... measured` lines as with `gpu clock`. `./tools/usbterm.py --reload
+gpu` replaces the driver in place; the new one finds the GPU on and
+powers it down first, and the screen maps the new one's stats page
+within 5 s.
 
 ## Hardware runs
 
