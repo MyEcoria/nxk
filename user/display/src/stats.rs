@@ -1,12 +1,14 @@
 //! What the screen shows: kernel counters (`sysinfo`) and the services'
 //! own. A missing service shows as such, a busy one keeps its last
-//! values: a refresh never waits more than `CALL_NS` on one.
+//! values: a refresh never waits more than `CALL_NS` on one. The GPU's
+//! come from its stats page, read without asking the service.
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
 use libnx::abi::proto::{cpufreq, eth, fan, fs, gpu, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
+use libnx::seqpage::SeqPage;
 use libnx::{sys, time};
 
 /// Longest wait on a service's reply.
@@ -125,27 +127,69 @@ impl Cpu {
     }
 }
 
-/// The GPU as `gpu::STATUS` reports it.
+/// The GPU as its stats page shows it.
 #[derive(Clone, Copy)]
 pub struct Gpu {
     /// `gpu::OFF`, `ON`, `FAILED`.
     pub state: u64,
-    /// `gpu::STAGE_*` reached or failed in.
+    /// `gpu::STAGE_*` reached (powering up while `OFF`) or failed in.
     pub stage: u64,
-    /// GPC clock (kHz, 0: PLL bypassed).
+    /// GPC clock (kHz, 0: off or PLL bypassed).
     pub khz: u64,
-    /// Rail (µV).
+    /// Rail (µV, 0: off).
     pub uv: u64,
+    /// Step set (kHz), applied at power-up while off.
+    pub step: u64,
+    /// The power source's cap (kHz) and `power::SUPPLY_*`.
+    pub cap: u64,
+    pub supply: u64,
+    /// Clock measured after the last change (kHz, 0: not measured).
+    pub measured: u64,
+    /// `gpu::CK_*` bits.
+    pub ck: u64,
+    /// Steps this chip runs (bit i: `gpu::STEPS_KHZ[i]`), 0: unknown.
+    pub steps: u64,
+    /// Share of the time with a batch in flight since the last
+    /// refresh (%); none while off.
+    pub load: Option<u64>,
 }
 
-impl Gpu {
-    pub fn from_reply(m: &Msg) -> Self {
-        Self {
-            state: m.mr[0] & 0xFF,
-            stage: m.mr[0] >> 8,
-            khz: m.mr[1],
-            uv: m.mr[2],
-        }
+/// The gpu service's stats page, mapped read-only.
+struct GpuPage {
+    page: SeqPage,
+    instance: u64,
+    /// Previous sample: time and busy time (ns).
+    prev: (u64, u64),
+}
+
+impl GpuPage {
+    /// The GPU now, its load since the previous sample.
+    fn sample(&mut self) -> Option<Gpu> {
+        // Time first: a batch that starts after it adds nothing.
+        let now = time::now_ns();
+        let w = self.page.read::<{ gpu::STATS_WORDS }>()?;
+        let running = match w[gpu::S_SINCE_NS] {
+            0 => 0,
+            t => now.saturating_sub(t),
+        };
+        let busy = w[gpu::S_BUSY_NS] + running;
+        let (t0, b0) = core::mem::replace(&mut self.prev, (now, busy));
+        let state = w[gpu::S_STATE] & 0xFF;
+        let load = (state == gpu::ON)
+            .then(|| (busy.saturating_sub(b0) * 100 / now.saturating_sub(t0).max(1)).min(100));
+        Some(Gpu {
+            state,
+            stage: w[gpu::S_STATE] >> 8,
+            khz: w[gpu::S_KHZ],
+            uv: w[gpu::S_UV],
+            step: w[gpu::S_STEP],
+            cap: w[gpu::S_CAP],
+            supply: w[gpu::S_SUPPLY],
+            measured: w[gpu::S_MEASURED],
+            ck: w[gpu::S_CK],
+            steps: w[gpu::S_STEPS],
+            load,
+        })
     }
 }
 
@@ -233,8 +277,9 @@ pub struct Data {
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
-    /// Busy while it powers up or runs a batch.
+    /// From the stats page, current even while the service is busy.
     pub gpu: Seen<Gpu>,
+    gpu_page: Option<GpuPage>,
     pub wifi: Seen<Wifi>,
     /// Card: free and total bytes.
     pub disk: Seen<(u64, u64)>,
@@ -273,6 +318,7 @@ impl Data {
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
+            gpu_page: None,
             wifi: Seen::Unknown,
             disk: Seen::Unknown,
             usb: Now::Missing,
@@ -332,7 +378,7 @@ impl Data {
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
-        self.gpu.poll(&GPU, gpu::STATUS, n, force, Gpu::from_reply);
+        self.gpu_refresh(n, force);
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {
                 state: m.mr[0],
@@ -375,6 +421,47 @@ impl Data {
             Now::Missing => Now::Missing,
         };
         self.wired(n, force);
+    }
+
+    /// The GPU from its stats page, asked for with the slow sources: the
+    /// service reads the power source again then, and a new instance
+    /// (restarted) hands over a new page.
+    fn gpu_refresh(&mut self, n: u64, force: bool) {
+        if self.gpu_page.is_none() || force || n.is_multiple_of(SLOW) {
+            let have = self.gpu_page.as_ref().map_or(0, |p| p.instance);
+            match GPU.call_timeout(&Msg::from_words(gpu::STATS, &[have]), CALL_NS) {
+                Ok(m) if m.handles() == 1 => {
+                    let h = ipc::received_handle(0);
+                    match SeqPage::map(h) {
+                        Ok(page) => {
+                            // Busy since the service started, at first.
+                            let instance = m.mr[0];
+                            let prev = (instance, 0);
+                            self.gpu_page = Some(GpuPage {
+                                page,
+                                instance,
+                                prev,
+                            });
+                        }
+                        Err(_) => {
+                            let _ = sys::handle_close(h);
+                        }
+                    }
+                }
+                // Same page, or busy: the page tells anyway.
+                Ok(_) => {}
+                Err(e) if e == -ETIMEDOUT => {}
+                Err(_) => {
+                    self.gpu_page = None;
+                    if time::now_ns() > BOOT_NS {
+                        self.gpu = Seen::Missing;
+                    }
+                }
+            }
+        }
+        if let Some(g) = self.gpu_page.as_mut().and_then(GpuPage::sample) {
+            self.gpu = Seen::Value(g);
+        }
     }
 
     /// The wired link: the PC's connection over USB-C (usbcon's network
