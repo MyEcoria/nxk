@@ -17,6 +17,7 @@ use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
 use libnx::abi::proto::{cpufreq, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
+use libnx::seqpage::SeqPage;
 use libnx::{console, env, ns, print, println, process, sys, time};
 
 /// Outcome of the running command: 0, `-errno`, or a program's exit code.
@@ -234,6 +235,7 @@ fn help() {
         "  gpu clock [MHZ] [force]  GPU clock, cap; MHZ: a sys-clk step (force: past the cap)"
     );
     println!("  gpu sweep [force]  gpu bench for 1 s at each step up to the cap");
+    println!("  gpu load [MS]   share of MS milliseconds (1000) the GPU ran batches");
     println!("  services        published services");
     println!("  poweroff        power off the machine");
     println!("  reboot          reboot the machine");
@@ -851,6 +853,67 @@ fn gpu_clock(argv: &[&str]) {
     let _ = sys::handle_close(h);
 }
 
+/// `gpu load [MS]`: share of MS milliseconds (1000) with a GPU batch
+/// in flight, from the service's stats page (read while it runs one).
+fn gpu_load(argv: &[&str]) {
+    let ms = match argv.get(2).map(|a| a.parse::<u64>()) {
+        None => 1000,
+        Some(Ok(ms)) if (1..=60_000).contains(&ms) => ms,
+        _ => {
+            println!("usage: gpu load [MS], MS 1 to 60000");
+            fail(-err::EINVAL);
+            return;
+        }
+    };
+    let Some(h) = service("gpu") else { return };
+    let r = ipc::call(h, &Msg::from_words(gpu::STATS, &[0])).and_then(ipc::checked);
+    let _ = sys::handle_close(h);
+    let page = match r {
+        Ok(m) if m.handles() == 1 => {
+            let ph = ipc::received_handle(0);
+            SeqPage::map(ph).inspect_err(|_| {
+                let _ = sys::handle_close(ph);
+            })
+        }
+        Ok(_) => Err(-err::EIO),
+        Err(e) => Err(e),
+    };
+    let page = match page {
+        Ok(p) => p,
+        Err(e) => {
+            println!("gpu load: {}", err::name(e));
+            fail(e);
+            return;
+        }
+    };
+    // Time, busy time up to it (the batch in flight too), state.
+    let sample = || {
+        let now = time::now_ns();
+        page.read::<{ gpu::STATS_WORDS }>().map(|w| {
+            let running = match w[gpu::S_SINCE_NS] {
+                0 => 0,
+                t => now.saturating_sub(t),
+            };
+            (now, w[gpu::S_BUSY_NS] + running, w[gpu::S_STATE] & 0xFF)
+        })
+    };
+    let first = sample();
+    time::sleep_ms(ms);
+    let (Some((t0, b0, _)), Some((t1, b1, state))) = (first, sample()) else {
+        println!("gpu load: stats page kept changing");
+        fail(-err::EIO);
+        return;
+    };
+    let pct = (b1.saturating_sub(b0) * 100 / (t1 - t0).max(1)).min(100);
+    println!(
+        "gpu load: {}% over {} ms ({}{} ms busy since the service started)",
+        pct,
+        (t1 - t0) / 1_000_000,
+        if state == gpu::ON { "" } else { "GPU off; " },
+        b1 / 1_000_000
+    );
+}
+
 /// `gpu sweep [force]`: `gpu bench` for 1 s at each step up to the cap
 /// (all with force), then back to the step set before.
 fn gpu_sweep(argv: &[&str]) {
@@ -915,6 +978,7 @@ fn gpu_cmd(argv: &[&str]) {
     match argv.get(1).copied() {
         Some("clock") => return gpu_clock(argv),
         Some("sweep") => return gpu_sweep(argv),
+        Some("load") => return gpu_load(argv),
         _ => {}
     }
     let req = match (argv.get(1).copied(), argv.get(2).map(|s| s.parse::<u64>())) {
@@ -927,7 +991,9 @@ fn gpu_cmd(argv: &[&str]) {
             Msg::from_words(gpu::BENCH, &[ms])
         }
         _ => {
-            println!("usage: gpu [on|off|test|bench [MS]|clock [MHZ] [force]|sweep [force]]");
+            println!(
+                "usage: gpu [on|off|test|bench [MS]|clock [MHZ] [force]|sweep [force]|load [MS]]"
+            );
             fail(-err::EINVAL);
             return;
         }
