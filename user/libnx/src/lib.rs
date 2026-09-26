@@ -20,6 +20,7 @@ pub mod net;
 pub mod ns;
 pub mod process;
 pub mod rt;
+pub mod seqpage;
 pub mod sync;
 pub mod sys;
 pub mod thread;

@@ -107,7 +107,7 @@
         <button data-cmd="wifi connect nxk-test hunter22">wifi connect</button>
         <button data-cmd="ls /bin">ls /bin</button><button data-cmd="cd /nxk">cd /nxk</button>
         <button data-cmd="ls /nope">ls /nope</button><button data-cmd="date">date</button>
-        <button data-cmd="fbecho hello">fbecho hello</button>
+        <button data-cmd="fbecho hello">fbecho hello</button><button data-cmd="gpu load">gpu load</button>
       </div>
     </section>
 
@@ -127,6 +127,14 @@
         <option value="value">speedo 2100 (1224 MHz max)</option><option value="hot">SoC hot: back to boot</option>
         <option value="unsupported">boot clock only</option>
         <option value="missing">no clock control</option><option value="unknown">starting</option></select></label>
+      <label class="row"><span>GPU</span><select data-sim="gpu">
+        <option value="off">off</option><option value="idle">on, idle</option>
+        <option value="busy">on, benchmark</option><option value="hot">SoC hot: back to 76.8 MHz</option>
+        <option value="powering">powering up</option><option value="failed">failed (secure boot)</option>
+        <option value="missing">no GPU service</option><option value="unknown">starting</option></select></label>
+      <label class="row"><span>Power source</span><select data-sim="supply">
+        <option value="battery">battery (GPU cap 460.8 MHz)</option>
+        <option value="external">input power (GPU cap 768 MHz)</option></select></label>
       <label class="row"><span>USB-C console</span><select data-sim="usb">
         <option value="terminal">terminal open</option><option value="configured">connected, terminal closed</option>
         <option value="host">host seen</option><option value="waiting">waiting for a PC</option>
@@ -316,7 +324,8 @@ const sim = {
   temps: 'value', chip: 42100, pkg: 38500,
   fan: 'auto', fanManual: 60,
   cpu: 'value', cpuStep: 0, // step (MHz), 0: the loader's clock
-  gpu: 'off', gpuStage: 0, // off, on, failed (at gpuStage)
+  gpu: 'off', gpuStage: 6, // off, idle, busy, hot, powering, failed (at gpuStage), missing, unknown
+  gpuStep: 76800, gpuForced: false, gpuLoad: null, supply: 'battery',
   usb: 'terminal', usbErrors: false, usbIn: 1843, usbOut: 48213,
   eth: 'up',
   wifi: 'connected', wlanPending: false, ssid: 'nxk-test', channel: 6, signal: 52,
@@ -369,6 +378,8 @@ function tick() {
     return Math.max(0, Math.min(100, Math.round(v)));
   });
   const sum = sim.load.reduce((a, p) => a + (p ?? 0), 0);
+  sim.gpuLoad = sim.gpu === 'busy' ? 97 + Math.floor(Math.random() * 4)
+    : ['idle', 'hot'].includes(sim.gpu) ? Math.floor(Math.random() * 3) : null;
   const j = () => 0.9 + Math.random() * 0.2;
   sim.rates = { sys: Math.round((800 + sum * 55) * j()), irq: Math.round((310 + sum * 7) * j()),
                 sw: Math.round((540 + sum * 21) * j()) };
@@ -527,15 +538,21 @@ function shell(line, at) {
     }
     case 'gpu': {
       const req = args.join(' ');
-      if (!['', 'on', 'off', 'test'].includes(req) && !/^bench( \d+)?$/.test(req))
-        return fail(['usage: gpu [on|off|test|bench [MS]]'], 'EINVAL');
+      if (!['', 'on', 'off', 'test'].includes(req) && !/^(bench|load)( \d+)?$/.test(req))
+        return fail(['usage: gpu [on|off|test|bench [MS]|load [MS]]'], 'EINVAL');
+      if (req.startsWith('load')) {
+        const g = gpuNow();
+        if (!g) return fail(['service gpu missing'], 'ENOENT');
+        return ok([`gpu load: ${g.load ?? 0}% over ${args[1] ?? 1000} ms (${g.on ? '' : 'GPU off; '}41210 ms busy since the service started)`]);
+      }
       if (req === 'off') sim.gpu = 'off';
-      else if (req) sim.gpu = 'on';
+      else if (req) sim.gpu = 'idle';
       if (req === 'test') return ok(['  2D fill       ok', '  2D copy       ok', '  fill kernel   ok',
         '  copy kernel   ok', '  saxpy kernel  ok', 'gpu test: 5/5 passed, GPU time 1830 us']);
       if (req.startsWith('bench')) return ok(['gpu bench: 38.95 GFLOP/s (38950 MFLOP in 1000 ms)']);
       if (sim.gpu === 'failed') return fail([`gpu failed at stage ${sim.gpuStage} (${GPU_STAGES[sim.gpuStage]}): EIO`], 'EIO');
-      return ok([sim.gpu === 'on' ? 'gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo 2034 (ID 3)' : 'gpu off']);
+      const g = gpuNow();
+      return ok([g?.on ? `gpu on: chip 0x12b000a1, ${gmhz(g.khz)} MHz, rail ${g.mv} mV, speedo 2034 (ID 3)` : 'gpu off']);
     }
     case 'mem': {
       const m = sim.mem, free = m.total - m.kernel - m.user;
@@ -724,7 +741,8 @@ const HEAD = 64, TABS = 96, M = 16;
 const CY = HEAD + M, CH = H - HEAD - TABS - 2 * M; // content: y 80, 528 high
 const PAGES = ['HOME', 'SYSTEM', 'NETWORK', 'TERMINAL', 'LOGS'];
 const ui = {
-  view: 'proposal', page: 0, pressed: null, down: null, modal: null, fanPanel: false, cpuPanel: false, toast: null,
+  view: 'proposal', page: 0, pressed: null, down: null, modal: null, fanPanel: false, cpuPanel: false,
+  gpuPanel: false, toast: null,
   scan: null,
   logScale: 1, termScale: 1, unread: 0, off: false, blackUntil: 0, grid: 0, showZones: false,
 };
@@ -756,6 +774,21 @@ function badge(xr, y, text, color) {
   scr.frame(xr - w, y, w, 40, 2, color);
   scr.text(xr - w + 12, y + 4, text, 2, color, PANEL);
   return w;
+}
+// A processor's load (user/display ui.rs load_row): name, bar and percentage, or off.
+function loadRow(x, w, y, name, p) {
+  scr.text(x + 16, y, name, 2, p === null ? DIM : FG, PANEL);
+  if (p === null) { scr.fill(x + 104, y + 4, 400, 24, TRACK); scr.textR(x + w - 16, y, 'off', 2, DIM, PANEL); }
+  else { bar(x + 104, y + 4, 400, 24, p, loadColor(p)); scr.textR(x + w - 16, y, `${p}%`, 2, FG, PANEL); }
+}
+// A card row that opens a panel (ui.rs open_row): label, value, ">".
+function openRow(id, x, w, y, label, text, color, tap) {
+  const bg = ui.pressed === id ? PRESS : PANEL;
+  scr.fill(x + 8, y - 8, w - 16, 48, bg);
+  scr.text(x + 16, y, label, 2, DIM, bg);
+  scr.textR(x + w - 48, y, text, 2, color, bg);
+  scr.textR(x + w - 16, y, '>', 2, DIM, bg);
+  zone(id, x + 8, y - 8, w - 16, 48, tap);
 }
 function bar(x, y, w, h, pct, color) {
   const f = Math.floor(w * Math.min(pct, 100) / 100);
@@ -916,28 +949,19 @@ function system() {
   const w = (W - 3 * M) / 2, xL = M, xR = 2 * M + w;
   card(xL, CY, w, CH, 'PROCESSOR');
   scr.textR(xL + w - 16, CY + 16, `up ${hms(up())}`, 2, DIM, PANEL);
-  sim.load.forEach((p, k) => {
-    const y = CY + 64 + k * 44;
-    scr.text(xL + 16, y, `CPU${k}`, 2, p === null ? DIM : FG, PANEL);
-    if (p === null) { scr.fill(xL + 104, y + 4, 400, 24, TRACK); scr.textR(xL + w - 16, y, 'off', 2, DIM, PANEL); }
-    else { bar(xL + 104, y + 4, 400, 24, p, loadColor(p)); scr.textR(xL + w - 16, y, `${p}%`, 2, FG, PANEL); }
-  });
-  // The clock row opens the CPU panel.
+  sim.load.forEach((p, k) => loadRow(xL, w, CY + 60 + k * 40, `CPU${k}`, p));
+  loadRow(xL, w, CY + 220, 'GPU', gpuNow()?.load ?? null);
+  // The clock rows open the CPU and GPU panels.
   const c = cpuNow(), [ct, cc] = c ? cpuText(c) : [sim.cpu === 'missing' ? 'no clock control' : 'starting', DIM];
-  const cy = CY + 246, cbg = ui.pressed === 's-cpu' ? PRESS : PANEL;
-  scr.fill(xL + 8, cy - 8, w - 16, 48, cbg);
-  scr.text(xL + 16, cy, 'clock', 2, DIM, cbg);
-  scr.textR(xL + w - 48, cy, ct, 2, cc, cbg);
-  scr.textR(xL + w - 16, cy, '>', 2, DIM, cbg);
-  zone('s-cpu', xL + 8, cy - 8, w - 16, 48, () => { ui.cpuPanel = true; });
+  openRow('s-cpu', xL, w, CY + 268, 'cpu clock', ct, cc, () => { ui.cpuPanel = true; });
   const [gt, gc] = gpuText();
-  scr.text(xL + 16, CY + 294, 'gpu', 2, DIM, PANEL);
-  scr.textR(xL + w - 48, CY + 294, gt, 2, gc, PANEL);
-  scr.fill(xL + 16, CY + 334, w - 32, 2, EDGE);
-  scr.text(xL + 16, CY + 344, 'ACTIVITY', 2, ACCENT, PANEL);
+  openRow('s-gpu', xL, w, CY + 316, 'gpu clock', gt, gc, () => { ui.gpuPanel = true; });
+  scr.fill(xL + 16, CY + 364, w - 32, 2, EDGE);
+  scr.text(xL + 16, CY + 376, 'ACTIVITY', 2, ACCENT, PANEL);
+  scr.textR(xL + w - 16, CY + 376, `${sim.procs} processes`, 2, DIM, PANEL);
   const r = sim.rates;
-  [['syscalls/s', r.sys], ['interrupts/s', r.irq], ['context switches/s', r.sw], ['processes', sim.procs]]
-    .forEach(([n, v], i) => kv(xL + 16, xL + w - 16, CY + 380 + i * 36, n, `${v}`));
+  [['syscalls/s', r.sys], ['interrupts/s', r.irq], ['context switches/s', r.sw]]
+    .forEach(([n, v], i) => kv(xL + 16, xL + w - 16, CY + 412 + i * 36, n, `${v}`));
 
   const m = memInfo();
   card(xR, CY, w, 256, 'MEMORY');
@@ -957,12 +981,7 @@ function system() {
   const [ft, fc] = f ? [`${f.mode[0]}: ${f.pct ? `${f.pct}%, ${f.rpm} rpm` : 'off'}`, f.mode[1]]
     : [sim.fan === 'missing' ? 'no fan control' : 'starting', DIM];
   // The fan row opens the FAN panel.
-  const fy = py + 136, fbg = ui.pressed === 's-fan' ? PRESS : PANEL;
-  scr.fill(xR + 8, fy - 8, w - 16, 48, fbg);
-  scr.text(xR + 16, fy, 'fan', 2, DIM, fbg);
-  scr.textR(xR + w - 48, fy, ft, 2, fc, fbg);
-  scr.textR(xR + w - 16, fy, '>', 2, DIM, fbg);
-  zone('s-fan', xR + 8, fy - 8, w - 16, 48, () => { ui.fanPanel = true; });
+  openRow('s-fan', xR, w, py + 136, 'fan', ft, fc, () => { ui.fanPanel = true; });
   const bw = (w - 48) / 2, bh = 64, by = py + 256 - 16 - bh;
   button('reboot', xR + 16, by, bw, bh, 'REBOOT', WARN, () => ask({
     title: 'Reboot the Switch?', ok: 'REBOOT', tone: WARN,
@@ -1173,14 +1192,82 @@ function fanPanel() {
   const cw = 240;
   button('f-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.fanPanel = false; });
 }
-// GPU row (user/display ui.rs gpu_text): off, clock and rail, or the stage
-// power-up failed in.
+// GPU row (user/display ui.rs gpu_text): off, powering up, clock and rail
+// (warning color when hot or forced past the cap), or the stage power-up
+// failed in. All from the gpu service's stats page (gpu::STATS).
 const GPU_STAGES = ['', 'rail', 'clocks', 'PLL', 'MMU', 'firmware', 'secure boot', 'FECS', 'context',
   'channel', 'ready'];
+// sys-clk's GPU steps (kHz); rail (mV) at GPU speedo 2034 (user/gpu pll.rs:
+// NVIDIA's NA-mode voltage plus 25 mV). Caps: battery, input power.
+const GPU_STEPS = [76800, 153600, 230400, 307200, 384000, 460800, 537600, 614400, 691200, 768000, 844800,
+  921600];
+const GPU_MV = [868, 868, 868, 868, 868, 868, 875, 918, 962, 1000, 1043, 1087];
+const GPU_CAP = { battery: 460800, external: 768000 };
+const gmhz = khz => `${Math.floor(khz / 1000)}.${Math.floor(khz % 1000 / 100)}`;
+function gpuNow() {
+  if (sim.gpu === 'missing' || sim.gpu === 'unknown') return null;
+  const on = ['idle', 'busy', 'hot'].includes(sim.gpu), step = sim.gpu === 'hot' ? 76800 : sim.gpuStep;
+  return { on, step, khz: on ? step : 0, mv: on ? GPU_MV[GPU_STEPS.indexOf(step)] : 0,
+           cap: GPU_CAP[sim.supply], supply: sim.supply, forced: sim.gpuForced, hot: sim.gpu === 'hot',
+           load: on ? sim.gpuLoad : null };
+}
 function gpuText() {
-  if (sim.gpu === 'on') return ['76.8 MHz, 868 mV', GOOD];
+  const g = gpuNow();
+  if (!g) return [sim.gpu === 'missing' ? 'no GPU service' : 'starting', DIM];
+  if (g.on) {
+    const t = `${gmhz(g.khz)} MHz, ${g.mv} mV`;
+    return g.hot ? [`hot: ${t}`, WARN] : [t, g.forced ? WARN : GOOD];
+  }
   if (sim.gpu === 'failed') return [`failed: ${GPU_STAGES[sim.gpuStage]}`, BAD];
+  if (sim.gpu === 'powering') return [`powering up: ${GPU_STAGES[5]}`, DIM];
   return ['off', DIM];
+}
+
+// GPU panel (user/display ui.rs gpu_panel): sys-clk's steps, those past the
+// power source's cap in the warning color, confirmed then set with
+// CLOCK_FORCE (no cap until the next change).
+function setGpu(khz, force) {
+  act(`gpu::CLOCK ${khz}${force ? ' CLOCK_FORCE' : ''}`);
+  Object.assign(sim, { gpuStep: khz, gpuForced: force });
+  if (sim.gpu === 'hot') sim.gpu = 'idle';
+  syncControls();
+}
+function gpuStep(g, k) {
+  if (g.step === k) return;
+  if (k <= g.cap) { setGpu(k, false); return; }
+  ask({ title: `Overclock the GPU to ${gmhz(k)} MHz?`, ok: 'OVERCLOCK', tone: WARN, run: () => setGpu(k, true),
+        lines: g.supply === 'external'
+          ? [`Above the ${gmhz(g.cap)} MHz cap on input power:`, 'the official charger or dock only.']
+          : [`Above the ${gmhz(g.cap)} MHz cap on battery, which`, 'sys-clk keeps to spare the battery.'] });
+}
+function gpuPanel() {
+  const x = 240, y = 96, w = 800, h = 528, bh = 72;
+  scr.fill(x - 8, y - 8, w + 16, h + 16, BG);
+  scr.fill(x, y, w, h, PANEL);
+  scr.frame(x, y, w, h, 4, ACCENT);
+  scr.text(x + 32, y + 32, 'GPU CLOCK', 2, ACCENT, PANEL);
+  const g = gpuNow();
+  if (g) {
+    const [t, tone] = gpuText();
+    scr.textR(x + w - 32, y + 32, t, 2, tone, PANEL);
+    const cols = 6, gap = 16, bw = Math.floor((w - 64 - (cols - 1) * gap) / cols);
+    GPU_STEPS.forEach((k, i) => {
+      const bx = x + 32 + (i % cols) * (bw + gap), by = y + 96 + Math.floor(i / cols) * (bh + gap);
+      const set = g.step === k;
+      button(`g-${k}`, bx, by, bw, bh, gmhz(k), set ? ACCENT : k > g.cap ? WARN : null, () => gpuStep(g, k));
+      if (set) scr.fill(bx + 16, by + bh - 12, bw - 32, 4, ACCENT);
+    });
+    const cap = `cap ${gmhz(g.cap)} MHz on ${g.supply === 'external' ? 'input power' : 'battery'}`;
+    scr.text(x + 32, y + 280, g.forced ? `${cap}, forced past it` : cap, 2, g.forced ? WARN : FG, PANEL);
+    scr.text(x + 32, y + 320, g.on ? `measured ${gmhz(g.step - 100)} MHz after the last change`
+      : 'off: the step applies at power-up', 2, DIM, PANEL);
+    const [note, nc] = g.hot ? ['SoC hot: back to 76.8 MHz', WARN] : ['Back to 76.8 MHz at 80°C', DIM];
+    scr.text(x + 32, y + 360, note, 2, nc, PANEL);
+    scr.text(x + 32, y + h - 32 - bh + 20, `${gmhz(GPU_STEPS[GPU_STEPS.length - 1])} MHz max on this chip`, 2, DIM,
+      PANEL);
+  } else scr.text(x + 32, y + 96, sim.gpu === 'missing' ? 'no GPU service' : 'starting', 2, DIM, PANEL);
+  const cw = 240;
+  button('g-close', x + w - 32 - cw, y + h - 32 - bh, cw, bh, 'CLOSE', null, () => { ui.gpuPanel = false; });
 }
 
 // CPU panel (user/display ui.rs cpu_panel): sys-clk's steps, those over the
@@ -1255,6 +1342,7 @@ function drawProposal() {
   if (ui.toast && Date.now() < ui.toast.until) toastBar();
   if (ui.fanPanel) { zones = []; fanPanel(); }
   if (ui.cpuPanel) { zones = []; cpuPanel(); }
+  if (ui.gpuPanel) { zones = []; gpuPanel(); }
   if (ui.modal) { zones = []; modal(); }
 }
 
@@ -1298,12 +1386,15 @@ function powerOff() { act('power::OFF'); ui.off = true; }
 let bootGen = 0;
 function boot() {
   const gen = ++bootGen;
-  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', cpu: 'unknown', cpuStep: 0, usb: 'waiting', eth: 'nopc', wifi: 'unknown',
+  Object.assign(sim, { bootAt: Date.now(), temps: 'unknown', fan: 'unknown', cpu: 'unknown', cpuStep: 0, gpu: 'unknown',
+                       gpuStep: 76800, gpuForced: false, usb: 'waiting', eth: 'nopc', wifi: 'unknown',
                        sd: 'unknown', msgs: [], partial: '', usbIn: 0, usbOut: 0, rx: 0, tx: 0 });
-  Object.assign(ui, { page: 0, scan: null, modal: null, fanPanel: false, cpuPanel: false, unread: 0 });
+  Object.assign(ui, { page: 0, scan: null, modal: null, fanPanel: false, cpuPanel: false, gpuPanel: false,
+                      unread: 0 });
   write('display: 720x1280 panel, turned landscape\n');
   termBoot();
-  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', cpu: 'value', eth: 'dhcp' }],
+  const steps = [[1500, { usb: 'host' }], [2200, { usb: 'configured', temps: 'value', fan: 'auto', cpu: 'value', gpu: 'off',
+                                                  eth: 'dhcp' }],
                  [3000, { sd: 'value' }], [3800, { eth: 'up' }], [4000, { wifi: 'idle' }],
                  [6000, { wifi: 'connecting' }], [9000, { wifi: 'connected' }], [12000, { usb: 'terminal' }]];
   for (const [t, st] of steps) later(t, () => { if (gen === bootGen) Object.assign(sim, st); });
@@ -1406,7 +1497,7 @@ simControls.forEach(el => el.addEventListener('change', () => {
   const k = el.dataset.sim;
   sim[k] = el.type === 'checkbox' ? el.checked : 'num' in el.dataset ? +el.value : el.value;
   bootGen++; // a manual change stops a simulated boot
-  if (k === 'cores' || k === 'loadMode') tick();
+  if (k === 'cores' || k === 'loadMode' || k === 'gpu') tick();
   render();
 }));
 document.getElementById('boot').addEventListener('click', () => { boot(); render(); });

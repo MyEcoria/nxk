@@ -21,8 +21,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use libnx::abi::err::EINVAL;
-use libnx::abi::proto::{console as con, cpufreq, display as proto, fan, input, wifi};
+use libnx::abi::err::{EINVAL, EIO};
+use libnx::abi::proto::{console as con, cpufreq, display as proto, fan, gpu, input, wifi};
 use libnx::abi::rights::{DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
@@ -87,6 +87,7 @@ static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
 static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
+static GPU: Service = Service::optional("gpu");
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -153,6 +154,8 @@ enum Done {
     Fan(Result<stats::Fan, i64>),
     /// The CPU clock after a `SET`.
     Cpu(Result<stats::Cpu, i64>),
+    /// A GPU `CLOCK` change (the stats page shows the result).
+    Gpu(Result<(), i64>),
 }
 
 struct Worker {
@@ -192,7 +195,8 @@ fn scan() -> Result<Vec<ScanNet>, i64> {
 }
 
 /// Runs the actions that may take seconds (Wi-Fi scan, chip recovery, a
-/// fan busy measuring its speed) one at a time, off the drawing loop.
+/// fan busy measuring its speed, a GPU running a batch) one at a time,
+/// off the drawing loop.
 fn work(w: &Worker, notif: u32) -> ! {
     loop {
         let mut q = w.jobs.lock();
@@ -223,6 +227,13 @@ fn work(w: &Worker, notif: u32) -> ! {
                     .call(&Msg::from_words(cpufreq::SET, &[v]))
                     .map(|m| stats::Cpu::from_reply(&m)),
             ),
+            Action::Gpu(khz, force) => {
+                let f = if force { gpu::CLOCK_FORCE } else { 0 };
+                Done::Gpu(
+                    GPU.call(&Msg::from_words(gpu::CLOCK, &[khz, f]))
+                        .map(|_| ()),
+                )
+            }
             Action::ClearLogs => continue,
         };
         w.done.lock().push_back(done);
@@ -453,7 +464,7 @@ fn main() -> i32 {
                 let batch: Vec<Done> = worker.done.lock().drain(..).collect();
                 let now = time::now_ns();
                 for d in batch {
-                    if !matches!(d, Done::Fan(_) | Done::Cpu(_)) {
+                    if !matches!(d, Done::Fan(_) | Done::Cpu(_) | Done::Gpu(_)) {
                         ui.busy = false;
                     }
                     match d {
@@ -472,6 +483,18 @@ fn main() -> i32 {
                                 Ok(c) => data.cpu = stats::Seen::Value(c),
                                 Err(e) => ui
                                     .toast(format!("cpu clock: {}", libnx::abi::err::name(e)), now),
+                            }
+                        }
+                        Done::Gpu(r) => {
+                            ui.gpu_done();
+                            match r {
+                                Ok(()) => {}
+                                Err(e) if e == -EIO => ui.toast(
+                                    "gpu clock: measured off its step, back to 76.8 MHz".into(),
+                                    now,
+                                ),
+                                Err(e) => ui
+                                    .toast(format!("gpu clock: {}", libnx::abi::err::name(e)), now),
                             }
                         }
                         Done::Scan(Ok(nets)) => ui.scan = Some(nets),

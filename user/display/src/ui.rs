@@ -14,7 +14,7 @@ use crate::screen::{
     self, accent, palette, width, Bytes, Celsius, Hms, Ipv4, Screen, BAD, BG, DIM, EDGE, FG, GOOD,
     PANEL, PRESS, TERM_BG, TRACK, WARN,
 };
-use crate::stats::{Cpu, Data, Eth, Fan, Now, Seen};
+use crate::stats::{Cpu, Data, Eth, Fan, Gpu, Now, Seen};
 use crate::term::Term;
 use crate::Messages;
 
@@ -79,6 +79,10 @@ enum Id {
     CpuStep(usize),
     CpuBoot,
     CpuClose,
+    GpuOpen,
+    /// A step of `gpu::STEPS_KHZ`, by index.
+    GpuStep(usize),
+    GpuClose,
 }
 
 /// What a tap asks the service to do.
@@ -93,6 +97,8 @@ pub enum Action {
     Fan(u64),
     /// `cpufreq::SET`: a step (MHz) or `cpufreq::BOOT`.
     Cpu(u64),
+    /// `gpu::CLOCK`: a step (kHz), with `CLOCK_FORCE` past the cap.
+    Gpu(u64, bool),
 }
 
 struct Zone {
@@ -147,6 +153,10 @@ pub struct Ui {
     cpu: Seen<Cpu>,
     /// A clock change is running: the steps wait for it.
     cpu_sent: bool,
+    /// The GPU panel is open.
+    gpu_panel: bool,
+    gpu: Seen<Gpu>,
+    gpu_sent: bool,
     zones: Vec<Zone>,
 }
 
@@ -170,6 +180,28 @@ fn bar(s: &mut Screen, x: usize, y: usize, w: usize, h: usize, pct: u64, c: u32)
     let f = w * pct.min(100) as usize / 100;
     s.fill(x, y, f, h, c);
     s.fill(x + f, y, w - f, h, TRACK);
+}
+
+/// A processor's load: name, bar and percentage, or off.
+fn load_row(s: &mut Screen, x: usize, w: usize, y: usize, name: &str, load: Option<u64>) {
+    s.text(
+        x + 16,
+        y,
+        name,
+        2,
+        if load.is_some() { FG } else { DIM },
+        PANEL,
+    );
+    match load {
+        Some(p) => {
+            bar(s, x + 104, y + 4, 400, 24, p, load_color(p));
+            s.text_r(x + w - 16, y, &format!("{}%", p), 2, FG, PANEL);
+        }
+        None => {
+            s.fill(x + 104, y + 4, 400, 24, TRACK);
+            s.text_r(x + w - 16, y, "off", 2, DIM, PANEL);
+        }
+    }
 }
 
 /// Memory split: kernel, programs, free.
@@ -356,8 +388,14 @@ fn cpu_text(c: &Cpu) -> (String, u32) {
     }
 }
 
-/// The GPU row: off, its clock and rail, or where power-up failed.
-fn gpu_text(g: &Seen<crate::stats::Gpu>) -> (String, u32) {
+/// GPU clock in MHz, one decimal (sys-clk's steps are 76.8 MHz apart).
+fn gpu_mhz(khz: u64) -> String {
+    format!("{}.{}", khz / 1000, khz % 1000 / 100)
+}
+
+/// The GPU row: off, powering up, its clock and rail (warning color when
+/// hot or forced past the cap), or where power-up failed.
+fn gpu_text(g: &Seen<Gpu>) -> (String, u32) {
     const STAGES: [&str; 11] = [
         "",
         "rail",
@@ -371,18 +409,24 @@ fn gpu_text(g: &Seen<crate::stats::Gpu>) -> (String, u32) {
         "channel",
         "ready",
     ];
+    let stage = |g: &Gpu| *STAGES.get(g.stage as usize).unwrap_or(&"?");
     match g {
         Seen::Value(g) if g.state == gpu::ON => {
             let clock = match g.khz {
                 0 => "bypass clock".into(),
-                k => format!("{}.{} MHz", k / 1000, k % 1000 / 100),
+                k => format!("{} MHz", gpu_mhz(k)),
             };
-            (format!("{}, {} mV", clock, g.uv / 1000), GOOD)
+            let text = format!("{}, {} mV", clock, g.uv / 1000);
+            if g.ck & gpu::CK_HOT != 0 {
+                (format!("hot: {}", text), WARN)
+            } else if g.ck & gpu::CK_FORCED != 0 {
+                (text, WARN)
+            } else {
+                (text, GOOD)
+            }
         }
-        Seen::Value(g) if g.state == gpu::FAILED => (
-            format!("failed: {}", STAGES.get(g.stage as usize).unwrap_or(&"?")),
-            BAD,
-        ),
+        Seen::Value(g) if g.state == gpu::FAILED => (format!("failed: {}", stage(g)), BAD),
+        Seen::Value(g) if g.stage != 0 => (format!("powering up: {}", stage(g)), DIM),
         Seen::Value(_) => ("off".into(), DIM),
         Seen::Missing => ("no GPU service".into(), DIM),
         Seen::Unknown => ("starting".into(), DIM),
@@ -416,6 +460,9 @@ impl Ui {
             cpu_panel: false,
             cpu: Seen::Unknown,
             cpu_sent: false,
+            gpu_panel: false,
+            gpu: Seen::Unknown,
+            gpu_sent: false,
             zones: Vec::new(),
         }
     }
@@ -435,6 +482,45 @@ impl Ui {
     /// A clock change came back.
     pub fn cpu_done(&mut self) {
         self.cpu_sent = false;
+    }
+
+    pub fn gpu_done(&mut self) {
+        self.gpu_sent = false;
+    }
+
+    /// A GPU step: at once within the power source's cap, past it once
+    /// confirmed (then without a cap until the next change).
+    fn gpu_step(&mut self, i: usize) -> Option<Action> {
+        let Seen::Value(g) = self.gpu else {
+            return None;
+        };
+        let k = gpu::STEPS_KHZ[i];
+        if g.step == k {
+            return None;
+        }
+        if k <= g.cap {
+            self.gpu_sent = true;
+            return Some(Action::Gpu(k, false));
+        }
+        let lines = if g.supply == power::SUPPLY_EXTERNAL {
+            [
+                format!("Above the {} MHz cap on input power:", gpu_mhz(g.cap)),
+                "the official charger or dock only.".into(),
+            ]
+        } else {
+            [
+                format!("Above the {} MHz cap on battery, which", gpu_mhz(g.cap)),
+                "sys-clk keeps to spare the battery.".into(),
+            ]
+        };
+        self.modal = Some(Modal {
+            title: format!("Overclock the GPU to {} MHz?", gpu_mhz(k)),
+            lines,
+            ok: "OVERCLOCK",
+            tone: WARN,
+            action: Action::Gpu(k, true),
+        });
+        None
     }
 
     /// Duty set by hand (%) as the FAN panel shows it, none in auto:
@@ -545,6 +631,10 @@ impl Ui {
                 self.cpu_sent = true;
                 return Some(Action::Cpu(cpufreq::BOOT));
             }
+            Id::GpuOpen => self.gpu_panel = true,
+            Id::GpuClose => self.gpu_panel = false,
+            Id::GpuStep(_) if self.gpu_sent => {}
+            Id::GpuStep(i) => return self.gpu_step(i),
             Id::Reboot => {
                 self.modal = Some(Modal {
                     title: "Reboot the Switch?".into(),
@@ -592,7 +682,13 @@ impl Ui {
             }
             Id::Back => self.scan = None,
             Id::No => self.modal = None,
-            Id::Yes => return self.modal.take().map(|m| m.action),
+            Id::Yes => {
+                let a = self.modal.take().map(|m| m.action);
+                if matches!(a, Some(Action::Gpu(..))) {
+                    self.gpu_sent = true;
+                }
+                return a;
+            }
             Id::LogSize => self.log_scale = 3 - self.log_scale,
             Id::LogClear => return Some(Action::ClearLogs),
             Id::TermSize => self.term_scale = 3 - self.term_scale,
@@ -624,6 +720,7 @@ impl Ui {
         }
         self.fan = d.fan;
         self.cpu = d.cpu;
+        self.gpu = d.gpu;
         if self.fan_panel {
             self.zones.clear();
             self.fan_panel(s);
@@ -631,6 +728,10 @@ impl Ui {
         if self.cpu_panel {
             self.zones.clear();
             self.cpu_panel(s);
+        }
+        if self.gpu_panel {
+            self.zones.clear();
+            self.gpu_panel(s);
         }
         if self.modal.is_some() {
             self.zones.clear();
@@ -680,6 +781,31 @@ impl Ui {
     ) {
         card(s, x, y, w, h, title, self.pressed == Some(id));
         self.zone(id, x, y, w, h);
+    }
+
+    /// A card row that opens a panel: label, value, ">".
+    #[allow(clippy::too_many_arguments)]
+    fn open_row(
+        &mut self,
+        s: &mut Screen,
+        id: Id,
+        x: usize,
+        w: usize,
+        y: usize,
+        label: &str,
+        text: &str,
+        c: u32,
+    ) {
+        let bg = if self.pressed == Some(id) {
+            PRESS
+        } else {
+            PANEL
+        };
+        s.fill(x + 8, y - 8, w - 16, 48, bg);
+        s.text(x + 16, y, label, 2, DIM, bg);
+        s.text_r(x + w - 48, y, text, 2, c, bg);
+        s.text_r(x + w - 16, y, ">", 2, DIM, bg);
+        self.zone(id, x + 8, y - 8, w - 16, 48);
     }
 
     fn header(&mut self, s: &mut Screen, d: &Data) {
@@ -1021,60 +1147,37 @@ impl Ui {
             PANEL,
         );
         for (k, p) in d.load.iter().enumerate() {
-            let y = CY + 64 + k * 44;
-            s.text(
-                xl + 16,
-                y,
-                &format!("CPU{}", k),
-                2,
-                if p.is_some() { FG } else { DIM },
-                PANEL,
-            );
-            match p {
-                Some(p) => {
-                    bar(s, xl + 104, y + 4, 400, 24, *p, load_color(*p));
-                    s.text_r(xl + w - 16, y, &format!("{}%", p), 2, FG, PANEL);
-                }
-                None => {
-                    s.fill(xl + 104, y + 4, 400, 24, TRACK);
-                    s.text_r(xl + w - 16, y, "off", 2, DIM, PANEL);
-                }
-            }
+            load_row(s, xl, w, CY + 60 + k * 40, &format!("CPU{}", k), *p);
         }
-        // The clock row opens the CPU panel.
-        let fy = CY + 246;
-        let bg = if self.pressed == Some(Id::CpuOpen) {
-            PRESS
-        } else {
-            PANEL
+        let gpu_load = match d.gpu {
+            Seen::Value(g) => g.load,
+            _ => None,
         };
-        s.fill(xl + 8, fy - 8, w - 16, 48, bg);
-        s.text(xl + 16, fy, "clock", 2, DIM, bg);
+        load_row(s, xl, w, CY + 220, "GPU", gpu_load);
+        // The clock rows open the CPU and GPU panels.
         let (t, c) = match d.cpu {
             Seen::Value(c) => cpu_text(&c),
             Seen::Missing => ("no clock control".into(), DIM),
             Seen::Unknown => ("starting".into(), DIM),
         };
-        s.text_r(xl + w - 48, fy, &t, 2, c, bg);
-        s.text_r(xl + w - 16, fy, ">", 2, DIM, bg);
-        self.zone(Id::CpuOpen, xl + 8, fy - 8, w - 16, 48);
+        self.open_row(s, Id::CpuOpen, xl, w, CY + 268, "cpu clock", &t, c);
         let (t, c) = gpu_text(&d.gpu);
-        s.text(xl + 16, CY + 294, "gpu", 2, DIM, PANEL);
-        s.text_r(xl + w - 48, CY + 294, &t, 2, c, PANEL);
-        s.fill(xl + 16, CY + 334, w - 32, 2, EDGE);
-        s.text(xl + 16, CY + 344, "ACTIVITY", 2, accent(), PANEL);
+        self.open_row(s, Id::GpuOpen, xl, w, CY + 316, "gpu clock", &t, c);
+        s.fill(xl + 16, CY + 364, w - 32, 2, EDGE);
+        s.text(xl + 16, CY + 376, "ACTIVITY", 2, accent(), PANEL);
+        let procs = format!("{} processes", d.procs);
+        s.text_r(xl + w - 16, CY + 376, &procs, 2, DIM, PANEL);
         let rows = [
             ("syscalls/s", d.rates[0]),
             ("interrupts/s", d.rates[1]),
             ("context switches/s", d.rates[2]),
-            ("processes", d.procs),
         ];
         for (i, (n, v)) in rows.iter().enumerate() {
             kv(
                 s,
                 xl + 16,
                 xl + w - 16,
-                CY + 380 + i * 36,
+                CY + 412 + i * 36,
                 n,
                 &format!("{}", v),
                 None,
@@ -1157,22 +1260,12 @@ impl Ui {
             }
         }
         // The fan row opens the FAN panel.
-        let fy = py + 136;
-        let bg = if self.pressed == Some(Id::FanOpen) {
-            PRESS
-        } else {
-            PANEL
-        };
-        s.fill(xr + 8, fy - 8, w - 16, 48, bg);
-        s.text(xr + 16, fy, "fan", 2, DIM, bg);
         let (t, c) = match d.fan {
             Seen::Value(f) => fan_text(&f),
             Seen::Missing => ("no fan control".into(), DIM),
             Seen::Unknown => ("starting".into(), DIM),
         };
-        s.text_r(xr + w - 48, fy, &t, 2, c, bg);
-        s.text_r(xr + w - 16, fy, ">", 2, DIM, bg);
-        self.zone(Id::FanOpen, xr + 8, fy - 8, w - 16, 48);
+        self.open_row(s, Id::FanOpen, xr, w, py + 136, "fan", &t, c);
         let (bw, bh) = ((w - 48) / 2, 64);
         let by = py + 256 - 16 - bh;
         self.button(
@@ -1740,6 +1833,110 @@ impl Ui {
         self.button(
             s,
             Id::CpuClose,
+            x + w - 32 - cw,
+            y + h - 32 - bh,
+            cw,
+            bh,
+            "CLOSE",
+            None,
+            true,
+        );
+    }
+
+    /// GPU panel: sys-clk's steps, those needing more than the rail's
+    /// maximum on this chip greyed out, those past the power source's
+    /// cap in the warning color (confirmed first).
+    fn gpu_panel(&mut self, s: &mut Screen) {
+        let (x, y, w, h) = (240, 96, 800, 528);
+        s.fill(x - 8, y - 8, w + 16, h + 16, BG);
+        s.fill(x, y, w, h, PANEL);
+        s.frame(x, y, w, h, 4, accent());
+        s.text(x + 32, y + 32, "GPU CLOCK", 2, accent(), PANEL);
+        let bh = 72;
+        match self.gpu {
+            // Fuses unread (0): the service still checks each request.
+            Seen::Value(g) if g.steps != 1 => {
+                let (t, tone) = gpu_text(&self.gpu);
+                s.text_r(x + w - 32, y + 32, &t, 2, tone, PANEL);
+                let (cols, gap) = (6, 16);
+                let bw = (w - 64 - (cols - 1) * gap) / cols;
+                let mut top = 0;
+                for (i, &k) in gpu::STEPS_KHZ.iter().enumerate() {
+                    let (bx, by) = (
+                        x + 32 + (i % cols) * (bw + gap),
+                        y + 96 + (i / cols) * (bh + gap),
+                    );
+                    if g.steps & 1 << i != 0 {
+                        top = k;
+                    }
+                    let runs = g.steps == 0 || g.steps & 1 << i != 0;
+                    let set = g.step == k;
+                    let tone = if set {
+                        Some(accent())
+                    } else if k > g.cap {
+                        Some(WARN)
+                    } else {
+                        None
+                    };
+                    let on = runs && !self.gpu_sent;
+                    self.button(s, Id::GpuStep(i), bx, by, bw, bh, &gpu_mhz(k), tone, on);
+                    if set {
+                        s.fill(bx + 16, by + bh - 12, bw - 32, 4, accent());
+                    }
+                }
+                let source = match g.supply {
+                    power::SUPPLY_EXTERNAL => "on input power",
+                    gpu::NO_SUPPLY => "(charger unread)",
+                    _ => "on battery",
+                };
+                let mut cap = format!("cap {} MHz {}", gpu_mhz(g.cap), source);
+                if g.ck & gpu::CK_FORCED != 0 {
+                    cap.push_str(", forced past it");
+                }
+                let tone = if g.ck & gpu::CK_FORCED != 0 { WARN } else { FG };
+                s.text(x + 32, y + 280, &cap, 2, tone, PANEL);
+                let clock: String = match (g.state, g.measured) {
+                    (gpu::ON, 0) => "not measured yet".into(),
+                    (gpu::ON, m) => format!("measured {} MHz after the last change", gpu_mhz(m)),
+                    _ => "off: the step applies at power-up".into(),
+                };
+                s.text(x + 32, y + 320, &clock, 2, DIM, PANEL);
+                let (note, nc) = if g.ck & gpu::CK_HOT != 0 {
+                    ("SoC hot: back to 76.8 MHz", WARN)
+                } else if g.ck & gpu::CK_CAPPED != 0 {
+                    ("Power source changed: down to its cap", WARN)
+                } else {
+                    ("Back to 76.8 MHz at 80\u{b0}C", DIM)
+                };
+                s.text(x + 32, y + 360, note, 2, nc, PANEL);
+                if top != 0 {
+                    let limit = format!("{} MHz max on this chip", gpu_mhz(top));
+                    s.text(x + 32, y + h - 32 - bh + 20, &limit, 2, DIM, PANEL);
+                }
+            }
+            Seen::Value(_) => {
+                s.text(x + 32, y + 96, "76.8 MHz", 2, FG, PANEL);
+                s.text(
+                    x + 32,
+                    y + 144,
+                    "Lowest step only on this console",
+                    2,
+                    DIM,
+                    PANEL,
+                );
+            }
+            Seen::Missing | Seen::Unknown => {
+                let t = match self.gpu {
+                    Seen::Missing => "no GPU service",
+                    _ => "starting",
+                };
+                s.text(x + 32, y + 96, t, 2, DIM, PANEL);
+            }
+        }
+        let cw = 240;
+        self.button(
+            s,
+            Id::GpuClose,
             x + w - 32 - cw,
             y + h - 32 - bh,
             cw,

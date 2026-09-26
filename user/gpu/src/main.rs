@@ -5,7 +5,8 @@
 //! init and golden context, one channel. Then 2D fills and copies,
 //! built-in compute kernels, a self-test and an FFMA benchmark, and
 //! sys-clk's clock steps with its power-source caps (back to the lowest
-//! step when the SoC reaches `HOT_MC`).
+//! step when the SoC reaches `HOT_MC`). A stats page shares its state,
+//! clock settings and busy time with clients (`STATS`).
 
 #![no_std]
 #![no_main]
@@ -26,6 +27,7 @@ mod power;
 mod push;
 mod qmd;
 mod sass;
+mod stats;
 
 use alloc::vec::Vec;
 
@@ -42,6 +44,7 @@ use fifo::Chan;
 use hw::{Dma, Regs, Result};
 use mmu::Vm;
 use push::Push;
+use stats::Stats;
 
 const BAR0: u64 = 0x5700_0000;
 const BAR1: u64 = 0x5800_0000;
@@ -99,6 +102,14 @@ struct Gpu {
     measured: u32,
     /// `CK_*` bits.
     ck: u64,
+    /// Power source's cap (kHz) and supply, as last read.
+    cap_khz: u32,
+    supply: u64,
+    /// Steps the chip runs (bit i: `STEPS_KHZ[i]`), 0: fuses unread.
+    steps: u64,
+    stats: Stats,
+    /// Handle sent with the last reply, closed once it went.
+    sent: u32,
 }
 
 fn read(name: &str) -> Result<Vec<u8>> {
@@ -126,6 +137,41 @@ impl Gpu {
     /// Stage `s` begins.
     fn at(&mut self, s: u64) {
         self.stage = s;
+        self.share();
+    }
+
+    /// State and clock settings to the stats page.
+    fn share(&self) {
+        let on = self.state == proto::ON;
+        let khz = self.clock.as_ref().map_or(0, |c| c.khz as u64);
+        self.stats.write(&[
+            (proto::S_STATE, self.state | self.stage << 8),
+            (proto::S_KHZ, khz),
+            (proto::S_UV, if on { self.rail as u64 } else { 0 }),
+            (proto::S_STEP, self.target as u64),
+            (proto::S_SUPPLY, self.supply),
+            (proto::S_MEASURED, self.measured as u64),
+            (proto::S_CK, self.ck),
+            (proto::S_CAP, self.cap_khz as u64),
+            (proto::S_STEPS, self.steps),
+        ]);
+    }
+
+    /// Fuses read once the fuse block is up; the steps this chip runs
+    /// follow (the lowest alone on a chip that is not a known Erista).
+    fn read_chip(&mut self) {
+        if self.steps != 0 || !libnx::clk::ready(clk::FUSE) {
+            return;
+        }
+        self.chip = power::chip(self.fuse.as_ref());
+        self.steps = match self.chip.speedo_id {
+            Some(id) => proto::STEPS_KHZ
+                .iter()
+                .enumerate()
+                .filter(|&(_, &k)| pll::rail_uv(k as u32, self.chip.speedo, id).is_some())
+                .fold(0, |m, (i, _)| m | 1 << i),
+            None => 1,
+        };
     }
 
     fn power_on(&mut self) -> Result<()> {
@@ -140,6 +186,7 @@ impl Gpu {
                 self.state = proto::ON;
                 self.stage = proto::STAGE_READY;
                 println!("[gpu] ready in {} ms", (time::now_ns() - t0) / 1_000_000);
+                self.share();
                 // Up at the lowest step, then the one asked for.
                 let (cap, _) = self.cap();
                 if !self.forced && self.target > cap {
@@ -164,6 +211,7 @@ impl Gpu {
                 self.state = proto::FAILED;
                 self.stage = stage;
                 self.err = -e;
+                self.share();
             }
         }
         r
@@ -179,9 +227,7 @@ impl Gpu {
         {
             return Err((ENODEV, "Mariko GPU rail not supported"));
         }
-        if libnx::clk::ready(clk::FUSE) {
-            self.chip = power::chip(self.fuse.as_ref());
-        }
+        self.read_chip();
         self.rail = match self.chip.speedo_id {
             Some(id) => pll::rail_uv(pll::GPC_KHZ, self.chip.speedo, id).unwrap_or(DEFAULT_UV),
             None => pll::rail_step(pll::rail_code(DEFAULT_UV)),
@@ -337,6 +383,7 @@ impl Gpu {
         self.clock = None;
         self.state = proto::OFF;
         self.stage = 0;
+        self.share();
         println!("[gpu] off");
     }
 
@@ -360,27 +407,34 @@ impl Gpu {
     fn run_with(&mut self, p: Push, timeout_us: u64, spin: bool) -> core::result::Result<u64, i64> {
         let d = self.dev.as_mut().ok_or(-ENODEV)?;
         let t0 = time::now_ns();
-        if let Err((e, what)) = d.chan.run(&self.regs, &self.bar1, p, timeout_us, spin) {
+        self.stats.start(t0);
+        let r = d.chan.run(&self.regs, &self.bar1, p, timeout_us, spin);
+        let t1 = time::now_ns();
+        self.stats.end(t1);
+        if let Err((e, what)) = r {
             drv::report("gpu", &alloc::format!("{}: powering the GPU down", what));
             self.power_down();
             self.state = proto::FAILED;
             self.stage = proto::STAGE_READY;
             self.err = -e;
+            self.share();
             return Err(-e);
         }
-        Ok(time::now_ns() - t0)
+        Ok(t1 - t0)
     }
 
     /// Cap of the power source (sys-clk's Erista caps) and the source;
-    /// an unreadable charger counts as the battery.
-    fn cap(&self) -> (u32, u64) {
-        match POWER.call(&Msg::new(psu::SUPPLY, 0, 0)) {
+    /// an unreadable charger counts as the battery. Kept for the page.
+    fn cap(&mut self) -> (u32, u64) {
+        let (cap, supply) = match POWER.call(&Msg::new(psu::SUPPLY, 0, 0)) {
             Ok(m) if m.mr[0] == psu::SUPPLY_EXTERNAL => {
                 (proto::CAP_EXTERNAL_KHZ as u32, psu::SUPPLY_EXTERNAL)
             }
             Ok(m) => (proto::CAP_BATTERY_KHZ as u32, m.mr[0]),
             Err(_) => (proto::CAP_BATTERY_KHZ as u32, proto::NO_SUPPLY),
-        }
+        };
+        (self.cap_khz, self.supply) = (cap, supply);
+        (cap, supply)
     }
 
     /// `CLOCK`: `khz` a step within the cap unless `force`.
@@ -388,9 +442,7 @@ impl Gpu {
         if !proto::STEPS_KHZ.contains(&(khz as u64)) {
             return Err(-ERANGE);
         }
-        if self.chip.speedo_id.is_none() && libnx::clk::ready(clk::FUSE) {
-            self.chip = power::chip(self.fuse.as_ref());
-        }
+        self.read_chip();
         let Some(id) = self.chip.speedo_id else {
             return if khz == pll::GPC_KHZ {
                 Ok(())
@@ -431,11 +483,14 @@ impl Gpu {
             self.state = proto::FAILED;
             self.stage = proto::STAGE_READY;
             self.err = -e;
+            self.share();
             return Err(-e);
         }
         self.rail = uv;
+        self.share();
         let m = self.measure(khz)?;
         self.measured = m;
+        self.share();
         println!(
             "[gpu] GPU {} -> {} kHz at {} mV, measured {} kHz",
             from,
@@ -522,7 +577,7 @@ impl Gpu {
         }
     }
 
-    fn clock_status(&self) -> Msg {
+    fn clock_status(&mut self) -> Msg {
         let (cap, supply) = self.cap();
         Msg::from_words(
             0,
@@ -863,6 +918,11 @@ fn main() -> i32 {
         forced: false,
         measured: 0,
         ck: 0,
+        cap_khz: proto::CAP_BATTERY_KHZ as u32,
+        supply: proto::NO_SUPPLY,
+        steps: 0,
+        stats: Stats::new().expect("gpu: stats page"),
+        sent: 0,
     };
     // Left on by an instance replaced in place (`usbterm.py --reload`):
     // clamped, reset, stopped and its rail off, like power-down.
@@ -871,6 +931,7 @@ fn main() -> i32 {
         power::rail_off(&g.i2c);
         println!("[gpu] found on: powered down");
     }
+    g.share();
     let ep = drv::publish("gpu").expect("gpu: publish");
     println!("[gpu] GPU service ready (off)");
     let mut next = time::now_ns() + CHECK_NS;
@@ -879,12 +940,17 @@ fn main() -> i32 {
         match ipc::recv_timeout(ep, wait) {
             Ok(rx) => {
                 let _ = ipc::reply(&handle(&mut g, &rx));
+                if g.sent != 0 {
+                    let _ = sys::handle_close(core::mem::take(&mut g.sent));
+                }
+                g.share();
             }
             Err(e) if e != -ETIMEDOUT => time::sleep_ms(10),
             Err(_) => {}
         }
         if time::now_ns() >= next {
             g.check();
+            g.share();
             next = time::now_ns() + CHECK_NS;
         }
     }
@@ -942,6 +1008,23 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
             };
             match r {
                 Ok(()) => g.clock_status(),
+                Err(e) => Msg::error(e),
+            }
+        }
+        // Fuses and power source read again for the page's readers.
+        proto::STATS => {
+            g.read_chip();
+            g.cap();
+            let reply = Msg::from_words(0, &[g.stats.instance]);
+            if m.mr[0] == g.stats.instance {
+                return reply;
+            }
+            match g.stats.handle() {
+                Ok(h) => {
+                    ipc::set_send_handle(0, h);
+                    g.sent = h;
+                    reply.with_handles(1)
+                }
                 Err(e) => Msg::error(e),
             }
         }
