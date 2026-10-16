@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod games;
 mod screen;
 mod stats;
 mod term;
@@ -56,6 +57,12 @@ const MSG_LINES: usize = 256;
 /// Notification bits: touches queued, an action finished.
 const EV_TOUCH: u64 = 1;
 const EV_DONE: u64 = 2;
+/// A game the library started has ended.
+const EV_EXIT: u64 = 4;
+/// The game list is read again this often (and every 3 s while empty).
+const SCAN_NS: u64 = 8_000_000_000;
+/// A game that took the screen by itself: its process checked this often.
+const LIVE_NS: u64 = 1_000_000_000;
 
 // 32-bit word register indices.
 const CMD_DISPLAY_COMMAND: usize = 0x32;
@@ -169,12 +176,69 @@ struct Game {
     images: Vec<SharedMemory>,
     /// The one on display.
     shown: usize,
+    /// The process that took the screen.
+    owner: u32,
     /// A copy of it for `SNAPSHOT`: the GPU is drawing on the others, and
     /// a capture takes longer than a frame.
     snap: Option<SharedMemory>,
     pas: Vec<u32>,
     events: VecDeque<Event>,
     waiter: Option<(u64, u64)>,
+}
+
+/// The game the library started.
+struct Running {
+    handle: u32,
+    title: String,
+}
+
+/// Starts games and learns when they end (a thread waits on each).
+struct Launcher {
+    running: Option<Running>,
+    exits: Arc<Mutex<VecDeque<(u32, i64)>>>,
+    notif: u32,
+}
+
+impl Launcher {
+    fn launch(&mut self, ui: &mut Ui, i: usize) {
+        let now = time::now_ns();
+        let Some(g) = ui.game(i).cloned() else {
+            return;
+        };
+        if let Some(r) = &self.running {
+            ui.toast(format!("{} is running", r.title), now);
+            return;
+        }
+        match libnx::process::spawn_args(&[&g.exe]) {
+            Ok(h) => {
+                let (q, notif) = (self.exits.clone(), self.notif);
+                let spawned = thread::spawn(move || {
+                    let code = libnx::process::wait(h);
+                    q.lock().push_back((h, code));
+                    let _ = sys::notify_signal(notif, EV_EXIT);
+                });
+                if spawned.is_err() {
+                    ui.toast("cannot watch the game".into(), now);
+                }
+                self.running = Some(Running {
+                    handle: h,
+                    title: g.title,
+                });
+            }
+            Err(e) => ui.toast(format!("{}: {}", g.title, libnx::abi::err::name(e)), now),
+        }
+    }
+
+    /// End the game: its exit comes back as an `EV_EXIT`.
+    fn stop(&mut self) -> bool {
+        match &self.running {
+            Some(r) => {
+                let _ = sys::process_kill(r.handle);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 struct Worker {
@@ -253,7 +317,7 @@ fn work(w: &Worker, notif: u32) -> ! {
                         .map(|_| ()),
                 )
             }
-            Action::ClearLogs => continue,
+            Action::ClearLogs | Action::Launch(_) => continue,
         };
         w.done.lock().push_back(done);
         let _ = sys::notify_signal(notif, EV_DONE);
@@ -332,6 +396,7 @@ fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Gam
     Ok(Game {
         images,
         shown: 0,
+        owner: 0,
         snap: None,
         pas,
         events: VecDeque::new(),
@@ -457,11 +522,42 @@ fn main() -> i32 {
     let mut game: Option<Game> = None;
     // Handles sent with the previous reply: closed afterwards.
     let mut sent: Vec<u32> = Vec::new();
+    let mut launcher = Launcher {
+        running: None,
+        exits: Arc::new(Mutex::new(VecDeque::new())),
+        notif,
+    };
+    let (mut next_scan, mut next_live) = (0u64, 0u64);
+    // The game goes: the UI comes back, the GPU forgets its buffers.
+    macro_rules! release_game {
+        () => {{
+            game = None;
+            let _ = GPU.call(&Msg::new(gpuproto::RESET, 0, 0));
+            give_back(&dc, w, pa);
+            scr.forget();
+            dirty = true;
+            next_refresh = 0;
+        }};
+    }
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
         let now = time::now_ns();
         let mut wake = u64::MAX;
         if !owned && game.is_none() {
+            if ui.page == ui::LIBRARY && now >= next_scan {
+                let found = games::scan();
+                next_scan = now
+                    + if found.is_empty() {
+                        3_000_000_000
+                    } else {
+                        SCAN_NS
+                    };
+                ui.set_games(found);
+                dirty = true;
+            }
+            if ui.animating() {
+                dirty = true;
+            }
             if now >= next_refresh {
                 data.refresh();
                 next_refresh = now + REFRESH_NS;
@@ -504,6 +600,22 @@ fn main() -> i32 {
             if let Some(d) = ui.deadline() {
                 wake = wake.min(d);
             }
+            if ui.page == ui::LIBRARY {
+                wake = wake.min(next_scan);
+            }
+            if ui.animating() {
+                wake = wake.min(now + 16_000_000);
+            }
+        }
+        if let Some(g) = &game {
+            wake = wake.min(next_live);
+            if now >= next_live {
+                next_live = now + LIVE_NS;
+                if !libnx::process::live_pids().contains(&g.owner) {
+                    release_game!();
+                    wake = 0;
+                }
+            }
         }
         if let Some((_, d)) = game.as_ref().and_then(|g| g.waiter).filter(|w| w.1 != 0) {
             wake = wake.min(d);
@@ -527,7 +639,16 @@ fn main() -> i32 {
         if rx.msg.is_notify() {
             let ev = rx.msg.mr[0];
             if ev & EV_TOUCH != 0 {
-                let batch: Vec<Event> = touches.lock().drain(..).collect();
+                let mut batch: Vec<Event> = touches.lock().drain(..).collect();
+                // HOME ends the game (a press; the game never sees it).
+                let home = |e: &Event| e.0 == input::KIND_BUTTON && e.1 == input::BTN_HOME;
+                if game.is_some() && batch.iter().any(home) {
+                    let pressed = batch.iter().any(|e| home(e) && e.2 == 1);
+                    batch.retain(|e| !home(e));
+                    if pressed && !launcher.stop() {
+                        release_game!();
+                    }
+                }
                 if let Some(g) = game.as_mut() {
                     for e in batch {
                         let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]);
@@ -557,6 +678,7 @@ fn main() -> i32 {
                         }
                         match action {
                             Some(Action::ClearLogs) => msgs.clear(),
+                            Some(Action::Launch(i)) => launcher.launch(&mut ui, i),
                             Some(a) => {
                                 worker.jobs.lock().push_back(a);
                                 worker.wake.notify_one();
@@ -589,6 +711,7 @@ fn main() -> i32 {
                     }
                     match action {
                         Some(Action::ClearLogs) => msgs.clear(),
+                        Some(Action::Launch(i)) => launcher.launch(&mut ui, i),
                         Some(a) => {
                             worker.jobs.lock().push_back(a);
                             worker.wake.notify_one();
@@ -596,6 +719,28 @@ fn main() -> i32 {
                         None => {}
                     }
                     dirty = true;
+                }
+            }
+            if ev & EV_EXIT != 0 {
+                let ended: Vec<(u32, i64)> = launcher.exits.lock().drain(..).collect();
+                for (h, code) in ended {
+                    let title = launcher
+                        .running
+                        .as_ref()
+                        .filter(|r| r.handle == h)
+                        .map(|r| r.title.clone());
+                    if title.is_some() {
+                        launcher.running = None;
+                    }
+                    let _ = sys::handle_close(h);
+                    dirty = true;
+                    if game.is_some() {
+                        release_game!();
+                    }
+                    // 137: ended by HOME.
+                    if let Some(t) = title.filter(|_| code != 0 && code != 137) {
+                        ui.toast(format!("{} stopped (code {})", t, code), now);
+                    }
                 }
             }
             if ev & EV_DONE != 0 {
@@ -701,7 +846,9 @@ fn main() -> i32 {
                 }
             }
             proto::SCANOUT if game.is_none() && !owned => match take_screen(&dc, w, h, &mut sent) {
-                Ok(g) => {
+                Ok(mut g) => {
+                    g.owner = rx.pid;
+                    next_live = time::now_ns() + LIVE_NS;
                     game = Some(g);
                     Msg::from_words(
                         0,
@@ -727,12 +874,7 @@ fn main() -> i32 {
                 _ => Msg::error(-EINVAL),
             },
             proto::RELEASE if game.is_some() => {
-                game = None;
-                let _ = GPU.call(&Msg::new(gpuproto::RESET, 0, 0));
-                give_back(&dc, w, pa);
-                scr.forget();
-                dirty = true;
-                next_refresh = 0;
+                release_game!();
                 Msg::new(0, 0, 0)
             }
             proto::EVENT => match game.as_mut() {

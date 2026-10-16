@@ -13,6 +13,7 @@ use libnx::abi::proto::input::{
 };
 use libnx::abi::proto::{cpufreq, fan, gpu, power, usbcon as usb, wifi};
 
+use crate::games::GameInfo;
 use crate::screen::{
     self, accent, palette, width, Bytes, Celsius, Hms, Ipv4, Screen, BAD, BG, DIM, EDGE, FG, GOOD,
     PANEL, PRESS, TERM_BG, TRACK, WARN,
@@ -30,11 +31,13 @@ const M: usize = 16;
 /// Content area between the header and the tab bar.
 const CY: usize = HEAD + M;
 const CH: usize = H - HEAD - TABS - 2 * M;
-const PAGES: [&str; 5] = ["HOME", "SYSTEM", "NETWORK", "TERMINAL", "LOGS"];
-const SYSTEM: usize = 1;
-const NETWORK: usize = 2;
-pub const TERMINAL: usize = 3;
-pub const LOGS: usize = 4;
+const PAGES: [&str; 6] = ["GAMES", "OVERVIEW", "SYSTEM", "NETWORK", "TERMINAL", "LOGS"];
+pub const LIBRARY: usize = 0;
+const OVERVIEW: usize = 1;
+const SYSTEM: usize = 2;
+const NETWORK: usize = 3;
+pub const TERMINAL: usize = 4;
+pub const LOGS: usize = 5;
 /// What a header chip opens.
 #[derive(Clone, Copy)]
 enum Opens {
@@ -59,6 +62,8 @@ const FOCUS: u32 = 0xFFFF_FFFF;
 #[derive(Clone, Copy, PartialEq)]
 enum Id {
     Tab(usize),
+    /// A game's card, by index.
+    Game(usize),
     /// Home tile: its slot and the page it opens.
     Tile(usize, usize),
     Chip(usize),
@@ -98,6 +103,8 @@ pub enum Action {
     Retry,
     Leave,
     ClearLogs,
+    /// Start game `n` of the library.
+    Launch(usize),
     /// `fan::SET`: `fan::AUTO` or a duty (%).
     Fan(u64),
     /// `cpufreq::SET`: a step (MHz) or `cpufreq::BOOT`.
@@ -167,6 +174,11 @@ pub struct Ui {
     /// last drawn: where a move starts once the zone is gone.
     focus: Option<Id>,
     focus_at: (usize, usize),
+    /// The games on the card, the one chosen, and where the row of
+    /// cards is scrolled to (in cards, eased toward the one chosen).
+    games: Vec<GameInfo>,
+    sel: usize,
+    scroll: f32,
 }
 
 fn load_color(p: u64) -> u32 {
@@ -178,8 +190,7 @@ fn load_color(p: u64) -> u32 {
 }
 
 fn card(s: &mut Screen, x: usize, y: usize, w: usize, h: usize, title: &str, hot: bool) {
-    s.fill(x, y, w, h, PANEL);
-    s.frame(x, y, w, h, 2, if hot { accent() } else { EDGE });
+    s.card_round(x, y, w, h, 10, 2, if hot { accent() } else { EDGE }, PANEL);
     if !title.is_empty() {
         s.text(x + 16, y + 16, title, 2, accent(), PANEL);
     }
@@ -475,6 +486,9 @@ impl Ui {
             zones: Vec::new(),
             focus: None,
             focus_at: (W / 2, H / 2),
+            games: Vec::new(),
+            sel: 0,
+            scroll: 0.0,
         }
     }
 
@@ -551,6 +565,20 @@ impl Ui {
         self.fan_sent += 1;
         self.fan_last = v;
         Some(Action::Fan(v))
+    }
+
+    pub fn set_games(&mut self, v: Vec<GameInfo>) {
+        self.sel = self.sel.min(v.len().saturating_sub(1));
+        self.games = v;
+    }
+
+    pub fn game(&self, i: usize) -> Option<&GameInfo> {
+        self.games.get(i)
+    }
+
+    /// The row of cards is still moving: draw again soon.
+    pub fn animating(&self) -> bool {
+        self.page == LIBRARY && (self.scroll - self.sel as f32).abs() > 0.004
     }
 
     /// Short notice above the tab bar.
@@ -636,8 +664,23 @@ impl Ui {
     /// HOME and + go to the home page.
     pub fn pad(&mut self, code: u64) -> Option<Action> {
         let open = self.modal.is_some() || self.fan_panel || self.cpu_panel || self.gpu_panel;
+        // On the library the chosen card is where the pad starts.
+        let first = matches!(code, BTN_A | BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+        if self.page == LIBRARY && !open && self.focus.is_none() && first && !self.games.is_empty()
+        {
+            self.focus = Some(Id::Game(self.sel));
+            if code != BTN_A {
+                // The first press of an arrow only shows where it is.
+                return None;
+            }
+        }
         match code {
-            BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT => self.step_focus(code),
+            BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT => {
+                self.step_focus(code);
+                if let Some(Id::Game(i)) = self.focus {
+                    self.sel = i;
+                }
+            }
             BTN_A => match self.focus {
                 Some(id) if self.zones.iter().any(|z| z.id == id) => return self.tap(id),
                 _ => self.step_focus(code),
@@ -665,6 +708,8 @@ impl Ui {
     fn tap(&mut self, id: Id) -> Option<Action> {
         match id {
             Id::Tab(p) | Id::Tile(_, p) => self.go(p),
+            Id::Game(i) if self.sel == i => return Some(Action::Launch(i)),
+            Id::Game(i) => self.sel = i,
             Id::Chip(k) => match CHIPS[k].1 {
                 Some(Opens::Page(p)) => self.go(p),
                 Some(Opens::Fan) => self.fan_panel = true,
@@ -778,7 +823,8 @@ impl Ui {
         s.clear(BG);
         self.header(s, d);
         match self.page {
-            0 => self.home(s, d, term),
+            LIBRARY => self.library(s, d, now),
+            OVERVIEW => self.home(s, d, term),
             SYSTEM => self.system(s, d),
             NETWORK => self.network(s, d),
             TERMINAL => self.terminal(s, d, term, now),
@@ -827,8 +873,116 @@ impl Ui {
             .map(|z| (z.x, z.y, z.w, z.h));
         if let Some((x, y, w, h)) = ring {
             self.focus_at = (x + w / 2, y + h / 2);
-            s.frame(x, y, w, h, 3, FOCUS);
+            // A game's card shows its own selection.
+            if !matches!(self.focus, Some(Id::Game(_))) {
+                s.frame(x, y, w, h, 3, FOCUS);
+            }
         }
+    }
+
+    /// The game library: a row of cards, the one chosen in the middle.
+    fn library(&mut self, s: &mut Screen, _d: &Data, _now: u64) {
+        self.scroll += (self.sel as f32 - self.scroll) * 0.3;
+        if (self.scroll - self.sel as f32).abs() < 0.004 {
+            self.scroll = self.sel as f32;
+        }
+        s.text(M + 8, CY + 6, "GAMES", 2, accent(), BG);
+        let n = self.games.len();
+        let count = if n == 1 {
+            "1 INSTALLED".into()
+        } else {
+            format!("{} INSTALLED", n)
+        };
+        s.text_r(W - M - 8, CY + 6, &count, 2, DIM, BG);
+        if n == 0 {
+            s.card_round(W / 2 - 330, 200, 660, 230, 16, 2, EDGE, PANEL);
+            s.text_c(W / 2, 250, "NO GAMES YET", 3, FG, PANEL);
+            s.text_c(W / 2, 310, "Copy a game to /games/NAME", 2, DIM, PANEL);
+            s.text_c(
+                W / 2,
+                342,
+                "on the SD card, with its game.txt.",
+                2,
+                DIM,
+                PANEL,
+            );
+            return;
+        }
+        let (cw, ch, pitch, y0) = (320usize, 372usize, 352.0f32, CY + 50);
+        for i in 0..n {
+            let left = (W as f32 / 2.0 + (i as f32 - self.scroll) * pitch) as i32 - cw as i32 / 2;
+            if left + cw as i32 <= 0 || left >= W as i32 {
+                continue;
+            }
+            let on = i == self.sel;
+            let g = &self.games[i];
+            let (color, light, dark) = (
+                g.color,
+                screen::mix(g.color, 0xFFFF_FFFF, 70),
+                screen::mix(g.color, 0xFF00_0000, 120),
+            );
+            s.dx = left;
+            // Shadow, outline, art, title, call to play.
+            s.fill_alpha(8, y0 + 12, cw, ch, 0xFF00_0000, 110);
+            let edge = if on { light } else { EDGE };
+            s.card_round(0, y0, cw, ch, 16, 3, edge, PANEL);
+            s.gradient(
+                12,
+                y0 + 12,
+                cw - 24,
+                214,
+                screen::mix(color, 0xFFFF_FFFF, 25),
+                dark,
+            );
+            for k in 0..8 {
+                s.fill(
+                    12 + 8 + k * 37,
+                    y0 + 12 + 214 - 28,
+                    22,
+                    8,
+                    screen::mix(color, 0xFFFF_FFFF, 90),
+                );
+            }
+            let initial: String = g.title.chars().take(1).collect();
+            s.text_c(
+                cw / 2,
+                y0 + 12 + (214 - 16 * 11) / 2,
+                &initial.to_uppercase(),
+                11,
+                light,
+                0,
+            );
+            let tscale = if g.title.chars().count() * 24 <= cw - 40 {
+                3
+            } else {
+                2
+            };
+            s.text(20, y0 + 250, &g.title, tscale, FG, PANEL);
+            if on {
+                s.fill_round(20, y0 + ch - 62, cw - 40, 40, 20, light);
+                s.text_c(cw / 2, y0 + ch - 54, "PLAY", 2, 0xFF2A_1608, light);
+            } else {
+                s.text_c(cw / 2, y0 + ch - 54, "READY", 2, DIM, PANEL);
+                s.fill_alpha(0, y0, cw, ch, 0xFF10_1E3A, 90);
+            }
+            s.dx = 0;
+            let (zx, zr) = (
+                left.max(0) as usize,
+                (left + cw as i32).min(W as i32) as usize,
+            );
+            self.zone(Id::Game(i), zx, y0, zr - zx, ch);
+        }
+        // What the chosen one is, and how to play.
+        let g = &self.games[self.sel];
+        s.text_c(W / 2, y0 + ch + 22, &g.desc, 2, FG, BG);
+        s.text_c(
+            W / 2,
+            y0 + ch + 54,
+            "A  PLAY      LEFT RIGHT  CHOOSE      L R  PAGES",
+            1,
+            DIM,
+            BG,
+        );
     }
 
     /// Button; `on` false: drawn disabled, no zone.
@@ -850,8 +1004,16 @@ impl Ui {
         } else {
             PANEL
         };
-        s.fill(x, y, w, h, bg);
-        s.frame(x, y, w, h, 2, if on { tone.unwrap_or(DIM) } else { EDGE });
+        s.card_round(
+            x,
+            y,
+            w,
+            h,
+            8,
+            2,
+            if on { tone.unwrap_or(DIM) } else { EDGE },
+            bg,
+        );
         let fg = if on { tone.unwrap_or(FG) } else { EDGE };
         s.text_c(x + w / 2, y + (h - 32) / 2, text, 2, fg, bg);
         if on {
@@ -958,34 +1120,34 @@ impl Ui {
 
     fn tab_bar(&mut self, s: &mut Screen) {
         let (y, w) = (H - TABS, W / PAGES.len());
+        s.fill(0, y, W, TABS, BG);
+        s.fill(0, y, W, 2, EDGE);
         for (i, name) in PAGES.iter().enumerate() {
             let (x, on) = (i * w, self.page == i);
-            let bg = if self.pressed == Some(Id::Tab(i)) {
-                PRESS
-            } else if on {
-                PANEL
-            } else {
-                BG
-            };
-            s.fill(x, y, w, TABS, bg);
-            s.fill(
-                x,
-                y,
-                w,
-                if on { 4 } else { 2 },
-                if on { accent() } else { EDGE },
-            );
-            if i > 0 && !on && self.page != i - 1 {
-                s.fill(x, y + 24, 2, TABS - 48, EDGE);
+            let pressed = self.pressed == Some(Id::Tab(i));
+            if on || pressed {
+                s.fill_round(
+                    x + 14,
+                    y + 14,
+                    w - 28,
+                    TABS - 28,
+                    14,
+                    if pressed { PRESS } else { PANEL },
+                );
+            }
+            if on {
+                s.fill_round(x + w / 2 - 22, y + TABS - 28, 44, 4, 2, accent());
             }
             let count = if i == LOGS && self.unread > 0 {
                 format!(" {}", self.unread.min(99))
             } else {
                 String::new()
             };
+            let bg = if on { PANEL } else { BG };
             let lx = x + (w - width(name, 2) - width(&count, 2)) / 2;
-            let lw = s.text(lx, y + 32, name, 2, if on { accent() } else { DIM }, bg);
-            s.text(lx + lw, y + 32, &count, 2, WARN, bg);
+            let lw = s.text(lx, y + 28, name, 2, if on { accent() } else { DIM }, 0);
+            s.text(lx + lw, y + 28, &count, 2, WARN, 0);
+            let _ = bg;
             self.zone(Id::Tab(i), x, y, w, TABS);
         }
     }

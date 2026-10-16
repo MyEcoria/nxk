@@ -62,6 +62,9 @@ pub struct Screen {
     /// Image size, in panel scan order.
     w: usize,
     h: usize,
+    /// Added to every x of the drawing calls (a card that is partly off
+    /// the screen is drawn in its own coordinates); clipped to the screen.
+    pub dx: i32,
     /// Portrait panel: landscape view turned 90 degrees counterclockwise.
     rot: bool,
 }
@@ -75,6 +78,7 @@ impl Screen {
             shown: vec![0; w * h],
             w,
             h,
+            dx: 0,
             rot: h > w,
         }
     }
@@ -96,6 +100,12 @@ impl Screen {
     /// (image columns when turned).
     pub fn fill(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32) {
         let (sw, sh) = self.size();
+        let x0 = (x as i32 + self.dx).max(0);
+        let x1 = (x as i32 + self.dx + w as i32).min(sw as i32);
+        if x1 <= x0 {
+            return;
+        }
+        let (x, w) = (x0 as usize, (x1 - x0) as usize);
         let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
         if w == 0 || h == 0 {
             return;
@@ -115,6 +125,74 @@ impl Screen {
 
     pub fn clear(&mut self, c: u32) {
         self.back.fill(c);
+    }
+
+    /// Rectangle with corners of radius `r`.
+    pub fn fill_round(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32) {
+        let r = r.min(w / 2).min(h / 2);
+        for dy in 0..r {
+            // Width of the circle at the middle of this row, in half pixels.
+            let a = 2 * (r - dy) - 1;
+            let ext = isqrt(4 * r * r - a * a) / 2;
+            let inset = r - ext.min(r);
+            self.fill(x + inset, y + dy, w - 2 * inset, 1, c);
+            self.fill(x + inset, y + h - 1 - dy, w - 2 * inset, 1, c);
+        }
+        self.fill(x, y + r, w, h - 2 * r, c);
+    }
+
+    /// Rounded outline `t` thick: `edge` around `inner`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn card_round(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        r: usize,
+        t: usize,
+        edge: u32,
+        inner: u32,
+    ) {
+        self.fill_round(x, y, w, h, r, edge);
+        self.fill_round(
+            x + t,
+            y + t,
+            w - 2 * t,
+            h - 2 * t,
+            r.saturating_sub(t),
+            inner,
+        );
+    }
+
+    /// Vertical gradient from `top` to `bottom`.
+    pub fn gradient(&mut self, x: usize, y: usize, w: usize, h: usize, top: u32, bottom: u32) {
+        for i in 0..h {
+            self.fill(x, y + i, w, 1, mix(top, bottom, i * 255 / h.max(1)));
+        }
+    }
+
+    /// `c` over what is there, `a` of 255 opaque.
+    pub fn fill_alpha(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32, a: usize) {
+        let (sw, sh) = self.size();
+        let x0 = (x as i32 + self.dx).max(0);
+        let x1 = (x as i32 + self.dx + w as i32).min(sw as i32);
+        if x1 <= x0 {
+            return;
+        }
+        let (x, w) = (x0 as usize, (x1 - x0) as usize);
+        let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
+        let (iw, ih) = (self.w, self.h);
+        for ly in y..y + h {
+            for lx in x..x + w {
+                let i = if self.rot {
+                    (ih - 1 - lx) * iw + ly
+                } else {
+                    ly * iw + lx
+                };
+                self.back[i] = mix(self.back[i], c, a);
+            }
+        }
     }
 
     /// Outline `t` pixels thick.
@@ -139,7 +217,10 @@ impl Screen {
                     end += 1;
                 }
                 let c = if on { fg } else { bg };
-                self.fill(x + dx * scale, y + dy * scale, (end - dx) * scale, scale, c);
+                // A background of 0 is not drawn: text over art.
+                if on || bg != 0 {
+                    self.fill(x + dx * scale, y + dy * scale, (end - dx) * scale, scale, c);
+                }
                 dx = end;
             }
         }
@@ -274,4 +355,20 @@ impl fmt::Display for Hms {
         let s = self.0;
         write!(f, "{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
     }
+}
+
+/// Integer square root.
+fn isqrt(n: usize) -> usize {
+    let mut r = 0;
+    while (r + 1) * (r + 1) <= n {
+        r += 1;
+    }
+    r
+}
+
+/// `a` towards `b`, `t` of 255 of the way, per channel (A B G R).
+pub fn mix(a: u32, b: u32, t: usize) -> u32 {
+    let t = t.min(255) as u32;
+    let ch = |s: u32| ((a >> s & 0xFF) * (255 - t) + (b >> s & 0xFF) * t) / 255;
+    0xFF00_0000 | ch(16) << 16 | ch(8) << 8 | ch(0)
 }
