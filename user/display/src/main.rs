@@ -485,7 +485,7 @@ fn main() -> i32 {
         thread::spawn(move || loop {
             let mut m = Msg::new(input::READ, 2, 0);
             m.mr[0] = 0;
-            m.mr[1] = 1 << input::KIND_TOUCH | 1 << input::KIND_BUTTON;
+            m.mr[1] = 1 << input::KIND_TOUCH | 1 << input::KIND_BUTTON | 1 << input::KIND_STICK;
             match INPUT.call(&m) {
                 Ok(r) => {
                     q.lock()
@@ -670,6 +670,10 @@ fn main() -> i32 {
                     continue;
                 }
                 for (kind, code, id, x, y) in batch {
+                    // The sticks are for games.
+                    if kind == input::KIND_STICK {
+                        continue;
+                    }
                     if kind == input::KIND_BUTTON {
                         if owned || id != 1 {
                             continue;

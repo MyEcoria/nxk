@@ -103,6 +103,13 @@ impl Button {
     }
 }
 
+/// Analog sticks (`input::STICK_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stick {
+    Left,
+    Right,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Down,
@@ -123,6 +130,13 @@ pub enum Event {
     Button {
         button: Button,
         down: bool,
+    },
+    /// A stick moved: x to the right and y up, -1.0 to 1.0, both 0.0 at
+    /// rest (the console's dead zone is taken off).
+    Stick {
+        stick: Stick,
+        x: f32,
+        y: f32,
     },
 }
 
@@ -441,6 +455,18 @@ impl Graphics {
                 button: Button::from_code(code)?,
                 down: value != 0,
             }),
+            input::KIND_STICK => {
+                let axis = |w: u64| (w as i64 as f32 / input::STICK_MAX as f32).clamp(-1.0, 1.0);
+                Some(Event::Stick {
+                    stick: match code {
+                        input::STICK_L => Stick::Left,
+                        input::STICK_R => Stick::Right,
+                        _ => return None,
+                    },
+                    x: axis(x),
+                    y: axis(y),
+                })
+            }
             _ => None,
         }
     }

@@ -1,5 +1,5 @@
 //! Starlane: fly a ship down a lane in 3D, dodge the blocks, grab the
-//! gems. Controls: D-pad or L / R to steer, a finger on the screen to
+//! gems. Controls: D-pad, left stick or L / R to steer, a finger on the screen to
 //! steer to it; A, + or a tap to start; B or HOME to leave. Everything is
 //! drawn by the GPU through nxgfx: lit meshes with depth, and 2D text.
 
@@ -7,7 +7,7 @@ use std::fs;
 
 use nxgfx::{
     cube, octahedron, rgb, tris_mesh, vec3, Button, Canvas, Event, Frame, Graphics, LitUniforms,
-    Mat4, Mesh, Phase, Rgba, Vec3, HEIGHT, WIDTH,
+    Mat4, Mesh, Phase, Rgba, Stick, Vec3, HEIGHT, WIDTH,
 };
 
 /// Half width of the playfield.
@@ -386,6 +386,7 @@ fn main() {
     let proj = Graphics::projection(1.0, 0.2, 140.0);
     let mut game = Game::new(g.seconds().to_bits() ^ 0x9E37_79B9);
     let (mut left, mut right) = (false, false);
+    let mut analog = 0.0f32;
     let mut last = g.seconds();
     let (mut fps_n, mut fps_t) = (0u32, last);
     let mut bg = Canvas::background();
@@ -407,6 +408,12 @@ fn main() {
                     Button::Home if down => quit = true,
                     _ => {}
                 },
+                Event::Stick {
+                    stick: Stick::Left,
+                    x,
+                    ..
+                } => analog = x,
+                Event::Stick { .. } => {}
                 Event::Touch { phase, x, .. } => match phase {
                     Phase::Down => {
                         go = true;
@@ -422,7 +429,7 @@ fn main() {
         if quit {
             break;
         }
-        game.steer = (right as i32 - left as i32) as f32;
+        game.steer = ((right as i32 - left as i32) as f32 + analog).clamp(-1.0, 1.0);
         if go && game.state != State::Playing && (game.state == State::Title || game.since > 0.8) {
             game.start();
         }
