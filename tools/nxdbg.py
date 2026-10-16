@@ -98,10 +98,11 @@ class Channel:
         self.request(BUTTON, bytes([BUTTONS.index(name) + 1, value]))
 
     def screen(self):
-        """The image on display: width, height, pixels (R, G, B, A bytes)."""
+        """The image on display: width, height, pixels (R, G, B, A bytes),
+        in scan order whatever the layout in memory."""
         data = b"".join(self.request(SCREEN))
-        w, h, _fmt = struct.unpack_from("<HHB", data, 0)
-        px, i = array("I"), 5
+        w, h, _fmt, lay = struct.unpack_from("<HHBB", data, 0)
+        px, i = array("I"), 6
         while i < len(data):
             (n,) = struct.unpack_from("<H", data, i)
             i += 2
@@ -113,7 +114,32 @@ class Channel:
                 i += 4 * (n + 1)
         if len(px) != w * h:
             raise ValueError(f"capture is {len(px)} pixels, not {w}x{h}")
+        if lay & 0xF == 1:
+            px = detile(px, w, h, lay >> 4)
         return w, h, px
+
+
+def detile(px, w, h, block_log2):
+    """Pixels of a block-linear image (GOBs of 64 x 8 bytes, 1 << block_log2
+    high per block, one wide) in scan order."""
+    gobs_x = (w * 4 + 63) // 64
+    gob_rows = 8 << block_log2
+    out = array("I", bytes(4 * w * h))
+    # Offset of (x, y) in its GOB, in pixels: x bits 3-0 of the byte
+    # offset, y bit 0, x bit 4, y bits 2-1, x bit 5.
+    inner = [[(((x * 4) % 64) // 32) * 256 + (y // 2) * 64 + (((x * 4) % 32) // 16) * 32
+              + (y % 2) * 16 + (x * 4) % 16 for x in range(16)] for y in range(8)]
+    for y in range(h):
+        gy, row = divmod(y, 8)
+        blk, in_blk = gy >> block_log2, gy & ((1 << block_log2) - 1)
+        for gx in range(gobs_x):
+            base = ((blk * gobs_x + gx) * (512 << block_log2) + in_blk * 512) // 4
+            x0 = gx * 16
+            n = min(16, w - x0)
+            o = y * w + x0
+            for k in range(n):
+                out[o + k] = px[base + inner[row][k] // 4]
+    return out
 
 
 def write_png(path, w, h, rows):

@@ -45,7 +45,7 @@ struct Capture {
     img: SharedMemory,
     pixels: usize,
     pos: usize,
-    head: [u8; 5],
+    head: [u8; 6],
     head_sent: bool,
 }
 
@@ -278,10 +278,11 @@ impl Dbg {
             return Err(-ENOSYS);
         }
         let img = SharedMemory::map(handle, h * stride, prot::READ)?;
-        let mut head = [0u8; 5];
+        let mut head = [0u8; 6];
         head[..2].copy_from_slice(&(w as u16).to_le_bytes());
         head[2..4].copy_from_slice(&(h as u16).to_le_bytes());
         head[4] = r.mr[3] as u8;
+        head[5] = (r.mr[4] as u8 & 0xF) | (r.mr[5] as u8) << 4;
         self.job = Some(Capture {
             id,
             img,
