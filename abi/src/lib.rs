@@ -1170,12 +1170,30 @@ pub mod proto {
         /// (`UART_BAUD` changes it): clock on, reset released.
         pub const UARTB: u64 = 28;
         pub const UARTC: u64 = 29;
+        /// Audio hub (AHUB, ADMA, I2S1) and the codec's clock: the AUD
+        /// partition on, pad power for I2S1 and the audio pads (1.8 V),
+        /// PLLA 368.64 MHz and its 36.864 MHz output, the APE, AHUB and
+        /// I2S1 clocks, EXTERN1 at 12.288 MHz (the codec's MCLK).
+        pub const AUDIO: u64 = 30;
         /// word 0 = `UARTB` or `UARTC`, word 1 = `BAUD_1M` or `BAUD_3M`:
         /// the UART's source clock divider, 16 times the baud rate
         /// (hekate `clock_uart_use_src_div`). Reply: word 0 = state.
         pub const UART_BAUD: u32 = 4;
         pub const BAUD_1M: u64 = 1_000_000;
         pub const BAUD_3M: u64 = 3_000_000;
+    }
+    /// Audio output (`audio`), published as "audio": the ALC5639 codec
+    /// on I2S1, fed through the audio hub.
+    pub mod audio {
+        /// words: frequency (Hz), duration (ms), level (0..100). A sine
+        /// on both speakers; the reply comes when it is done. Reply:
+        /// word 0 = frames written.
+        pub const TONE: u32 = 1;
+        /// Reply: word 0 = `ST_*` bits, word 1 = codec ID (0x1c reads).
+        pub const STATUS: u32 = 2;
+        /// Codec and I2S up.
+        pub const ST_READY: u64 = 1;
+        pub const RATE: u32 = 48_000;
     }
     /// I2C bus.
     pub mod i2c {

@@ -43,7 +43,13 @@ const DRIVERS: &[Driver] = &[
     // CAR, plus the PMC page to read power-partition status.
     Driver {
         name: "clk",
-        mmio: &[(0x6000_6000, 0x1000), (0x7000_E000, 0x1000)],
+        // CAR, PMC, and the audio hub (its I2S blocks, for the MBIST
+        // workaround after the AUD partition comes up).
+        mmio: &[
+            (0x6000_6000, 0x1000),
+            (0x7000_E000, 0x1000),
+            (0x702D_0000, 0x2000),
+        ],
         ro_mmio: &[],
         irqs: &[],
         sysctl: false,
@@ -131,6 +137,23 @@ const DRIVERS: &[Driver] = &[
             (0x6000_D000, 0x1000),
         ],
         ro_mmio: &[(0x7000_0000, 0x1000)],
+        irqs: &[],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
+    // Audio: the codec on I2C1, I2S1 and the hub's ADMAIF / crossbar
+    // (AHUB) and its DMA (ADMA), pinmux (DAP1, MCLK, codec LDO enable), GPIO (Z4). Clocks
+    // and pad power through clk.
+    Driver {
+        name: "audio",
+        mmio: &[
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+            (0x702D_0000, 0x2000),
+            (0x702E_2000, 0x1000),
+        ],
+        ro_mmio: &[],
         irqs: &[],
         sysctl: false,
         console: 0,

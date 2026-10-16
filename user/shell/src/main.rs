@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
-use libnx::abi::proto::{cpufreq, fan, gpu, pm, power};
+use libnx::abi::proto::{audio, cpufreq, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::seqpage::SeqPage;
@@ -190,6 +190,7 @@ fn command(line: &str) {
         "fan" => fan_cmd(argv.get(1).copied()),
         "cpufreq" => cpufreq_cmd(argv.get(1).copied()),
         "gpu" => gpu_cmd(&argv),
+        "audio" => audio_cmd(&argv),
         "services" => {
             let mut buf = [0u8; 512];
             let n = ns::services(&mut buf);
@@ -229,6 +230,7 @@ fn help() {
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
+    println!("  audio [tone [HZ [MS [LEVEL]]]]  codec state; a test tone on the speakers");
     println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels, 3D clear and triangle");
     println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
     println!(
@@ -967,6 +969,38 @@ fn gpu_sweep(argv: &[&str]) {
     match gpu_clock_call(h, before.mr[0], was_forced) {
         Ok(_) => println!("gpu sweep: back to {}", mhz(before.mr[0])),
         Err(e) => gpu_clock_error(e),
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `audio`: bring the codec up and show the hub; `audio tone [HZ [MS
+/// [LEVEL]]]`: a sine on the speakers (440 Hz, 1000 ms, level 30).
+fn audio_cmd(argv: &[&str]) {
+    let num = |i: usize, d: u64| argv.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let req = match argv.get(1).copied() {
+        None | Some("status") => Msg::new(audio::STATUS, 0, 0),
+        Some("tone") => Msg::from_words(audio::TONE, &[num(2, 440), num(3, 1000), num(4, 30)]),
+        _ => {
+            println!("usage: audio [status|tone [HZ [MS [LEVEL]]]]");
+            fail(-err::EINVAL);
+            return;
+        }
+    };
+    let Some(h) = service("audio") else { return };
+    match ipc::call(h, &req).and_then(ipc::checked) {
+        Ok(m) if req.label() == audio::TONE => println!("audio: {} frames played", m.mr[0]),
+        Ok(m) => println!(
+            "audio: {}",
+            if m.mr[0] & audio::ST_READY != 0 {
+                "ready"
+            } else {
+                "off"
+            }
+        ),
+        Err(e) => {
+            println!("audio: {}", err::name(e));
+            fail(e);
+        }
     }
     let _ = sys::handle_close(h);
 }

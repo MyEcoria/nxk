@@ -14,6 +14,7 @@ use libnx::ipc::Msg;
 use libnx::{println, time};
 
 const CAR: u64 = 0x6000_6000;
+const AHUB_PAGE: u64 = 0x702D_0000;
 /// CLR register of a SET/CLR pair.
 const CLR: usize = 4;
 
@@ -34,10 +35,21 @@ const PART_XUSBC: u32 = 1 << 22;
 /// ones the loader leaves on.
 const PART_PCIE_ID: u32 = 3;
 const PART_PCIE: u32 = 1 << PART_PCIE_ID;
+const PART_AUD_ID: u32 = 27;
+const PART_AUD: u32 = 1 << PART_AUD_ID;
 /// I/O pad deep power-down (Atmosphère tegra_pmc.hpp: code in bits 31:30).
 /// PEX bias and reference-clock pads: bits 4-6 (Linux `tegra210_io_pads`).
 const PMC_IO_DPD_REQ: usize = 0x400 + 0x1B8;
 const PMC_IO_DPD_STATUS: usize = 0x400 + 0x1BC;
+const PMC_IO_DPD2_REQ: usize = 0x400 + 0x1C0;
+const PMC_IO_DPD2_STATUS: usize = 0x400 + 0x1C4;
+const PMC_PWR_DET: usize = 0x400 + 0x48;
+const PMC_PWR_DET_VAL: usize = 0x400 + 0xE4;
+/// Audio pads: deep power-down bits (IO_DPD, IO_DPD2) and the 3.3 V
+/// enable of the audio-hv pad in PWR_DET_VAL.
+const AUDIO_PAD: u32 = 1 << 17;
+const AUDIO_HV_PAD: u32 = 1 << 29;
+const AUDIO_HV_3V3: u32 = 1 << 18;
 const IO_DPD_OFF: u32 = 1 << 30;
 const PEX_PADS: u32 = 0x7 << 4;
 
@@ -182,6 +194,8 @@ enum Needs {
     Shared,
     /// GPU rail unclamped (its own sequence, `gpu_up`).
     Gpu,
+    /// AUD partition on and PLLA locked (`audio_up`).
+    Audio,
 }
 
 /// One device: its clocks in enable order plus PMC partitions that must
@@ -329,6 +343,55 @@ const GPU: [Clock; 2] = [
     },
 ];
 
+/// Audio hub (Linux clk-tegra210.c, clk-tegra-periph.c; tegra210-odin DT):
+/// D_AUDIO (V 10, AHUB), APBIF (V 11), APE (Y 6) and I2S1 (L 11) from
+/// PLLA_OUT0 (source 0), then EXTERN1 (V 24, no reset), the codec's MCLK.
+/// PLLA_OUT0 is 36.864 MHz: D_AUDIO and APE run it undivided, I2S1 at /24
+/// (1.536 MHz, the 48 kHz 16-bit stereo bit clock), EXTERN1 at /3
+/// (12.288 MHz = 256 fs). Divider field: 2 * ratio - 2.
+const AUDIO: [Clock; 5] = [
+    Clock {
+        bank: &V,
+        bit: 10,
+        source: 0x3D0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+    Clock {
+        bank: &V,
+        bit: 11,
+        source: 0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+    Clock {
+        bank: &Y,
+        bit: 6,
+        source: 0x6C0,
+        keep: 0,
+        src: 0,
+        reset: true,
+    },
+    Clock {
+        bank: &L,
+        bit: 11,
+        source: 0x100,
+        keep: 0,
+        src: 2 * 24 - 2,
+        reset: true,
+    },
+    Clock {
+        bank: &V,
+        bit: 24,
+        source: 0x3EC,
+        keep: 0,
+        src: 2 * 3 - 2,
+        reset: false,
+    },
+];
+
 /// UART B (bank L bit 7) and C (bank H bit 23): PLLP_OUT0 (408 MHz)
 /// through the 16x clock divider at 1 Mbaud (hekate `clock_uart_use_src_div`).
 const UART_DIV_EN: u32 = 1 << 24;
@@ -368,6 +431,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::PCIE => Needs::Pcie,
         proto::PWM => Needs::Shared,
         proto::GPU => Needs::Gpu,
+        proto::AUDIO => Needs::Audio,
         _ => Needs::Nothing,
     };
     let (clocks, parts): (&'static [Clock], u32) = match dev {
@@ -386,6 +450,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::PCIE => (&PCIE, PART_PCIE),
         proto::PWM => (&PWM, 0),
         proto::GPU => (&GPU, 0),
+        proto::AUDIO => (&AUDIO, PART_AUD),
         proto::UARTB => (&UARTB, 0),
         proto::UARTC => (&UARTC, 0),
         _ => return None,
@@ -426,6 +491,7 @@ fn status(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> u64 {
         Needs::FuseVisible => car.r32(MISC_CLK_ENB) & FUSE_VISIBLE != 0,
         Needs::Pcie => car.r32(PLLE_MISC) & PLLE_MISC_LOCK != 0,
         Needs::Gpu => pmc.is_some_and(|p| p.r32(PMC_GPU_RG_CNTRL) & 1 == 0),
+        Needs::Audio => car.r32(PLLA_BASE) & PLL_LOCK != 0,
     };
     if powered(pmc, d.parts) && extra {
         st |= proto::ST_POWERED;
@@ -599,6 +665,114 @@ fn pcie_up(car: &Mmio, pmc: Option<&Mmio>) -> i64 {
     0
 }
 
+/// PLLA (Linux clk-tegra210.c `pll_a_freq_table`, 38.4 MHz reference):
+/// M 3, N 57, P 2 and the sigma-delta fraction 0x0333, 368.64 MHz, then
+/// PLLA_OUT0 at /10 = 36.864 MHz (divider field 2 * 10 - 2).
+const PLLA_BASE: usize = 0xB0;
+const PLLA_OUT: usize = 0xB4;
+const PLLA_MISC1: usize = 0xB8;
+const PLLA_MISC0: usize = 0xBC;
+const PLLA_MISC2: usize = 0x5D8;
+const PLLA_IDDQ: u32 = 1 << 25;
+const PLLA_MISC0_DEFAULT: u32 = 0x1200_0020;
+const PLLA_SDM_EN: u32 = 1 << 26;
+const PLLA_DIVS: u32 = 3 | 57 << 8 | 2 << 20;
+const PLLA_OUT0_ON: u32 = (2 * 10 - 2) << 8 | 1 << 1 | 1;
+const LVL2_CLK_GATE_OVRC: usize = 0x3A0;
+const LVL2_CLK_GATE_OVRE: usize = 0x554;
+/// AHUB's I2S blocks (five, 0x100 apart from AHUB + 0x1000).
+const I2S_CTRL: usize = 0xA0;
+const I2S_CG: usize = 0x88;
+
+/// Audio hub, in Linux's order: AUD partition on, pads out of deep
+/// power-down and the audio-hv pad at 1.8 V (the DT's), PLLA, its
+/// output, then the clocks with their resets held until all run, and the
+/// MBIST workaround Linux applies after the partition comes up.
+fn audio_up(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>) -> i64 {
+    let Some(pmc) = pmc else {
+        return ENODEV;
+    };
+    if !ungate(pmc, PART_AUD_ID) {
+        return EIO;
+    }
+    // Pads: the audio pads (I2S1 and MCLK sit on them) out of deep
+    // power-down; audio-hv at 1.8 V from the PMIC's SD3 as the DT says.
+    pmc.w32(PMC_IO_DPD_REQ, IO_DPD_OFF | AUDIO_PAD);
+    pmc.w32(PMC_IO_DPD2_REQ, IO_DPD_OFF | AUDIO_HV_PAD);
+    pmc.wait(PMC_IO_DPD_STATUS, AUDIO_PAD, 0, 250_000);
+    pmc.wait(PMC_IO_DPD2_STATUS, AUDIO_HV_PAD, 0, 250_000);
+    let det = pmc.r32(PMC_PWR_DET_VAL);
+    println!(
+        "[clk] audio-hv pad voltage {:#x} (3.3 V bit {})",
+        det,
+        det >> 18 & 1
+    );
+    if det & AUDIO_HV_3V3 != 0 {
+        pmc.w32(PMC_PWR_DET, pmc.r32(PMC_PWR_DET) | AUDIO_HV_3V3);
+        pmc.w32(PMC_PWR_DET_VAL, det & !AUDIO_HV_3V3);
+        let _ = pmc.r32(PMC_PWR_DET_VAL);
+        time::sleep_us(250);
+    }
+    if car.r32(PLLA_BASE) & PLL_LOCK == 0 {
+        car.w32(PLLA_BASE, car.r32(PLLA_BASE) & !PLLA_IDDQ);
+        let _ = car.r32(PLLA_BASE);
+        time::sleep_us(5);
+        car.w32(PLLA_MISC0, PLLA_MISC0_DEFAULT);
+        car.w32(PLLA_MISC1, 0x0333);
+        car.w32(PLLA_MISC2, car.r32(PLLA_MISC2) | PLLA_SDM_EN);
+        car.w32(PLLA_BASE, PLLA_DIVS);
+        car.w32(PLLA_BASE, PLLA_DIVS | PLL_ENABLE);
+        if !wait_bits(car, PLLA_BASE, PLL_LOCK, 1_000) {
+            println!("[clk] PLLA did not lock: {:#x}", car.r32(PLLA_BASE));
+            return EIO;
+        }
+    }
+    car.w32(PLLA_OUT, PLLA_OUT0_ON);
+    time::sleep_us(10);
+    // Clocks and resets, as `enable`'s loop, but all the resets are held
+    // until every clock runs.
+    for c in AUDIO.iter() {
+        let m = 1u32 << c.bit;
+        if c.reset {
+            car.w32(c.bank.rst_set, m);
+        }
+        car.w32(c.bank.enb_set + CLR, m);
+        if c.source != 0 {
+            car.w32(c.source, (car.r32(c.source) & c.keep) | c.src);
+        }
+        car.w32(c.bank.enb_set, m);
+    }
+    time::sleep_us(5);
+    for c in AUDIO.iter().filter(|c| c.reset) {
+        car.w32(c.bank.rst_set + CLR, 1 << c.bit);
+    }
+    let _ = car.r32(V.rst);
+    time::sleep_us(5);
+    // MBIST workaround (clk-tegra210.c `tegra210_ape_mbist_war`).
+    if let Some(ahub) = ahub {
+        let (c, e) = (car.r32(LVL2_CLK_GATE_OVRC), car.r32(LVL2_CLK_GATE_OVRE));
+        car.w32(LVL2_CLK_GATE_OVRC, c | 1 << 1);
+        car.w32(LVL2_CLK_GATE_OVRE, e | 1 << 10 | 1 << 11);
+        let _ = car.r32(LVL2_CLK_GATE_OVRE);
+        time::sleep_us(1);
+        for i in 0..5 {
+            let b = 0x1000 + 0x100 * i;
+            let ctrl = ahub.r32(b + I2S_CTRL);
+            ahub.w32(b + I2S_CTRL, ctrl | 1 << 10);
+            ahub.w32(b + I2S_CG, 0);
+            let _ = ahub.r32(b + I2S_CG);
+            ahub.w32(b + I2S_CG, 1);
+            ahub.w32(b + I2S_CTRL, ctrl);
+            let _ = ahub.r32(b + I2S_CTRL);
+        }
+        car.w32(LVL2_CLK_GATE_OVRC, c);
+        car.w32(LVL2_CLK_GATE_OVRE, e);
+        let _ = car.r32(LVL2_CLK_GATE_OVRE);
+        time::sleep_us(1);
+    }
+    0
+}
+
 /// GPU, its rail already on. Order from NVIDIA's railgate code (Linux
 /// `nvkm_device_tegra_power_up`): clocks running with the reset held,
 /// clamps off, then the reset released, 10 us apart.
@@ -674,7 +848,31 @@ fn pcie_link(car: &Mmio, pmc: Option<&Mmio>, label: u32) -> (i64, u64) {
     }
 }
 
-fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
+fn enable(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>, d: &Device) -> i64 {
+    if d.needs == Needs::Audio {
+        if status(car, pmc, d) == proto::ST_READY {
+            return 0;
+        }
+        let r = audio_up(car, pmc, ahub);
+        if r != 0 {
+            return r;
+        }
+        let st = status(car, pmc, d);
+        if st != proto::ST_READY {
+            println!(
+                "[clk] audio state {:#x}: PLLA {:#x}, V enb {:#x} rst {:#x}, L enb {:#x}, Y enb {:#x} rst {:#x}, parts {:#x}",
+                st,
+                car.r32(PLLA_BASE),
+                car.r32(V.enb),
+                car.r32(V.rst),
+                car.r32(L.enb),
+                car.r32(Y.enb),
+                car.r32(Y.rst),
+                pmc.map_or(0, |p| p.r32(PMC_PWRGATE_STATUS))
+            );
+        }
+        return if st == proto::ST_READY { 0 } else { EIO };
+    }
     if d.needs == Needs::Pcie {
         if status(car, pmc, d) == proto::ST_READY {
             return 0;
@@ -793,6 +991,9 @@ libnx::entry!(main);
 fn main() -> i32 {
     let car = Mmio::map(drv::dev_slot(0), CAR, 0x1000).expect("clk: CAR registers");
     let pmc = Mmio::map(drv::dev_slot(1), PMC_PAGE, 0x1000).ok();
+    // The audio hub's I2S blocks, for the MBIST workaround after its
+    // partition comes up.
+    let ahub = Mmio::map(drv::dev_slot(2), AHUB_PAGE, 0x2000).ok();
     let ep = drv::publish("clk").expect("clk: publish");
     println!("[clk] clock service ready");
     drv::serve(ep, |rx| {
@@ -811,7 +1012,7 @@ fn main() -> i32 {
         }
         let mut st = 0;
         let r = match (rx.msg.label(), table(rx.msg.mr[0])) {
-            (proto::ENABLE, Some(d)) => enable(&car, pmc.as_ref(), &d),
+            (proto::ENABLE, Some(d)) => enable(&car, pmc.as_ref(), ahub.as_ref(), &d),
             (proto::DISABLE, Some(d)) if d.needs == Needs::Gpu => {
                 gpu_down(&car, pmc.as_ref());
                 0
