@@ -374,7 +374,10 @@ fn main() -> i32 {
                 Some(i) => {
                     let e = queue.remove(i).unwrap();
                     readers.remove(k);
-                    let _ = ipc::reply_to(tok, &reply(e));
+                    // A reader that died (a restarted client) must not eat it.
+                    if ipc::reply_to(tok, &reply(e)).is_err() {
+                        queue.insert(i, e);
+                    }
                 }
                 None => k += 1,
             }
