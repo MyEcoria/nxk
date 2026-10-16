@@ -1448,6 +1448,9 @@ pub mod proto {
         pub const OPEN: u32 = 1;
         /// Text for the on-screen terminal (see `pack`).
         pub const WRITE: u32 = 2;
+        /// Like `OPEN`, but the UI keeps running: handle 0 = the image
+        /// being displayed, read-only (what `dbg` captures). Same words.
+        pub const SNAPSHOT: u32 = 3;
         pub const FORMAT_RGBA8888: u64 = 1;
     }
     /// USB-C console (`usbcon`), published as "usbcon".
@@ -1592,5 +1595,59 @@ pub mod proto {
         /// Key: code = HID code (keyboard page), value = 1 press,
         /// 0 release; x = Unicode char produced (0: none).
         pub const KEY_PRESSED: u64 = 1;
+        /// Button (gamepad): code = `BTN_*`, value = 1 press, 0 release.
+        pub const BTN_A: u64 = 1;
+        pub const BTN_B: u64 = 2;
+        pub const BTN_X: u64 = 3;
+        pub const BTN_Y: u64 = 4;
+        pub const BTN_L: u64 = 5;
+        pub const BTN_R: u64 = 6;
+        pub const BTN_ZL: u64 = 7;
+        pub const BTN_ZR: u64 = 8;
+        pub const BTN_PLUS: u64 = 9;
+        pub const BTN_MINUS: u64 = 10;
+        pub const BTN_UP: u64 = 11;
+        pub const BTN_DOWN: u64 = 12;
+        pub const BTN_LEFT: u64 = 13;
+        pub const BTN_RIGHT: u64 = 14;
+        pub const BTN_LSTICK: u64 = 15;
+        pub const BTN_RSTICK: u64 = 16;
+        pub const BTN_HOME: u64 = 17;
+        pub const BTN_CAPTURE: u64 = 18;
+        /// Raw touch coordinates (hekate bdk/input/touch.c): landscape
+        /// 1280x720 with the edges cut.
+        pub const TOUCH_EDGE: u64 = 15;
+        pub const TOUCH_X_MAX: u64 = 1264;
+        pub const TOUCH_Y_MAX: u64 = 704;
+    }
+    /// Debug channel on the USB-C console (`usbcon`, `tools/nxdbg.py`):
+    /// frames inside the serial stream, which usbcon takes out of the
+    /// shell's input and puts between its output. A frame is an APC
+    /// string, `FRAME_START`, the base64 of a payload, `FRAME_END`:
+    /// terminals ignore it, the console never makes one.
+    pub mod dbg {
+        pub const FRAME_START: &[u8] = b"\x1b_N";
+        pub const FRAME_END: &[u8] = b"\x1b\\";
+        /// Payload of a request: id, op, then the op's bytes (little-endian).
+        /// Payload of a reply: the id, a status, then data.
+        /// `PING`: no bytes. Reply: protocol version.
+        pub const PING: u8 = 0;
+        /// `SCREEN`: no bytes. Reply: the image on display, in chunks
+        /// (`MORE`) until `DONE`; concatenated they are width (u16), height
+        /// (u16), `display::FORMAT_*` (u8), then the pixels (panel scan
+        /// order, 32 bits each, as in memory) as tokens: u16 n, then bit 15
+        /// clear: n + 1 pixels follow; set: one pixel follows, repeated
+        /// (n & 0x7FFF) + 1 times.
+        pub const SCREEN: u8 = 1;
+        /// `TOUCH`: action (`input::TOUCH_*`, u8), finger (u8), x (u16), y
+        /// (u16), landscape pixels of the image.
+        pub const TOUCH: u8 = 2;
+        /// `BUTTON`: `input::BTN_*` (u8), 1 press or 0 release (u8).
+        pub const BUTTON: u8 = 3;
+        pub const DONE: u8 = 0;
+        pub const MORE: u8 = 1;
+        /// Data: the error number (u16, positive).
+        pub const ERROR: u8 = 2;
+        pub const VERSION: u8 = 1;
     }
 }
