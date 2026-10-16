@@ -13,6 +13,7 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
+mod dbg;
 mod udc;
 
 use libnx::abi::err::{EAGAIN, EINVAL, ENETDOWN, ETIMEDOUT};
@@ -181,6 +182,7 @@ struct Dev {
     /// first in the next one.
     carry: Option<u8>,
     stats: Stats,
+    dbg: dbg::Dbg,
     hs: bool,
     ep0: Ep0,
     config: u8,
@@ -222,6 +224,9 @@ impl Dev {
         let online = self.config != 0 && self.dtr;
         if self.online != online {
             self.online = online;
+            if !online {
+                self.dbg.reset();
+            }
             self.hold_until = time::now_ns() + HOLD_NS;
             println!(
                 "[usbcon] {}",
@@ -464,9 +469,12 @@ impl Dev {
         }
         self.stats.rx_bytes += n as u64;
         self.stats.rx_xfers += 1;
-        for chunk in data[..n].chunks(ipc::MAX_BYTES) {
+        // Debug frames stay here; the rest is typed.
+        let typed = self.dbg.feed(&data[..n]);
+        for chunk in typed.chunks(ipc::MAX_BYTES) {
             let _ = ipc::call(self.term, &ipc::pack(con::INPUT, chunk));
         }
+        self.dbg.run();
     }
 
     /// Next IN transfer, pulled from the console, if the endpoint is
@@ -489,10 +497,16 @@ impl Dev {
             buf[0] = b;
             n = 1;
         }
-        let ask = Msg::from_words(con::OUTPUT, &[(TX_LEN - n) as u64]);
-        if let Ok(m) = ipc::call(self.term, &ask) {
-            if m.label() == 0 {
-                n += ipc::unpack(&m, &mut buf[n..]);
+        // Debug frames go out whole before more console output, so that
+        // none is cut by it.
+        if self.dbg.pending() {
+            n += self.dbg.fill(&mut buf[n..]);
+        } else {
+            let ask = Msg::from_words(con::OUTPUT, &[(TX_LEN - n) as u64]);
+            if let Ok(m) = ipc::call(self.term, &ask) {
+                if m.label() == 0 {
+                    n += ipc::unpack(&m, &mut buf[n..]);
+                }
             }
         }
         // Never a whole number of packets: the host sees the end of
@@ -673,6 +687,7 @@ fn main() -> i32 {
         hold_until: 0,
         carry: None,
         stats: Stats::default(),
+        dbg: dbg::Dbg::new(),
         hs: true,
         ep0: Ep0::Idle,
         config: 0,
