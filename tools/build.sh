@@ -26,6 +26,11 @@ python3 "$ici/tools/mkstd.py"
 (cd "$ici/apps" && RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$cache/target-apps" cargo build --release)
 for p in "${apps[@]}"; do bins+=("$cache/target-apps/aarch64-unknown-nxk/release/$p"); done
 
+echo "== games"
+# Games (jeux/ dir) are std programs too, but live on the SD card
+# (/games/NAME), not in the boot image: tools/mksd.py installs them.
+(cd "$ici/jeux" && RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$cache/target-apps" cargo build --release)
+
 python3 "$ici/tools/mkbootfs.py" -o "$ici/build/bootfs.img" "${bins[@]}"
 
 echo "== kernel"

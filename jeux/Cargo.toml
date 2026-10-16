@@ -1,0 +1,17 @@
+# Games for nxk: ordinary Rust (std) programs on top of `nxgfx`, the SDK
+# that talks to `display` (the screen, the input), `gpu` (the 3D engine).
+#
+# Build: tools/build.sh (or here: cargo build --release), with the
+# "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
+[workspace]
+resolver = "2"
+members = ["nxgfx", "cube"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

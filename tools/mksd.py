@@ -68,6 +68,13 @@ if not a.no_bin:
         p = os.path.join(appdir, prog)
         if os.path.exists(p):
             put("/bin/" + prog, open(p, "rb").read())
+    # Games (jeux/ dir): /games/NAME/NAME, with its manifest game.txt.
+    gamesrc = os.path.join(ROOT, "jeux")
+    for name in sorted(os.listdir(gamesrc)) if os.path.isdir(gamesrc) else []:
+        exe = os.path.join(appdir, name)
+        if os.path.exists(exe) and os.path.exists(os.path.join(gamesrc, name, "game.txt")):
+            put(f"/games/{name}/{name}", open(exe, "rb").read())
+            put(f"/games/{name}/game.txt", open(os.path.join(gamesrc, name, "game.txt"), "rb").read())
 put("/etc/motd", "Welcome to nxk: this file comes from the SD card (FAT32).\n".encode())
 put("/Documents/Read me.txt",
     "Long name and spaces: FAT32 LFN entries.\n".encode())

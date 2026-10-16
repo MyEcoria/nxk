@@ -1,0 +1,3 @@
+title=Cube
+description=A lit cube turning on the GPU
+color=6CA0F0

@@ -1,0 +1,8 @@
+[package]
+name = "nxgfx"
+version = "0.1.0"
+edition = "2021"
+description = "Game SDK for nxk: screen, GPU 3D engine, input, math"
+
+[dependencies]
+nxk-abi = { path = "../../abi" }

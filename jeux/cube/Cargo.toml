@@ -1,0 +1,8 @@
+[package]
+name = "cube"
+version = "0.1.0"
+edition = "2021"
+description = "A lit cube on the GPU: the first program on nxgfx"
+
+[dependencies]
+nxgfx = { path = "../nxgfx" }
