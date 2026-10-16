@@ -415,7 +415,8 @@ Then at the shell:
 
 ```text
 gpu             gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo NNNN (ID 3)
-gpu test        2D fill and copy, fill / copy / SAXPY kernels: 5/5 ok
+gpu test        2D fill and copy, fill / copy / SAXPY kernels, 3D clear and a
+                triangle through a vertex and a fragment shader: 7/7 ok
 gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
 gpu clock 768   [gpu] GPU 76800 -> 768000 kHz at 987 mV, measured 768292 kHz
 gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
@@ -786,6 +787,18 @@ within 5 s.
     instance's pending read. It now keeps the event when the reply
     fails; `usbcon` retries a call once when a service was restarted.
     `ktest` 29/29, `stdtest` 17/17 afterwards.
+
+29. 16/10/2026, Erista, `gpu` (`gfx.rs`): **the 3D engine (MAXWELL_B,
+    0xB197) draws**. `gpu test` 7/7: the clear writes 0.1/0.2/0.3 as
+    0x19/0x33/0x4C (the hardware truncates 25.5 and 76.5), and a triangle
+    with a hand-assembled vertex shader (ALD, AST) and fragment shader
+    (IPA) interpolates its three vertex colors into a linear render
+    target. Two traps on the way, both reported by the batch timeout dump
+    (`gr::report`: trapped method and data error code): SET_SPH_VERSION
+    is not a method of this class (illegal method), and a shader's
+    program offset is refused (INVALID_VALUE) unless the header sits at
+    0x30 modulo 0x80, so that the code 0x50 later starts on a 0x80
+    boundary, as Kepler and later want.
 
 ## Hardware test (once the SD card is back in the PC)
 
