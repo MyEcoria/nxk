@@ -245,6 +245,7 @@ impl Chan {
                 r.rd(0x40108),
                 r.rd(0x400100)
             );
+            crate::gr::report(r, "batch");
             return Err((libnx::abi::err::ETIMEDOUT, "GPU batch timed out"));
         }
         r.l2_flush()

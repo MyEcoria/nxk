@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 /// Subchannels the channel binds its GR classes to (Mesa's numbering).
+pub const SUBC_3D: u32 = 0;
 pub const SUBC_COMPUTE: u32 = 1;
 pub const SUBC_2D: u32 = 3;
 

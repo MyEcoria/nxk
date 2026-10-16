@@ -1324,6 +1324,11 @@ pub mod proto {
         /// word 0 = this instance (`S_INSTANCE`); handle 0 = the stats
         /// page, read-only, unless word 0 named it already.
         pub const STATS: u32 = 11;
+        /// 3D engine self-test on the service's own buffers (clear, then a
+        /// triangle with vertex and fragment shaders), checked by the CPU.
+        /// Reply: word 0 = tests passed (bit `T3_*`), word 1 = tests run,
+        /// word 2 = GPU time (ns).
+        pub const TEST3D: u32 = 12;
         /// Stats page: `STATS_WORDS` u64 words, kept current by the
         /// service even while a batch runs. Written under `S_SEQ`: odd
         /// while it changes; a read is good if it saw one even value.
@@ -1384,6 +1389,9 @@ pub mod proto {
         pub const T_KFILL: u64 = 4;
         pub const T_KCOPY: u64 = 8;
         pub const T_KSAXPY: u64 = 16;
+        /// `TEST` bits of the 3D engine (and `TEST3D`'s alone).
+        pub const T3_CLEAR: u64 = 32;
+        pub const T3_TRIANGLE: u64 = 64;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {

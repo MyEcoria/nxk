@@ -18,6 +18,7 @@ mod engine;
 mod falcon;
 mod fifo;
 mod fw;
+mod gfx;
 mod gr;
 mod hw;
 mod kernels;
@@ -41,6 +42,7 @@ use libnx::{fs, println, sys, time};
 
 use engine::{Compute, Kernel, Surface};
 use fifo::Chan;
+use gfx::Gfx;
 use hw::{Dma, Regs, Result};
 use mmu::Vm;
 use push::Push;
@@ -77,6 +79,7 @@ struct Dev {
     _global: gr::Global,
     _ctx: gr::ChanCtx,
     compute: Compute,
+    gfx: Gfx,
     topo: gr::Topo,
     surfaces: Vec<Option<(Surface, u32)>>,
 }
@@ -344,10 +347,12 @@ impl Gpu {
 
         self.at(proto::STAGE_CHANNEL);
         let compute = Compute::new(&mut vm)?;
+        let gfx = Gfx::new(&mut vm)?;
         mmu::invalidate(&r, &vm)?;
         chan.schedule(&r)?;
         let mut p = Push::default();
         compute.setup(&mut p);
+        gfx.setup(&mut p);
         chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US, false)?;
         self.dev = Some(Dev {
             vm,
@@ -357,6 +362,7 @@ impl Gpu {
             _global: global,
             _ctx: ctx,
             compute,
+            gfx,
             topo,
             surfaces: Vec::new(),
         });
@@ -841,6 +847,90 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     Ok((pass, all, ns))
 }
 
+/// 3D engine self-test: a clear, then a triangle through both shaders.
+fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
+    const W: u32 = 128;
+    const H: u32 = 128;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+    let d = g.dev(0)?;
+    let img = Dma::new((W * H * 4) as usize).map_err(e)?;
+    let vb = Dma::new(4096).map_err(e)?;
+    let s = Surface {
+        va: d.vm.map(&img, false).map_err(e)?,
+        width: W,
+        height: H,
+        pitch: W * 4,
+        format: proto::FMT_A8B8G8R8 as u32,
+    };
+    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let px = |x: u32, y: u32| img.r32(((y * W + x) * 4) as usize);
+    let (mut pass, mut ns) = (0, 0);
+    // Memory order R, G, B, A: 0xAABBGGRR.
+    let clear = [0.1f32, 0.2, 0.3, 1.0];
+    let want = |c: [f32; 4]| {
+        c.iter()
+            .enumerate()
+            .fold(0u32, |w, (i, v)| w | ((v * 255.0 + 0.5) as u32) << (8 * i))
+    };
+    let near = |a: u32, b: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 1)
+    };
+
+    img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    let mut p = Push::default();
+    d.gfx.clear(&mut p, &s, clear);
+    ns += g.run(p, BATCH_TIMEOUT_US)?;
+    println!(
+        "[gpu] 3D clear: {:#010x} {:#010x} {:#010x}, want {:#010x}",
+        px(0, 0),
+        px(64, 64),
+        px(W - 1, H - 1),
+        want(clear)
+    );
+    if near(px(0, 0), want(clear))
+        && near(px(64, 64), want(clear))
+        && near(px(W - 1, H - 1), want(clear))
+    {
+        pass |= proto::T3_CLEAR;
+    }
+
+    // Red, green and blue corners; position then color, w = 1.
+    let tri: [[f32; 8]; 3] = [
+        [-0.8, -0.8, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0],
+        [0.8, -0.8, 0.5, 1.0, 0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.8, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0],
+    ];
+    for (i, v) in tri.iter().flatten().enumerate() {
+        vb.w32(i * 4, v.to_bits());
+    }
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    let mut p = Push::default();
+    d.gfx.draw(&mut p, &s, vbv, 3);
+    ns += g.run(p, BATCH_TIMEOUT_US)?;
+    let (inside, outside) = (px(64, 50), px(4, 4));
+    println!(
+        "[gpu] 3D triangle: inside {:#010x}, outside {:#010x}, vertex red {:#010x}",
+        inside,
+        outside,
+        px(28, 28)
+    );
+    if near(outside, want(clear))
+        && !near(inside, want(clear))
+        && inside & 0xFF00_0000 == 0xFF00_0000
+    {
+        pass |= proto::T3_TRIANGLE;
+    }
+
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    let _ = d.vm.unmap(s.va, img.len() as u64);
+    let _ = d.vm.unmap(vbv, vb.len() as u64);
+    let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((pass, proto::T3_CLEAR | proto::T3_TRIANGLE, ns))
+}
+
 /// `n` words of `m` against `want`; the first wrong one reported.
 fn check(name: &str, m: &Dma, n: u32, want: impl Fn(usize) -> u32) -> bool {
     let bad: Vec<usize> = (0..n as usize)
@@ -993,7 +1083,13 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
         proto::FILL => reply(fill(g, m)),
         proto::COPY => reply(copy(g, m)),
         proto::COMPUTE => reply(compute(g, m)),
-        proto::TEST => match test(g) {
+        proto::TEST => {
+            match test(g).and_then(|a| test3d(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2))) {
+                Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
+                Err(e) => Msg::error(e),
+            }
+        }
+        proto::TEST3D => match test3d(g) {
             Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
             Err(e) => Msg::error(e),
         },

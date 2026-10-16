@@ -229,7 +229,7 @@ fn help() {
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
-    println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels");
+    println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels, 3D clear and triangle");
     println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
     println!(
         "  gpu clock [MHZ] [force]  GPU clock, cap; MHZ: a sys-clk step (force: past the cap)"
@@ -1008,6 +1008,8 @@ fn gpu_cmd(argv: &[&str]) {
                 (gpu::T_KFILL, "fill kernel"),
                 (gpu::T_KCOPY, "copy kernel"),
                 (gpu::T_KSAXPY, "saxpy kernel"),
+                (gpu::T3_CLEAR, "3D clear"),
+                (gpu::T3_TRIANGLE, "3D triangle"),
             ] {
                 let r = match (pass & bit != 0, run & bit != 0) {
                     (true, _) => "ok",

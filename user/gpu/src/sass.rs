@@ -169,6 +169,55 @@ pub fn stg(a: u8, v: u8) -> u64 {
     op(0xEED8) | reg(v, 0) | reg(a, 8) | 1 << 45 | 4 << 48
 }
 
+/// ALD: `comps` (1-4) words of attribute `addr` into `d`, of this
+/// vertex (a vertex shader's input).
+pub fn ald(d: u8, addr: u32, comps: u8) -> u64 {
+    assert!(addr < 0x400 && (1..=4).contains(&comps));
+    op(0xEFD8)
+        | reg(d, 0)
+        | reg(RZ, 8)
+        | (addr as u64) << 20
+        | reg(RZ, 39)
+        | ((comps - 1) as u64) << 47
+}
+
+/// AST: `comps` words from `d` to output attribute `addr`.
+pub fn ast(d: u8, addr: u32, comps: u8) -> u64 {
+    assert!(addr < 0x400 && (1..=4).contains(&comps));
+    op(0xEFF0)
+        | reg(d, 0)
+        | reg(RZ, 8)
+        | (addr as u64) << 20
+        | 1 << 32
+        | reg(RZ, 39)
+        | ((comps - 1) as u64) << 47
+}
+
+/// Interpolation of a fragment shader's inputs (IPA).
+#[derive(Clone, Copy)]
+pub enum Interp {
+    /// Screen-linear: the plane equation as it stands.
+    Pass = 0,
+    /// Perspective-correct: multiplied by the 1/w in `inv_w`.
+    PassMulW = 1,
+    /// The provoking vertex's value.
+    Constant = 2,
+}
+
+/// IPA: input `addr` of the fragment (one word) into `d`; `inv_w` holds
+/// the interpolated 1/w for `PassMulW`, RZ otherwise.
+pub fn ipa(d: u8, addr: u32, how: Interp, inv_w: u8) -> u64 {
+    assert!(addr.is_multiple_of(4) && addr < 0x400);
+    op(0xE000)
+        | reg(d, 0)
+        | reg(RZ, 8)
+        | reg(inv_w, 20)
+        | (addr as u64) << 28
+        | (PT as u64) << 47
+        | reg(RZ, 39)
+        | (how as u64) << 54
+}
+
 /// A position in the code a branch can target.
 #[derive(Clone, Copy)]
 pub struct Label(usize);
@@ -331,5 +380,25 @@ mod tests {
         assert_eq!(iadd_c(5, RZ, 4, false, true), 0x4C10_0800_0017_FF05);
         assert_eq!(ffma_c(8, 3, 0x14, 8), 0x4980_0400_0057_0308);
         assert_eq!(isetp_c(0, 0, 0x10, Cmp::Ge, false), 0x4B6C_0380_0047_0007);
+    }
+
+    /// Fields as NAK's sm50.rs places them (opcode 0xefd8, 0xeff0, 0xe000).
+    #[test]
+    fn attribute_fields() {
+        // ALD.4 R4, a[0x90]: dst 0-7, offset and vertex RZ, addr 20-29.
+        assert_eq!(
+            ald(4, 0x90, 4),
+            0xEFD8_0000_0007_0004 | 0xFF << 8 | 0x90 << 20 | 0xFF << 39 | 3 << 47
+        );
+        // AST.4 a[0x70], R0.
+        assert_eq!(
+            ast(0, 0x70, 4),
+            0xEFF0_0000_0007_0000 | 0xFF << 8 | 0x70 << 20 | 1 << 32 | 0xFF << 39 | 3 << 47
+        );
+        // IPA R1, a[0x84], pass, no 1/w.
+        assert_eq!(
+            ipa(1, 0x84, Interp::Pass, RZ),
+            0xE000_0000_0007_0001 | 0xFF << 8 | 0xFF << 20 | 0x84 << 28 | 7 << 47 | 0xFF << 39
+        );
     }
 }

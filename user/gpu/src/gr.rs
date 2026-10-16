@@ -152,6 +152,38 @@ fn mmio(r: &Regs, list: impl Iterator<Item = (u32, u32)>) {
     }
 }
 
+/// GR status, activity, interrupts and trapped-method registers
+/// (nvgpu's GR dump starts with the same ones).
+pub fn report(r: &Regs, what: &str) {
+    println!(
+        "[gpu] {}: status {:#x} {:#x} {:#x}, engine {:#x}, activity {:#x} {:#x} {:#x} {:#x}, GPC {:#x}, BE {:#x}, FE power {:#x}, FECS mailbox {:#x}, interrupts GR {:#x} exception {:#x} FECS {:#x} MC {:#x}, FIFO engine {:#x}, FE ESR {:#x} info {:#x}, trapped {:#x} {:#x} {:#x}, data error {:#x}",
+        what,
+        r.rd(0x400700),
+        r.rd(0x400604),
+        r.rd(0x400608),
+        r.rd(0x40060C),
+        r.rd(0x400380),
+        r.rd(0x400384),
+        r.rd(0x400388),
+        r.rd(0x400390),
+        r.rd(0x502C80),
+        r.rd(0x410200),
+        r.rd(0x404170),
+        r.rd(0x409800),
+        r.rd(0x400100),
+        r.rd(0x400108),
+        r.rd(0x409C18),
+        r.rd(0x100),
+        r.rd(0x2640),
+        r.rd(0x404000),
+        r.rd(0x4041B0),
+        r.rd(0x400704),
+        r.rd(0x400708),
+        r.rd(0x40070C),
+        r.rd(0x400110)
+    );
+}
+
 /// Idle: disabled, or not busy (`gf100_gr_wait_idle`; the FIFO's context
 /// switch flag is not tracked here: one channel). A timeout reports the
 /// status and activity registers nvgpu's GR dump starts with.
@@ -161,32 +193,7 @@ fn wait_idle(r: &Regs, what: &'static str) -> Result<()> {
         r.rd(0x200) & 0x1000 == 0 || r.rd(0x40060C) & 1 == 0
     });
     if res.is_err() {
-        println!(
-            "[gpu] {}: status {:#x} {:#x} {:#x}, engine {:#x}, activity {:#x} {:#x} {:#x} {:#x}, GPC {:#x}, BE {:#x}, FE power {:#x}, FECS mailbox {:#x}, interrupts GR {:#x} exception {:#x} FECS {:#x} MC {:#x}, FIFO engine {:#x}, FE ESR {:#x} info {:#x}, trapped {:#x} {:#x} {:#x}",
-            what,
-            r.rd(0x400700),
-            r.rd(0x400604),
-            r.rd(0x400608),
-            r.rd(0x40060C),
-            r.rd(0x400380),
-            r.rd(0x400384),
-            r.rd(0x400388),
-            r.rd(0x400390),
-            r.rd(0x502C80),
-            r.rd(0x410200),
-            r.rd(0x404170),
-            r.rd(0x409800),
-            r.rd(0x400100),
-            r.rd(0x400108),
-            r.rd(0x409C18),
-            r.rd(0x100),
-            r.rd(0x2640),
-            r.rd(0x404000),
-            r.rd(0x4041B0),
-            r.rd(0x400704),
-            r.rd(0x400708),
-            r.rd(0x40070C)
-        );
+        report(r, what);
     }
     res
 }
