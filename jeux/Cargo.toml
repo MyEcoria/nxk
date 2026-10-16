@@ -5,7 +5,7 @@
 # "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
 [workspace]
 resolver = "2"
-members = ["nxgfx", "cube"]
+members = ["nxgfx", "cube", "starlane"]
 
 [profile.release]
 opt-level = 3

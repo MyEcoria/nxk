@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod canvas;
 pub mod math;
 pub mod os;
 
@@ -21,6 +22,7 @@ use nxk_abi::proto::{display, gpu, input};
 use nxk_abi::shm;
 use nxk_abi::user::Msg;
 
+pub use canvas::{rgb, Canvas, Rgba};
 pub use math::{vec3, Mat4, Vec3};
 pub use os::{now_ns, sleep_ns, Result};
 
@@ -48,6 +50,8 @@ pub const WIDTH: u32 = 1280;
 pub const HEIGHT: u32 = 720;
 /// Bytes of the command stream of a frame.
 const CMD_BYTES: usize = 1 << 20;
+/// Vertices of a canvas: 32 bytes each.
+const CANVAS_BYTES: usize = 2 << 20;
 
 /// Gamepad buttons (`input::BTN_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,9 +216,14 @@ pub struct Graphics {
     depth: Target,
     cmd: Shm,
     cmd_id: u64,
+    /// Memory for a canvas, rewritten every frame (the GPU is idle then).
+    canvas: Shm,
+    canvas_id: u64,
+    canvas_used: usize,
     words: Vec<u32>,
     /// Frames presented.
     pub frames: u64,
+    started: u64,
     open: bool,
 }
 
@@ -289,6 +298,9 @@ impl Graphics {
         let cmd = at("command memory", Shm::new(CMD_BYTES, 0))?;
         let m = Msg::from_words(gpu::BUFFER_ATTACH, &[CMD_BYTES as u64]);
         let c = at("command buffer", gpu_s.call_with(m, cmd.handle()))?;
+        let cvs = at("canvas memory", Shm::new(CANVAS_BYTES, shm::UNCACHED))?;
+        let m = Msg::from_words(gpu::BUFFER_ATTACH, &[CANVAS_BYTES as u64]);
+        let cid = word(&at("canvas buffer", gpu_s.call_with(m, cvs.handle()))?, 0);
         Ok(Self {
             display,
             gpu: gpu_s,
@@ -297,8 +309,12 @@ impl Graphics {
             depth,
             cmd,
             cmd_id: word(&c, 0),
+            canvas: cvs,
+            canvas_id: cid,
+            canvas_used: 0,
             words: Vec::with_capacity(4096),
             frames: 0,
+            started: now_ns(),
             open: true,
         })
     }
@@ -377,9 +393,15 @@ impl Graphics {
         })
     }
 
+    /// Seconds since the program started.
+    pub fn seconds(&self) -> f32 {
+        (now_ns() - self.started) as f32 / 1e9
+    }
+
     /// A new frame, drawing on the image that is not on display.
     pub fn frame(&mut self) -> Frame<'_> {
         self.words.clear();
+        self.canvas_used = 0;
         let back = (self.shown + 1) % self.images.len();
         let (c, z) = (self.images[back].id as u32, self.depth.id as u32);
         let mut f = Frame { gfx: self, back };
@@ -472,6 +494,28 @@ impl Frame<'_> {
         self.push(gpu::CMD_UNIFORMS, &u.words());
     }
 
+    /// Draw a canvas: flat triangles in front of the scene.
+    pub fn canvas(&mut self, c: &Canvas) {
+        let at = self.gfx.canvas_used;
+        let n = c.verts.len().min((CANVAS_BYTES - at) / 32) / 3 * 3;
+        if n == 0 {
+            return;
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                c.verts.as_ptr() as *const u8,
+                n * core::mem::size_of::<FlatVertex>(),
+            )
+        };
+        self.gfx.canvas.write(at, bytes);
+        self.gfx.canvas_used = at + n * 32;
+        self.pipeline(Pipe::Flat, false);
+        self.push(
+            gpu::CMD_DRAW,
+            &[self.gfx.canvas_id as u32, at as u32, n as u32, 0, n as u32],
+        );
+    }
+
     pub fn draw(&mut self, m: &Mesh) {
         self.push(
             gpu::CMD_DRAW_INDEXED,
@@ -552,4 +596,60 @@ pub fn cube(size: f32, colors: [[u8; 4]; 6]) -> (Vec<LitVertex>, Vec<u16>) {
         i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     (v, i)
+}
+
+/// Flat-shaded mesh from triangles (each with a color): the normals are
+/// computed and turned away from `center`, so winding does not matter.
+pub fn tris_mesh(tris: &[([Vec3; 3], [u8; 4])], center: Vec3) -> (Vec<LitVertex>, Vec<u16>) {
+    let mut v = Vec::new();
+    let mut i = Vec::new();
+    for (p, color) in tris {
+        let mut n = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
+        let mid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+        if n.dot(mid - center) < 0.0 {
+            n = -n;
+        }
+        let base = v.len() as u16;
+        for q in p {
+            v.push(LitVertex {
+                pos: [q.x, q.y, q.z],
+                normal: [n.x, n.y, n.z],
+                color: *color,
+            });
+        }
+        i.extend_from_slice(&[base, base + 1, base + 2]);
+    }
+    (v, i)
+}
+
+/// Octahedron of radius `r`, one color.
+pub fn octahedron(r: f32, color: [u8; 4]) -> (Vec<LitVertex>, Vec<u16>) {
+    let (px, nx) = (vec3(r, 0.0, 0.0), vec3(-r, 0.0, 0.0));
+    let (py, ny) = (vec3(0.0, r, 0.0), vec3(0.0, -r, 0.0));
+    let (pz, nz) = (vec3(0.0, 0.0, r), vec3(0.0, 0.0, -r));
+    let mut t = Vec::new();
+    for (a, b) in [(px, pz), (pz, nx), (nx, nz), (nz, px)] {
+        t.push(([py, a, b], color));
+        t.push(([ny, b, a], color));
+    }
+    tris_mesh(&t, Vec3::default())
+}
+
+/// Large flat quad facing up at height `y`, from (-hx, -hz_far) to (hx, hz_near).
+pub fn ground(
+    hx: f32,
+    y: f32,
+    z_far: f32,
+    z_near: f32,
+    color: [u8; 4],
+) -> (Vec<LitVertex>, Vec<u16>) {
+    let v = [(-hx, z_near), (hx, z_near), (hx, z_far), (-hx, z_far)]
+        .iter()
+        .map(|&(x, z)| LitVertex {
+            pos: [x, y, z],
+            normal: [0.0, 1.0, 0.0],
+            color,
+        })
+        .collect();
+    (v, alloc::vec![0, 1, 2, 0, 2, 3])
 }
