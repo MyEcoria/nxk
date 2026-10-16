@@ -167,6 +167,11 @@ pub fn ffma_c(d: u8, a: u8, off: u32, c: u8) -> u64 {
     op(0x4980) | reg(d, 0) | reg(a, 8) | cb(off) | reg(c, 39)
 }
 
+/// MUFU.RCP: d = 1 / a.
+pub fn mufu_rcp(d: u8, a: u8) -> u64 {
+    op(0x5080) | reg(d, 0) | reg(a, 8) | 4 << 20
+}
+
 /// d = a * c[idx][off].
 pub fn fmul_c(d: u8, a: u8, idx: u8, off: u32) -> u64 {
     op(0x4C68) | reg(d, 0) | reg(a, 8) | cbi(idx, off)
@@ -422,6 +427,8 @@ mod tests {
         // FMUL.SAT sets bit 50, FADD with a constant uses 0x4c58.
         assert_eq!(fmul(1, 2, 3, true) >> 48, 0x5C68 | 1 << 2);
         assert_eq!(fadd_c(1, 2, 3, 4) >> 48, 0x4C58);
+        // MUFU.RCP R0, R0: opcode 0x5080, function 4 at bit 20.
+        assert_eq!(mufu_rcp(0, 0), 0x5080_0000_0047_0000);
     }
 
     /// Fields as NAK's sm50.rs places them (opcode 0xefd8, 0xeff0, 0xe000).

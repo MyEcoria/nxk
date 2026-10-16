@@ -1389,6 +1389,61 @@ pub mod proto {
         pub const T_KFILL: u64 = 4;
         pub const T_KCOPY: u64 = 8;
         pub const T_KSAXPY: u64 = 16;
+        /// Share a buffer with the engine (vertices, indices, command
+        /// streams): handle 0 = shm with the `DMA` right (`MAP` too, for a
+        /// command stream); word 0 = length in bytes. Reply: word 0 =
+        /// buffer ID.
+        pub const BUFFER_ATTACH: u32 = 13;
+        /// word 0 = buffer ID.
+        pub const BUFFER_DETACH: u32 = 14;
+        /// A block-linear color image or a depth buffer to draw on:
+        /// handle 0 = shm with the `DMA` right; words: width | height <<
+        /// 32, kind (`TARGET_*`), block height (log2 of GOBs; the
+        /// scanout images have `display::SCANOUT`'s). Reply: word 0 =
+        /// target ID (its own numbering).
+        pub const TARGET_ATTACH: u32 = 15;
+        pub const TARGET_DETACH: u32 = 16;
+        pub const TARGET_COLOR: u64 = 0;
+        pub const TARGET_DEPTH: u64 = 1;
+        /// Run a command stream (`CMD_*`): words: buffer ID, first word,
+        /// word count. Reply: word 0 = GPU time (ns). The stream is
+        /// checked first: IDs, offsets and sizes; nothing runs on a bad one.
+        pub const RENDER: u32 = 17;
+        /// Drop every buffer and target a client attached (it is gone).
+        pub const RESET: u32 = 18;
+        /// Bytes of a block-linear image `width` x `height` of four-byte
+        /// pixels, GOBs `1 << block_log2` high per block; the depth
+        /// buffer is the same with 16 (`DEPTH_BLOCK_LOG2`).
+        pub const fn tiled_bytes(width: u32, height: u32, block_log2: u32) -> usize {
+            let gobs_x = (width as usize * 4).div_ceil(64);
+            let rows = 8usize << block_log2;
+            gobs_x * (height as usize).div_ceil(rows) * (512usize << block_log2)
+        }
+        pub const DEPTH_BLOCK_LOG2: u32 = 4;
+        /// Commands: a word with the opcode (low 16 bits) and the count
+        /// of words that follow (high 16), then those.
+        /// `[color target, depth target or NO_TARGET]`.
+        pub const CMD_TARGET: u32 = 1;
+        /// `[r, g, b, a (f32 bits)]`: color to all the target, depth to 1.
+        pub const CMD_CLEAR: u32 = 2;
+        /// `[pipeline (PIPE_*), flags (PF_*)]`.
+        pub const CMD_PIPELINE: u32 = 3;
+        /// Words for the shaders' constant buffer 1 (`PIPE_LIT`: 33).
+        pub const CMD_UNIFORMS: u32 = 4;
+        /// `[vertex buffer, byte offset, vertices, first, count]`.
+        pub const CMD_DRAW: u32 = 5;
+        /// `[vertex buffer, byte offset, vertices, index buffer, byte
+        /// offset, indices (u16), first, count]`.
+        pub const CMD_DRAW_INDEXED: u32 = 6;
+        pub const NO_TARGET: u32 = u32::MAX;
+        /// Vertex of 32 bytes, clip-space position and color (4 floats each).
+        pub const PIPE_FLAT: u32 = 0;
+        /// Vertex of 28 bytes: position, normal (3 floats), color (4
+        /// unorm8); one directional light.
+        pub const PIPE_LIT: u32 = 1;
+        /// Cull back faces (counter-clockwise front).
+        pub const PF_CULL_BACK: u32 = 1;
+        pub const LIT_UBO_WORDS: usize = 33;
         /// `TEST` bits of the 3D engine (and `TEST3D`'s alone).
         pub const T3_CLEAR: u64 = 32;
         pub const T3_TRIANGLE: u64 = 64;
@@ -1459,8 +1514,29 @@ pub mod proto {
         /// Text for the on-screen terminal (see `pack`).
         pub const WRITE: u32 = 2;
         /// Like `OPEN`, but the UI keeps running: handle 0 = the image
-        /// being displayed, read-only (what `dbg` captures). Same words.
+        /// being displayed, read-only (what `dbg` captures). Same words,
+        /// then the layout (0: pitch-linear, 1: block-linear, as a game's
+        /// images are) and its block height (log2 of GOBs).
         pub const SNAPSHOT: u32 = 3;
+        /// A game takes the screen (the UI stops): `SCANOUT_BUFFERS`
+        /// block-linear images for the GPU to draw on, `CONTIGUOUS |
+        /// DMA32 | UNCACHED`, handles 0-2 with the `DMA` and `MAP` rights.
+        /// Reply: words = width, height (of the panel as it scans out),
+        /// format (`FORMAT_RGBA8888`), block height (log2 of GOBs),
+        /// bytes per image; the first image is on display. `ENODEV`: not
+        /// started by `display`, or the screen is taken already.
+        pub const SCANOUT: u32 = 4;
+        /// Show image word 0 from the next vertical blank; the reply
+        /// comes once it is on display.
+        pub const FLIP: u32 = 5;
+        /// The game is done: the UI comes back (also when it exits).
+        pub const RELEASE: u32 = 6;
+        /// The next input event routed to the game (`input::READ`'s
+        /// reply: kind, code, value, x, y; raw touch coordinates), waiting
+        /// up to word 0 ns (0: no limit). While a game has the screen the
+        /// UI reads none.
+        pub const EVENT: u32 = 7;
+        pub const SCANOUT_BUFFERS: usize = 3;
         pub const FORMAT_RGBA8888: u64 = 1;
     }
     /// USB-C console (`usbcon`), published as "usbcon".
@@ -1644,8 +1720,9 @@ pub mod proto {
         pub const PING: u8 = 0;
         /// `SCREEN`: no bytes. Reply: the image on display, in chunks
         /// (`MORE`) until `DONE`; concatenated they are width (u16), height
-        /// (u16), `display::FORMAT_*` (u8), then the pixels (panel scan
-        /// order, 32 bits each, as in memory) as tokens: u16 n, then bit 15
+        /// (u16), `display::FORMAT_*` (u8), layout (u8: 0 pitch-linear, 1
+        /// block-linear) and block height log2 (u8), then the pixels (the
+        /// image in memory order, 32 bits each) as tokens: u16 n, then bit 15
         /// clear: n + 1 pixels follow; set: one pixel follows, repeated
         /// (n & 0x7FFF) + 1 times.
         pub const SCREEN: u8 = 1;

@@ -15,7 +15,8 @@ use crate::hw::{Dma, Result};
 use crate::mmu::Vm;
 use crate::push::{Push, SET_OBJECT, SUBC_3D};
 use crate::sass::{
-    ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, Asm, Interp, Sched, RZ,
+    ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, mufu_rcp, Asm, Interp,
+    Sched, RZ,
 };
 
 pub const MAXWELL_B: u32 = 0xB197;
@@ -109,7 +110,7 @@ const LIT_VS: usize = 0x830;
 const LIT_FS: usize = 0x1030;
 const REGION_SIZE: usize = 0x2000;
 /// Constant buffer data of a batch.
-const UBO_SIZE: usize = 0x10000;
+const UBO_SIZE: usize = 0x40000;
 
 /// Which shaders, and the vertex layout they read.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,7 +155,9 @@ impl Pipe {
         let a = |offset: u32, width: u32, ty: u32| width << 21 | ty << 27 | offset << 7;
         match self {
             Pipe::Flat => alloc::vec![a(0, R32X4, FLOAT), a(16, R32X4, FLOAT)],
-            Pipe::Lit => alloc::vec![a(0, R32X3, FLOAT), a(12, R32X3, FLOAT), a(24, R8X4, UNORM)],
+            Pipe::Lit => {
+                alloc::vec![a(0, R32X3, FLOAT), a(12, R32X3, FLOAT), a(24, R8X4, UNORM)]
+            }
         }
     }
 }
@@ -275,11 +278,18 @@ fn alu() -> Sched {
     Sched::stall(6)
 }
 
+/// Sets barrier `sb`, waited on by a later instruction: a barrier arms a
+/// cycle after issue, so with a stall of 1 the very next wait would pass
+/// on a stale register (the same rule as `kernels.rs`).
+fn sets(sb: u8) -> Sched {
+    Sched::stall(2).wr(sb)
+}
+
 fn flat_vs() -> Vec<u64> {
     let mut a = Asm::new();
     // Input attribute n is at 0x80 + 16 n, as outputs are.
-    a.emit(ald(0, A_GENERIC0, 4), Sched::stall(1).wr(0));
-    a.emit(ald(4, A_GENERIC1, 4), Sched::stall(1).wr(1));
+    a.emit(ald(0, A_GENERIC0, 4), sets(0));
+    a.emit(ald(4, A_GENERIC1, 4), sets(1));
     a.emit(ast(0, A_POSITION, 4), Sched::stall(1).rd(2).wait(1));
     a.emit(ast(4, A_GENERIC0, 4), Sched::stall(1).rd(3).wait(2));
     a.emit(exit(), Sched::stall(5).wait(0x3F));
@@ -289,10 +299,7 @@ fn flat_vs() -> Vec<u64> {
 fn flat_fs() -> Vec<u64> {
     let mut a = Asm::new();
     for c in 0..4u8 {
-        a.emit(
-            ipa(c, A_GENERIC0 + 4 * c as u32, Interp::Pass, RZ),
-            Sched::stall(1).wr(0),
-        );
+        a.emit(ipa(c, A_GENERIC0 + 4 * c as u32, Interp::Pass, RZ), sets(0));
     }
     a.emit(exit(), Sched::stall(5).wait(0x3F));
     a.finish()
@@ -301,11 +308,11 @@ fn flat_fs() -> Vec<u64> {
 /// clip = MVP * (position, 1); normal = N * normal; color through.
 fn lit_vs() -> Vec<u64> {
     let mut a = Asm::new();
-    a.emit(ald(0, A_GENERIC0, 3), Sched::stall(1).wr(0)); // R0-R2 position
-    a.emit(ald(4, A_GENERIC1, 3), Sched::stall(1).wr(1)); // R4-R6 normal
-    a.emit(ald(8, A_GENERIC2, 4), Sched::stall(1).wr(2)); // R8-R11 color
-                                                          // One matrix row: d = m.x * s + m.y * (s + 1) + m.z * (s + 2) (+ m.w);
-                                                          // the first multiply waits for the attribute `barrier`.
+    a.emit(ald(0, A_GENERIC0, 3), sets(0)); // R0-R2 position
+    a.emit(ald(4, A_GENERIC1, 3), sets(1)); // R4-R6 normal
+    a.emit(ald(8, A_GENERIC2, 4), sets(2)); // R8-R11 color
+                                            // One matrix row: d = m.x * s + m.y * (s + 1) + m.z * (s + 2) (+ m.w);
+                                            // the first multiply waits for the attribute `barrier`.
     let row = |a: &mut Asm, d: u8, s: u8, at: u32, w: bool, barrier: u8| {
         a.emit(
             fmul_c(d, s, UBO_SLOT, at),
@@ -334,7 +341,10 @@ fn lit_vs() -> Vec<u64> {
 fn lit_fs() -> Vec<u64> {
     let mut a = Asm::new();
     // 1/w, then the perspective-correct normal (R4-R6) and color (R8-R11).
-    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), Sched::stall(1).wr(0));
+    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), sets(0));
+    // The attributes are interpolated divided by w: w itself is the
+    // reciprocal of the interpolated 1/w.
+    a.emit(mufu_rcp(0, 0), sets(0).wait(1 << 0));
     for (k, (d, addr)) in [
         (4u8, A_GENERIC0),
         (5, A_GENERIC0 + 4),
@@ -347,7 +357,7 @@ fn lit_fs() -> Vec<u64> {
     .into_iter()
     .enumerate()
     {
-        let s = Sched::stall(1).wr(1);
+        let s = sets(1);
         a.emit(
             ipa(d, addr, Interp::PassMulW, 0),
             if k == 0 { s.wait(1 << 0) } else { s },
@@ -554,10 +564,13 @@ impl Gfx {
 
     /// `words` as the shaders' constant buffer, for the draws that follow
     /// (copied now: the batch runs after).
-    pub fn uniforms(&mut self, p: &mut Push, words: &[u32]) {
+    /// False if the batch has used up its constant buffer memory.
+    pub fn uniforms(&mut self, p: &mut Push, words: &[u32]) -> bool {
         let bytes = words.len() * 4;
         let at = self.ubo_pos.next_multiple_of(256);
-        assert!(at + bytes <= UBO_SIZE, "constant buffer data of a batch");
+        if at + bytes.next_multiple_of(256) > UBO_SIZE {
+            return false;
+        }
         self.ubo.words(at, words);
         self.ubo_pos = at + bytes;
         let va = self.ubo_va + at as u64;
@@ -574,6 +587,7 @@ impl Gfx {
         for g in [GROUP_VERTEX, GROUP_PIXEL] {
             p.inc(SUBC_3D, BIND_GROUP_CONSTANT_BUFFER + g * 0x20, &[bind]);
         }
+        true
     }
 
     fn stream(&self, p: &mut Push, pipe: Pipe, vb: u64, vertices: u32) {
@@ -592,11 +606,11 @@ impl Gfx {
         p.inc(SUBC_3D, SET_VERTEX_ATTRIBUTE_A, &pipe.attributes());
     }
 
-    /// `count` vertices at `vb` as triangles.
-    pub fn draw(&self, p: &mut Push, pipe: Pipe, vb: u64, count: u32) {
-        self.stream(p, pipe, vb, count);
+    /// `count` vertices from `first`, of the `vertices` at `vb`, as triangles.
+    pub fn draw(&self, p: &mut Push, pipe: Pipe, vb: u64, vertices: u32, first: u32, count: u32) {
+        self.stream(p, pipe, vb, vertices);
         p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES]);
-        p.inc(SUBC_3D, SET_VERTEX_ARRAY_START, &[0]);
+        p.inc(SUBC_3D, SET_VERTEX_ARRAY_START, &[first]);
         p.inc(SUBC_3D, DRAW_VERTEX_ARRAY, &[count]);
         p.inc(SUBC_3D, END, &[0]);
     }

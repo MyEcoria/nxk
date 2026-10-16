@@ -14,6 +14,7 @@
 extern crate alloc;
 
 mod acr;
+mod client;
 mod engine;
 mod falcon;
 mod fifo;
@@ -80,6 +81,7 @@ struct Dev {
     _ctx: gr::ChanCtx,
     compute: Compute,
     gfx: Gfx,
+    client: client::Client,
     topo: gr::Topo,
     surfaces: Vec<Option<(Surface, u32)>>,
 }
@@ -363,6 +365,7 @@ impl Gpu {
             _ctx: ctx,
             compute,
             gfx,
+            client: client::Client::default(),
             topo,
             surfaces: Vec::new(),
         });
@@ -655,6 +658,37 @@ fn attach(g: &mut Gpu, m: &Msg) -> core::result::Result<u64, i64> {
         let _ = sys::handle_close(h);
     }
     r
+}
+
+/// `BUFFER_ATTACH` and `TARGET_ATTACH`: the client's shm is taken (and
+/// closed on any failure).
+fn attach_shared(g: &mut Gpu, m: &Msg, target: bool) -> core::result::Result<u64, i64> {
+    let h = ipc::received_handle(0);
+    let regs = g.regs;
+    let d = match g.dev(0) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = sys::handle_close(h);
+            return Err(e);
+        }
+    };
+    let id = if target {
+        let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
+        d.client
+            .attach_target(&mut d.vm, h, w, ht, m.mr[1], m.mr[2] as u32)
+    } else {
+        d.client.attach_buffer(&mut d.vm, h, m.mr[0])
+    }?;
+    mmu::invalidate(&regs, &d.vm).map_err(|(e, _)| -e)?;
+    Ok(id)
+}
+
+fn render(g: &mut Gpu, m: &Msg) -> core::result::Result<u64, i64> {
+    let d = g.dev(proto::IF_ON)?;
+    let p = d
+        .client
+        .build(&mut d.gfx, m.mr[0] as u32, m.mr[1] as u32, m.mr[2] as u32)?;
+    g.run(p, BATCH_TIMEOUT_US)
 }
 
 fn surface(d: &Dev, id: u64) -> core::result::Result<Surface, i64> {
@@ -952,7 +986,7 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     let mut p = Push::default();
     d.gfx.begin(&mut p);
     d.gfx.pipeline(&mut p, &flat, gfx::Pipe::Flat, false);
-    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 3);
+    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 3, 0, 3);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
     let (inside, outside) = (px(64, 50), px(4, 4));
     println!(
@@ -986,7 +1020,7 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     d.gfx.begin(&mut p);
     d.gfx.clear(&mut p, &deep, clear);
     d.gfx.pipeline(&mut p, &deep, gfx::Pipe::Flat, false);
-    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 6);
+    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 6, 0, 6);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
     println!(
         "[gpu] 3D depth: centre {:#010x}, want {:#010x} (the near triangle)",
@@ -1036,12 +1070,43 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     d.gfx
         .draw_indexed(&mut p, gfx::Pipe::Lit, vbv, 4, ibv, 6, 0, 6);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
-    println!(
-        "[gpu] 3D lit quad: centre {:#010x}, want about {:#010x}",
-        tpx(64, 64),
-        rgba(191, 96, 0)
-    );
-    if near(tpx(64, 64), rgba(191, 96, 0), 3) && near(tpx(4, 4), to_u8(clear), 1) {
+    let mut persp_ok = true;
+    for (label, w3, w) in [
+        ("w 1", [0.0f32, 0.0, 0.0], 1.0f32),
+        ("w 4 flat", [0.0, 0.0, 0.0], 4.0),
+        ("w 2 + x/2", [0.5, 0.0, 0.0], 2.0),
+    ] {
+        let mut u2 = u;
+        u2[12] = w3[0].to_bits();
+        u2[13] = w3[1].to_bits();
+        u2[14] = w3[2].to_bits();
+        u2[15] = w.to_bits();
+        let d = g.dev.as_mut().ok_or(-ENODEV)?;
+        let mut p = Push::default();
+        d.gfx.begin(&mut p);
+        d.gfx.clear(&mut p, &deep, clear);
+        d.gfx.pipeline(&mut p, &deep, gfx::Pipe::Lit, false);
+        d.gfx.uniforms(&mut p, &u2);
+        d.gfx
+            .draw_indexed(&mut p, gfx::Pipe::Lit, vbv, 4, ibv, 6, 0, 6);
+        ns += g.run(p, BATCH_TIMEOUT_US)?;
+        let want = rgba(191, 96, 0);
+        let ok = [(64, 64), (58, 64), (70, 64), (64, 58), (64, 70)]
+            .iter()
+            .all(|&(x, y)| near(tpx(x, y), want, 3));
+        println!(
+            "[gpu] 3D perspective {}: centre {:#010x}, {}",
+            label,
+            tpx(64, 64),
+            if ok {
+                "uniform, as a flat face is"
+            } else {
+                "NOT uniform"
+            }
+        );
+        persp_ok &= ok;
+    }
+    if persp_ok && near(tpx(4, 4), to_u8(clear), 1) {
         pass |= proto::T3_LIT;
     }
 
@@ -1217,6 +1282,32 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
                 Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
                 Err(e) => Msg::error(e),
             }
+        }
+        proto::BUFFER_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, false)),
+        proto::TARGET_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, true)),
+        proto::BUFFER_DETACH | proto::TARGET_DETACH => {
+            let regs = g.regs;
+            reply(match g.dev.as_mut() {
+                Some(d) => {
+                    let r = if m.label() == proto::BUFFER_DETACH {
+                        d.client.detach_buffer(&mut d.vm, m.mr[0])
+                    } else {
+                        d.client.detach_target(&mut d.vm, m.mr[0])
+                    };
+                    let _ = mmu::invalidate(&regs, &d.vm);
+                    r.map(|_| 0)
+                }
+                None => Err(-EINVAL),
+            })
+        }
+        proto::RENDER => reply(render(g, m)),
+        proto::RESET => {
+            let regs = g.regs;
+            if let Some(d) = g.dev.as_mut() {
+                d.client.clear(&mut d.vm);
+                let _ = mmu::invalidate(&regs, &d.vm);
+            }
+            Msg::new(0, 0, 0)
         }
         proto::TEST3D => match test3d(g) {
             Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
