@@ -120,6 +120,22 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 8,
     },
+    // Joy-Cons on the rails: UART B and C (one page, UART-A's too), pinmux,
+    // GPIO (rail detect H6 / E6, charge enables K3 / CC3); APB_MISC
+    // read-only (chip revision). Clocks through clk, the 5V rail through fan.
+    Driver {
+        name: "joycon",
+        mmio: &[
+            (0x7000_6000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+        ],
+        ro_mmio: &[(0x7000_0000, 0x1000)],
+        irqs: &[],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
     // Started before `sd`: a driver that stalls the APB bus must not cost
     // us the console. Registers plus queue-head RAM; APB_MISC (chip
     // revision) and fuses (PHY trims) read-only. IRQ: SPI 20.

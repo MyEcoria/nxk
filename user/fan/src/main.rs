@@ -113,6 +113,8 @@ struct Fan {
     tach: Option<Irq>,
     duty: u32,
     rail: bool,
+    /// Other users of the 5V rail (`proto::RAIL_*` bits).
+    users: u64,
 }
 
 impl Fan {
@@ -170,13 +172,13 @@ impl Fan {
         self.rail = on;
     }
 
-    /// hekate `fan_set_duty`: stopped, the rail goes off and the pad is
-    /// parked (pulled down).
+    /// hekate `fan_set_duty`: stopped, the rail goes off (unless a Joy-Con
+    /// needs it) and the pad is parked (pulled down).
     fn set(&mut self, duty: u32) {
         let duty = duty.min(FULL);
         if duty == 0 {
             self.pwm.w32(PWM_CSR_1, PWM_STOP);
-            self.power(false);
+            self.power(self.users != 0);
             self.pinmux.w32(
                 PINMUX_LCD_GPIO2,
                 INPUT_ENABLE | PARKED | TRISTATE | PULL_DOWN,
@@ -323,6 +325,19 @@ fn request(fan: &mut Fan, ctl: &mut Control, m: &Msg) -> Msg {
             }
             None => Msg::error(-ENODEV),
         },
+        proto::RAIL => {
+            let bit = m.mr[0];
+            if !matches!(bit, proto::RAIL_JC_R | proto::RAIL_JC_L) {
+                return Msg::error(-EINVAL);
+            }
+            if m.mr[1] != 0 {
+                fan.users |= bit;
+            } else {
+                fan.users &= !bit;
+            }
+            fan.power(fan.duty != 0 || fan.users != 0);
+            Msg::from_words(0, &[fan.users])
+        }
         _ => Msg::error(-EINVAL),
     }
 }
@@ -357,6 +372,7 @@ fn open() -> Result<Fan, i64> {
         tach: Irq::new(drv::dev_slot(5)).ok(),
         duty: 0,
         rail: true,
+        users: 0,
     };
     fan.start();
     Ok(fan)

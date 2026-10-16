@@ -329,6 +329,28 @@ const GPU: [Clock; 2] = [
     },
 ];
 
+/// UART B (bank L bit 7) and C (bank H bit 23): PLLP_OUT0 (408 MHz)
+/// through the 16x clock divider at 1 Mbaud (hekate `clock_uart_use_src_div`).
+const UART_DIV_EN: u32 = 1 << 24;
+const UART_DIV_1M: u32 = 49;
+const UART_DIV_3M: u32 = 15;
+const UARTB: [Clock; 1] = [Clock {
+    bank: &L,
+    bit: 7,
+    source: 0x17C,
+    keep: 0,
+    src: UART_DIV_EN | UART_DIV_1M,
+    reset: true,
+}];
+const UARTC: [Clock; 1] = [Clock {
+    bank: &H,
+    bit: 23,
+    source: 0x1A0,
+    keep: 0,
+    src: UART_DIV_EN | UART_DIV_1M,
+    reset: true,
+}];
+
 /// Fuse controller (bank H bit 7): status only, for readers of fuses.
 const FUSE: [Clock; 1] = [Clock {
     bank: &H,
@@ -364,6 +386,8 @@ fn table(dev: u64) -> Option<Device> {
         proto::PCIE => (&PCIE, PART_PCIE),
         proto::PWM => (&PWM, 0),
         proto::GPU => (&GPU, 0),
+        proto::UARTB => (&UARTB, 0),
+        proto::UARTC => (&UARTC, 0),
         _ => return None,
     };
     Some(Device {
@@ -730,6 +754,30 @@ fn enable(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> i64 {
     }
 }
 
+/// `UART_BAUD`: the divider of a running UART's source clock.
+fn uart_baud(car: &Mmio, dev: u64, baud: u64) -> i64 {
+    let (Some(d), Some(div)) = (
+        table(dev).filter(|_| matches!(dev, proto::UARTB | proto::UARTC)),
+        match baud {
+            proto::BAUD_1M => Some(UART_DIV_1M),
+            proto::BAUD_3M => Some(UART_DIV_3M),
+            _ => None,
+        },
+    ) else {
+        return EINVAL;
+    };
+    let c = &d.clocks[0];
+    if car.r32(c.bank.enb) & (1 << c.bit) == 0 {
+        return ENODEV;
+    }
+    car.w32(
+        c.source,
+        (car.r32(c.source) & 0xE000_0000) | UART_DIV_EN | div,
+    );
+    let _ = car.r32(c.source);
+    0
+}
+
 fn disable(car: &Mmio, d: &Device) {
     for c in d.clocks.iter().rev() {
         let m = 1u32 << c.bit;
@@ -753,6 +801,13 @@ fn main() -> i32 {
             let mut m = Msg::new(r as u32, 1, 0);
             m.mr[0] = st;
             return Some(m);
+        }
+        if rx.msg.label() == proto::UART_BAUD {
+            return Some(Msg::new(
+                uart_baud(&car, rx.msg.mr[0], rx.msg.mr[1]) as u32,
+                0,
+                0,
+            ));
         }
         let mut st = 0;
         let r = match (rx.msg.label(), table(rx.msg.mr[0])) {

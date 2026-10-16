@@ -176,6 +176,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "joycon"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+]
+
+[[package]]
 name = "ktest"
 version = "0.1.0"
 dependencies = [

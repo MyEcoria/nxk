@@ -30,3 +30,9 @@ pub fn status(dev: u64) -> Result<(u64, u64), i64> {
 pub fn ready(dev: u64) -> bool {
     matches!(status(dev), Ok((st, _)) if st & clk::ST_READY == clk::ST_READY)
 }
+
+/// Baud rate (`clk::BAUD_*`) of a running UART (`clk::UARTB`, `UARTC`).
+pub fn uart_baud(dev: u64, baud: u64) -> Result<(), i64> {
+    CLK.call(&Msg::from_words(clk::UART_BAUD, &[dev, baud]))
+        .map(|_| ())
+}

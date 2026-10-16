@@ -1166,6 +1166,16 @@ pub mod proto {
         /// ENABLE needs the GPU rail on (`gpu` does it first); DISABLE
         /// clamps, resets and stops it before the rail goes off.
         pub const GPU: u64 = 27;
+        /// UART B (right Joy-Con rail) and UART C (left), 1 Mbaud
+        /// (`UART_BAUD` changes it): clock on, reset released.
+        pub const UARTB: u64 = 28;
+        pub const UARTC: u64 = 29;
+        /// word 0 = `UARTB` or `UARTC`, word 1 = `BAUD_1M` or `BAUD_3M`:
+        /// the UART's source clock divider, 16 times the baud rate
+        /// (hekate `clock_uart_use_src_div`). Reply: word 0 = state.
+        pub const UART_BAUD: u32 = 4;
+        pub const BAUD_1M: u64 = 1_000_000;
+        pub const BAUD_3M: u64 = 3_000_000;
     }
     /// I2C bus.
     pub mod i2c {
@@ -1217,6 +1227,14 @@ pub mod proto {
         pub const SET: u32 = 2;
         /// Count tachometer pulses for 1 s. Reply: word 0 = RPM.
         pub const MEASURE: u32 = 3;
+        /// word 0 = a `RAIL_*` user, word 1 = 1: it needs the battery's
+        /// 5V rail (GPIO A5, also the Joy-Con rails' source), 0: it does
+        /// not. The rail stays on while the fan runs or a user needs it.
+        /// Reply: word 0 = the users' mask.
+        pub const RAIL: u32 = 4;
+        pub const RAIL_FAN: u64 = 1;
+        pub const RAIL_JC_R: u64 = 2;
+        pub const RAIL_JC_L: u64 = 4;
         pub const AUTO: u64 = u64::MAX;
         pub const NO_TEMP: u64 = i64::MIN as u64;
         pub const NO_RPM: u64 = u64::MAX;
@@ -1673,6 +1691,14 @@ pub mod proto {
         pub const KIND_KEY: u64 = 1;
         pub const KIND_TOUCH: u64 = 2;
         pub const KIND_BUTTON: u64 = 3;
+        /// Analog stick: code = `STICK_L` or `STICK_R`, value = 0,
+        /// x and y = signed positions (two's complement in the word),
+        /// -`STICK_MAX`..=`STICK_MAX`, right and up positive, inside the
+        /// driver's dead zone 0. Sent when a position moved.
+        pub const KIND_STICK: u64 = 4;
+        pub const STICK_L: u64 = 1;
+        pub const STICK_R: u64 = 2;
+        pub const STICK_MAX: i64 = 32767;
         /// Touch: code = press (1), move (2), release (3);
         /// value = finger index.
         pub const TOUCH_DOWN: u64 = 1;
