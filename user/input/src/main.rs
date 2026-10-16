@@ -214,6 +214,116 @@ impl TouchIrq {
     }
 }
 
+/// The volume buttons as a gamepad: GPIO X6 (up) and X7 (down), active
+/// low (hekate bdk/input/btn.c), on the same interrupt bank as the
+/// touchscreen's line. Up is LEFT, down is RIGHT; both at once are A.
+/// A button alone waits `CHORD_NS` for the other before it counts, so a
+/// chord does not move first.
+const VOL_UP: u32 = 1 << 6;
+const VOL_DOWN: u32 = 1 << 7;
+const VOLS: u32 = VOL_UP | VOL_DOWN;
+const GPIO_IN: usize = 0x30;
+const CHORD_NS: u64 = 120_000_000;
+
+struct Keys {
+    gpio: Mmio,
+    /// Buttons down now, since when, and the gamepad button standing in
+    /// for them (pressed, not yet released).
+    cur: u32,
+    since: u64,
+    emitted: Option<u64>,
+    /// A chord is held: nothing else until all are up.
+    latched: bool,
+    /// Buttons that read down at the start (held at boot, or no such pin:
+    /// the emulator has none): ignored until they read up once.
+    stuck: u32,
+}
+
+impl Keys {
+    /// GPIO inputs with an interrupt on both edges.
+    fn new(gpio: Mmio) -> Self {
+        gpio.w32(port(PORT_X, GPIO_CNF_MSK), VOLS << 8 | VOLS);
+        gpio.w32(port(PORT_X, GPIO_OE_MSK), VOLS << 8);
+        gpio.modify(port(PORT_X, GPIO_INT_LVL), VOLS, VOLS << 8 | VOLS << 16);
+        gpio.w32(port(PORT_X, GPIO_INT_CLR), VOLS);
+        gpio.w32(port(PORT_X, GPIO_INT_ENB_MSK), VOLS << 8 | VOLS);
+        println!(
+            "[input] volume buttons on GPIO X6 and X7 (port reads {:#04x}, both high when up)",
+            gpio.r32(port(PORT_X, GPIO_IN)) & 0xFF
+        );
+        let down = !gpio.r32(port(PORT_X, GPIO_IN)) & VOLS;
+        Self {
+            gpio,
+            cur: 0,
+            since: 0,
+            emitted: None,
+            latched: false,
+            stuck: down,
+        }
+    }
+
+    fn ack(&self) {
+        self.gpio.w32(port(PORT_X, GPIO_INT_CLR), VOLS);
+    }
+
+    fn event(code: u64, down: bool) -> Event {
+        Event([proto::KIND_BUTTON, code, down as u64, 0, 0])
+    }
+
+    /// Read the buttons; the events they make go to `out`.
+    fn update(&mut self, now: u64, out: &mut VecDeque<Event>) {
+        let raw = !self.gpio.r32(port(PORT_X, GPIO_IN)) & VOLS;
+        self.stuck &= raw;
+        let m = raw & !self.stuck;
+        if m != self.cur {
+            println!(
+                "[input] volume buttons: up {}, down {}",
+                if m & VOL_UP != 0 {
+                    "pressed"
+                } else {
+                    "released"
+                },
+                if m & VOL_DOWN != 0 {
+                    "pressed"
+                } else {
+                    "released"
+                }
+            );
+            self.cur = m;
+            self.since = now;
+            if let Some(c) = self.emitted.take() {
+                out.push_back(Self::event(c, false));
+            }
+            if m == VOLS {
+                self.latched = true;
+                self.emitted = Some(proto::BTN_A);
+                out.push_back(Self::event(proto::BTN_A, true));
+            } else if m == 0 {
+                self.latched = false;
+            }
+        }
+        if !self.latched && self.emitted.is_none() && self.cur != 0 && now >= self.since + CHORD_NS
+        {
+            let c = if self.cur == VOL_UP {
+                proto::BTN_LEFT
+            } else {
+                proto::BTN_RIGHT
+            };
+            self.emitted = Some(c);
+            out.push_back(Self::event(c, true));
+        }
+    }
+
+    /// ns until a lone button counts (0: nothing waits).
+    fn deadline(&self, now: u64) -> u64 {
+        if !self.latched && self.emitted.is_none() && self.cur != 0 {
+            (self.since + CHORD_NS).saturating_sub(now).max(1)
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Event([u64; 5]);
 
@@ -267,8 +377,15 @@ fn main() -> i32 {
         (Err(e), _) | (_, Err(e)) => Err(e),
     };
     let touch = started.is_ok();
-    let mut line = match started {
-        Ok((gpio, pinmux)) => TouchIrq::new(gpio, &pinmux),
+    let mut keys = None;
+    let line = match started {
+        Ok((gpio, pinmux)) => {
+            let l = TouchIrq::new(gpio, &pinmux);
+            if l.is_some() {
+                keys = Some(Keys::new(gpio));
+            }
+            l
+        }
         Err(e) => {
             drv::report(
                 "input",
@@ -289,6 +406,9 @@ fn main() -> i32 {
         );
     }
     let mut stuck = 0;
+    // The touch line is given up (stuck low): its interrupt stays bound
+    // for the buttons.
+    let mut line_off = false;
 
     let mut queue: VecDeque<Event> = VecDeque::new();
     // Waiting readers: reply token, deadline (0: none), kinds wanted.
@@ -300,7 +420,7 @@ fn main() -> i32 {
         // Poll only while a reader waits or a finger is down (else idle);
         // wake up for the nearest reader deadline too.
         let near = time::now_ns() < contact + NEAR_NS;
-        let polled = touch && line.is_none();
+        let polled = touch && (line.is_none() || line_off);
         let mut wait = match (polled, down, readers.is_empty()) {
             (true, true, _) => POLL_NS,
             (true, false, false) if near => POLL_NEAR_NS,
@@ -311,6 +431,13 @@ fn main() -> i32 {
             let left = d.saturating_sub(time::now_ns()).max(1);
             wait = if wait == 0 { left } else { wait.min(left) };
         }
+        if let Some(d) = keys
+            .as_ref()
+            .map(|k| k.deadline(time::now_ns()))
+            .filter(|&d| d != 0)
+        {
+            wait = if wait == 0 { d } else { wait.min(d) };
+        }
         let mut rx: Option<Received> = match ipc::recv_timeout(ep, wait) {
             Ok(r) => Some(r),
             Err(e) if e == -ETIMEDOUT => None,
@@ -320,22 +447,35 @@ fn main() -> i32 {
         if irq {
             rx = None;
         }
+        let q0 = queue.len();
+        if let Some(k) = keys.as_mut() {
+            k.update(time::now_ns(), &mut queue);
+        }
         if polled || irq && line.is_some() {
-            let n = queue.len();
+            let n = q0.min(queue.len());
             down = poll_touch(&i2c, &mut queue, down);
             let seen = down || queue.len() != n;
             if seen {
                 contact = time::now_ns();
             }
-            if let Some(l) = line.as_ref().filter(|_| irq) {
+            if let Some(l) = line.as_ref().filter(|_| irq && !line_off) {
                 stuck = if seen { 0 } else { stuck + 1 };
                 if stuck < STUCK {
+                    if let Some(k) = &keys {
+                        k.ack();
+                    }
                     l.done();
                 } else {
                     l.off();
-                    line = None;
+                    line_off = true;
                     println!("[input] touch interrupt stuck low, polling instead");
                 }
+            }
+        }
+        if irq && line_off {
+            if let (Some(l), Some(k)) = (&line, &keys) {
+                k.ack();
+                l.irq.ack();
             }
         }
         if let Some(rx) = rx {

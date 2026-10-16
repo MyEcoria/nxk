@@ -532,7 +532,10 @@ fn main() -> i32 {
     macro_rules! release_game {
         () => {{
             game = None;
+            // Nothing runs on the GPU any more: it goes off (the clock asked
+            // for is kept for the next game).
             let _ = GPU.call(&Msg::new(gpuproto::RESET, 0, 0));
+            let _ = GPU.call(&Msg::from_words(gpuproto::POWER, &[0]));
             give_back(&dc, w, pa);
             scr.forget();
             dirty = true;
