@@ -9,9 +9,11 @@
 
 Microkernel written **entirely in Rust**, with no host OS, for the
 NVIDIA Tegra X1 SoC in the Nintendo Switch (Erista and Mariko). It runs
-directly on the four Cortex-A57 cores, server-oriented: no windowing
-system, a shell over the serial console, and a touch dashboard on the
-screen.
+directly on the four Cortex-A57 cores. It is a **video game console**:
+the screen is a game library (`display`), the GPU draws 3D in games
+(`gpu`, the engine written from its registers up), games are ordinary
+Rust programs on a small SDK (`jeux/nxgfx`); and it stays a
+microkernel with a shell over the USB-C console and a system dashboard.
 
 Like Linux, it is the interface between hardware and programs, which
 are written on top of system calls. But as a true microkernel, it keeps
@@ -27,7 +29,7 @@ like any other.
 
 ```
 EL0  Rust programs (std) · shell
-     services: fs (FAT32) · net (TCP/IP) · display · input · power
+     services: fs (FAT32) · net (TCP/IP) · display (library, screen, input) · input · power
      drivers : console (UART) · usbcon (USB-C) · sd · usb (xHCI) · i2c · clk · gpu
      init: process manager and name service
      ─────────── ported std · libnx (no_std) ───────────
@@ -35,13 +37,39 @@ EL0  Rust programs (std) · shell
 EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 ```
 
-Everything has been verified in the `tegra_qemu` emulator. On a **real
-Switch** (Erista), nxk boots through hekate on its four cores; the
-`display` service turns the screen into a touch dashboard (home tiles,
-system, network, a mirror of the USB-C terminal, screen messages) and the
-shell is reached over the USB-C console (`usbcon`: the Switch as a USB
-serial device, `tools/usbterm.py` on the PC), with the SD card and
-Wi-Fi (see "Limits" and `hwboot/README.md`).
+Everything but the GPU has been verified in the `tegra_qemu` emulator. On
+a **real Switch** (Erista), nxk boots through hekate on its four cores;
+the `display` service shows the **game library** (cards read from
+`/games`, played with touch or a gamepad, HOME to leave) and the
+dashboard pages (overview, system, network, a mirror of the USB-C
+terminal, screen messages); games draw with the **GPU's 3D engine**
+(vertex and fragment shaders, depth, block-linear surfaces, 60 Hz
+flips); the shell is reached over the USB-C console (`usbcon`: the
+Switch as a USB serial device, `tools/usbterm.py` on the PC), which also
+carries a debug channel (`tools/nxdbg.py`: screen capture, touch and
+gamepad input), with the SD card and Wi-Fi (see "Limits" and
+`hwboot/README.md`).
+
+## Games
+
+`jeux/` holds the game SDK (`nxgfx`, a library on `nxk-abi` alone:
+screen, GPU command streams, meshes, a 2D canvas with text, input, math)
+and the games. `jeux/starlane` is the sample, a 3D lane runner:
+
+```bash
+./tools/build.sh && ./tools/mksd.py -o build/sd.img --firmware firmware
+# a game is /games/NAME/NAME on the card, with /games/NAME/game.txt:
+#   title=Starlane  description=...  color=F0A04C
+./tools/usbterm.py --put ~/.cache/nxk/target-apps/aarch64-unknown-nxk/release/starlane:/games/starlane/starlane
+```
+
+A game opens `Graphics::open()`, which powers the GPU, takes the screen
+(three block-linear images the GPU draws on, flipped at the vertical
+blank) and gets the input `display` routes to it; each frame is a
+command stream (`Frame`: clear, pipeline, uniforms, indexed draws,
+canvas) the GPU service checks and runs. The panel is portrait:
+`Graphics::projection` turns the landscape picture. HOME (or the
+`Event::Button` the SDK passes) ends a game; the library is back.
 
 ## Build, run, test
 
@@ -148,6 +176,7 @@ kernel/     the microkernel
 user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
+jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),
@@ -275,7 +304,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU 3D, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders and depth, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU textures, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 

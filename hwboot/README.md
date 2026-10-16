@@ -277,6 +277,24 @@ lone ESC typed in the shell reaches it with the next key. `--reload` of
 `usbcon`, `display` or `input` replaces them in place; the PC's port
 disappears and returns for `usbcon`.
 
+## Games
+
+The library (GAMES, the first page of `display`) lists `/games/NAME`
+directories: the program `NAME` and `game.txt` (`title=`,
+`description=`, `color=RRGGBB`), re-read every 8 s. `mksd-hw.sh`
+installs the ones built from `jeux/`; for a card in the console,
+`./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
+`-c "mkdir /games/NAME"` in an earlier call).
+
+Gamepad (or `nxdbg.py button`): left and right choose a card, A plays;
+touch: a tap chooses, a second tap plays. In a game `display` hands out
+the input (`display::EVENT`): touch and the same buttons, HOME ends the
+game (the library comes back; a game that exits or crashes gives the
+screen back too, and so does one run from the shell). On entering a
+game the GPU is put on the highest clock the power source allows
+(768.0 MHz on a charger, 460.8 on battery). Screen captures of a game
+(`nxdbg.py shot`) come from a copy of the image on display.
+
 ## Internet over USB-C (usb0)
 
 The same cable carries a network link: `usbcon` is a composite device,
@@ -814,6 +832,20 @@ within 5 s.
     buffer's size is taken in multiples of 256 bytes (INVALID_VALUE
     otherwise); INVALIDATE_SHADER_CACHES has no UNIFORM bit and
     INVALIDATE_CONSTANT_BUFFER_CACHE is not a method of this class.
+
+31. 16/10/2026, Erista, games: **Starlane runs on the Switch at 60
+    fps** from the library. A game is launched by `display` (spawn,
+    wait thread), takes the screen through `SCANOUT` (three 720x1280
+    block-linear images, `DC_WINBUF_SURFACE_KIND` block, flipped with
+    the window's update and activation request), and draws with the GPU
+    at 768 MHz: lit meshes with depth, perspective-correct shading,
+    pixel-font text through a GPU canvas. HOME in the middle of a game
+    kills it and brings the library back. Three findings: a shader that
+    sets a scoreboard barrier needs a stall of 2 before an instruction
+    waits on it (a stall of 1 read stale registers: speckled faces); the
+    interpolation of perspective attributes takes the reciprocal of the
+    interpolated 1/w; and a debug capture longer than a frame must read
+    a copy of the image, not the one the GPU is drawing on.
 
 ## Hardware test (once the SD card is back in the PC)
 

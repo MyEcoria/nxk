@@ -6,7 +6,8 @@ This file guides AI coding agents working on **nxk**. Follow it on every task
 ## 1. What nxk is
 
 - Microkernel in **pure Rust**, no host OS, for NVIDIA Tegra X1 (Nintendo
-  Switch Erista / Mariko: 4x Cortex-A57).
+  Switch Erista / Mariko: 4x Cortex-A57), run as a **video game
+  console**: library UI, GPU 3D engine, games on an SDK (`jeux/`).
 - EL1 keeps only: address spaces, threads, scheduler, IPC, capabilities,
   IRQ routing, futex. Everything else (drivers, fs, net, services) runs as
   ordinary **EL0** programs with only the capabilities granted to them.
@@ -39,6 +40,7 @@ kernel/     the EL1 microkernel (crate `nxk`)
 user/       workspace: libnx (no_std) + init, shell, drivers, services, tests
 std/        Rust std port: std/library overlay, target JSON, linker script
 apps/       ordinary std programs: hello-std, stdtest
+jeux/       games (std) and nxgfx, the game SDK (on nxk-abi alone)
 bench/      nxk vs L4T comparison (lbench, scripts, RESULTS.md)
 tools/      build.sh, mksd.py, run.sh, debug.sh, nxtest.py, mkstd.py,
             usbterm.py, tegra_qemu patches, ...
@@ -126,9 +128,13 @@ Key details agents must respect:
 ## 4. Architecture rules (do not break)
 
 - No GUI toolkit or windows: the shell stays on the serial and USB-C
-  consoles. The screen is the `display` service's touch dashboard
-  (status pages, a read-only mirror of the USB-C terminal); its mockup
-  is `docs/ui/home.html`.
+  consoles. The screen is the `display` service's: the game library
+  (cards from `/games`), then status pages and a read-only mirror of the
+  USB-C terminal; a game takes the whole screen (`display::SCANOUT`,
+  three block-linear images, flips at the vertical blank) and gets the
+  input `display` routes to it. Games draw through `gpu`'s command
+  streams (`gpu::RENDER`: checked before anything runs), never by
+  writing GPU registers or pushbuffers themselves.
 - EL1/EL0 split: no driver or filesystem logic in the kernel. Services get
   least-privilege capabilities; designate objects only via handles with
   rights + generation (revocation by generation bump).
