@@ -415,8 +415,8 @@ Then at the shell:
 
 ```text
 gpu             gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo NNNN (ID 3)
-gpu test        2D fill and copy, fill / copy / SAXPY kernels, 3D clear and a
-                triangle through a vertex and a fragment shader: 7/7 ok
+gpu test        2D fill and copy, fill / copy / SAXPY kernels, 3D clear,
+                a triangle, depth ordering and a lit indexed quad: 9/9 ok
 gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
 gpu clock 768   [gpu] GPU 76800 -> 768000 kHz at 987 mV, measured 768292 kHz
 gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
@@ -799,6 +799,21 @@ within 5 s.
     program offset is refused (INVALID_VALUE) unless the header sits at
     0x30 modulo 0x80, so that the code 0x50 later starts on a 0x80
     boundary, as Kepler and later want.
+
+30. 16/10/2026, Erista, `gpu` 3D: **depth, constant buffers, indexed
+    draws and a lit shader**. `gpu test` 9/9: a block-linear render target
+    with a 32-bit float depth buffer (near triangle kept over a far one),
+    and a quad of two triangles through an index buffer, a vertex shader
+    with a model-view-projection and a normal matrix from constant buffer
+    1, and a fragment shader with perspective-correct interpolation and
+    a directional light: the center pixel is exactly the expected
+    0xff0060bf. Findings: the engine refuses a depth buffer with a
+    pitch-linear color target (INVALID_OPERATION on the clear); block-linear
+    surfaces write nothing unless their PTE carries a storage kind
+    (generic 16Bx2, 0xFE, for color; ZF32, 0x7B, for depth); a constant
+    buffer's size is taken in multiples of 256 bytes (INVALID_VALUE
+    otherwise); INVALIDATE_SHADER_CACHES has no UNIFORM bit and
+    INVALIDATE_CONSTANT_BUFFER_CACHE is not a method of this class.
 
 ## Hardware test (once the SD card is back in the PC)
 
