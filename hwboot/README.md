@@ -243,6 +243,40 @@ The USB-C line locates a failure:
   trims` there means hekate did not leave the fuses readable; high
   speed may then fail.
 
+## Debug channel: screen capture, touch and gamepad
+
+The same serial stream carries a side channel that lets the PC (or an
+agent) see the screen and act on it, without touching the console:
+`usbcon` takes frames out of the shell's input (APC strings, `ESC _ N`,
+base64 of a request, `ESC \\`, which terminals ignore) and puts its
+replies in the output between two console transfers. `nxk_abi::proto::dbg`
+has the requests; `tools/nxdbg.py` is the client (close `usbterm.py`
+first: one program per port).
+
+```bash
+./tools/nxdbg.py ping
+./tools/nxdbg.py shot screen.png            # the screen as held, landscape PNG
+./tools/nxdbg.py tap 640 670                # landscape pixels (1280x720)
+./tools/nxdbg.py swipe 1000 300 200 300 400 # x1 y1 x2 y2 [ms]
+./tools/nxdbg.py button A                   # gamepad: A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT HOME ...
+./tools/nxdbg.py tap 640 670 wait 0.5 shot after.png   # chained, in order
+```
+
+A capture is the image `display` shows (`display::SNAPSHOT`, read-only),
+cut into 32-bit pixel runs by `usbcon` as the IN endpoint frees up: about
+0.09 s for a whole screen, 30 in a row in 2.7 s. Touches go to `input`
+as the panel's raw coordinates (`input::INJECT`), buttons as `KIND_BUTTON`
+events. `display` reads both: the D-pad moves an outline over the tappable
+zones (the panel and the confirmation dialogs restrict it to their own),
+A taps the outlined one, B closes a panel or goes back, L and R (or ZL
+and ZR) turn the page, HOME and + go to the home page. A finger on the
+screen hides the outline.
+
+Frames only flow while a terminal is open on the host (DTR), and a
+lone ESC typed in the shell reaches it with the next key. `--reload` of
+`usbcon`, `display` or `input` replaces them in place; the PC's port
+disappears and returns for `usbcon`.
+
 ## Internet over USB-C (usb0)
 
 The same cable carries a network link: `usbcon` is a composite device,
@@ -698,6 +732,7 @@ within 5 s.
     the cores lost their clock. The switch now opens it, goes through
     CCLKG_BURST_POLICY (0x368) as they do, and checks the CPU really
     slowed down before turning PLLX off.
+
 25. 25/09/2026, Erista, commit `3ca3fea` (no SD card: `fs` exits, as
     expected): CPU speedo 2079, steps up to 1224 MHz. Each change logs
     the clock measured against PLLP, matching PLLX: 1020 -> 1018 MHz at
@@ -741,6 +776,16 @@ within 5 s.
     304.4 = 336.2 GFLOP/s, SoC at most 49.6 C after 30 s, fan 32%.
     Not exercised: the battery cap (the USB-C console needs the cable)
     and the 80 C fallback (the SoC stayed under 50 C).
+
+28. 16/10/2026, Erista, the debug channel (`usbcon`, `display`, `input`,
+    `tools/nxdbg.py`), installed over USB-C with `--reload`: `shot` reads
+    the real screen (1280x720 landscape, 0.09 s), taps change the page
+    reliably (7 of 7), and the virtual gamepad moves the outline, presses
+    A on the TERMINAL tab and turns pages with L and R. The first tap
+    after a `display` restart was lost: `input` answered it to the dead
+    instance's pending read. It now keeps the event when the reply
+    fails; `usbcon` retries a call once when a service was restarted.
+    `ktest` 29/29, `stdtest` 17/17 afterwards.
 
 ## Hardware test (once the SD card is back in the PC)
 
