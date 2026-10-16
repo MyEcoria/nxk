@@ -169,6 +169,9 @@ struct Game {
     images: Vec<SharedMemory>,
     /// The one on display.
     shown: usize,
+    /// A copy of it for `SNAPSHOT`: the GPU is drawing on the others, and
+    /// a capture takes longer than a frame.
+    snap: Option<SharedMemory>,
     pas: Vec<u32>,
     events: VecDeque<Event>,
     waiter: Option<(u64, u64)>,
@@ -289,6 +292,18 @@ fn touch_xy(x: u64, y: u64, sw: usize, sh: usize) -> (usize, usize) {
     (x as usize, y as usize)
 }
 
+/// The image on display, copied (cached memory, allocated on the first
+/// capture).
+fn still(g: &mut Game) -> Option<&SharedMemory> {
+    let n = g.images[g.shown].len();
+    if g.snap.is_none() {
+        g.snap = Some(SharedMemory::new(n, 0).ok()?);
+    }
+    let snap = g.snap.as_ref()?;
+    snap.as_mut_slice()[..n].copy_from_slice(&g.images[g.shown].as_slice()[..n]);
+    Some(snap)
+}
+
 /// The images of a game, black, the first on display, block-linear:
 /// handles queued in `sent` for the reply.
 fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Game, i64> {
@@ -317,6 +332,7 @@ fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Gam
     Ok(Game {
         images,
         shown: 0,
+        snap: None,
         pas,
         events: VecDeque::new(),
         waiter: None,
@@ -657,8 +673,11 @@ fn main() -> i32 {
             // The image as it is, read-only: the UI goes on.
             proto::SNAPSHOT => {
                 // What is on display: the UI's image, or a game's.
-                let (mem, layout, block) = match &game {
-                    Some(g) => (&g.images[g.shown], 1, SCANOUT_BLOCK_LOG2 as u64),
+                let (mem, layout, block) = match game.as_mut() {
+                    Some(g) => match still(g) {
+                        Some(m) => (m, 1, SCANOUT_BLOCK_LOG2 as u64),
+                        None => (&scr.fb, 0, 0),
+                    },
                     None => (&scr.fb, 0, 0),
                 };
                 match sys::handle_dup(mem.handle(), MAP | GRANT | DUP, 0) {
