@@ -37,6 +37,7 @@ fn state_name(s: u64) -> &'static str {
         proto::ST_SCANNING => "scanning",
         proto::ST_CONNECTING => "connecting",
         proto::ST_CONNECTED => "connected",
+        proto::ST_RADIO_OFF => "radio off",
         _ => "down",
     }
 }
@@ -197,9 +198,14 @@ fn main() -> i32 {
         Some("connect") if args.len() >= 3 => connect(args[2], args.get(3).copied().unwrap_or("")),
         Some("disconnect") => call(&Msg::new(proto::DISCONNECT, 0, 0)).map(|_| ()),
         Some("retry") => text(proto::RETRY),
+        Some("radio") if matches!(args.get(2).copied(), Some("on" | "off")) => {
+            let on = args[2] == "on";
+            call(&Msg::from_words(proto::RADIO, &[on as u64]))
+                .map(|_| println!("radio {}", args[2]))
+        }
         Some("status") | None => status(),
         _ => {
-            println!("usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status | retry");
+            println!("usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status | retry | radio on|off");
             return 2;
         }
     };

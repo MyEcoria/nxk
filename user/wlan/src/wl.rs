@@ -19,6 +19,7 @@ use crate::wpa::{self, Supplicant};
 
 // Commands.
 const WLC_UP: u32 = 2;
+const WLC_DOWN: u32 = 3;
 const WLC_SET_INFRA: u32 = 20;
 const WLC_GET_CHANNEL: u32 = 29;
 const WLC_DISASSOC: u32 = 52;
@@ -614,6 +615,13 @@ impl Dev<'_> {
             return Err(-EAGAIN);
         }
         self.mb.send(bp, tcm, frame).map(|_| ()).map_err(failed)
+    }
+
+    /// Radio on (`WLC_UP`) or off (`WLC_DOWN`, as `brcmf_cfg80211_down`):
+    /// off, the chip neither scans nor joins.
+    pub fn radio(&mut self, on: bool) -> Result<(), String> {
+        let cmd = if on { WLC_UP } else { WLC_DOWN };
+        self.mb.cmd_int(self.bp, self.tcm, cmd, 1)
     }
 
     /// Leave the network (`brcmf_link_down`).

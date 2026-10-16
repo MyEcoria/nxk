@@ -1,7 +1,7 @@
 //! display: Tegra X1 DC-A screen; window A on a shared image, drawn as
-//! the touch UI of `ui` (docs/ui/home.html): header, home tiles, system,
-//! network, the USB-C terminal and the lines written to the screen
-//! (driver failures, `fbecho`). Redrawn every second and on touches.
+//! the Switch-style touch UI of `ui`: home screen with horizontal game
+//! tiles and bottom dock, quick settings overlay, settings, system,
+//! network, USB-C terminal and logs. Redrawn every second and on input.
 //! Panel init is left to the bootloader; only the window is changed. A
 //! portrait panel (Switch) is drawn turned.
 
@@ -10,11 +10,17 @@
 
 extern crate alloc;
 
+mod backlight;
+mod config;
+mod font;
 mod games;
+mod pages;
 mod screen;
 mod stats;
 mod term;
+mod theme;
 mod ui;
+mod widgets;
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -155,11 +161,18 @@ impl Messages {
 /// move, up), finger, raw x, y; for a button its code and 1 or 0.
 type Event = (u64, u64, u64, u64, u64);
 
+enum Job {
+    Act(Action),
+    Save(config::Config),
+    SleepCpu(u64),
+}
+
 /// Outcome of an action run by the worker.
 enum Done {
     Scan(Result<Vec<ScanNet>, i64>),
     Retry(Result<String, i64>),
     Leave(Result<(), i64>),
+    Flight(Result<bool, i64>),
     Power(i64),
     /// The fan's state after a `SET`.
     Fan(Result<stats::Fan, i64>),
@@ -242,7 +255,7 @@ impl Launcher {
 }
 
 struct Worker {
-    jobs: Mutex<VecDeque<Action>>,
+    jobs: Mutex<VecDeque<Job>>,
     wake: Condvar,
     done: Mutex<VecDeque<Done>>,
 }
@@ -290,7 +303,18 @@ fn work(w: &Worker, notif: u32) -> ! {
             }
         };
         drop(q);
-        let done = match job {
+        let act = match job {
+            Job::Act(a) => a,
+            Job::Save(cfg) => {
+                let _ = cfg.save();
+                continue;
+            }
+            Job::SleepCpu(mhz) => {
+                let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
+                continue;
+            }
+        };
+        let done = match act {
             Action::Scan => Done::Scan(scan()),
             Action::Retry => Done::Retry(WIFI.call(&Msg::new(wifi::RETRY, 0, 0)).map(|r| {
                 let mut buf = [0u8; 256];
@@ -298,6 +322,10 @@ fn work(w: &Worker, notif: u32) -> ! {
                 String::from_utf8_lossy(&buf[..n]).into_owned()
             })),
             Action::Leave => Done::Leave(WIFI.call(&Msg::new(wifi::DISCONNECT, 0, 0)).map(|_| ())),
+            Action::Flight(off) => Done::Flight(
+                WIFI.call(&Msg::from_words(wifi::RADIO, &[(!off) as u64]))
+                    .map(|_| off),
+            ),
             Action::Power(label) => {
                 Done::Power(POWER.call(&Msg::new(label, 0, 0)).err().unwrap_or(0))
             }
@@ -317,7 +345,11 @@ fn work(w: &Worker, notif: u32) -> ! {
                         .map(|_| ()),
                 )
             }
-            Action::ClearLogs | Action::Launch(_) => continue,
+            Action::ClearLogs
+            | Action::Launch(_)
+            | Action::Brightness(_)
+            | Action::Save
+            | Action::Sleep => continue,
         };
         w.done.lock().push_back(done);
         let _ = sys::notify_signal(notif, EV_DONE);
@@ -425,10 +457,17 @@ fn give_back(dc: &Mmio, w: usize, pa: u32) {
     flip(dc, pa);
 }
 
+fn set_window_enabled(dc: &Mmio, en: bool) {
+    wr(dc, WIN_OPTIONS, if en { 1 << 30 } else { 0 });
+    wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
+    wr(dc, CMD_STATE_CONTROL, 1 | 2);
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
     let dc = Mmio::map(drv::dev_slot(0), DC, 0x40000).expect("display: registers");
+    let bl = backlight::Backlight::open();
     let active = dc.r32(DISP_DISP_ACTIVE * 4);
     let (mut w, mut h) = (
         (active & 0x1FFF) as usize,
@@ -510,6 +549,16 @@ fn main() -> i32 {
     let ep = drv::publish("display").expect("display: publish");
     let mut data = stats::Data::new();
     let mut ui = Ui::new();
+    ui.has_backlight = bl.is_some();
+    if let Some(b) = &bl {
+        ui.cfg.brightness = b.percent();
+    }
+    let mut cfg_loaded = false;
+    let mut save_at: u64 = 0;
+    let mut sleeping = false;
+    let mut pre_sleep_cpu: Option<u64> = None;
+    let mut last_input = time::now_ns();
+
     let mut term = term::Term::new();
     let (mut tail, mut tail_buf) = (0u64, alloc::vec![0u8; ipc::MAX_BYTES]);
     // Finger followed (the first one down) and where it last was.
@@ -540,13 +589,93 @@ fn main() -> i32 {
             scr.forget();
             dirty = true;
             next_refresh = 0;
+            last_input = time::now_ns();
         }};
     }
+    macro_rules! enter_sleep {
+        () => {{
+            if !sleeping {
+                sleeping = true;
+                if let Some(b) = &bl {
+                    b.off();
+                }
+                set_window_enabled(&dc, false);
+                pre_sleep_cpu = match &data.cpu {
+                    stats::Seen::Value(c) => Some(c.step),
+                    _ => None,
+                };
+                worker
+                    .jobs
+                    .lock()
+                    .push_back(Job::SleepCpu(cpufreq::STEPS_MHZ[0] as u64));
+                worker.wake.notify_one();
+            }
+        }};
+    }
+    macro_rules! wake_sleep {
+        ($now:expr) => {{
+            if sleeping {
+                sleeping = false;
+                set_window_enabled(&dc, true);
+                if let Some(b) = &bl {
+                    b.set(ui.cfg.brightness);
+                }
+                if let Some(mhz) = pre_sleep_cpu.take() {
+                    worker.jobs.lock().push_back(Job::SleepCpu(mhz));
+                    worker.wake.notify_one();
+                }
+                dirty = true;
+                next_refresh = 0;
+                last_input = $now;
+            }
+        }};
+    }
+
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
         let now = time::now_ns();
         let mut wake = u64::MAX;
-        if !owned && game.is_none() {
+
+        if save_at != 0 && now >= save_at {
+            save_at = 0;
+            worker.jobs.lock().push_back(Job::Save(ui.cfg));
+            worker.wake.notify_one();
+        }
+        if save_at != 0 {
+            wake = wake.min(save_at);
+        }
+
+        if !owned && game.is_none() && !sleeping {
+            let sleep_mins = ui.sleep_minutes() as u64;
+            if sleep_mins > 0 {
+                let sleep_at = last_input + sleep_mins * 60_000_000_000;
+                if now >= sleep_at {
+                    enter_sleep!();
+                } else {
+                    wake = wake.min(sleep_at);
+                }
+            }
+        }
+
+        if !owned && game.is_none() && !sleeping {
+            if !cfg_loaded && now >= next_scan && libnx::fs::read_dir("/").is_ok() {
+                cfg_loaded = true;
+                if let Some(mut cfg) = config::Config::load() {
+                    if cfg.brightness > 0 {
+                        if let Some(b) = &bl {
+                            b.set(cfg.brightness);
+                        }
+                    } else {
+                        cfg.brightness = ui.cfg.brightness;
+                    }
+                    if cfg.flight {
+                        worker.jobs.lock().push_back(Job::Act(Action::Flight(true)));
+                        worker.wake.notify_one();
+                    }
+                    ui.apply_config(cfg);
+                    dirty = true;
+                }
+            }
             if ui.page == ui::LIBRARY && now >= next_scan {
                 let found = games::scan();
                 next_scan = now
@@ -596,7 +725,7 @@ fn main() -> i32 {
                 scr.present();
                 dirty = false;
             }
-            wake = next_refresh.min(next_tail);
+            wake = wake.min(next_refresh.min(next_tail));
             if terminal {
                 wake = wake.min((blink + 1) * BLINK_NS);
             }
@@ -642,7 +771,20 @@ fn main() -> i32 {
         if rx.msg.is_notify() {
             let ev = rx.msg.mr[0];
             if ev & EV_TOUCH != 0 {
+                let now = time::now_ns();
                 let mut batch: Vec<Event> = touches.lock().drain(..).collect();
+                if sleeping {
+                    let wake_ev = batch.iter().any(|&(kind, code, id, _, _)| {
+                        (kind == input::KIND_TOUCH && code == input::TOUCH_DOWN)
+                            || (kind == input::KIND_BUTTON && id == 1)
+                    });
+                    if wake_ev {
+                        wake_sleep!(now);
+                        finger = None;
+                    }
+                    continue;
+                }
+                last_input = now;
                 // HOME ends the game (a press; the game never sees it).
                 let home = |e: &Event| e.0 == input::KIND_BUTTON && e.1 == input::BTN_HOME;
                 if game.is_some() && batch.iter().any(home) {
@@ -674,53 +816,67 @@ fn main() -> i32 {
                     if kind == input::KIND_STICK {
                         continue;
                     }
-                    if kind == input::KIND_BUTTON {
+                    let action = if kind == input::KIND_BUTTON {
                         if owned || id != 1 {
                             continue;
                         }
                         let page = ui.page;
-                        let action = ui.pad(code);
+                        let a = ui.pad(code);
                         if ui.page != page {
                             next_tail = 0;
                         }
-                        match action {
-                            Some(Action::ClearLogs) => msgs.clear(),
-                            Some(Action::Launch(i)) => launcher.launch(&mut ui, i),
-                            Some(a) => {
-                                worker.jobs.lock().push_back(a);
-                                worker.wake.notify_one();
+                        a
+                    } else {
+                        // One finger at a time; its release where it last was.
+                        let (x, y) = match (code, finger) {
+                            (input::TOUCH_DOWN, None) => touch_xy(x, y, sw, sh),
+                            (_, Some((f, fx, fy))) if f == id => {
+                                if code == input::TOUCH_UP {
+                                    (fx, fy)
+                                } else {
+                                    touch_xy(x, y, sw, sh)
+                                }
                             }
-                            None => {}
+                            _ => continue,
+                        };
+                        finger = (code != input::TOUCH_UP).then_some((id, x, y));
+                        if owned {
+                            continue;
                         }
-                        dirty = true;
-                        continue;
-                    }
-                    // One finger at a time; its release where it last was.
-                    let (x, y) = match (code, finger) {
-                        (input::TOUCH_DOWN, None) => touch_xy(x, y, sw, sh),
-                        (_, Some((f, fx, fy))) if f == id => {
-                            if code == input::TOUCH_UP {
-                                (fx, fy)
-                            } else {
-                                touch_xy(x, y, sw, sh)
-                            }
+                        let page = ui.page;
+                        let a = ui.touch(code, x, y);
+                        if ui.page != page {
+                            next_tail = 0; // TERMINAL and LOGS show up to date
                         }
-                        _ => continue,
+                        a
                     };
-                    finger = (code != input::TOUCH_UP).then_some((id, x, y));
-                    if owned {
-                        continue;
-                    }
-                    let page = ui.page;
-                    let action = ui.touch(code, x, y);
-                    if ui.page != page {
-                        next_tail = 0; // TERMINAL and LOGS show up to date
-                    }
                     match action {
                         Some(Action::ClearLogs) => msgs.clear(),
                         Some(Action::Launch(i)) => launcher.launch(&mut ui, i),
+                        Some(Action::Brightness(pct)) => {
+                            if let Some(b) = &bl {
+                                b.set(pct);
+                            }
+                            save_at = now + 800_000_000;
+                        }
+                        Some(Action::Save) => {
+                            save_at = 0;
+                            worker.jobs.lock().push_back(Job::Save(ui.cfg));
+                            worker.wake.notify_one();
+                        }
+                        Some(Action::Flight(off)) => {
+                            save_at = 0;
+                            let mut q = worker.jobs.lock();
+                            q.push_back(Job::Save(ui.cfg));
+                            q.push_back(Job::Act(Action::Flight(off)));
+                            drop(q);
+                            worker.wake.notify_one();
+                        }
+                        Some(Action::Sleep) => {
+                            enter_sleep!();
+                        }
                         Some(a) => {
-                            worker.jobs.lock().push_back(a);
+                            worker.jobs.lock().push_back(Job::Act(a));
                             worker.wake.notify_one();
                         }
                         None => {}
@@ -754,7 +910,10 @@ fn main() -> i32 {
                 let batch: Vec<Done> = worker.done.lock().drain(..).collect();
                 let now = time::now_ns();
                 for d in batch {
-                    if !matches!(d, Done::Fan(_) | Done::Cpu(_) | Done::Gpu(_)) {
+                    if !matches!(
+                        d,
+                        Done::Fan(_) | Done::Cpu(_) | Done::Gpu(_) | Done::Flight(_)
+                    ) {
                         ui.busy = false;
                     }
                     match d {
@@ -787,6 +946,11 @@ fn main() -> i32 {
                                     .toast(format!("gpu clock: {}", libnx::abi::err::name(e)), now),
                             }
                         }
+                        Done::Flight(r) => match r {
+                            Ok(true) => ui.toast("flight mode on (radio off)".into(), now),
+                            Ok(false) => ui.toast("flight mode off".into(), now),
+                            Err(e) => ui.toast(format!("wifi: {}", libnx::abi::err::name(e)), now),
+                        },
                         Done::Scan(Ok(nets)) => ui.scan = Some(nets),
                         Done::Retry(Ok(t)) => ui.toast(format!("wlan: {}", t), now),
                         Done::Leave(Ok(())) => ui.toast("wlan: left the network".into(), now),
@@ -810,6 +974,7 @@ fn main() -> i32 {
         let reply = match rx.msg.label() {
             proto::OPEN => match sys::handle_dup(scr.fb.handle(), MAP | WRITE | GRANT | DUP, 0) {
                 Ok(h2) => {
+                    wake_sleep!(now);
                     ipc::set_send_handle(0, h2);
                     sent.push(h2);
                     owned = true;
@@ -852,25 +1017,29 @@ fn main() -> i32 {
                     Err(e) => Msg::error(e),
                 }
             }
-            proto::SCANOUT if game.is_none() && !owned => match take_screen(&dc, w, h, &mut sent) {
-                Ok(mut g) => {
-                    g.owner = rx.pid;
-                    next_live = time::now_ns() + LIVE_NS;
-                    game = Some(g);
-                    Msg::from_words(
-                        0,
-                        &[
-                            w as u64,
-                            h as u64,
-                            proto::FORMAT_RGBA8888,
-                            SCANOUT_BLOCK_LOG2 as u64,
-                            gpuproto::tiled_bytes(w as u32, h as u32, SCANOUT_BLOCK_LOG2) as u64,
-                        ],
-                    )
-                    .with_handles(proto::SCANOUT_BUFFERS)
+            proto::SCANOUT if game.is_none() && !owned => {
+                wake_sleep!(now);
+                match take_screen(&dc, w, h, &mut sent) {
+                    Ok(mut g) => {
+                        g.owner = rx.pid;
+                        next_live = time::now_ns() + LIVE_NS;
+                        game = Some(g);
+                        Msg::from_words(
+                            0,
+                            &[
+                                w as u64,
+                                h as u64,
+                                proto::FORMAT_RGBA8888,
+                                SCANOUT_BLOCK_LOG2 as u64,
+                                gpuproto::tiled_bytes(w as u32, h as u32, SCANOUT_BLOCK_LOG2)
+                                    as u64,
+                            ],
+                        )
+                        .with_handles(proto::SCANOUT_BUFFERS)
+                    }
+                    Err(e) => Msg::error(e),
                 }
-                Err(e) => Msg::error(e),
-            },
+            }
             proto::SCANOUT => Msg::error(-ENODEV),
             proto::FLIP => match game.as_mut() {
                 Some(g) if (rx.msg.mr[0] as usize) < g.pas.len() => {

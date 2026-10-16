@@ -1684,6 +1684,14 @@ pub mod proto {
         /// (module reset, firmware, rejoin), as after a chip loss.
         /// Reply: bytes, like DIAG.
         pub const RETRY: u32 = 6;
+        /// Flight mode: word 0 = 0 turns the radio off (leave the
+        /// network, then the chip's `WLC_DOWN`, so it neither scans nor
+        /// joins until turned on), 1 turns it on (`WLC_UP`, nothing is
+        /// joined by itself). Kept across a chip recovery. Reply: word 0 =
+        /// 1 if the radio is on.
+        pub const RADIO: u32 = 7;
+        /// The radio is off (`RADIO`).
+        pub const ST_RADIO_OFF: u64 = 5;
         /// No adapter: no PCIe device, or its firmware is missing.
         pub const ST_DOWN: u64 = 0;
         pub const ST_IDLE: u64 = 1;

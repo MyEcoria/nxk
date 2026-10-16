@@ -93,6 +93,8 @@ struct Hw {
     /// loss; `rejoin` while that is still to do.
     last: Option<(Vec<u8>, Vec<u8>)>,
     rejoin: bool,
+    /// Flight mode: the radio is off, also after a recovery.
+    radio_off: bool,
     /// Chip losses, the report on the last one, and recoveries.
     losses: u32,
     loss: String,
@@ -130,6 +132,9 @@ impl Hw {
 
     /// Every network in range, remembered with its security.
     fn scan(&mut self, timeout: u64) -> Result<Vec<wl::Bss>, i64> {
+        if self.radio_off {
+            return Err(-ENETDOWN);
+        }
         match self.dev(|d| d.scan(timeout)) {
             Some(Ok(found)) => {
                 self.seen = found.clone();
@@ -146,6 +151,9 @@ impl Hw {
     /// Join by name, secured as the last scan saw it (one is run if the
     /// network was not in it).
     fn connect(&mut self, ssid: &[u8], psk: &[u8], timeout: u64) -> Result<(), i64> {
+        if self.radio_off {
+            return Err(-ENETDOWN);
+        }
         let known = |hw: &Hw| {
             let b = hw.seen.iter().find(|b| b.ssid == ssid)?;
             Some((b.security, b.rsn.clone()))
@@ -178,6 +186,20 @@ impl Hw {
             }
             None => Err(-ENOSYS),
         }
+    }
+
+    /// Flight mode: radio off (leaving the network first) or on again.
+    fn set_radio(&mut self, on: bool) -> Result<(), i64> {
+        if !on {
+            self.disconnect();
+        }
+        // If gone, the recovery applies it.
+        if let Some(Err(e)) = self.dev(|d| d.radio(on)) {
+            println!("[wlan] radio: {}", e);
+            return Err(-EIO);
+        }
+        self.radio_off = !on;
+        Ok(())
     }
 
     fn disconnect(&mut self) {
@@ -334,6 +356,11 @@ impl Hw {
         self.mb = Some(mb.ok_or_else(|| text.clone())?);
         let now = time::now_ns();
         self.gone = false;
+        if self.radio_off {
+            if let Some(Err(e)) = self.dev(|d| d.radio(false)) {
+                println!("[wlan] radio: {}", e);
+            }
+        }
         self.up_at = now;
         self.next_check = now + CHECK_NS;
         self.console = (String::new(), 0);
@@ -441,6 +468,8 @@ enum Backend {
 impl Backend {
     fn state(&self) -> u64 {
         match self {
+            Backend::Chip(hw) if hw.radio_off => wifi::ST_RADIO_OFF,
+            Backend::Sim(s) if s.radio_off => wifi::ST_RADIO_OFF,
             Backend::Chip(hw) if hw.gone => wifi::ST_DOWN,
             Backend::Chip(hw) if hw.joined.is_some() => wifi::ST_CONNECTED,
             Backend::Chip(hw) if hw.mb.is_some() => wifi::ST_IDLE,
@@ -452,6 +481,7 @@ impl Backend {
 
     fn scan(&mut self, timeout: u64) -> Result<(usize, Vec<u8>), i64> {
         match self {
+            Backend::Sim(s) if s.radio_off => Err(-ENETDOWN),
             Backend::Sim(s) => Ok((sim::APS.len(), s.scan())),
             Backend::Chip(hw) => {
                 let mut found = hw.scan(timeout)?;
@@ -609,6 +639,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             next_check: 0,
             last: None,
             rejoin: false,
+            radio_off: false,
             losses: 0,
             loss: String::new(),
             recoveries: 0,
@@ -856,6 +887,7 @@ fn main() -> i32 {
                         let (ssid, psk) = buf[..n].split_at(cut);
                         let psk = if psk.is_empty() { psk } else { &psk[1..] };
                         Some(match &mut backend {
+                            Backend::Sim(s) if s.radio_off => Msg::error(-ENETDOWN),
                             Backend::Sim(s) => match s.connect(ssid, psk) {
                                 Ok(()) => {
                                     publish_link(&mut link_up);
@@ -948,6 +980,19 @@ fn main() -> i32 {
                             }
                         }
                         Some(ipc::pack(0, diag.as_bytes()))
+                    }
+                    (wifi::BADGE_CTRL, wifi::RADIO) => {
+                        let on = rx.msg.mr[0] != 0;
+                        Some(match &mut backend {
+                            Backend::Sim(s) => {
+                                s.set_radio(on);
+                                Msg::from_words(0, &[on as u64])
+                            }
+                            Backend::Chip(hw) => match hw.set_radio(on) {
+                                Ok(()) => Msg::from_words(0, &[on as u64]),
+                                Err(e) => Msg::error(e),
+                            },
+                        })
                     }
                     (wifi::BADGE_CTRL, wifi::DISCONNECT) => {
                         match &mut backend {

@@ -274,6 +274,8 @@ pub struct Data {
     pub procs: u64,
     pub mem: Option<MemInfo>,
     pub temps: Seen<(i64, i64)>,
+    /// `power::SUPPLY_*`: battery, or input power on the USB-C port.
+    pub supply: Seen<u64>,
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
@@ -315,6 +317,7 @@ impl Data {
             procs: 0,
             mem: None,
             temps: Seen::Unknown,
+            supply: Seen::Unknown,
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
@@ -375,6 +378,8 @@ impl Data {
         self.temps.poll(&POWER, power::TEMPERATURE, n, force, |m| {
             (m.mr[0] as i64, m.mr[1] as i64)
         });
+        self.supply
+            .poll(&POWER, power::SUPPLY, n, force, |m| m.mr[0]);
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);

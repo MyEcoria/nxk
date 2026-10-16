@@ -40,6 +40,8 @@ const MIN_PSK: usize = 8;
 #[derive(Default)]
 pub struct Sim {
     pub joined: Option<usize>,
+    /// Flight mode.
+    pub radio_off: bool,
 }
 
 impl Sim {
@@ -71,5 +73,12 @@ impl Sim {
 
     pub fn disconnect(&mut self) {
         self.joined = None;
+    }
+
+    pub fn set_radio(&mut self, on: bool) {
+        self.radio_off = !on;
+        if !on {
+            self.joined = None;
+        }
     }
 }

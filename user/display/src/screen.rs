@@ -1,7 +1,10 @@
-//! Landscape drawing: rectangles, 8x16 glyphs, the logo. A frame is drawn
-//! whole into a cached image, then only its changed pixels are copied to
-//! the displayed one (uncached): no flicker, few slow writes. A portrait
-//! panel (Switch) is drawn turned, as hekate stores its boot logo.
+//! Landscape drawing: antialiased rounded shapes, lines, text in the UI
+//! font and Terminus (terminal and logs), the logo. A frame is drawn
+//! whole into a 16-bit cached image (RGB565), then only its changed
+//! pixels are copied, widened to 32 bits, to the displayed one
+//! (uncached): no flicker, few slow writes, half the cache's memory. A
+//! portrait panel (Switch) is drawn turned, as hekate stores its boot
+//! logo.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -9,25 +12,19 @@ use core::fmt;
 
 use libnx::mem::SharedMemory;
 
+use crate::font::{self, Face};
+
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
 /// tools/mklogo.py --raw: width, height, 8 R G B A palette entries, indices.
 const LOGO: &[u8] = include_bytes!("../../../build/logo.bin");
 
-// Colors, A B G R (docs/ui/home.html uses the same values).
-pub const BG: u32 = 0xFF3A_1E10;
+// The terminal's colors, A B G R: it is dark in both themes.
 pub const FG: u32 = 0xFFD8_D8D8;
 pub const DIM: u32 = 0xFF98_8880;
 pub const GOOD: u32 = 0xFF6A_D06A;
-pub const WARN: u32 = 0xFF40_C0F0;
 pub const BAD: u32 = 0xFF50_60F0;
-/// Empty part of a bar.
-pub const TRACK: u32 = 0xFF50_3020;
-/// Cards, their outline, a pressed control.
-pub const PANEL: u32 = 0xFF4C_2916;
-pub const EDGE: u32 = 0xFF75_462B;
-pub const PRESS: u32 = 0xFF8A_4F2A;
 pub const BLUE: u32 = 0xFFF0_A06C;
-pub const TERM_BG: u32 = 0xFF24_130B;
+pub const TERM_BG: u32 = 0xFF14_110F;
 
 /// Logo palette entry `i` (A B G R).
 pub fn palette(i: usize) -> u32 {
@@ -39,26 +36,71 @@ pub fn palette(i: usize) -> u32 {
     ])
 }
 
-/// Labels and titles: the logo's light amber.
-pub fn accent() -> u32 {
-    palette(6)
-}
-
 pub fn logo_size() -> (usize, usize) {
     (LOGO[0] as usize, LOGO[1] as usize)
 }
 
-/// Width of `s` in pixels at `scale`.
-pub fn width(s: &str, scale: usize) -> usize {
-    s.chars().count() * 8 * scale
+/// Width of `s` in the UI font.
+pub fn width(f: Face, s: &str) -> usize {
+    font::width(f, s)
+}
+
+/// A B G R to RGB565.
+fn c565(c: u32) -> u16 {
+    ((c & 0xF8) << 8 | (c >> 5 & 0x7E0) | (c >> 19 & 0x1F)) as u16
+}
+
+fn pack(r: u32, g: u32, b: u32) -> u16 {
+    ((r & 0xF8) << 8 | (g & 0xFC) << 3 | b >> 3) as u16
+}
+
+/// RGB565 widened to a displayed pixel (R8G8B8A8, opaque).
+fn expand(p: u16) -> u32 {
+    let (r, g, b) = ((p >> 11) as u32 & 31, (p >> 5) as u32 & 63, p as u32 & 31);
+    0xFF00_0000 | (b << 3 | b >> 2) << 16 | (g << 2 | g >> 4) << 8 | (r << 3 | r >> 2)
+}
+
+/// `c` (A B G R) over `d`, `a` of 255 opaque.
+fn blend(d: u16, c: u32, a: u32) -> u16 {
+    let (r, g, b) = ((d >> 11) as u32 & 31, (d >> 5) as u32 & 63, d as u32 & 31);
+    let (r, g, b) = (r << 3 | r >> 2, g << 2 | g >> 4, b << 3 | b >> 2);
+    let m = |d: u32, s: u32| (d * (255 - a) + s * a + 127) / 255;
+    pack(m(r, c & 0xFF), m(g, c >> 8 & 0xFF), m(b, c >> 16 & 0xFF))
+}
+
+/// Coverage (0..=255) of pixel (px, py) of a w x h box with corners of
+/// radius `r`: distances in eighths of a pixel from the pixel's centre.
+fn rr_cov(px: usize, py: usize, w: usize, h: usize, r: usize) -> u32 {
+    let cx = if px < r {
+        r
+    } else if px + r >= w {
+        w - r
+    } else {
+        return 255;
+    };
+    let cy = if py < r {
+        r
+    } else if py + r >= h {
+        h - r
+    } else {
+        return 255;
+    };
+    let (ex, ey) = (
+        (2 * px as i32 + 1 - 2 * cx as i32) * 4,
+        (2 * py as i32 + 1 - 2 * cy as i32) * 4,
+    );
+    let d = isqrt32((ex * ex + ey * ey) as u32) as i32;
+    ((r as i32 * 8 - d + 4).clamp(0, 8) * 255 / 8) as u32
 }
 
 pub struct Screen {
     pub fb: SharedMemory,
     /// Frame being drawn, and what the displayed image holds; both in
-    /// panel scan order.
-    back: Vec<u32>,
-    shown: Vec<u32>,
+    /// panel scan order, RGB565.
+    back: Vec<u16>,
+    shown: Vec<u16>,
+    /// The displayed image is not what `shown` says: copy it whole.
+    all: bool,
     /// Image size, in panel scan order.
     w: usize,
     h: usize,
@@ -73,9 +115,9 @@ impl Screen {
     pub fn new(fb: SharedMemory, w: usize, h: usize) -> Self {
         Self {
             fb,
-            back: vec![BG; w * h],
-            // No drawn color is 0 (all opaque): the first frame is copied whole.
+            back: vec![0; w * h],
             shown: vec![0; w * h],
+            all: true,
             w,
             h,
             dx: 0,
@@ -110,7 +152,7 @@ impl Screen {
         if w == 0 || h == 0 {
             return;
         }
-        let (iw, ih) = (self.w, self.h);
+        let (iw, ih, c) = (self.w, self.h, c565(c));
         if self.rot {
             // Landscape (x, y) is image pixel (row ih-1-x, column y).
             for r in ih - x - w..ih - x {
@@ -124,21 +166,90 @@ impl Screen {
     }
 
     pub fn clear(&mut self, c: u32) {
-        self.back.fill(c);
+        self.back.fill(c565(c));
     }
 
-    /// Rectangle with corners of radius `r`.
-    pub fn fill_round(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32) {
-        let r = r.min(w / 2).min(h / 2);
-        for dy in 0..r {
-            // Width of the circle at the middle of this row, in half pixels.
-            let a = 2 * (r - dy) - 1;
-            let ext = isqrt(4 * r * r - a * a) / 2;
-            let inset = r - ext.min(r);
-            self.fill(x + inset, y + dy, w - 2 * inset, 1, c);
-            self.fill(x + inset, y + h - 1 - dy, w - 2 * inset, 1, c);
+    /// One pixel at landscape (x, y) (the shift `dx` applied), `c` over
+    /// what is there, `a` of 255 opaque; clipped.
+    fn plot(&mut self, x: i32, y: i32, c: u32, a: u32) {
+        let (sw, sh) = self.size();
+        let x = x + self.dx;
+        if x < 0 || y < 0 || x >= sw as i32 || y >= sh as i32 {
+            return;
         }
-        self.fill(x, y + r, w, h - 2 * r, c);
+        let i = if self.rot {
+            (self.h - 1 - x as usize) * self.w + y as usize
+        } else {
+            y as usize * self.w + x as usize
+        };
+        self.back[i] = if a >= 255 {
+            c565(c)
+        } else {
+            blend(self.back[i], c, a)
+        };
+    }
+
+    /// `c` over what is there, `a` of 255 opaque.
+    pub fn fill_alpha(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32, a: usize) {
+        if a >= 255 {
+            return self.fill(x, y, w, h, c);
+        }
+        let (sw, sh) = self.size();
+        let x0 = (x as i32 + self.dx).max(0);
+        let x1 = (x as i32 + self.dx + w as i32).min(sw as i32);
+        if x1 <= x0 {
+            return;
+        }
+        let (x, w) = (x0 as usize, (x1 - x0) as usize);
+        let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
+        let (iw, ih) = (self.w, self.h);
+        let a = a as u32;
+        if self.rot {
+            for lx in x..x + w {
+                let row = (ih - 1 - lx) * iw;
+                for p in &mut self.back[row + y..row + y + h] {
+                    *p = blend(*p, c, a);
+                }
+            }
+        } else {
+            for ly in y..y + h {
+                for p in &mut self.back[ly * iw + x..ly * iw + x + w] {
+                    *p = blend(*p, c, a);
+                }
+            }
+        }
+    }
+
+    /// Rectangle with antialiased corners of radius `r`.
+    pub fn fill_round(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32) {
+        self.round_a(x, y, w, h, r, c, 255);
+    }
+
+    /// Rounded rectangle, `a` of 255 opaque.
+    #[allow(clippy::too_many_arguments)]
+    pub fn round_a(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32, a: u32) {
+        let r = r.min(w / 2).min(h / 2);
+        self.fill_alpha(x, y + r, w, h - 2 * r, c, a as usize);
+        if r == 0 {
+            return;
+        }
+        self.fill_alpha(x + r, y, w - 2 * r, r, c, a as usize);
+        self.fill_alpha(x + r, y + h - r, w - 2 * r, r, c, a as usize);
+        let (x, y) = (x as i32, y as i32);
+        let (w, h) = (w as i32, h as i32);
+        for py in 0..r {
+            for px in 0..r {
+                let cov = rr_cov(px, py, 2 * r, 2 * r, r) * a / 255;
+                if cov == 0 {
+                    continue;
+                }
+                let (px, py) = (px as i32, py as i32);
+                self.plot(x + px, y + py, c, cov);
+                self.plot(x + w - 1 - px, y + py, c, cov);
+                self.plot(x + px, y + h - 1 - py, c, cov);
+                self.plot(x + w - 1 - px, y + h - 1 - py, c, cov);
+            }
+        }
     }
 
     /// Rounded outline `t` thick: `edge` around `inner`.
@@ -165,46 +276,124 @@ impl Screen {
         );
     }
 
-    /// Vertical gradient from `top` to `bottom`.
-    pub fn gradient(&mut self, x: usize, y: usize, w: usize, h: usize, top: u32, bottom: u32) {
-        for i in 0..h {
-            self.fill(x, y + i, w, 1, mix(top, bottom, i * 255 / h.max(1)));
-        }
-    }
-
-    /// `c` over what is there, `a` of 255 opaque.
-    pub fn fill_alpha(&mut self, x: usize, y: usize, w: usize, h: usize, c: u32, a: usize) {
-        let (sw, sh) = self.size();
-        let x0 = (x as i32 + self.dx).max(0);
-        let x1 = (x as i32 + self.dx + w as i32).min(sw as i32);
-        if x1 <= x0 {
-            return;
-        }
-        let (x, w) = (x0 as usize, (x1 - x0) as usize);
-        let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
-        let (iw, ih) = (self.w, self.h);
-        for ly in y..y + h {
-            for lx in x..x + w {
-                let i = if self.rot {
-                    (ih - 1 - lx) * iw + ly
-                } else {
-                    ly * iw + lx
-                };
-                self.back[i] = mix(self.back[i], c, a);
+    /// Outline only, `t` thick, over what is there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ring_round(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        r: usize,
+        t: usize,
+        c: u32,
+    ) {
+        let r = r.min(w / 2).min(h / 2);
+        let ri = r.saturating_sub(t);
+        let (iw, ih) = (w.saturating_sub(2 * t), h.saturating_sub(2 * t));
+        for py in 0..h {
+            let thin = py >= t + ri && py + t + ri < h;
+            let band = |s: &mut Self, from: usize, to: usize| {
+                for px in from..to {
+                    let out = rr_cov(px, py, w, h, r);
+                    let inn = if px < t || py < t || px + t >= w || py + t >= h {
+                        0
+                    } else {
+                        rr_cov(px - t, py - t, iw, ih, ri)
+                    };
+                    let a = out * (255 - inn) / 255;
+                    if a > 0 {
+                        s.plot((x + px) as i32, (y + py) as i32, c, a);
+                    }
+                }
+            };
+            if thin {
+                band(self, 0, t);
+                band(self, w - t, w);
+            } else {
+                band(self, 0, w);
             }
         }
     }
 
-    /// Outline `t` pixels thick.
-    pub fn frame(&mut self, x: usize, y: usize, w: usize, h: usize, t: usize, c: u32) {
-        self.fill(x, y, w, t, c);
-        self.fill(x, y + h - t, w, t, c);
-        self.fill(x, y, t, h, c);
-        self.fill(x + w - t, y, t, h, c);
+    /// Soft shadow under a rounded rectangle.
+    pub fn shadow(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32) {
+        self.round_a(x, y + 10, w + 8, h + 4, r + 4, c, 22);
+        self.round_a(x + 2, y + 6, w + 4, h + 2, r + 2, c, 30);
+        self.round_a(x + 4, y + 3, w, h, r, c, 40);
     }
 
-    /// Glyph `ch` (Latin-1) at landscape pixel (x, y), `scale` times
-    /// enlarged, on `bg`.
+    /// Disc of radius `r` centered on (cx, cy).
+    pub fn disc(&mut self, cx: usize, cy: usize, r: usize, c: u32) {
+        self.fill_round(cx - r, cy - r, 2 * r, 2 * r, r, c);
+    }
+
+    /// Circle outline `t` thick.
+    pub fn ring(&mut self, cx: usize, cy: usize, r: usize, t: usize, c: u32) {
+        self.ring_round(cx - r, cy - r, 2 * r, 2 * r, r, t, c);
+    }
+
+    /// Antialiased segment `t` thick with round ends, between pixel
+    /// centres.
+    #[allow(clippy::too_many_arguments)]
+    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, c: u32) {
+        let (ax, ay, bx, by) = (x0 * 8 + 4, y0 * 8 + 4, x1 * 8 + 4, y1 * 8 + 4);
+        let (dx, dy) = ((bx - ax) as i64, (by - ay) as i64);
+        let den = dx * dx + dy * dy;
+        let m = t / 2 + 1;
+        for py in y0.min(y1) - m..=y0.max(y1) + m {
+            for px in x0.min(x1) - m..=x0.max(x1) + m {
+                let (qx, qy) = ((px * 8 + 4 - ax) as i64, (py * 8 + 4 - ay) as i64);
+                let u = if den == 0 {
+                    0
+                } else {
+                    (qx * dx + qy * dy).clamp(0, den)
+                };
+                let (ex, ey) = if den == 0 {
+                    (qx, qy)
+                } else {
+                    (qx - dx * u / den, qy - dy * u / den)
+                };
+                let d = isqrt32((ex * ex + ey * ey) as u32) as i32;
+                let cov = ((t * 4 - d + 4).clamp(0, 8) * 255 / 8) as u32;
+                if cov > 0 {
+                    self.plot(px, py, c, cov);
+                }
+            }
+        }
+    }
+
+    /// Text from (x, y), the top of its line, in `f`; returns its width.
+    pub fn text(&mut self, x: usize, y: usize, s: &str, f: Face, c: u32) -> usize {
+        let base = (y + font::ascent(f)) as i32;
+        let mut pen = x as i32;
+        for ch in s.chars() {
+            let g = font::glyph(f, ch);
+            for gy in 0..g.h {
+                for gx in 0..g.w {
+                    let a = g.alpha(gx, gy);
+                    if a != 0 {
+                        self.plot(pen + g.xo + gx as i32, base - g.yo + gy as i32, c, a * 17);
+                    }
+                }
+            }
+            pen += g.adv as i32;
+        }
+        (pen - x as i32) as usize
+    }
+
+    /// Text ending at `xr`.
+    pub fn text_r(&mut self, xr: usize, y: usize, s: &str, f: Face, c: u32) -> usize {
+        self.text(xr.saturating_sub(width(f, s)), y, s, f, c)
+    }
+
+    /// Text centered on `cx`.
+    pub fn text_c(&mut self, cx: usize, y: usize, s: &str, f: Face, c: u32) -> usize {
+        self.text(cx.saturating_sub(width(f, s) / 2), y, s, f, c)
+    }
+
+    /// Terminus glyph `ch` (Latin-1) at landscape pixel (x, y), `scale`
+    /// times enlarged, on `bg`.
     pub fn glyph(&mut self, x: usize, y: usize, ch: u8, scale: usize, fg: u32, bg: u32) {
         let g = ch as usize * 16;
         for (dy, &bits) in FONT[g..g + 16].iter().enumerate() {
@@ -226,8 +415,9 @@ impl Screen {
         }
     }
 
-    /// Text from (x, y), a character outside Latin-1 as '?'; returns its width.
-    pub fn text(&mut self, x: usize, y: usize, s: &str, scale: usize, fg: u32, bg: u32) -> usize {
+    /// Terminus text from (x, y), a character outside Latin-1 as '?';
+    /// returns its width.
+    pub fn mono(&mut self, x: usize, y: usize, s: &str, scale: usize, fg: u32, bg: u32) -> usize {
         let mut k = 0;
         for ch in s.chars() {
             let b = u8::try_from(ch as u32).unwrap_or(b'?');
@@ -237,8 +427,8 @@ impl Screen {
         8 * scale * k
     }
 
-    /// Text ending at `xr`.
-    pub fn text_r(
+    /// Terminus text ending at `xr`.
+    pub fn mono_r(
         &mut self,
         xr: usize,
         y: usize,
@@ -247,20 +437,14 @@ impl Screen {
         fg: u32,
         bg: u32,
     ) -> usize {
-        self.text(xr.saturating_sub(width(s, scale)), y, s, scale, fg, bg)
-    }
-
-    /// Text centered on `cx`.
-    pub fn text_c(
-        &mut self,
-        cx: usize,
-        y: usize,
-        s: &str,
-        scale: usize,
-        fg: u32,
-        bg: u32,
-    ) -> usize {
-        self.text(cx.saturating_sub(width(s, scale) / 2), y, s, scale, fg, bg)
+        self.mono(
+            xr.saturating_sub(s.chars().count() * 8 * scale),
+            y,
+            s,
+            scale,
+            fg,
+            bg,
+        )
     }
 
     /// The logo, `s` times enlarged, index 0 transparent.
@@ -279,25 +463,36 @@ impl Screen {
         let fb = unsafe {
             core::slice::from_raw_parts_mut(self.fb.as_ptr() as *mut u32, self.w * self.h)
         };
+        let all = core::mem::take(&mut self.all);
         for r in 0..self.h {
             let row = r * self.w..(r + 1) * self.w;
             let (b, s) = (&self.back[row.clone()], &mut self.shown[row.clone()]);
-            let Some(first) = b.iter().zip(s.iter()).position(|(a, c)| a != c) else {
-                continue;
+            let (first, last) = if all {
+                (0, self.w - 1)
+            } else {
+                let Some(first) = b.iter().zip(s.iter()).position(|(a, c)| a != c) else {
+                    continue;
+                };
+                let last = b
+                    .iter()
+                    .zip(s.iter())
+                    .rposition(|(a, c)| a != c)
+                    .unwrap_or(first);
+                (first, last)
             };
-            let last = b
-                .iter()
-                .zip(s.iter())
-                .rposition(|(a, c)| a != c)
-                .unwrap_or(first);
             s[first..=last].copy_from_slice(&b[first..=last]);
-            fb[row.start + first..=row.start + last].copy_from_slice(&b[first..=last]);
+            for (d, &p) in fb[row.start + first..=row.start + last]
+                .iter_mut()
+                .zip(&b[first..=last])
+            {
+                *d = expand(p);
+            }
         }
     }
 
     /// A client drew on the image itself: the next frame is copied whole.
     pub fn forget(&mut self) {
-        self.shown.fill(0);
+        self.all = true;
     }
 }
 
@@ -358,10 +553,19 @@ impl fmt::Display for Hms {
 }
 
 /// Integer square root.
-fn isqrt(n: usize) -> usize {
-    let mut r = 0;
-    while (r + 1) * (r + 1) <= n {
-        r += 1;
+fn isqrt32(mut n: u32) -> u32 {
+    let (mut r, mut bit) = (0u32, 1u32 << 30);
+    while bit > n {
+        bit >>= 2;
+    }
+    while bit != 0 {
+        if n >= r + bit {
+            n -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
     }
     r
 }

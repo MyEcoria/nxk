@@ -462,22 +462,6 @@ impl Term {
         }
     }
 
-    /// The last `n` commands typed, oldest first (empty lines left out).
-    pub fn commands(&self, n: usize) -> Vec<&Cmd> {
-        let mut v: Vec<&Cmd> = self
-            .entries
-            .iter()
-            .rev()
-            .filter_map(|e| match e {
-                Entry::Cmd(c) if !c.line.is_empty() => Some(c),
-                _ => None,
-            })
-            .take(n)
-            .collect();
-        v.reverse();
-        v
-    }
-
     /// The last `max` rows `cols` wide; the last one is the live prompt
     /// or line with the cursor, or `notice` (terminal closed) instead.
     pub fn rows(&self, cols: usize, max: usize, notice: Option<String>) -> Vec<Row> {

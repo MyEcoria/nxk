@@ -107,7 +107,9 @@ const DRIVERS: &[Driver] = &[
     },
     Driver {
         name: "display",
-        mmio: &[(0x5420_0000, 0x40000)],
+        // Display controller A, and the PWM block (channel 0 dims the
+        // backlight; the fan owns channel 1).
+        mmio: &[(0x5420_0000, 0x40000), (0x7000_A000, 0x1000)],
         ro_mmio: &[],
         irqs: &[105],
         sysctl: false,
