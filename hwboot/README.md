@@ -286,6 +286,14 @@ installs the ones built from `jeux/`; for a card in the console,
 `./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
 `-c "mkdir /games/NAME"` in an earlier call).
 
+Console buttons (`input`, GPIO X6 and X7, active low, interrupt on both
+edges): Volume+ is LEFT, Volume- is RIGHT, both together are A (a lone
+button counts after 120 ms, so a chord does not move first). The port
+reads 0xC0 at rest on the Switch; **not yet checked with a finger on the
+buttons** (the pins are hekate's `btn.c`'s, from memory: `[input] volume
+buttons: ...` lines on the LOGS page show each press). The Power button
+(PMIC) is not read yet.
+
 Gamepad (or `nxdbg.py button`): left and right choose a card, A plays;
 touch: a tap chooses, a second tap plays. In a game `display` hands out
 the input (`display::EVENT`): touch and the same buttons, HOME ends the

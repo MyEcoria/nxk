@@ -304,7 +304,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders and depth, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU textures, audio, Joy-Con, buttons (GPIO), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders and depth, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU textures, audio, Joy-Con, the Power button (the volume buttons are read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
