@@ -21,9 +21,10 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{EINVAL, EIO};
+use libnx::abi::err::{EINVAL, EIO, ENODEV};
+use libnx::abi::proto::gpu as gpuproto;
 use libnx::abi::proto::{console as con, cpufreq, display as proto, fan, gpu, input, wifi};
-use libnx::abi::rights::{DUP, GRANT, MAP, WRITE};
+use libnx::abi::rights::{DMA, DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
 use libnx::drv::{self, Mmio};
@@ -74,6 +75,13 @@ const WIN_LINE_STRIDE: usize = 0x70A;
 const WINBUF_START_ADDR: usize = 0x800;
 const WINBUF_ADDR_H_OFFSET: usize = 0x806;
 const WINBUF_ADDR_V_OFFSET: usize = 0x808;
+const WINBUF_SURFACE_KIND: usize = 0x80B;
+/// `WINBUF_SURFACE_KIND`: block-linear, block height in bits 6-4.
+const KIND_BLOCK: u32 = 2;
+/// Block height of the scanout images (log2 of GOBs): 16 GOBs.
+const SCANOUT_BLOCK_LOG2: u32 = 4;
+/// Events kept for a game that does not read them.
+const GAME_EVENTS: usize = 256;
 
 const R8G8B8A8: u32 = 13;
 
@@ -152,6 +160,18 @@ enum Done {
     Cpu(Result<stats::Cpu, i64>),
     /// A GPU `CLOCK` change (the stats page shows the result).
     Gpu(Result<(), i64>),
+}
+
+/// A game that took the screen: the images it draws on (block-linear,
+/// scanned out in turn), the input events routed to it and the caller
+/// waiting for the next one (reply token, deadline).
+struct Game {
+    images: Vec<SharedMemory>,
+    /// The one on display.
+    shown: usize,
+    pas: Vec<u32>,
+    events: VecDeque<Event>,
+    waiter: Option<(u64, u64)>,
 }
 
 struct Worker {
@@ -269,6 +289,61 @@ fn touch_xy(x: u64, y: u64, sw: usize, sh: usize) -> (usize, usize) {
     (x as usize, y as usize)
 }
 
+/// The images of a game, black, the first on display, block-linear:
+/// handles queued in `sent` for the reply.
+fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Game, i64> {
+    let bytes = gpuproto::tiled_bytes(w as u32, h as u32, SCANOUT_BLOCK_LOG2);
+    let mut images = Vec::new();
+    let mut pas = Vec::new();
+    for _ in 0..proto::SCANOUT_BUFFERS {
+        let m = SharedMemory::new(bytes, CONTIGUOUS | DMA32 | UNCACHED)?;
+        pas.push(m.paddr(0)? as u32);
+        images.push(m);
+    }
+    for (i, m) in images.iter().enumerate() {
+        let h2 = sys::handle_dup(m.handle(), MAP | DMA | GRANT | DUP, 0)?;
+        ipc::set_send_handle(i, h2);
+        sent.push(h2);
+    }
+    // Block-linear window, pitch the width in bytes.
+    wr(
+        dc,
+        WINBUF_SURFACE_KIND,
+        KIND_BLOCK | SCANOUT_BLOCK_LOG2 << 4,
+    );
+    wr(dc, WIN_LINE_STRIDE, w as u32 * 4);
+    flip(dc, pas[0]);
+    let _ = h;
+    Ok(Game {
+        images,
+        shown: 0,
+        pas,
+        events: VecDeque::new(),
+        waiter: None,
+    })
+}
+
+/// Window A reads `pa` from the next vertical blank; returns once it does.
+fn flip(dc: &Mmio, pa: u32) {
+    wr(dc, WINBUF_START_ADDR, pa);
+    wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
+    wr(dc, CMD_STATE_CONTROL, 1 | 2);
+    // The request bits clear when the controller takes the update.
+    for _ in 0..400 {
+        if dc.r32(CMD_STATE_CONTROL * 4) & 3 == 0 {
+            return;
+        }
+        time::sleep_us(100);
+    }
+}
+
+/// The UI's image again, pitch-linear.
+fn give_back(dc: &Mmio, w: usize, pa: u32) {
+    wr(dc, WINBUF_SURFACE_KIND, 0);
+    wr(dc, WIN_LINE_STRIDE, w as u32 * 4);
+    flip(dc, pa);
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -362,13 +437,15 @@ fn main() -> i32 {
     let mut dirty = true;
     // A client drawing on the image itself (OPEN) stops the UI.
     let mut owned = false;
-    // Handle sent with the previous reply: closed afterwards.
-    let mut sent = 0u32;
+    // A game drawing with the GPU (SCANOUT) stops it too, and gets the input.
+    let mut game: Option<Game> = None;
+    // Handles sent with the previous reply: closed afterwards.
+    let mut sent: Vec<u32> = Vec::new();
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
         let now = time::now_ns();
         let mut wake = u64::MAX;
-        if !owned {
+        if !owned && game.is_none() {
             if now >= next_refresh {
                 data.refresh();
                 next_refresh = now + REFRESH_NS;
@@ -412,18 +489,46 @@ fn main() -> i32 {
                 wake = wake.min(d);
             }
         }
+        if let Some((_, d)) = game.as_ref().and_then(|g| g.waiter).filter(|w| w.1 != 0) {
+            wake = wake.min(d);
+        }
         let wait = if wake == u64::MAX {
             0
         } else {
             wake.saturating_sub(time::now_ns()).max(1)
         };
         let Ok(rx) = ipc::recv_timeout(ep, wait) else {
+            if let Some(g) = game.as_mut() {
+                if let Some((tok, d)) = g.waiter {
+                    if d != 0 && time::now_ns() >= d {
+                        g.waiter = None;
+                        let _ = ipc::reply_to(tok, &Msg::error(-libnx::abi::err::ETIMEDOUT));
+                    }
+                }
+            }
             continue;
         };
         if rx.msg.is_notify() {
             let ev = rx.msg.mr[0];
             if ev & EV_TOUCH != 0 {
                 let batch: Vec<Event> = touches.lock().drain(..).collect();
+                if let Some(g) = game.as_mut() {
+                    for e in batch {
+                        let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]);
+                        match g.waiter.take() {
+                            Some((tok, _)) => {
+                                let _ = ipc::reply_to(tok, &m);
+                            }
+                            None => {
+                                if g.events.len() == GAME_EVENTS {
+                                    g.events.pop_front();
+                                }
+                                g.events.push_back(e);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 for (kind, code, id, x, y) in batch {
                     if kind == input::KIND_BUTTON {
                         if owned || id != 1 {
@@ -531,14 +636,14 @@ fn main() -> i32 {
             }
             continue;
         }
-        if sent != 0 {
-            let _ = sys::handle_close(core::mem::take(&mut sent));
+        for h in sent.drain(..) {
+            let _ = sys::handle_close(h);
         }
         let reply = match rx.msg.label() {
             proto::OPEN => match sys::handle_dup(scr.fb.handle(), MAP | WRITE | GRANT | DUP, 0) {
                 Ok(h2) => {
                     ipc::set_send_handle(0, h2);
-                    sent = h2;
+                    sent.push(h2);
                     owned = true;
                     scr.forget();
                     Msg::from_words(
@@ -550,17 +655,78 @@ fn main() -> i32 {
                 Err(e) => Msg::error(e),
             },
             // The image as it is, read-only: the UI goes on.
-            proto::SNAPSHOT => match sys::handle_dup(scr.fb.handle(), MAP | GRANT | DUP, 0) {
-                Ok(h2) => {
-                    ipc::set_send_handle(0, h2);
-                    sent = h2;
+            proto::SNAPSHOT => {
+                // What is on display: the UI's image, or a game's.
+                let (mem, layout, block) = match &game {
+                    Some(g) => (&g.images[g.shown], 1, SCANOUT_BLOCK_LOG2 as u64),
+                    None => (&scr.fb, 0, 0),
+                };
+                match sys::handle_dup(mem.handle(), MAP | GRANT | DUP, 0) {
+                    Ok(h2) => {
+                        ipc::set_send_handle(0, h2);
+                        sent.push(h2);
+                        Msg::from_words(
+                            0,
+                            &[
+                                w as u64,
+                                h as u64,
+                                w as u64 * 4,
+                                proto::FORMAT_RGBA8888,
+                                layout,
+                                block,
+                            ],
+                        )
+                        .with_handles(1)
+                    }
+                    Err(e) => Msg::error(e),
+                }
+            }
+            proto::SCANOUT if game.is_none() && !owned => match take_screen(&dc, w, h, &mut sent) {
+                Ok(g) => {
+                    game = Some(g);
                     Msg::from_words(
                         0,
-                        &[w as u64, h as u64, w as u64 * 4, proto::FORMAT_RGBA8888],
+                        &[
+                            w as u64,
+                            h as u64,
+                            proto::FORMAT_RGBA8888,
+                            SCANOUT_BLOCK_LOG2 as u64,
+                            gpuproto::tiled_bytes(w as u32, h as u32, SCANOUT_BLOCK_LOG2) as u64,
+                        ],
                     )
-                    .with_handles(1)
+                    .with_handles(proto::SCANOUT_BUFFERS)
                 }
                 Err(e) => Msg::error(e),
+            },
+            proto::SCANOUT => Msg::error(-ENODEV),
+            proto::FLIP => match game.as_mut() {
+                Some(g) if (rx.msg.mr[0] as usize) < g.pas.len() => {
+                    g.shown = rx.msg.mr[0] as usize;
+                    flip(&dc, g.pas[g.shown]);
+                    Msg::new(0, 0, 0)
+                }
+                _ => Msg::error(-EINVAL),
+            },
+            proto::RELEASE if game.is_some() => {
+                game = None;
+                let _ = GPU.call(&Msg::new(gpuproto::RESET, 0, 0));
+                give_back(&dc, w, pa);
+                scr.forget();
+                dirty = true;
+                next_refresh = 0;
+                Msg::new(0, 0, 0)
+            }
+            proto::EVENT => match game.as_mut() {
+                None => Msg::error(-ENODEV),
+                Some(g) => match g.events.pop_front() {
+                    Some(e) => Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]),
+                    None => {
+                        let t = rx.msg.mr[0];
+                        let deadline = if t == 0 { 0 } else { time::now_ns() + t };
+                        g.waiter = Some((rx.token, deadline));
+                        continue;
+                    }
+                },
             },
             proto::WRITE => {
                 let n = ipc::unpack(&rx.msg, &mut buf);
