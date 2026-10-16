@@ -7,7 +7,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::layout::PAGE_SIZE;
-use libnx::abi::proto::input::{TOUCH_DOWN, TOUCH_UP};
+use libnx::abi::proto::input::{
+    BTN_A, BTN_B, BTN_DOWN, BTN_HOME, BTN_L, BTN_LEFT, BTN_PLUS, BTN_R, BTN_RIGHT, BTN_UP, BTN_ZL,
+    BTN_ZR, TOUCH_DOWN, TOUCH_UP,
+};
 use libnx::abi::proto::{cpufreq, fan, gpu, power, usbcon as usb, wifi};
 
 use crate::screen::{
@@ -50,6 +53,8 @@ const CHIPS: [(&str, Option<Opens>); 5] = [
 const FAN_STEP: u64 = 10;
 const TAGLINE: &str = "AArch64 microkernel for Tegra X1";
 const TOAST_NS: u64 = 2_500_000_000;
+/// Outline of the zone the gamepad has selected.
+const FOCUS: u32 = 0xFFFF_FFFF;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Id {
@@ -158,6 +163,10 @@ pub struct Ui {
     gpu: Seen<Gpu>,
     gpu_sent: bool,
     zones: Vec<Zone>,
+    /// Zone the gamepad's A would tap (drawn outlined), and its centre as
+    /// last drawn: where a move starts once the zone is gone.
+    focus: Option<Id>,
+    focus_at: (usize, usize),
 }
 
 fn load_color(p: u64) -> u32 {
@@ -464,6 +473,8 @@ impl Ui {
             gpu: Seen::Unknown,
             gpu_sent: false,
             zones: Vec::new(),
+            focus: None,
+            focus_at: (W / 2, H / 2),
         }
     }
 
@@ -568,6 +579,7 @@ impl Ui {
     pub fn touch(&mut self, code: u64, x: usize, y: usize) -> Option<Action> {
         match code {
             TOUCH_DOWN => {
+                self.focus = None;
                 self.pressed = self.hit(x, y);
                 None
             }
@@ -577,6 +589,70 @@ impl Ui {
             },
             _ => None,
         }
+    }
+
+    /// Zone nearest to the landscape point (x, y).
+    fn nearest(&self, x: usize, y: usize) -> Option<Id> {
+        let d = |z: &Zone| {
+            let (cx, cy) = (z.x + z.w / 2, z.y + z.h / 2);
+            cx.abs_diff(x).pow(2) + cy.abs_diff(y).pow(2)
+        };
+        self.zones.iter().min_by_key(|z| d(z)).map(|z| z.id)
+    }
+
+    /// The D-pad's step: the zone ahead that is closest, favouring the
+    /// ones in line with the focused one.
+    fn step_focus(&mut self, code: u64) {
+        let Some(cur) = self
+            .focus
+            .and_then(|f| self.zones.iter().rev().find(|z| z.id == f))
+        else {
+            self.focus = self.nearest(self.focus_at.0, self.focus_at.1);
+            return;
+        };
+        let (cx, cy) = ((cur.x + cur.w / 2) as i64, (cur.y + cur.h / 2) as i64);
+        let best = self
+            .zones
+            .iter()
+            .filter(|z| z.id != cur.id)
+            .filter_map(|z| {
+                let (dx, dy) = ((z.x + z.w / 2) as i64 - cx, (z.y + z.h / 2) as i64 - cy);
+                let (ahead, aside) = match code {
+                    BTN_RIGHT => (dx, dy),
+                    BTN_LEFT => (-dx, dy),
+                    BTN_DOWN => (dy, dx),
+                    _ => (-dy, dx),
+                };
+                (ahead > 0).then_some((ahead + 2 * aside.abs(), z.id))
+            })
+            .min_by_key(|c| c.0);
+        if let Some((_, id)) = best {
+            self.focus = Some(id);
+        }
+    }
+
+    /// A gamepad button was pressed. The D-pad moves the focus, A taps
+    /// the focused zone, B backs out, L and R (ZL and ZR) turn the page,
+    /// HOME and + go to the home page.
+    pub fn pad(&mut self, code: u64) -> Option<Action> {
+        let open = self.modal.is_some() || self.fan_panel || self.cpu_panel || self.gpu_panel;
+        match code {
+            BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT => self.step_focus(code),
+            BTN_A => match self.focus {
+                Some(id) if self.zones.iter().any(|z| z.id == id) => return self.tap(id),
+                _ => self.step_focus(code),
+            },
+            BTN_B if self.modal.is_some() => return self.tap(Id::No),
+            BTN_B if self.fan_panel => self.fan_panel = false,
+            BTN_B if self.cpu_panel => self.cpu_panel = false,
+            BTN_B if self.gpu_panel => self.gpu_panel = false,
+            BTN_B if self.scan.is_some() => self.scan = None,
+            BTN_B | BTN_HOME | BTN_PLUS if !open => self.go(0),
+            BTN_L | BTN_ZL if !open => self.go((self.page + PAGES.len() - 1) % PAGES.len()),
+            BTN_R | BTN_ZR if !open => self.go((self.page + 1) % PAGES.len()),
+            _ => {}
+        }
+        None
     }
 
     fn go(&mut self, page: usize) {
@@ -736,6 +812,22 @@ impl Ui {
         if self.modal.is_some() {
             self.zones.clear();
             self.modal(s);
+        }
+        // The focus outline comes last; a zone that is gone passes it on
+        // to the one nearest to where it was.
+        if self
+            .focus
+            .is_some_and(|f| self.zones.iter().all(|z| z.id != f))
+        {
+            self.focus = self.nearest(self.focus_at.0, self.focus_at.1);
+        }
+        let ring = self
+            .focus
+            .and_then(|f| self.zones.iter().rev().find(|z| z.id == f))
+            .map(|z| (z.x, z.y, z.w, z.h));
+        if let Some((x, y, w, h)) = ring {
+            self.focus_at = (x + w / 2, y + h / 2);
+            s.frame(x, y, w, h, 3, FOCUS);
         }
     }
 

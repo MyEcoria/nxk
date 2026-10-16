@@ -56,11 +56,6 @@ const MSG_LINES: usize = 256;
 const EV_TOUCH: u64 = 1;
 const EV_DONE: u64 = 2;
 
-// Touch panel range (hekate bdk/input/touch.c): landscape, edges cut.
-const TOUCH_EDGE: u64 = 15;
-const TOUCH_X_MAX: u64 = 1264;
-const TOUCH_Y_MAX: u64 = 704;
-
 // 32-bit word register indices.
 const CMD_DISPLAY_COMMAND: usize = 0x32;
 const CMD_STATE_CONTROL: usize = 0x41;
@@ -141,8 +136,9 @@ impl Messages {
     }
 }
 
-/// A touch as `input` reports it: code (down, move, up), finger, raw x, y.
-type Touch = (u64, u64, u64, u64);
+/// An event as `input` reports it: kind, then for a touch the code (down,
+/// move, up), finger, raw x, y; for a button its code and 1 or 0.
+type Event = (u64, u64, u64, u64, u64);
 
 /// Outcome of an action run by the worker.
 enum Done {
@@ -267,9 +263,9 @@ fn read_console(term: &mut term::Term, pos: &mut u64, buf: &mut [u8]) -> bool {
 
 /// Raw touch coordinates to screen pixels.
 fn touch_xy(x: u64, y: u64, sw: usize, sh: usize) -> (usize, usize) {
-    let e = TOUCH_EDGE;
-    let x = (x.clamp(e, TOUCH_X_MAX) - e) * sw as u64 / (TOUCH_X_MAX - e);
-    let y = (y.clamp(e, TOUCH_Y_MAX) - e) * sh as u64 / (TOUCH_Y_MAX - e);
+    let e = input::TOUCH_EDGE;
+    let x = (x.clamp(e, input::TOUCH_X_MAX) - e) * sw as u64 / (input::TOUCH_X_MAX - e);
+    let y = (y.clamp(e, input::TOUCH_Y_MAX) - e) * sh as u64 / (input::TOUCH_Y_MAX - e);
     (x as usize, y as usize)
 }
 
@@ -327,16 +323,17 @@ fn main() -> i32 {
     // Touches and finished actions arrive as notifications on the endpoint.
     let notif = sys::notify_create().expect("display: notification");
     sys::notify_bind(notif).expect("display: notification bind");
-    let touches: Arc<Mutex<VecDeque<Touch>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let touches: Arc<Mutex<VecDeque<Event>>> = Arc::new(Mutex::new(VecDeque::new()));
     {
         let q = touches.clone();
         thread::spawn(move || loop {
             let mut m = Msg::new(input::READ, 2, 0);
             m.mr[0] = 0;
-            m.mr[1] = 1 << input::KIND_TOUCH;
+            m.mr[1] = 1 << input::KIND_TOUCH | 1 << input::KIND_BUTTON;
             match INPUT.call(&m) {
                 Ok(r) => {
-                    q.lock().push_back((r.mr[1], r.mr[2], r.mr[3], r.mr[4]));
+                    q.lock()
+                        .push_back((r.mr[0], r.mr[1], r.mr[2], r.mr[3], r.mr[4]));
                     let _ = sys::notify_signal(notif, EV_TOUCH);
                 }
                 Err(_) => time::sleep_ms(1000),
@@ -426,8 +423,28 @@ fn main() -> i32 {
         if rx.msg.is_notify() {
             let ev = rx.msg.mr[0];
             if ev & EV_TOUCH != 0 {
-                let batch: Vec<Touch> = touches.lock().drain(..).collect();
-                for (code, id, x, y) in batch {
+                let batch: Vec<Event> = touches.lock().drain(..).collect();
+                for (kind, code, id, x, y) in batch {
+                    if kind == input::KIND_BUTTON {
+                        if owned || id != 1 {
+                            continue;
+                        }
+                        let page = ui.page;
+                        let action = ui.pad(code);
+                        if ui.page != page {
+                            next_tail = 0;
+                        }
+                        match action {
+                            Some(Action::ClearLogs) => msgs.clear(),
+                            Some(a) => {
+                                worker.jobs.lock().push_back(a);
+                                worker.wake.notify_one();
+                            }
+                            None => {}
+                        }
+                        dirty = true;
+                        continue;
+                    }
                     // One finger at a time; its release where it last was.
                     let (x, y) = match (code, finger) {
                         (input::TOUCH_DOWN, None) => touch_xy(x, y, sw, sh),
@@ -524,6 +541,19 @@ fn main() -> i32 {
                     sent = h2;
                     owned = true;
                     scr.forget();
+                    Msg::from_words(
+                        0,
+                        &[w as u64, h as u64, w as u64 * 4, proto::FORMAT_RGBA8888],
+                    )
+                    .with_handles(1)
+                }
+                Err(e) => Msg::error(e),
+            },
+            // The image as it is, read-only: the UI goes on.
+            proto::SNAPSHOT => match sys::handle_dup(scr.fb.handle(), MAP | GRANT | DUP, 0) {
+                Ok(h2) => {
+                    ipc::set_send_handle(0, h2);
+                    sent = h2;
                     Msg::from_words(
                         0,
                         &[w as u64, h as u64, w as u64 * 4, proto::FORMAT_RGBA8888],
