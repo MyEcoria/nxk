@@ -5,6 +5,7 @@
     nxtest.py -c "ps" -c "run hello"   # chain commands
     nxtest.py -c "ipcbench" --timeout 120
     nxtest.py --usb-cmd "ps"             # type over the USB-C console (usbterm.py host)
+    nxtest.py --dbg "tap 640 670 shot net.png"   # debug channel (nxdbg.py) over the USB-C console
     nxtest.py --tap 640,670:home.ppm     # touch the screen at (x, y), then capture it
     nxtest.py --usb-net share --usb-cmd "nettest ping 10.42.0.1"   # the PC shares its connection
 
@@ -18,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True
 import usbterm  # noqa: E402  (console output filter, USB-C host)
+import nxdbg  # noqa: E402  (debug channel: screen capture, touch, gamepad)
 # UART output shown without the console's log marks (logs kept).
 SHOWN = usbterm.Logs(True)
 ROOT = os.path.dirname(HERE)
@@ -212,6 +214,8 @@ def main():
     ap.add_argument("--keys", default=None, help="keys sent to the USB keyboard (sendkey) after the 1st command")
     ap.add_argument("--usb-cmd", action="append", default=[],
                     help="command typed on the USB-C console (usbcon), the script acting as the PC")
+    ap.add_argument("--dbg", action="append", default=[], metavar="COMMANDS",
+                    help="nxdbg.py commands over the USB-C console, e.g. 'shot a.png tap 640 670 button A'")
     ap.add_argument("--usb-put", action="append", default=[], metavar="LOCAL:REMOTE",
                     help="file copied to the SD card over the USB-C console, before --usb-cmd")
     ap.add_argument("--usb-net", choices=("share", "quiet"), default=None,
@@ -245,7 +249,7 @@ def main():
       + (["-global", "driver=tegra.xusb,property=slots,value=8"] if a.usb_kbd or a.net is not None else []) \
       + (["-device", "usb-kbd,bus=usb-bus.2"] if a.usb_kbd else []) \
       + (["-chardev", f"socket,id=usbotg,path={usb},server=on,wait=off"]
-         if a.usb_cmd or a.usb_put else []) \
+         if a.usb_cmd or a.usb_put or a.dbg else []) \
       + (["-netdev", "user,id=n0" + "".join(f",hostfwd={f}" for f in a.net.split()), "-device", "usb-net,netdev=n0,bus=usb-bus.2"]
          if a.net is not None else []) \
       + os.environ.get("NXTEST_QEMU_ARGS", "").split()
@@ -285,7 +289,7 @@ def main():
                 ok = False
                 break
         print()
-        if ok and (a.usb_cmd or a.usb_put):
+        if ok and (a.usb_cmd or a.usb_put or a.dbg):
             # Unread, the emulated UART stalls the console that feeds USB too.
             s.settimeout(None)
             threading.Thread(target=lambda: all(iter(lambda: s.recv(65536), b"")), daemon=True).start()
@@ -299,16 +303,20 @@ def main():
                     threading.Thread(target=pc_network, args=(link, stop, print, share), daemon=True).start()
                     time.sleep(3)  # net looks at its links every 2 s
                 puts = [tuple(p.rsplit(":", 1)) for p in a.usb_put]
-                if not usbterm.run(link, a.usb_cmd, a.timeout, puts=puts):
+                if (a.usb_cmd or puts) and not usbterm.run(link, a.usb_cmd, a.timeout, puts=puts):
                     dump_cpus(mon, a.kernel)
                     ok = False
+                if a.dbg:
+                    ch = nxdbg.Channel(link, a.timeout)
+                    for c in a.dbg:
+                        nxdbg.run(ch, c.split(), False)
                 stop.set()
                 link.close()
-            except (OSError, ConnectionError, TimeoutError, usbterm.Stall) as e:
+            except (OSError, ConnectionError, TimeoutError, ValueError, usbterm.Stall) as e:
                 print(f"\n[nxtest] USB console: {e}", file=sys.stderr)
                 dump_cpus(mon, a.kernel)
                 ok = False
-        if ok and a.tap and b"[input] touchscreen" not in seen and not (a.usb_cmd or a.usb_put):
+        if ok and a.tap and b"[input] touchscreen" not in seen and not (a.usb_cmd or a.usb_put or a.dbg):
             # input starts the panel once `power` is up, at times past the
             # prompt; a tap before that is lost to the controller's reset.
             read_until(s, b"[input] touchscreen", a.timeout, sys.stdout)
