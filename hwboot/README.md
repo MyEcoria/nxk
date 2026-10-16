@@ -855,6 +855,28 @@ within 5 s.
     interpolated 1/w; and a debug capture longer than a frame must read
     a copy of the image, not the one the GPU is drawing on.
 
+32. 16/10/2026, Erista, the Joy-Con driver (`joycon`), installed over
+    USB-C (`--put` of `bl33.bin`, `bl31.bin` and Starlane; `--reload
+    joycon` afterwards): the **left Joy-Con works** as a gamepad. It is
+    detected on GPIO E6, answers the wake and handshake at 1 Mbaud, then
+    its controller info (type 0x01) and the switch to 3 Mbaud, and the
+    HID connection; the HID rate reply takes tens of ms, longer than
+    hekate's 2 ms wait. Polled every 15 ms it answers 91 to 100% of the
+    polls (a latency that drifts between 1.3 and 8 ms against the
+    Joy-Con's own 15 ms clock). Two findings: a reply may pause after
+    its first bytes (the 250 us gap of `uart_recv` cut it in three: the
+    gap is 2 ms until the 24 bytes we parse are in, and a read looks for
+    the packet's magic), and the stick rests far from the middle of its
+    range (1457, 2393 of 4095) so the centre is measured, not assumed.
+    Buttons (D-pad, L, ZL, minus, capture, stick click) and the stick
+    (to -32767 at its stop) reach `input` and show on the LOGS page; a
+    game started from the library still runs. **The right Joy-Con is not
+    detected**: clipped on, its detect line (H6) and the UART-B TX net
+    stay high whatever the pad pulls, the charge enables and the rail do
+    (a forced handshake gets no byte): not understood yet. `ktest` 29/29
+    and `stdtest` 17/17 in the emulator, where `joycon` only logs
+    `no handshake`.
+
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).

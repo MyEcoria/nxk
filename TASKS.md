@@ -23,3 +23,21 @@ not known. One
 difference: hekate gates the SDMMC1 clock in CAR when it powers the
 slot off (`sdmmc_end`) and re-enables it, resetting the controller, on
 the next init; `recover()` keeps the controller clocked throughout.
+
+## 2. `joycon`: the right Joy-Con is not detected
+
+On the Erista tried (hardware run 32) the left Joy-Con works; the right
+one, clipped on, is not seen. Its detect line (GPIO H6, behind UART-B's
+TX pad G0 turned into an input) reads high, and so does G0 itself,
+whatever the pad's pull (none, down, up), the charge enables (K3, CC3)
+or a stray hand on the rail; a handshake forced on UART-B at 1 Mbaud
+gets no byte. The code follows hekate's `joycon.c` for both sides, the
+left rail works, and the pad registers read back as written.
+
+To try, with options before coding: (a) check whether the right
+Joy-Con wakes with hekate's own `uart_port=2` left out of
+`hwboot/nxk.ini` (hekate then does not touch UART-B), (b) read the
+pad and rail state hekate leaves (a dump from nxk before `joycon`
+runs), (c) a different Joy-Con R or a second console to tell a unit
+fault from a driver fault. Stick positions are also centred by
+measurement, not from the unit's SPI calibration (0x603D).
