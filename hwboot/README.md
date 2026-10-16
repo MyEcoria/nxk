@@ -892,6 +892,30 @@ within 5 s.
     the GPC/TPC traps (TPC exception 0x2 is the MP; warp and global
     errors) behind a GR exception 0x1000000.
 
+34. 17/10/2026, Erista, **audio**: `audio tone` and Starlane's sound
+    effects on the speakers. Path: `nxgfx::Audio` ring -> `audio`'s pump
+    thread -> ADMA ring (8 periods of 512 frames) -> ADMAIF1 -> crossbar ->
+    I2S1 (master, 1.536 MHz) -> ALC5639 (I2C1 0x1c, MCLK = EXTERN1 12.288
+    MHz) -> speakers. Findings, in the order they cost time: (1) the hub's
+    first I2S (0x702d1000, the DT's i2s1) takes the CAR clock **I2S0**,
+    not I2S1: with the wrong one every I2S soft reset stayed pending and
+    nothing left the chip; (2) PLLA_OUT0 came out 1.5 times slower than the
+    DT's 36.864 MHz (the ADMA paced at 32 kHz with /24 for I2S): I2S0 /16
+    and EXTERN1 /2 give 48 kHz and 12.288 MHz; (3) the codec needs rt5640's
+    probe writes (private registers of its `init_list`, GCTL1 0x0301, mic
+    bias, DSP path 2) before anything plays; (4) left on without a bit
+    clock the speaker amplifier hisses and picks up the CPU's activity, so
+    the speakers are muted when the stream is idle; (5) the ADMA's period
+    count restarts from zero with the channel, and the ADMAIF wants its
+    stop sequence (disable, wait, reset) between streams, else the next
+    one runs 16 times too fast; (6) with four 128-frame periods and a 1 ms
+    pump the ring was lapped by up to 29 ms while a game ran: thread
+    priority 6 and a bigger ring cured it (max one period late). A 1 kHz
+    tone and a 440 Hz one were heard; inside Starlane the sound was still
+    reported distorted or noisy (TASKS.md 3). The first commit of the audio
+    service said the tone was heard before it was: it was not (the I2S
+    was stuck in reset, only codec pops reached the speakers).
+
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).

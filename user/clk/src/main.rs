@@ -344,11 +344,13 @@ const GPU: [Clock; 2] = [
 ];
 
 /// Audio hub (Linux clk-tegra210.c, clk-tegra-periph.c; tegra210-odin DT):
-/// D_AUDIO (V 10, AHUB), APBIF (V 11), APE (Y 6) and I2S1 (L 11) from
-/// PLLA_OUT0 (source 0), then EXTERN1 (V 24, no reset), the codec's MCLK.
-/// PLLA_OUT0 is 36.864 MHz: D_AUDIO and APE run it undivided, I2S1 at /24
-/// (1.536 MHz, the 48 kHz 16-bit stereo bit clock), EXTERN1 at /3
-/// (12.288 MHz = 256 fs). Divider field: 2 * ratio - 2.
+/// D_AUDIO (V 10, AHUB), APBIF (V 11), APE (Y 6) and CAR's I2S0 (L 30: the
+/// hub's first I2S, the DT's i2s1) from PLLA_OUT0 (source 0), then EXTERN1
+/// (V 24, no reset), the codec's MCLK. Divider field: 2 * ratio - 2.
+/// PLLA_OUT0 measured 24.576 MHz on this chip, not the 36.864 the DT
+/// assigns (ADMA's pace at 1.5 times what /24 should give): I2S0 at /16 is
+/// the 1.536 MHz bit clock of 48 kHz 16-bit stereo, EXTERN1 at /2 the
+/// 12.288 MHz (256 fs) the codec's MCLK wants. Heard on the speakers.
 const AUDIO: [Clock; 5] = [
     Clock {
         bank: &V,
@@ -376,10 +378,10 @@ const AUDIO: [Clock; 5] = [
     },
     Clock {
         bank: &L,
-        bit: 11,
-        source: 0x100,
+        bit: 30,
+        source: 0x1D8,
         keep: 0,
-        src: 2 * 24 - 2,
+        src: 2 * 16 - 2,
         reset: true,
     },
     Clock {
@@ -387,7 +389,7 @@ const AUDIO: [Clock; 5] = [
         bit: 24,
         source: 0x3EC,
         keep: 0,
-        src: 2 * 3 - 2,
+        src: 2 * 2 - 2,
         reset: false,
     },
 ];

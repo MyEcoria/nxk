@@ -41,3 +41,32 @@ pad and rail state hekate leaves (a dump from nxk before `joycon`
 runs), (c) a different Joy-Con R or a second console to tell a unit
 fault from a driver fault. Stick positions are also centred by
 measurement, not from the unit's SPI calibration (0x603D).
+
+## 3. `audio`: sound inside games is distorted or noisy
+
+`audio tone` plays a clean 440 Hz or 1 kHz note on the Erista's speakers
+(hardware run 34), but the effects of Starlane (a triangle-wave jingle,
+a gem blip, a noise burst) were reported distorted or noisy, and the
+tone played from the shell while a game runs was, before the ADMA ring
+fix, not heard at all. Known: with the final ring the pump is never more
+than one period late and the ring is never lapped (`audio` shows `max
+step` and `laps` in its log line); the samples in the client ring are a
+clean ramp at the service. Not known: whether what is left is the
+signal (a triangle is harsh: try a sine, lower gains, the codec's
+speaker DRC and Class D ratio, `RT5640_CLS_D_OUT` 0x8d), the supply
+noise a busy GPU and display put on the amplifier (the hiss changed
+pitch when the UI redrew, with the amplifier unmuted and idle), or the
+stop / start of the stream around each sound (idle stop after 3 s, mute
+and unmute pops, I2S reset at every start).
+
+To try, with options before coding: (a) keep the stream running with
+silence while a game has the audio, unmuting once (no start / stop pops),
+(b) a sine and a gentler envelope for the effects, (c) measure on the
+Switch whether the noise follows the GPU or the display (play a tone with
+the GPU off, then `gpu bench`), (d) codec-side: speaker volume plus DAC
+digital volume instead of full DAC and a quiet amplifier, DRC on.
+
+Also open: no headphone path or jack detect (GPIO V6), no volume control,
+one client at a time, no mipmaps for textures (Starlane's far grid is
+faded to dark instead), and no alpha blending (Starlane's crash banner
+is an opaque black band).

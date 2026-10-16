@@ -305,7 +305,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps, audio, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power button (the volume buttons are read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), speakers (codec, audio hub), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps, audio quality in games, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power button (the volume buttons are read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
@@ -397,8 +397,13 @@ program that vanished without closing them (crash) are reclaimed.
   The emulator's GPU model runs the whole power-up with
   `tools/tegra_qemu-gpu.patch` but renders and computes nothing:
   `gpu test` fails there by design.
-- Audio, Joy-Con charging and rumble, and frequency scaling are not done (the last one
-  risks damaging hardware).
+- Audio: the `audio` service plays 16-bit stereo 48 kHz PCM on the Switch's
+  speakers (ALC5639 on I2S1, ADMA ring, `clk::AUDIO`; `nxgfx::Audio` and
+  `Sound` for games; `audio tone HZ MS LEVEL` in the shell). Not done:
+  headphones and jack detection, volume control, capture, mixing several
+  clients, and a clean sound while a game runs (TASKS.md 3). Joy-Con
+  charging and rumble, and frequency scaling are not done either (the last
+  one risks damaging hardware).
 - A pipe has no buffer: the writer waits until a reader takes its data.
   `output()` reads both outputs in parallel for this reason.
 - The `fs` service refuses to delete a file that is still open

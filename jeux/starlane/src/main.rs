@@ -6,8 +6,8 @@
 use std::fs;
 
 use nxgfx::{
-    cube, octahedron, rgb, tris_mesh, vec3, Button, Canvas, Event, Frame, Graphics, LitUniforms,
-    Mat4, Mesh, Phase, Rgba, Sampling, Stick, Texture, Vec3, HEIGHT, WIDTH,
+    cube, octahedron, rgb, tris_mesh, vec3, Audio, Button, Canvas, Event, Frame, Graphics,
+    LitUniforms, Mat4, Mesh, Phase, Rgba, Sampling, Sound, Stick, Texture, Vec3, HEIGHT, WIDTH,
 };
 
 /// Half width of the playfield.
@@ -172,6 +172,9 @@ struct Game {
     score: u32,
     best: u32,
     shake: f32,
+    /// Sound cues since the last frame: gems picked up, a crash.
+    gems_got: u32,
+    crashed: bool,
     rng: Rng,
 }
 
@@ -206,6 +209,8 @@ impl Game {
             score: 0,
             best,
             shake: 0.0,
+            gems_got: 0,
+            crashed: false,
             rng,
         }
     }
@@ -306,6 +311,7 @@ impl Game {
         let before = self.gems.len();
         self.gems
             .retain(|g| !((g.x - sx).abs() < 0.9 && g.z.abs() < 1.2));
+        self.gems_got += (before - self.gems.len()) as u32;
         self.score += 250 * (before - self.gems.len()) as u32;
         let hit = self
             .blocks
@@ -315,6 +321,7 @@ impl Game {
         self.score = self.score.max(dist);
         if hit {
             self.state = State::Over;
+            self.crashed = true;
             self.since = 0.0;
             self.shake = 0.6;
             if self.score > self.best {
@@ -422,6 +429,13 @@ fn main() {
             return;
         }
     };
+    // Sound is a bonus: no audio service (the emulator) or no codec, no sound.
+    let mut audio = Audio::open().ok();
+    let (sfx_gem, sfx_start, sfx_crash) = (
+        Sound::tone(660.0, 1320.0, 140, 0.5, true),
+        Sound::tone(220.0, 660.0, 260, 0.5, true),
+        Sound::noise(700, 0.8),
+    );
     let proj = Graphics::projection(1.0, 0.2, 140.0);
     let mut game = Game::new(g.seconds().to_bits() ^ 0x9E37_79B9);
     let (mut left, mut right) = (false, false);
@@ -471,8 +485,22 @@ fn main() {
         game.steer = ((right as i32 - left as i32) as f32 + analog).clamp(-1.0, 1.0);
         if go && game.state != State::Playing && (game.state == State::Title || game.since > 0.8) {
             game.start();
+            if let Some(a) = audio.as_mut() {
+                a.play(&sfx_start, 0.4);
+            }
         }
         game.update(dt);
+        if let Some(a) = audio.as_mut() {
+            if game.gems_got > 0 {
+                a.play(&sfx_gem, 0.35);
+            }
+            if game.crashed {
+                a.play(&sfx_crash, 0.45);
+            }
+            a.pump();
+        }
+        game.gems_got = 0;
+        game.crashed = false;
 
         // Scene.
         let shake = if game.shake > 0.0 {

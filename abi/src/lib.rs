@@ -1182,18 +1182,37 @@ pub mod proto {
         pub const BAUD_1M: u64 = 1_000_000;
         pub const BAUD_3M: u64 = 3_000_000;
     }
-    /// Audio output (`audio`), published as "audio": the ALC5639 codec
-    /// on I2S1, fed through the audio hub.
+    /// Audio output (`audio`), published as "audio": 16-bit stereo PCM at
+    /// 48 kHz to the speakers (the ALC5639 codec on I2S1, through the audio
+    /// hub's ADMA). A client shares a ring of frames (`RING_*`): it writes
+    /// frames after `RING_WRITE` and publishes the new position (release),
+    /// the service copies them into the DMA ring and publishes `RING_READ`;
+    /// an empty ring plays silence. One client at a time (`OPEN` replaces).
     pub mod audio {
-        /// words: frequency (Hz), duration (ms), level (0..100). A sine
-        /// on both speakers; the reply comes when it is done. Reply:
-        /// word 0 = frames written.
+        /// handle 0 = shm (any flags, read/write) of `RING_HEADER` bytes
+        /// plus the frames: 4 bytes each, left then right, 16-bit signed.
+        /// word 0 = its length. Reply: word 0 = frames in the ring.
+        pub const OPEN: u32 = 3;
+        /// Stop playing the client's ring.
+        pub const CLOSE: u32 = 4;
+        /// words: frequency (Hz), duration (ms), level (0..100): a sine on
+        /// both speakers, with no client (the reply comes at once).
         pub const TONE: u32 = 1;
-        /// Reply: word 0 = `ST_*` bits, word 1 = codec ID (0x1c reads).
+        /// Reply: word 0 = `ST_*` bits, word 1 = underruns (periods the
+        /// ring could not fill), word 2 = periods played.
         pub const STATUS: u32 = 2;
-        /// Codec and I2S up.
+        /// Codec and hub up.
         pub const ST_READY: u64 = 1;
+        /// The DMA is running.
+        pub const ST_PLAYING: u64 = 2;
         pub const RATE: u32 = 48_000;
+        /// Ring header (u32 words, bytes from the start): frames written
+        /// by the client (wrapping count), frames read by the service,
+        /// underruns. The frames start at `RING_HEADER`.
+        pub const RING_WRITE: usize = 0;
+        pub const RING_READ: usize = 4;
+        pub const RING_UNDERRUNS: usize = 8;
+        pub const RING_HEADER: usize = 64;
     }
     /// I2C bus.
     pub mod i2c {

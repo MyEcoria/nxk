@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod audio;
 pub mod canvas;
 pub mod math;
 pub mod os;
@@ -22,6 +23,7 @@ use nxk_abi::proto::{display, gpu, input};
 use nxk_abi::shm;
 use nxk_abi::user::Msg;
 
+pub use audio::{Audio, Sound};
 pub use canvas::{rgb, Canvas, Rgba};
 pub use math::{vec3, Mat4, Vec3};
 pub use os::{now_ns, sleep_ns, Result};
