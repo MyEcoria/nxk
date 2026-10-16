@@ -70,6 +70,13 @@ fn cb(off: u32) -> u64 {
     ((off as u64) >> 2) << 20
 }
 
+/// Constant buffer `idx` operand: offset in words at bits 20-33, buffer
+/// at 34-38 (NAK `set_src_cb`).
+fn cbi(idx: u8, off: u32) -> u64 {
+    assert!(idx < 32);
+    cb(off) | (idx as u64) << 34
+}
+
 /// 20-bit signed immediate at bits 20-38, sign at 56.
 fn imm20(v: i32) -> u64 {
     assert!((-(1 << 19)..(1 << 19)).contains(&v));
@@ -158,6 +165,31 @@ pub fn ffma(d: u8, a: u8, b: u8, c: u8) -> u64 {
 /// d = a * c[0][off] + c.
 pub fn ffma_c(d: u8, a: u8, off: u32, c: u8) -> u64 {
     op(0x4980) | reg(d, 0) | reg(a, 8) | cb(off) | reg(c, 39)
+}
+
+/// d = a * c[idx][off].
+pub fn fmul_c(d: u8, a: u8, idx: u8, off: u32) -> u64 {
+    op(0x4C68) | reg(d, 0) | reg(a, 8) | cbi(idx, off)
+}
+
+/// d = a * b, saturated to 0..1 if `sat`.
+pub fn fmul(d: u8, a: u8, b: u8, sat: bool) -> u64 {
+    op(0x5C68) | reg(d, 0) | reg(a, 8) | reg(b, 20) | (sat as u64) << 50
+}
+
+/// d = a + c[idx][off].
+pub fn fadd_c(d: u8, a: u8, idx: u8, off: u32) -> u64 {
+    op(0x4C58) | reg(d, 0) | reg(a, 8) | cbi(idx, off)
+}
+
+/// d = a * c[idx][off] + c.
+pub fn ffma_cb(d: u8, a: u8, idx: u8, off: u32, c: u8) -> u64 {
+    op(0x4980) | reg(d, 0) | reg(a, 8) | cbi(idx, off) | reg(c, 39)
+}
+
+/// d = c[idx][off].
+pub fn mov_cb(d: u8, idx: u8, off: u32) -> u64 {
+    op(0x4C98) | reg(d, 0) | cbi(idx, off) | 0xF << 39
 }
 
 /// 32-bit global load / store, 64-bit address in a (even) register pair.
@@ -380,6 +412,16 @@ mod tests {
         assert_eq!(iadd_c(5, RZ, 4, false, true), 0x4C10_0800_0017_FF05);
         assert_eq!(ffma_c(8, 3, 0x14, 8), 0x4980_0400_0057_0308);
         assert_eq!(isetp_c(0, 0, 0x10, Cmp::Ge, false), 0x4B6C_0380_0047_0007);
+    }
+
+    #[test]
+    fn constant_buffer_index() {
+        // c[1][0x10]: word 4 at bit 20, buffer 1 at bit 34.
+        assert_eq!(mov_cb(3, 1, 0x10), mov_c(3, 0x10) | 1 << 34);
+        assert_eq!(ffma_cb(8, 3, 0, 0x14, 8), ffma_c(8, 3, 0x14, 8));
+        // FMUL.SAT sets bit 50, FADD with a constant uses 0x4c58.
+        assert_eq!(fmul(1, 2, 3, true) >> 48, 0x5C68 | 1 << 2);
+        assert_eq!(fadd_c(1, 2, 3, 4) >> 48, 0x4C58);
     }
 
     /// Fields as NAK's sm50.rs places them (opcode 0xefd8, 0xeff0, 0xe000).

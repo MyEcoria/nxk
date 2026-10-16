@@ -25,6 +25,13 @@ const HOLE: core::ops::Range<u64> = 0xFE00_0000..0x1_0000_0000;
 const PTE_VALID: u64 = 1;
 const PTE_PRIV: u64 = 1 << 1;
 const PTE_VOL: u64 = 1 << 32;
+/// Storage kind: 0 is pitch-linear memory, 0xFE the generic 16Bx2
+/// block-linear layout of render targets and depth buffers.
+const PTE_KIND_SHIFT: u32 = 36;
+pub const KIND_PITCH: u8 = 0;
+pub const KIND_GENERIC_16BX2: u8 = 0xFE;
+/// 32-bit float depth, not compressed.
+pub const KIND_ZF32: u8 = 0x7B;
 /// PDE small-table half: video memory aperture, volatile.
 const PDE_SPT_VIDMEM: u64 = 1 << 32;
 const PDE_SPT_VOL: u64 = 1 << 34;
@@ -65,9 +72,24 @@ impl Vm {
     /// Map pages (physical addresses) at `va`; `privileged`: only for
     /// the GPU's own units (context buffers), not shaders.
     pub fn map_at(&mut self, va: u64, pages: &[u64], privileged: bool) -> Result<()> {
+        self.map_at_kind(va, pages, privileged, 0)
+    }
+
+    /// Like `map_at`, with the PTE's storage kind (`KIND_*`).
+    pub fn map_at_kind(
+        &mut self,
+        va: u64,
+        pages: &[u64],
+        privileged: bool,
+        kind: u8,
+    ) -> Result<()> {
         for (k, &pa) in pages.iter().enumerate() {
             let v = va + k as u64 * PAGE;
-            let pte = (pa >> 8) | PTE_VALID | PTE_VOL | if privileged { PTE_PRIV } else { 0 };
+            let pte = (pa >> 8)
+                | PTE_VALID
+                | PTE_VOL
+                | (kind as u64) << PTE_KIND_SHIFT
+                | if privileged { PTE_PRIV } else { 0 };
             let pt = self.pt(v)?;
             pt.w64(((v % PDE_SPAN) / PAGE) as usize * 8, pte);
         }
@@ -89,11 +111,17 @@ impl Vm {
 
     /// Map contiguous DMA memory somewhere; its GPU address.
     pub fn map(&mut self, m: &Dma, privileged: bool) -> Result<u64> {
-        let va = self.alloc(m.len() as u64, PAGE)?;
+        self.map_kind(m, privileged, KIND_PITCH, PAGE)
+    }
+
+    /// Like `map`, as storage of `kind`, `align`ed (a block-linear surface
+    /// starts on a block boundary).
+    pub fn map_kind(&mut self, m: &Dma, privileged: bool, kind: u8, align: u64) -> Result<u64> {
+        let va = self.alloc(m.len() as u64, align)?;
         let pages: Vec<u64> = (0..m.len() as u64 / PAGE)
             .map(|k| m.pa + k * PAGE)
             .collect();
-        self.map_at(va, &pages, privileged)?;
+        self.map_at_kind(va, &pages, privileged, kind)?;
         Ok(va)
     }
 

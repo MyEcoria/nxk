@@ -1392,6 +1392,8 @@ pub mod proto {
         /// `TEST` bits of the 3D engine (and `TEST3D`'s alone).
         pub const T3_CLEAR: u64 = 32;
         pub const T3_TRIANGLE: u64 = 64;
+        pub const T3_DEPTH: u64 = 128;
+        pub const T3_LIT: u64 = 256;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {

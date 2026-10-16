@@ -1,10 +1,10 @@
-//! The 3D engine (MAXWELL_B, class 0xB197): state, a vertex and a
-//! fragment shader with their program headers, clears and draws into a
+//! The 3D engine (MAXWELL_B, class 0xB197): state, shaders with their
+//! program headers, depth, constant buffers, clears and draws into a
 //! linear render target. Method numbers from NVIDIA's open-gpu-doc
 //! (classes/3d/cl9097.h, clb197.h), sequences from Mesa's Gallium nvc0
-//! (nvc0_screen.c, nvc0_state_validate.c) and NVK; shader encodings and
-//! the program header (SPH version 3, classes/3d/cla097sph.h) as NAK
-//! writes them.
+//! (nvc0_screen.c, nvc0_state_validate.c, nvc0_shader_state.c) and NVK;
+//! shader encodings and the program header (SPH version 3,
+//! classes/3d/cla097sph.h) as NAK writes them.
 
 extern crate alloc;
 
@@ -14,86 +14,250 @@ use crate::engine::Surface;
 use crate::hw::{Dma, Result};
 use crate::mmu::Vm;
 use crate::push::{Push, SET_OBJECT, SUBC_3D};
-use crate::sass::{ald, ast, exit, ipa, Asm, Interp, Sched, RZ};
+use crate::sass::{
+    ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, Asm, Interp, Sched, RZ,
+};
 
 pub const MAXWELL_B: u32 = 0xB197;
 
 // Methods (cl9097.h).
-const SET_SHADER_LOCAL_MEMORY_WINDOW: u32 = 0x077C;
+const INVALIDATE_SHADER_CACHES: u32 = 0x021C;
 const SET_RASTER_ENABLE: u32 = 0x037C;
+const SET_SHADER_LOCAL_MEMORY_WINDOW: u32 = 0x077C;
 const SET_COLOR_TARGET_A: u32 = 0x0800;
 const SET_VIEWPORT_SCALE_X: u32 = 0x0A00;
 const SET_VIEWPORT_CLIP_HORIZONTAL: u32 = 0x0C00;
-const SET_SCISSOR_ENABLE: u32 = 0x0E00;
-const SET_SURFACE_CLIP_HORIZONTAL: u32 = 0x0FF4;
-const SET_COLOR_CLEAR_VALUE: u32 = 0x0D80;
 const SET_VERTEX_ARRAY_START: u32 = 0x0D74;
 const DRAW_VERTEX_ARRAY: u32 = 0x0D78;
+const SET_COLOR_CLEAR_VALUE: u32 = 0x0D80;
+const SET_Z_CLEAR_VALUE: u32 = 0x0D90;
+const SET_SCISSOR_ENABLE: u32 = 0x0E00;
+const SET_ZT_A: u32 = 0x0FE0;
+const SET_SURFACE_CLIP_HORIZONTAL: u32 = 0x0FF4;
 const SET_CLEAR_SURFACE_CONTROL: u32 = 0x10F8;
 const SET_VERTEX_ATTRIBUTE_A: u32 = 0x1160;
 const SET_CT_SELECT: u32 = 0x121C;
+const SET_ZT_SIZE_A: u32 = 0x1228;
 const SET_DEPTH_TEST: u32 = 0x12CC;
+const SET_DEPTH_WRITE: u32 = 0x12E8;
+const SET_DEPTH_FUNC: u32 = 0x130C;
 const SET_BLEND: u32 = 0x1360;
 const SET_WINDOW_ORIGIN: u32 = 0x13AC;
+const SET_ZT_SELECT: u32 = 0x1538;
 const SET_PROGRAM_REGION_A: u32 = 0x1608;
 const END: u32 = 0x1614;
 const BEGIN: u32 = 0x1618;
 const CHECK_SPH_VERSION: u32 = 0x16A8;
+const SET_INDEX_BUFFER_A: u32 = 0x17C8;
+const DRAW_INDEX_BUFFER: u32 = 0x17E0;
+const OGL_SET_CULL: u32 = 0x1918;
+const OGL_SET_FRONT_FACE: u32 = 0x191C;
+const OGL_SET_CULL_FACE: u32 = 0x1920;
 const SET_VIEWPORT_SCALE_OFFSET: u32 = 0x192C;
 const CLEAR_SURFACE: u32 = 0x19D0;
 const SET_CT_WRITE: u32 = 0x1A00;
-const SET_ZT_SELECT: u32 = 0x1538;
 const SET_VERTEX_STREAM_A_FORMAT: u32 = 0x1C00;
 const SET_VERTEX_STREAM_LIMIT_A_A: u32 = 0x1F00;
 const SET_PIPELINE_SHADER: u32 = 0x2000;
 const PIPELINE_STRIDE: u32 = 0x40;
+const SET_CONSTANT_BUFFER_SELECTOR_A: u32 = 0x2380;
+const BIND_GROUP_CONSTANT_BUFFER: u32 = 0x2410;
 
 /// `SET_PIPELINE_SHADER` index = type: vertex, pixel.
 const TYPE_VERTEX: u32 = 1;
 const TYPE_PIXEL: u32 = 5;
+/// Constant buffer binding groups: vertex, fragment.
+const GROUP_VERTEX: u32 = 0;
+const GROUP_PIXEL: u32 = 4;
 const PRIM_TRIANGLES: u32 = 4;
 /// Linear (pitch) layout in `SET_COLOR_TARGET_MEMORY`.
 const LAYOUT_PITCH: u32 = 1 << 12;
+const ZT_FORMAT_ZF32: u32 = 0x0A;
+const DEPTH_LESS: u32 = 0x201;
+/// ZT blocks are 16 GOBs high (`SET_ZT_BLOCK_SIZE` height 4).
+const ZT_BLOCK_HEIGHT_LOG2: u32 = 4;
+const GOB_BYTES: u64 = 512;
+const GOB_WIDTH: u64 = 64;
+const GOB_ROWS: u64 = 8;
 
-/// Vertex: position and color, four floats each.
-pub const VERTEX_SIZE: u32 = 32;
+/// Constant buffer slot the shaders read their parameters from.
+pub const UBO_SLOT: u8 = 1;
+/// Parameters of `Pipe::Lit` (words, in constant buffer 1): model-view-
+/// projection rows 0-15, normal matrix rows 16-27 (three vec4), light
+/// direction 28-30 and ambient 31, diffuse strength 32.
+pub const LIT_UBO_WORDS: usize = 33;
+const U_MVP: u32 = 0x00;
+const U_NORMAL: u32 = 0x40;
+const U_LIGHT: u32 = 0x70;
+const U_DIFFUSE: u32 = 0x80;
+
+/// Vertex shader outputs and fragment shader inputs.
+const A_POSITION: u32 = 0x70;
+const A_FRAG_W: u32 = 0x7C;
+const A_GENERIC0: u32 = 0x80;
+const A_GENERIC1: u32 = 0x90;
+const A_GENERIC2: u32 = 0xA0;
+
 /// Program header, then code.
 const SPH_WORDS: usize = 20;
 const SPH_BYTES: usize = SPH_WORDS * 4;
 /// Headers at 0x30 modulo 0x80, so that the code that follows (0x50
 /// later) starts on a 0x80 boundary, as Kepler and later want.
-const VS_AT: usize = 0x30;
-const FS_AT: usize = 0x430;
-const REGION_SIZE: usize = 0x1000;
-/// Registers the shaders use, as `SET_PIPELINE_REGISTER_COUNT` wants.
-const GPRS: u32 = 8;
+const FLAT_VS: usize = 0x030;
+const FLAT_FS: usize = 0x430;
+const LIT_VS: usize = 0x830;
+const LIT_FS: usize = 0x1030;
+const REGION_SIZE: usize = 0x2000;
+/// Constant buffer data of a batch.
+const UBO_SIZE: usize = 0x10000;
 
-/// Attribute addresses (NAK: 0x70 position, 0x80 + 16 n generic n).
-const A_POSITION: u32 = 0x70;
-const A_GENERIC0: u32 = 0x80;
-const A_GENERIC1: u32 = 0x90;
+/// Which shaders, and the vertex layout they read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pipe {
+    /// Clip-space position and color, four floats each (32 bytes).
+    Flat,
+    /// Position and normal (three floats each), color (four unorm8):
+    /// 28 bytes; lit by one directional light (`LIT_UBO_WORDS`).
+    Lit,
+}
+
+impl Pipe {
+    pub fn stride(self) -> u32 {
+        match self {
+            Pipe::Flat => 32,
+            Pipe::Lit => 28,
+        }
+    }
+
+    fn shaders(self) -> [(u32, usize, u32, u32); 2] {
+        // (type, header, registers, binding group)
+        match self {
+            Pipe::Flat => [
+                (TYPE_VERTEX, FLAT_VS, 8, GROUP_VERTEX),
+                (TYPE_PIXEL, FLAT_FS, 8, GROUP_PIXEL),
+            ],
+            Pipe::Lit => [
+                (TYPE_VERTEX, LIT_VS, 24, GROUP_VERTEX),
+                (TYPE_PIXEL, LIT_FS, 16, GROUP_PIXEL),
+            ],
+        }
+    }
+
+    /// `SET_VERTEX_ATTRIBUTE_A` words, one per attribute: stream 0,
+    /// offset, component widths, numeric type.
+    fn attributes(self) -> Vec<u32> {
+        const R32X4: u32 = 1;
+        const R32X3: u32 = 2;
+        const R8X4: u32 = 0x0A;
+        const UNORM: u32 = 2;
+        const FLOAT: u32 = 7;
+        let a = |offset: u32, width: u32, ty: u32| width << 21 | ty << 27 | offset << 7;
+        match self {
+            Pipe::Flat => alloc::vec![a(0, R32X4, FLOAT), a(16, R32X4, FLOAT)],
+            Pipe::Lit => alloc::vec![a(0, R32X3, FLOAT), a(12, R32X3, FLOAT), a(24, R8X4, UNORM)],
+        }
+    }
+}
+
+/// Depth buffer: 32-bit float, block-linear (the engine does not take it
+/// pitch-linear), `bytes` of memory for a `width` x `height` image.
+#[derive(Clone, Copy)]
+pub struct Depth {
+    pub va: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Depth {
+    pub fn bytes(width: u32, height: u32) -> usize {
+        let gobs_x = (width as u64 * 4).div_ceil(GOB_WIDTH);
+        let block_rows = GOB_ROWS << ZT_BLOCK_HEIGHT_LOG2;
+        let blocks_y = (height as u64).div_ceil(block_rows);
+        (gobs_x * blocks_y * (GOB_BYTES << ZT_BLOCK_HEIGHT_LOG2)) as usize
+    }
+}
+
+/// A block-linear color surface: GOBs of 64 x 8 bytes, stacked
+/// `1 << block_log2` high in a block. The engine takes a depth buffer
+/// only with a surface like this one (Gallium does the same).
+#[derive(Clone, Copy)]
+pub struct Tiled {
+    pub va: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub block_log2: u32,
+}
+
+impl Tiled {
+    pub fn bytes(&self) -> usize {
+        let gobs_x = (self.width as u64 * 4).div_ceil(GOB_WIDTH);
+        let rows = GOB_ROWS << self.block_log2;
+        let blocks_y = (self.height as u64).div_ceil(rows);
+        (gobs_x * blocks_y * (GOB_BYTES << self.block_log2)) as usize
+    }
+
+    /// Byte offset of pixel (x, y), four bytes each (the GOB's swizzle:
+    /// x bits 3-0, y bit 0, x bit 4, y bits 2-1, x bit 5).
+    pub fn offset(&self, x: u32, y: u32) -> usize {
+        let (bx, gob_x) = ((x as u64 * 4) % GOB_WIDTH, (x as u64 * 4) / GOB_WIDTH);
+        let (gob_row, row) = ((y as u64) / GOB_ROWS, (y as u64) % GOB_ROWS);
+        let gobs_x = (self.width as u64 * 4).div_ceil(GOB_WIDTH);
+        let block = (gob_row >> self.block_log2) * gobs_x + gob_x;
+        let in_block = gob_row & ((1 << self.block_log2) - 1);
+        let inner =
+            (bx / 32) * 256 + (row / 2) * 64 + ((bx % 32) / 16) * 32 + (row % 2) * 16 + bx % 16;
+        (block * (GOB_BYTES << self.block_log2) + in_block * GOB_BYTES + inner) as usize
+    }
+}
+
+/// The color part of a target: pitch-linear or block-linear.
+#[derive(Clone, Copy)]
+pub enum Color {
+    Linear(Surface),
+    Tiled(Tiled),
+}
+
+impl Color {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Color::Linear(s) => (s.width, s.height),
+            Color::Tiled(t) => (t.width, t.height),
+        }
+    }
+}
+
+/// Where a batch draws.
+#[derive(Clone, Copy)]
+pub struct Target {
+    pub color: Color,
+    pub depth: Option<Depth>,
+}
 
 fn field(w: &mut [u32; SPH_WORDS], lo: usize, v: u32) {
     w[lo / 32] |= v << (lo % 32);
 }
 
-/// Vertex shader header: attributes 0 and 1 in, position and generic 0
-/// out (NAK `encode_header`).
-fn vs_header() -> [u32; SPH_WORDS] {
+/// Vertex shader header (NAK `encode_header`): `attrs_in` is the mask of
+/// input words (4 per attribute), `attrs_out` that of generic output
+/// words, plus the position.
+fn vs_header(attrs_in: u32, attrs_out: u32) -> [u32; SPH_WORDS] {
     let mut h = [0u32; SPH_WORDS];
     field(&mut h, 0, 1); // SPH type: VTG
     field(&mut h, 5, 3); // version
     field(&mut h, 10, 1); // vertex shader
     field(&mut h, 17, 1); // SASS version
     field(&mut h, 140, 0xFF); // no store-request range
-    field(&mut h, 192, 0xFF); // attributes 0, 1 in: xyzw each
+    field(&mut h, 192, attrs_in);
     field(&mut h, 428, 0xF); // position out
-    field(&mut h, 432, 0xF); // generic 0 out
+    field(&mut h, 432, attrs_out);
     h
 }
 
-/// Fragment shader header: generic 0 in, screen-linear; target 0 out.
-fn fs_header() -> [u32; SPH_WORDS] {
+/// Fragment shader header: generic input words with their interpolation
+/// (`imap`: 2 bits each: 1 constant, 2 perspective, 3 screen-linear);
+/// target 0 out.
+fn fs_header(imap: u32) -> [u32; SPH_WORDS] {
     let mut h = [0u32; SPH_WORDS];
     field(&mut h, 0, 2); // SPH type: PS
     field(&mut h, 5, 3);
@@ -101,12 +265,17 @@ fn fs_header() -> [u32; SPH_WORDS] {
     field(&mut h, 14, 1); // MRT enable (color 0 broadcast)
     field(&mut h, 17, 1);
     field(&mut h, 191, 1); // reads position.w, as Gallium declares it
-    field(&mut h, 192, 0xFF); // generic 0 in, four words, screen-linear (3)
+    field(&mut h, 192, imap);
     field(&mut h, 576, 0xF); // target 0 out: RGBA
     h
 }
 
-fn vs_code() -> Vec<u64> {
+/// Fixed-latency result read by the next instruction.
+fn alu() -> Sched {
+    Sched::stall(6)
+}
+
+fn flat_vs() -> Vec<u64> {
     let mut a = Asm::new();
     // Input attribute n is at 0x80 + 16 n, as outputs are.
     a.emit(ald(0, A_GENERIC0, 4), Sched::stall(1).wr(0));
@@ -117,7 +286,7 @@ fn vs_code() -> Vec<u64> {
     a.finish()
 }
 
-fn fs_code() -> Vec<u64> {
+fn flat_fs() -> Vec<u64> {
     let mut a = Asm::new();
     for c in 0..4u8 {
         a.emit(
@@ -129,18 +298,105 @@ fn fs_code() -> Vec<u64> {
     a.finish()
 }
 
-/// Shaders in GPU memory.
+/// clip = MVP * (position, 1); normal = N * normal; color through.
+fn lit_vs() -> Vec<u64> {
+    let mut a = Asm::new();
+    a.emit(ald(0, A_GENERIC0, 3), Sched::stall(1).wr(0)); // R0-R2 position
+    a.emit(ald(4, A_GENERIC1, 3), Sched::stall(1).wr(1)); // R4-R6 normal
+    a.emit(ald(8, A_GENERIC2, 4), Sched::stall(1).wr(2)); // R8-R11 color
+                                                          // One matrix row: d = m.x * s + m.y * (s + 1) + m.z * (s + 2) (+ m.w);
+                                                          // the first multiply waits for the attribute `barrier`.
+    let row = |a: &mut Asm, d: u8, s: u8, at: u32, w: bool, barrier: u8| {
+        a.emit(
+            fmul_c(d, s, UBO_SLOT, at),
+            Sched::stall(6).wait(1 << barrier),
+        );
+        a.emit(ffma_cb(d, s + 1, UBO_SLOT, at + 4, d), alu());
+        a.emit(ffma_cb(d, s + 2, UBO_SLOT, at + 8, d), alu());
+        if w {
+            a.emit(fadd_c(d, d, UBO_SLOT, at + 12), alu());
+        }
+    };
+    for r in 0..4u8 {
+        row(&mut a, 12 + r, 0, U_MVP + 0x10 * r as u32, true, 0);
+    }
+    for r in 0..3u8 {
+        row(&mut a, 16 + r, 4, U_NORMAL + 0x10 * r as u32, false, 1);
+    }
+    a.emit(ast(12, A_POSITION, 4), Sched::stall(1).rd(3));
+    a.emit(ast(16, A_GENERIC0, 3), Sched::stall(1).rd(4));
+    a.emit(ast(8, A_GENERIC1, 4), Sched::stall(1).rd(5).wait(1 << 2));
+    a.emit(exit(), Sched::stall(5).wait(0x3F));
+    a.finish()
+}
+
+/// color = vertex color * (ambient + diffuse * saturate(N . L)).
+fn lit_fs() -> Vec<u64> {
+    let mut a = Asm::new();
+    // 1/w, then the perspective-correct normal (R4-R6) and color (R8-R11).
+    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), Sched::stall(1).wr(0));
+    for (k, (d, addr)) in [
+        (4u8, A_GENERIC0),
+        (5, A_GENERIC0 + 4),
+        (6, A_GENERIC0 + 8),
+        (8, A_GENERIC1),
+        (9, A_GENERIC1 + 4),
+        (10, A_GENERIC1 + 8),
+        (11, A_GENERIC1 + 12),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = Sched::stall(1).wr(1);
+        a.emit(
+            ipa(d, addr, Interp::PassMulW, 0),
+            if k == 0 { s.wait(1 << 0) } else { s },
+        );
+    }
+    // N . L
+    a.emit(
+        fmul_c(12, 4, UBO_SLOT, U_LIGHT),
+        Sched::stall(6).wait(1 << 1),
+    );
+    a.emit(ffma_cb(12, 5, UBO_SLOT, U_LIGHT + 4, 12), alu());
+    a.emit(ffma_cb(12, 6, UBO_SLOT, U_LIGHT + 8, 12), alu());
+    // saturate: times 1.0, clamped.
+    a.emit(mov32i(13, 1.0f32.to_bits()), alu());
+    a.emit(fmul(12, 12, 13, true), alu());
+    // ambient + diffuse * saturate(N . L)
+    a.emit(mov_cb(14, UBO_SLOT, U_LIGHT + 12), alu());
+    a.emit(ffma_cb(12, 12, UBO_SLOT, U_DIFFUSE, 14), alu());
+    a.emit(fmul(0, 8, 12, false), alu());
+    a.emit(fmul(1, 9, 12, false), alu());
+    a.emit(fmul(2, 10, 12, false), alu());
+    a.emit(mov(3, 11), alu());
+    a.emit(exit(), Sched::stall(5).wait(0x3F));
+    a.finish()
+}
+
+/// Shaders in GPU memory, and the constant buffer data of a batch.
 pub struct Gfx {
     _prog: Dma,
     prog_va: u64,
+    ubo: Dma,
+    ubo_va: u64,
+    ubo_pos: usize,
 }
 
 impl Gfx {
     pub fn new(vm: &mut Vm) -> Result<Self> {
         let prog = Dma::new(REGION_SIZE)?;
+        let lit_in = 0x7 | 0x7 << 4 | 0xF << 8;
+        // Output words: normal in generic 0 (3), color in generic 1 (4).
+        let lit_out = 0x7 | 0xF << 4;
+        // Input interpolation: perspective (2) on normal words 0-2 and
+        // color words 4-7 (generic 1 at word 4: attributes are 4 words).
+        let persp = |words: u32| (0..16).fold(0u32, |m, i| m | (((words >> i) & 1) * 2) << (2 * i));
         for (at, hdr, code) in [
-            (VS_AT, vs_header(), vs_code()),
-            (FS_AT, fs_header(), fs_code()),
+            (FLAT_VS, vs_header(0xFF, 0xF), flat_vs()),
+            (FLAT_FS, fs_header(0xFF), flat_fs()),
+            (LIT_VS, vs_header(lit_in, lit_out), lit_vs()),
+            (LIT_FS, fs_header(persp(0x7 | 0xF << 4)), lit_fs()),
         ] {
             prog.words(at, &hdr);
             for (i, w) in code.iter().enumerate() {
@@ -148,9 +404,14 @@ impl Gfx {
             }
         }
         let prog_va = vm.map(&prog, false)?;
+        let ubo = Dma::new(UBO_SIZE)?;
+        let ubo_va = vm.map(&ubo, false)?;
         Ok(Self {
             _prog: prog,
             prog_va,
+            ubo,
+            ubo_va,
+            ubo_pos: 0,
         })
     }
 
@@ -167,32 +428,29 @@ impl Gfx {
         p.inc(SUBC_3D, SET_RASTER_ENABLE, &[1]);
         p.inc(SUBC_3D, SET_VIEWPORT_SCALE_OFFSET, &[1]);
         p.inc(SUBC_3D, SET_WINDOW_ORIGIN, &[0]);
-        p.inc(SUBC_3D, SET_ZT_SELECT, &[0]);
-        p.inc(SUBC_3D, SET_DEPTH_TEST, &[0]);
         p.inc(SUBC_3D, SET_BLEND, &[0]);
         // All four channels written.
         p.inc(SUBC_3D, SET_CT_WRITE, &[0x1111]);
-        // Shaders: vertex (type 1), pixel (type 5), each at its header.
-        for (ty, at, bind) in [(TYPE_VERTEX, VS_AT, 0), (TYPE_PIXEL, FS_AT, 4)] {
-            let m = SET_PIPELINE_SHADER + ty * PIPELINE_STRIDE;
-            // Shader (enabled, type), program offset; register count and
-            // binding group after the reserved word.
-            p.inc(SUBC_3D, m, &[1 | ty << 4, at as u32]);
-            p.inc(SUBC_3D, m + 0xC, &[GPRS, bind]);
-        }
     }
 
-    /// The render target and its viewport.
-    fn target(&self, p: &mut Push, s: &Surface) {
+    /// Start of a batch: caches that may hold what the CPU rewrote, and
+    /// the constant buffer data from its start.
+    pub fn begin(&mut self, p: &mut Push) {
+        self.ubo_pos = 0;
+        p.inc(SUBC_3D, INVALIDATE_SHADER_CACHES, &[1 | 1 << 4 | 1 << 12]);
+    }
+
+    /// The render target, its depth buffer and the viewport.
+    fn target(&self, p: &mut Push, t: &Target) {
+        let (width, height) = t.color.size();
         p.inc(
             SUBC_3D,
             SET_SURFACE_CLIP_HORIZONTAL,
-            &[s.width << 16, s.height << 16],
+            &[width << 16, height << 16],
         );
-        p.inc(
-            SUBC_3D,
-            SET_COLOR_TARGET_A,
-            &[
+        let rt = match t.color {
+            // Pitch layouts give the pitch as the width.
+            Color::Linear(s) => [
                 (s.va >> 32) as u32,
                 s.va as u32,
                 s.pitch,
@@ -203,9 +461,46 @@ impl Gfx {
                 0,
                 0,
             ],
-        );
+            Color::Tiled(c) => [
+                (c.va >> 32) as u32,
+                c.va as u32,
+                c.width,
+                c.height,
+                c.format,
+                c.block_log2 << 4,
+                1,
+                (c.bytes() >> 2) as u32,
+                0,
+            ],
+        };
+        p.inc(SUBC_3D, SET_COLOR_TARGET_A, &rt);
         p.inc(SUBC_3D, SET_CT_SELECT, &[1]);
-        let (w, h) = (s.width as f32, s.height as f32);
+        match t.depth {
+            Some(d) => {
+                let size = Depth::bytes(d.width, d.height) as u32;
+                p.inc(
+                    SUBC_3D,
+                    SET_ZT_A,
+                    &[
+                        (d.va >> 32) as u32,
+                        d.va as u32,
+                        ZT_FORMAT_ZF32,
+                        ZT_BLOCK_HEIGHT_LOG2 << 4,
+                        size >> 2,
+                    ],
+                );
+                p.inc(SUBC_3D, SET_ZT_SIZE_A, &[d.width, d.height, 1 | 1 << 16]);
+                p.inc(SUBC_3D, SET_ZT_SELECT, &[1]);
+                p.inc(SUBC_3D, SET_DEPTH_TEST, &[1]);
+                p.inc(SUBC_3D, SET_DEPTH_FUNC, &[DEPTH_LESS]);
+                p.inc(SUBC_3D, SET_DEPTH_WRITE, &[1]);
+            }
+            None => {
+                p.inc(SUBC_3D, SET_ZT_SELECT, &[0]);
+                p.inc(SUBC_3D, SET_DEPTH_TEST, &[0]);
+            }
+        }
+        let (w, h) = (width as f32, height as f32);
         // NDC (-1..1) to the window, y down.
         p.inc(
             SUBC_3D,
@@ -223,35 +518,70 @@ impl Gfx {
             SUBC_3D,
             SET_VIEWPORT_CLIP_HORIZONTAL,
             &[
-                s.width << 16,
-                s.height << 16,
+                width << 16,
+                height << 16,
                 0.0f32.to_bits(),
                 1.0f32.to_bits(),
             ],
         );
+        p.inc(SUBC_3D, SET_SCISSOR_ENABLE, &[1, width << 16, height << 16]);
+    }
+
+    /// Whole target set to `rgba`; the depth buffer, if any, to 1.0.
+    pub fn clear(&self, p: &mut Push, t: &Target, rgba: [f32; 4]) {
+        self.target(p, t);
+        p.inc(SUBC_3D, SET_COLOR_CLEAR_VALUE, &rgba.map(|c| c.to_bits()));
+        p.inc(SUBC_3D, SET_Z_CLEAR_VALUE, &[1.0f32.to_bits()]);
+        p.inc(SUBC_3D, SET_CLEAR_SURFACE_CONTROL, &[0]);
+        let z = t.depth.is_some() as u32;
+        p.inc(SUBC_3D, CLEAR_SURFACE, &[0xF << 2 | z]);
+    }
+
+    /// Select shaders and the draw state for the draws that follow.
+    pub fn pipeline(&self, p: &mut Push, t: &Target, pipe: Pipe, cull_back: bool) {
+        self.target(p, t);
+        for (ty, at, gprs, group) in pipe.shaders() {
+            let m = SET_PIPELINE_SHADER + ty * PIPELINE_STRIDE;
+            // Shader (enabled, type), program offset; register count and
+            // binding group after the reserved word.
+            p.inc(SUBC_3D, m, &[1 | ty << 4, at as u32]);
+            p.inc(SUBC_3D, m + 0xC, &[gprs, group]);
+        }
+        p.inc(SUBC_3D, OGL_SET_CULL, &[cull_back as u32]);
+        p.inc(SUBC_3D, OGL_SET_FRONT_FACE, &[0x901]);
+        p.inc(SUBC_3D, OGL_SET_CULL_FACE, &[0x405]);
+    }
+
+    /// `words` as the shaders' constant buffer, for the draws that follow
+    /// (copied now: the batch runs after).
+    pub fn uniforms(&mut self, p: &mut Push, words: &[u32]) {
+        let bytes = words.len() * 4;
+        let at = self.ubo_pos.next_multiple_of(256);
+        assert!(at + bytes <= UBO_SIZE, "constant buffer data of a batch");
+        self.ubo.words(at, words);
+        self.ubo_pos = at + bytes;
+        let va = self.ubo_va + at as u64;
         p.inc(
             SUBC_3D,
-            SET_SCISSOR_ENABLE,
-            &[1, s.width << 16, s.height << 16],
+            SET_CONSTANT_BUFFER_SELECTOR_A,
+            &[
+                bytes.next_multiple_of(256) as u32,
+                (va >> 32) as u32,
+                va as u32,
+            ],
         );
+        let bind = (UBO_SLOT as u32) << 4 | 1;
+        for g in [GROUP_VERTEX, GROUP_PIXEL] {
+            p.inc(SUBC_3D, BIND_GROUP_CONSTANT_BUFFER + g * 0x20, &[bind]);
+        }
     }
 
-    /// Whole target set to `rgba`.
-    pub fn clear(&self, p: &mut Push, s: &Surface, rgba: [f32; 4]) {
-        self.target(p, s);
-        p.inc(SUBC_3D, SET_COLOR_CLEAR_VALUE, &rgba.map(|c| c.to_bits()));
-        p.inc(SUBC_3D, SET_CLEAR_SURFACE_CONTROL, &[0]);
-        p.inc(SUBC_3D, CLEAR_SURFACE, &[0xF << 2]);
-    }
-
-    /// `count` vertices of `VERTEX_SIZE` bytes at `vb` as triangles.
-    pub fn draw(&self, p: &mut Push, s: &Surface, vb: u64, count: u32) {
-        self.target(p, s);
-        let size = count as u64 * VERTEX_SIZE as u64;
+    fn stream(&self, p: &mut Push, pipe: Pipe, vb: u64, vertices: u32) {
+        let size = vertices as u64 * pipe.stride() as u64;
         p.inc(
             SUBC_3D,
             SET_VERTEX_STREAM_A_FORMAT,
-            &[VERTEX_SIZE | 1 << 12, (vb >> 32) as u32, vb as u32],
+            &[pipe.stride() | 1 << 12, (vb >> 32) as u32, vb as u32],
         );
         let end = vb + size - 1;
         p.inc(
@@ -259,12 +589,47 @@ impl Gfx {
             SET_VERTEX_STREAM_LIMIT_A_A,
             &[(end >> 32) as u32, end as u32],
         );
-        // Four 32-bit floats each (component widths 1, FLOAT numeric).
-        let attr = |offset: u32| 1 << 21 | 7 << 27 | offset << 7;
-        p.inc(SUBC_3D, SET_VERTEX_ATTRIBUTE_A, &[attr(0), attr(16)]);
+        p.inc(SUBC_3D, SET_VERTEX_ATTRIBUTE_A, &pipe.attributes());
+    }
+
+    /// `count` vertices at `vb` as triangles.
+    pub fn draw(&self, p: &mut Push, pipe: Pipe, vb: u64, count: u32) {
+        self.stream(p, pipe, vb, count);
         p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES]);
         p.inc(SUBC_3D, SET_VERTEX_ARRAY_START, &[0]);
         p.inc(SUBC_3D, DRAW_VERTEX_ARRAY, &[count]);
+        p.inc(SUBC_3D, END, &[0]);
+    }
+
+    /// `count` 16-bit indices from `first`, into the `vertices` at `vb`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed(
+        &self,
+        p: &mut Push,
+        pipe: Pipe,
+        vb: u64,
+        vertices: u32,
+        ib: u64,
+        indices: u32,
+        first: u32,
+        count: u32,
+    ) {
+        self.stream(p, pipe, vb, vertices);
+        let end = ib + indices as u64 * 2 - 1;
+        p.inc(
+            SUBC_3D,
+            SET_INDEX_BUFFER_A,
+            &[
+                (ib >> 32) as u32,
+                ib as u32,
+                (end >> 32) as u32,
+                end as u32,
+                1, // two bytes
+                first,
+            ],
+        );
+        p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES]);
+        p.inc(SUBC_3D, DRAW_INDEX_BUFFER, &[count]);
         p.inc(SUBC_3D, END, &[0]);
     }
 }

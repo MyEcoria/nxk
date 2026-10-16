@@ -847,7 +847,8 @@ fn test(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     Ok((pass, all, ns))
 }
 
-/// 3D engine self-test: a clear, then a triangle through both shaders.
+/// 3D engine self-test: a clear, a triangle through the flat shaders, depth
+/// ordering, and a quad of two triangles lit by the lit shaders.
 fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     const W: u32 = 128;
     const H: u32 = 128;
@@ -855,7 +856,17 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     let regs = g.regs;
     let d = g.dev(0)?;
     let img = Dma::new((W * H * 4) as usize).map_err(e)?;
+    let zbuf = Dma::new(gfx::Depth::bytes(W, H)).map_err(e)?;
+    let mut tiled = gfx::Tiled {
+        va: 0,
+        width: W,
+        height: H,
+        format: proto::FMT_A8B8G8R8 as u32,
+        block_log2: 4,
+    };
+    let timg = Dma::new(tiled.bytes()).map_err(e)?;
     let vb = Dma::new(4096).map_err(e)?;
+    let ib = Dma::new(4096).map_err(e)?;
     let s = Surface {
         va: d.vm.map(&img, false).map_err(e)?,
         width: W,
@@ -863,52 +874,85 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         pitch: W * 4,
         format: proto::FMT_A8B8G8R8 as u32,
     };
-    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    let kind = mmu::KIND_GENERIC_16BX2;
+    let zva =
+        d.vm.map_kind(&zbuf, false, mmu::KIND_ZF32, 1 << 17)
+            .map_err(e)?;
+    tiled.va = d.vm.map_kind(&timg, false, kind, 1 << 17).map_err(e)?;
+    let (vbv, ibv) = (
+        d.vm.map(&vb, false).map_err(e)?,
+        d.vm.map(&ib, false).map_err(e)?,
+    );
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let flat = gfx::Target {
+        color: gfx::Color::Linear(s),
+        depth: None,
+    };
+    let deep = gfx::Target {
+        color: gfx::Color::Tiled(tiled),
+        depth: Some(gfx::Depth {
+            va: zva,
+            width: W,
+            height: H,
+        }),
+    };
     let px = |x: u32, y: u32| img.r32(((y * W + x) * 4) as usize);
+    let tpx = |x: u32, y: u32| timg.r32(tiled.offset(x, y));
     let (mut pass, mut ns) = (0, 0);
     // Memory order R, G, B, A: 0xAABBGGRR.
+    let rgba = |r: u32, g: u32, b: u32| 0xFF00_0000 | b << 16 | g << 8 | r;
+    let near = |a: u32, b: u32, tol: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= tol)
+    };
+    let to_u8 = |c: [f32; 4]| {
+        rgba(
+            (c[0] * 255.0 + 0.5) as u32,
+            (c[1] * 255.0 + 0.5) as u32,
+            (c[2] * 255.0 + 0.5) as u32,
+        )
+    };
     let clear = [0.1f32, 0.2, 0.3, 1.0];
-    let want = |c: [f32; 4]| {
-        c.iter()
-            .enumerate()
-            .fold(0u32, |w, (i, v)| w | ((v * 255.0 + 0.5) as u32) << (8 * i))
-    };
-    let near = |a: u32, b: u32| {
-        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 1)
-    };
 
+    // Clear.
     img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
     let d = g.dev.as_mut().ok_or(-ENODEV)?;
     let mut p = Push::default();
-    d.gfx.clear(&mut p, &s, clear);
+    d.gfx.begin(&mut p);
+    d.gfx.clear(&mut p, &flat, clear);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
     println!(
         "[gpu] 3D clear: {:#010x} {:#010x} {:#010x}, want {:#010x}",
         px(0, 0),
         px(64, 64),
         px(W - 1, H - 1),
-        want(clear)
+        to_u8(clear)
     );
-    if near(px(0, 0), want(clear))
-        && near(px(64, 64), want(clear))
-        && near(px(W - 1, H - 1), want(clear))
+    if [px(0, 0), px(64, 64), px(W - 1, H - 1)]
+        .iter()
+        .all(|&c| near(c, to_u8(clear), 1))
     {
         pass |= proto::T3_CLEAR;
     }
 
-    // Red, green and blue corners; position then color, w = 1.
-    let tri: [[f32; 8]; 3] = [
-        [-0.8, -0.8, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0],
-        [0.8, -0.8, 0.5, 1.0, 0.0, 1.0, 0.0, 1.0],
-        [0.0, 0.8, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0],
-    ];
-    for (i, v) in tri.iter().flatten().enumerate() {
-        vb.w32(i * 4, v.to_bits());
-    }
+    // Flat triangle: red, green and blue corners; position then color.
+    let put = |m: &Dma, v: &[f32]| {
+        for (i, x) in v.iter().enumerate() {
+            m.w32(i * 4, x.to_bits());
+        }
+    };
+    put(
+        &vb,
+        &[
+            -0.8, -0.8, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, //
+            0.8, -0.8, 0.5, 1.0, 0.0, 1.0, 0.0, 1.0, //
+            0.0, 0.8, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0,
+        ],
+    );
     let d = g.dev.as_mut().ok_or(-ENODEV)?;
     let mut p = Push::default();
-    d.gfx.draw(&mut p, &s, vbv, 3);
+    d.gfx.begin(&mut p);
+    d.gfx.pipeline(&mut p, &flat, gfx::Pipe::Flat, false);
+    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 3);
     ns += g.run(p, BATCH_TIMEOUT_US)?;
     let (inside, outside) = (px(64, 50), px(4, 4));
     println!(
@@ -917,18 +961,103 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         outside,
         px(28, 28)
     );
-    if near(outside, want(clear))
-        && !near(inside, want(clear))
-        && inside & 0xFF00_0000 == 0xFF00_0000
-    {
+    if near(outside, to_u8(clear), 1) && !near(inside, to_u8(clear), 1) && inside >> 24 == 0xFF {
         pass |= proto::T3_TRIANGLE;
     }
 
+    // Depth: the far (green, z 0.5) triangle after the near (red, z -0.5).
+    let tri = |z: f32, c: [f32; 3]| {
+        [
+            -0.9, -0.9, z, 1.0, c[0], c[1], c[2], 1.0, //
+            0.9, -0.9, z, 1.0, c[0], c[1], c[2], 1.0, //
+            0.0, 0.9, z, 1.0, c[0], c[1], c[2], 1.0,
+        ]
+    };
+    put(
+        &vb,
+        &[
+            tri(-0.5, [1.0, 0.0, 0.0]).as_slice(),
+            tri(0.5, [0.0, 1.0, 0.0]).as_slice(),
+        ]
+        .concat(),
+    );
     let d = g.dev.as_mut().ok_or(-ENODEV)?;
-    let _ = d.vm.unmap(s.va, img.len() as u64);
-    let _ = d.vm.unmap(vbv, vb.len() as u64);
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    d.gfx.clear(&mut p, &deep, clear);
+    d.gfx.pipeline(&mut p, &deep, gfx::Pipe::Flat, false);
+    d.gfx.draw(&mut p, gfx::Pipe::Flat, vbv, 6);
+    ns += g.run(p, BATCH_TIMEOUT_US)?;
+    println!(
+        "[gpu] 3D depth: centre {:#010x}, want {:#010x} (the near triangle)",
+        tpx(64, 64),
+        rgba(255, 0, 0)
+    );
+    if near(tpx(64, 64), rgba(255, 0, 0), 1) && near(tpx(4, 4), to_u8(clear), 1) {
+        pass |= proto::T3_DEPTH;
+    }
+
+    // Lit quad (indexed), facing the light: color * (ambient + diffuse).
+    let vertex = |x: f32, y: f32| -> [u8; 28] {
+        let mut v = [0u8; 28];
+        for (i, f) in [x, y, 0.0, 0.0, 0.0, 1.0].iter().enumerate() {
+            v[4 * i..4 * i + 4].copy_from_slice(&f.to_bits().to_le_bytes());
+        }
+        v[24..28].copy_from_slice(&[255, 128, 0, 255]);
+        v
+    };
+    let quad: Vec<u8> = [(-0.8, -0.8), (0.8, -0.8), (0.8, 0.8), (-0.8, 0.8)]
+        .iter()
+        .flat_map(|&(x, y)| vertex(x, y))
+        .collect();
+    vb.write(0, &quad);
+    ib.write(0, &[0u8, 0, 1, 0, 2, 0, 0, 0, 2, 0, 3, 0]);
+    let mut u = [0u32; gfx::LIT_UBO_WORDS];
+    for (k, v) in [
+        (0, 1.0f32),
+        (5, 1.0),
+        (10, 1.0),
+        (15, 1.0),
+        (16, 1.0),
+        (21, 1.0),
+        (26, 1.0),
+        (30, 1.0),
+        (31, 0.25),
+        (32, 0.5),
+    ] {
+        u[k] = v.to_bits();
+    }
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    d.gfx.clear(&mut p, &deep, clear);
+    d.gfx.pipeline(&mut p, &deep, gfx::Pipe::Lit, false);
+    d.gfx.uniforms(&mut p, &u);
+    d.gfx
+        .draw_indexed(&mut p, gfx::Pipe::Lit, vbv, 4, ibv, 6, 0, 6);
+    ns += g.run(p, BATCH_TIMEOUT_US)?;
+    println!(
+        "[gpu] 3D lit quad: centre {:#010x}, want about {:#010x}",
+        tpx(64, 64),
+        rgba(191, 96, 0)
+    );
+    if near(tpx(64, 64), rgba(191, 96, 0), 3) && near(tpx(4, 4), to_u8(clear), 1) {
+        pass |= proto::T3_LIT;
+    }
+
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    for (va, len) in [
+        (s.va, img.len()),
+        (tiled.va, timg.len()),
+        (zva, zbuf.len()),
+        (vbv, vb.len()),
+        (ibv, ib.len()),
+    ] {
+        let _ = d.vm.unmap(va, len as u64);
+    }
     let _ = mmu::invalidate(&regs, &d.vm);
-    Ok((pass, proto::T3_CLEAR | proto::T3_TRIANGLE, ns))
+    let all = proto::T3_CLEAR | proto::T3_TRIANGLE | proto::T3_DEPTH | proto::T3_LIT;
+    Ok((pass, all, ns))
 }
 
 /// `n` words of `m` against `want`; the first wrong one reported.

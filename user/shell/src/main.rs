@@ -1010,6 +1010,8 @@ fn gpu_cmd(argv: &[&str]) {
                 (gpu::T_KSAXPY, "saxpy kernel"),
                 (gpu::T3_CLEAR, "3D clear"),
                 (gpu::T3_TRIANGLE, "3D triangle"),
+                (gpu::T3_DEPTH, "3D depth"),
+                (gpu::T3_LIT, "3D lit quad"),
             ] {
                 let r = match (pass & bit != 0, run & bit != 0) {
                     (true, _) => "ok",
