@@ -158,6 +158,17 @@ pub struct LitVertex {
     pub color: [u8; 4],
 }
 
+/// Vertex of `Pipe::Textured`: `LitVertex` with texture coordinates after
+/// the normal. (0, 0) is the first row and column of the image.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TexVertex {
+    pub pos: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub color: [u8; 4],
+}
+
 /// Vertex of `Pipe::Flat`: clip-space position and color.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +181,26 @@ pub struct FlatVertex {
 pub enum Pipe {
     Flat,
     Lit,
+    /// `Lit`, with the color times the texel of the texture bound by
+    /// `Frame::texture`; the uniforms are `LitUniforms`.
+    Textured,
+}
+
+/// How a texture is sampled: linear filtering and repeat by default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sampling {
+    /// Nearest texel rather than a blend of four.
+    pub nearest: bool,
+    /// Coordinates outside 0..1 take the edge texel rather than repeat.
+    pub clamp: bool,
+}
+
+/// An RGBA8 image the GPU samples (`Graphics::texture`).
+pub struct Texture {
+    _mem: Shm,
+    id: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Parameters of `Pipe::Lit`: the shaders compute `mvp * position`,
@@ -204,6 +235,20 @@ impl LitUniforms {
         w[32] = self.diffuse.to_bits();
         w
     }
+}
+
+/// Byte offset of pixel (`x`, `y`) of a block-linear image of
+/// `width`-pixel rows of four bytes, blocks `1 << block_log2` GOBs high:
+/// GOBs of 64 x 8 bytes, swizzled inside (x bits 3-0, y bit 0, x bit 4,
+/// y bits 2-1, x bit 5).
+fn tiled_offset(width: u32, x: u32, y: u32, block_log2: u32) -> usize {
+    let (bx, gob_x) = ((x as usize * 4) % 64, (x as usize * 4) / 64);
+    let (gob_row, row) = (y as usize / 8, y as usize % 8);
+    let gobs_x = (width as usize * 4).div_ceil(64);
+    let block = (gob_row >> block_log2) * gobs_x + gob_x;
+    let in_block = gob_row & ((1 << block_log2) - 1);
+    let inner = (bx / 32) * 256 + (row / 2) * 64 + ((bx % 32) / 16) * 32 + (row % 2) * 16 + bx % 16;
+    block * (512 << block_log2) + in_block * 512 + inner
 }
 
 /// Vertices and indices in GPU-visible memory.
@@ -358,31 +403,63 @@ impl Graphics {
     }
 
     pub fn mesh_lit(&self, vertices: &[LitVertex], indices: &[u16]) -> Result<Mesh> {
-        let vb = unsafe {
-            core::slice::from_raw_parts(
-                vertices.as_ptr() as *const u8,
-                core::mem::size_of_val(vertices),
-            )
-        };
-        let ib = unsafe {
-            core::slice::from_raw_parts(
-                indices.as_ptr() as *const u8,
-                core::mem::size_of_val(indices),
-            )
-        };
-        let (vs, vid) = self.buffer(vb)?;
-        let (is, iid) = self.buffer(ib)?;
-        Ok(Mesh {
-            _vertices: vs,
-            _indices: is,
-            vb: vid,
-            ib: iid,
-            vertex_count: vertices.len() as u32,
-            index_count: indices.len() as u32,
-        })
+        self.mesh(vertices, indices)
+    }
+
+    pub fn mesh_textured(&self, vertices: &[TexVertex], indices: &[u16]) -> Result<Mesh> {
+        self.mesh(vertices, indices)
     }
 
     pub fn mesh_flat(&self, vertices: &[FlatVertex], indices: &[u16]) -> Result<Mesh> {
+        self.mesh(vertices, indices)
+    }
+
+    /// An image for `Frame::texture`: `rgba` is `width` x `height` pixels,
+    /// four bytes each (R, G, B, A), rows from the top. The GPU wants
+    /// them in its block-linear layout: this swizzles them.
+    pub fn texture(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        sampling: Sampling,
+    ) -> Result<Texture> {
+        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+            return Err(-nxk_abi::err::EINVAL);
+        }
+        let bl = gpu::tex_block_log2(height);
+        let bytes = gpu::tiled_bytes(width, height, bl);
+        let mut tiled = alloc::vec![0u8; bytes];
+        for y in 0..height {
+            for x in 0..width {
+                let at = tiled_offset(width, x, y, bl);
+                let from = (y as usize * width as usize + x as usize) * 4;
+                tiled[at..at + 4].copy_from_slice(&rgba[from..from + 4]);
+            }
+        }
+        let mem = Shm::new(bytes, shm::UNCACHED)?;
+        mem.write(0, &tiled);
+        let mut flags = 0;
+        if sampling.nearest {
+            flags |= gpu::TEX_NEAREST;
+        }
+        if sampling.clamp {
+            flags |= gpu::TEX_CLAMP;
+        }
+        let m = Msg::from_words(
+            gpu::TEXTURE_ATTACH,
+            &[width as u64 | (height as u64) << 32, flags],
+        );
+        let id = word(&self.gpu.call_with(m, mem.handle())?, 0);
+        Ok(Texture {
+            _mem: mem,
+            id,
+            width,
+            height,
+        })
+    }
+
+    fn mesh<T: Copy>(&self, vertices: &[T], indices: &[u16]) -> Result<Mesh> {
         let vb = unsafe {
             core::slice::from_raw_parts(
                 vertices.as_ptr() as *const u8,
@@ -508,6 +585,7 @@ impl Frame<'_> {
         let p = match pipe {
             Pipe::Flat => gpu::PIPE_FLAT,
             Pipe::Lit => gpu::PIPE_LIT,
+            Pipe::Textured => gpu::PIPE_TEXTURED,
         };
         self.push(
             gpu::CMD_PIPELINE,
@@ -515,7 +593,13 @@ impl Frame<'_> {
         );
     }
 
-    /// Constant buffer data for the draws that follow with `Pipe::Lit`.
+    /// The texture `Pipe::Textured` draws sample, from here on.
+    pub fn texture(&mut self, t: &Texture) {
+        self.push(gpu::CMD_TEXTURE, &[t.id as u32]);
+    }
+
+    /// Constant buffer data for the draws that follow with `Pipe::Lit` or
+    /// `Pipe::Textured`.
     pub fn lit(&mut self, u: &LitUniforms) {
         self.push(gpu::CMD_UNIFORMS, &u.words());
     }
@@ -659,6 +743,36 @@ pub fn octahedron(r: f32, color: [u8; 4]) -> (Vec<LitVertex>, Vec<u16>) {
         t.push(([ny, b, a], color));
     }
     tris_mesh(&t, Vec3::default())
+}
+
+/// `ground` with texture coordinates: `texels_per_unit` repeats of the
+/// image per world unit, and a color from `near_color` at `z_near` to
+/// `far_color` at `z_far` (the texel is multiplied by it: a fade to dark
+/// hides the shimmer of a far-off pattern, there being no mipmaps).
+pub fn ground_textured(
+    hx: f32,
+    y: f32,
+    z_far: f32,
+    z_near: f32,
+    texels_per_unit: f32,
+    near_color: [u8; 4],
+    far_color: [u8; 4],
+) -> (Vec<TexVertex>, Vec<u16>) {
+    let v = [
+        (-hx, z_near, near_color),
+        (hx, z_near, near_color),
+        (hx, z_far, far_color),
+        (-hx, z_far, far_color),
+    ]
+    .iter()
+    .map(|&(x, z, color)| TexVertex {
+        pos: [x, y, z],
+        normal: [0.0, 1.0, 0.0],
+        uv: [x * texels_per_unit, z * texels_per_unit],
+        color,
+    })
+    .collect();
+    (v, alloc::vec![0, 1, 2, 0, 2, 3])
 }
 
 /// Large flat quad facing up at height `y`, from (-hx, -hz_far) to (hx, hz_near).

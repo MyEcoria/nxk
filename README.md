@@ -43,8 +43,8 @@ the `display` service shows the **game library** (cards read from
 `/games`, played with touch or a gamepad, HOME to leave) and the
 dashboard pages (overview, system, network, a mirror of the USB-C
 terminal, screen messages); games draw with the **GPU's 3D engine**
-(vertex and fragment shaders, depth, block-linear surfaces, 60 Hz
-flips); the shell is reached over the USB-C console (`usbcon`: the
+(vertex and fragment shaders, depth, textures, block-linear
+surfaces, 60 Hz flips); the shell is reached over the USB-C console (`usbcon`: the
 Switch as a USB serial device, `tools/usbterm.py` on the PC), which also
 carries a debug channel (`tools/nxdbg.py`: screen capture, touch and
 gamepad input), with the SD card and Wi-Fi (see "Limits" and
@@ -305,7 +305,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Rust | `no_std` (libnx) and **`std`** (see "What `std` provides") | panic unwinding, backtraces |
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders and depth, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU textures, audio, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power button (the volume buttons are read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps, audio, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power button (the volume buttons are read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC), debugger (gdb), L4T comparison, USB-C terminal | |
 
@@ -393,7 +393,7 @@ program that vanished without closing them (crash) are reclaimed.
   Runs on an Erista Switch (`gpu test` 5/5 at every step, `gpu bench`
   30.4 GFLOP/s at 76.8 MHz to 365.8 at 921.6; `hwboot/README.md`, "GPU"
   and runs 26 and 27); Erista only (Mariko's GPU rail is on a
-  MAX77812); no 3D.
+  MAX77812).
   The emulator's GPU model runs the whole power-up with
   `tools/tegra_qemu-gpu.patch` but renders and computes nothing:
   `gpu test` fails there by design.

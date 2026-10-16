@@ -1438,6 +1438,30 @@ pub mod proto {
             gobs_x * (height as usize).div_ceil(rows) * (512usize << block_log2)
         }
         pub const DEPTH_BLOCK_LOG2: u32 = 4;
+        /// A texture to sample: handle 0 = shm with the `DMA` right
+        /// holding an RGBA8 image (bytes in R, G, B, A order) in
+        /// block-linear layout, `tiled_bytes(width, height,
+        /// tex_block_log2(height))` long; words: width | height << 32,
+        /// flags (`TEX_*`). Reply: word 0 = texture ID (its own
+        /// numbering). The image is sampled normalized, without mipmaps.
+        pub const TEXTURE_ATTACH: u32 = 19;
+        /// word 0 = texture ID.
+        pub const TEXTURE_DETACH: u32 = 20;
+        /// Flags: nearest filtering (linear otherwise), clamp to the
+        /// edge (repeat otherwise).
+        pub const TEX_NEAREST: u64 = 1;
+        pub const TEX_CLAMP: u64 = 2;
+        /// Block height (log2 of GOBs) of a texture `height` rows high:
+        /// no taller than the image needs.
+        pub const fn tex_block_log2(height: u32) -> u32 {
+            match height {
+                0..=8 => 0,
+                9..=16 => 1,
+                17..=32 => 2,
+                33..=64 => 3,
+                _ => 4,
+            }
+        }
         /// Commands: a word with the opcode (low 16 bits) and the count
         /// of words that follow (high 16), then those.
         /// `[color target, depth target or NO_TARGET]`.
@@ -1453,12 +1477,19 @@ pub mod proto {
         /// `[vertex buffer, byte offset, vertices, index buffer, byte
         /// offset, indices (u16), first, count]`.
         pub const CMD_DRAW_INDEXED: u32 = 6;
+        /// `[texture ID]`: the texture `PIPE_TEXTURED` samples, for the
+        /// draws that follow (before or after `CMD_UNIFORMS`).
+        pub const CMD_TEXTURE: u32 = 7;
         pub const NO_TARGET: u32 = u32::MAX;
         /// Vertex of 32 bytes, clip-space position and color (4 floats each).
         pub const PIPE_FLAT: u32 = 0;
         /// Vertex of 28 bytes: position, normal (3 floats), color (4
         /// unorm8); one directional light.
         pub const PIPE_LIT: u32 = 1;
+        /// Vertex of 36 bytes: position, normal (3 floats), texture
+        /// coordinates (2 floats), color (4 unorm8); `PIPE_LIT`'s light
+        /// and uniforms, the color times the bound texture's texel.
+        pub const PIPE_TEXTURED: u32 = 2;
         /// Cull back faces (counter-clockwise front).
         pub const PF_CULL_BACK: u32 = 1;
         pub const LIT_UBO_WORDS: usize = 33;
@@ -1467,6 +1498,7 @@ pub mod proto {
         pub const T3_TRIANGLE: u64 = 64;
         pub const T3_DEPTH: u64 = 128;
         pub const T3_LIT: u64 = 256;
+        pub const T3_TEXTURE: u64 = 512;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {

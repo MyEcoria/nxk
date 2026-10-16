@@ -7,13 +7,16 @@ use std::fs;
 
 use nxgfx::{
     cube, octahedron, rgb, tris_mesh, vec3, Button, Canvas, Event, Frame, Graphics, LitUniforms,
-    Mat4, Mesh, Phase, Rgba, Stick, Vec3, HEIGHT, WIDTH,
+    Mat4, Mesh, Phase, Rgba, Sampling, Stick, Texture, Vec3, HEIGHT, WIDTH,
 };
 
 /// Half width of the playfield.
 const HALF: f32 = 3.9;
 const GROUND_Y: f32 = -0.5;
-const FAR: f32 = -110.0;
+const FAR: f32 = -112.0;
+/// World size of one repeat of the ground texture; it divides the
+/// scroll's period, so the pattern runs on without a jump.
+const GROUND_CELL: f32 = 2.0;
 const BEST_FILE: &str = "/games/starlane/best.txt";
 /// Columns blocks and gems come in.
 const COLUMNS: [f32; 5] = [-3.2, -1.6, 0.0, 1.6, 3.2];
@@ -67,7 +70,32 @@ struct Assets {
     ship: Mesh,
     flame: Mesh,
     ground: Mesh,
+    ground_tex: Texture,
     white: Mesh,
+}
+
+/// One cell of the ground: dark violet with a soft neon line along its
+/// left and top edges, a little grain.
+fn ground_texels() -> Vec<u8> {
+    const N: u32 = 64;
+    let mut px = Vec::with_capacity((N * N * 4) as usize);
+    for y in 0..N {
+        for x in 0..N {
+            // Distance (texels) to the nearest line; the lines sit on
+            // the cell's edge, so they wrap.
+            let d = x.min(N - x).min(y).min(N - y) as f32;
+            let line = (1.0 - d / 3.0).max(0.0);
+            let grain = (x.wrapping_mul(73856093) ^ y.wrapping_mul(19349663)) % 9;
+            let base = [46.0, 38.0, 86.0];
+            let neon = [150.0, 110.0, 255.0];
+            for c in 0..3 {
+                let v = base[c] + (neon[c] - base[c]) * line + grain as f32 - 4.0;
+                px.push(v.clamp(0.0, 255.0) as u8);
+            }
+            px.push(255);
+        }
+    }
+    px
 }
 
 fn load(g: &Graphics) -> nxgfx::Result<Assets> {
@@ -101,8 +129,18 @@ fn load(g: &Graphics) -> nxgfx::Result<Assets> {
     let ship = g.mesh_lit(&v, &i)?;
     let (v, i) = solid([255, 214, 120, 255]);
     let flame = g.mesh_lit(&v, &i)?;
-    let (v, i) = nxgfx::ground(HALF + 4.0, GROUND_Y, FAR, 14.0, [34, 28, 62, 255]);
-    let ground = g.mesh_lit(&v, &i)?;
+    // Brighter near, fading to the dark of the sky far off.
+    let (v, i) = nxgfx::ground_textured(
+        HALF + 4.0,
+        GROUND_Y,
+        FAR,
+        14.0,
+        1.0 / GROUND_CELL,
+        [255, 255, 255, 255],
+        [26, 26, 40, 255],
+    );
+    let ground = g.mesh_textured(&v, &i)?;
+    let ground_tex = g.texture(64, 64, &ground_texels(), Sampling::default())?;
     let (v, i) = solid([210, 220, 255, 255]);
     let white = g.mesh_lit(&v, &i)?;
     let [a, b, cc]: [Mesh; 3] = blocks.try_into().ok().unwrap();
@@ -112,6 +150,7 @@ fn load(g: &Graphics) -> nxgfx::Result<Assets> {
         ship,
         flame,
         ground,
+        ground_tex,
         white,
     })
 }
@@ -478,10 +517,14 @@ fn main() {
         let mut f = g.frame();
         f.clear([0.03, 0.04, 0.12, 1.0]);
         f.canvas(&bg);
-        f.pipeline(nxgfx::Pipe::Lit, false);
         let id = Mat4::IDENTITY;
         let one = vec3(1.0, 1.0, 1.0);
-        draw_obj(&mut f, &assets.ground, &vp, Vec3::default(), id, one);
+        // The ground moves a cell at most: the pattern scrolls with the lane.
+        f.pipeline(nxgfx::Pipe::Textured, false);
+        f.texture(&assets.ground_tex);
+        let slide = vec3(0.0, 0.0, game.scroll % GROUND_CELL);
+        draw_obj(&mut f, &assets.ground, &vp, slide, id, one);
+        f.pipeline(nxgfx::Pipe::Lit, false);
         for s in &game.stars {
             draw_obj(
                 &mut f,

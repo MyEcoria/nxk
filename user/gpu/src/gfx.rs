@@ -10,13 +10,15 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use libnx::abi::proto::gpu as proto;
+
 use crate::engine::Surface;
 use crate::hw::{Dma, Result};
 use crate::mmu::Vm;
 use crate::push::{Push, SET_OBJECT, SUBC_3D};
 use crate::sass::{
-    ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, mufu_rcp, Asm, Interp,
-    Sched, RZ,
+    ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, mufu_rcp, tex_b, Asm,
+    Interp, Sched, RZ,
 };
 
 pub const MAXWELL_B: u32 = 0xB197;
@@ -42,9 +44,15 @@ const SET_ZT_SIZE_A: u32 = 0x1228;
 const SET_DEPTH_TEST: u32 = 0x12CC;
 const SET_DEPTH_WRITE: u32 = 0x12E8;
 const SET_DEPTH_FUNC: u32 = 0x130C;
+const SET_SAMPLER_BINDING: u32 = 0x1234;
+const INVALIDATE_SAMPLER_CACHE: u32 = 0x1330;
+const INVALIDATE_TEXTURE_HEADER_CACHE: u32 = 0x1334;
+const INVALIDATE_TEXTURE_DATA_CACHE: u32 = 0x1338;
 const SET_BLEND: u32 = 0x1360;
 const SET_WINDOW_ORIGIN: u32 = 0x13AC;
 const SET_ZT_SELECT: u32 = 0x1538;
+const SET_TEX_SAMPLER_POOL_A: u32 = 0x155C;
+const SET_TEX_HEADER_POOL_A: u32 = 0x1574;
 const SET_PROGRAM_REGION_A: u32 = 0x1608;
 const END: u32 = 0x1614;
 const BEGIN: u32 = 0x1618;
@@ -87,10 +95,14 @@ pub const UBO_SLOT: u8 = 1;
 /// projection rows 0-15, normal matrix rows 16-27 (three vec4), light
 /// direction 28-30 and ambient 31, diffuse strength 32.
 pub const LIT_UBO_WORDS: usize = 33;
+/// `Pipe::Textured` adds the texture handle (header index | sampler index
+/// << 20), which the service fills in, as word 33.
+pub const TEX_UBO_WORDS: usize = LIT_UBO_WORDS + 1;
 const U_MVP: u32 = 0x00;
 const U_NORMAL: u32 = 0x40;
 const U_LIGHT: u32 = 0x70;
 const U_DIFFUSE: u32 = 0x80;
+const U_TEXTURE: u32 = 0x84;
 
 /// Vertex shader outputs and fragment shader inputs.
 const A_POSITION: u32 = 0x70;
@@ -98,6 +110,7 @@ const A_FRAG_W: u32 = 0x7C;
 const A_GENERIC0: u32 = 0x80;
 const A_GENERIC1: u32 = 0x90;
 const A_GENERIC2: u32 = 0xA0;
+const A_GENERIC3: u32 = 0xB0;
 
 /// Program header, then code.
 const SPH_WORDS: usize = 20;
@@ -108,9 +121,15 @@ const FLAT_VS: usize = 0x030;
 const FLAT_FS: usize = 0x430;
 const LIT_VS: usize = 0x830;
 const LIT_FS: usize = 0x1030;
-const REGION_SIZE: usize = 0x2000;
+const TEX_VS: usize = 0x2030;
+const TEX_FS: usize = 0x2830;
+const REGION_SIZE: usize = 0x3000;
 /// Constant buffer data of a batch.
 const UBO_SIZE: usize = 0x40000;
+/// Textures a client may have attached; entries in the header and
+/// sampler pools (32 bytes each).
+pub const MAX_TEXTURES: usize = 64;
+const POOL_ENTRY: usize = 32;
 
 /// Which shaders, and the vertex layout they read.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +139,9 @@ pub enum Pipe {
     /// Position and normal (three floats each), color (four unorm8):
     /// 28 bytes; lit by one directional light (`LIT_UBO_WORDS`).
     Lit,
+    /// `Lit` and texture coordinates (two floats after the normal): 36
+    /// bytes; the color is multiplied by the texel of the bound texture.
+    Textured,
 }
 
 impl Pipe {
@@ -127,6 +149,7 @@ impl Pipe {
         match self {
             Pipe::Flat => 32,
             Pipe::Lit => 28,
+            Pipe::Textured => 36,
         }
     }
 
@@ -141,6 +164,10 @@ impl Pipe {
                 (TYPE_VERTEX, LIT_VS, 24, GROUP_VERTEX),
                 (TYPE_PIXEL, LIT_FS, 16, GROUP_PIXEL),
             ],
+            Pipe::Textured => [
+                (TYPE_VERTEX, TEX_VS, 24, GROUP_VERTEX),
+                (TYPE_PIXEL, TEX_FS, 32, GROUP_PIXEL),
+            ],
         }
     }
 
@@ -149,6 +176,7 @@ impl Pipe {
     fn attributes(self) -> Vec<u32> {
         const R32X4: u32 = 1;
         const R32X3: u32 = 2;
+        const R32X2: u32 = 4;
         const R8X4: u32 = 0x0A;
         const UNORM: u32 = 2;
         const FLOAT: u32 = 7;
@@ -158,6 +186,12 @@ impl Pipe {
             Pipe::Lit => {
                 alloc::vec![a(0, R32X3, FLOAT), a(12, R32X3, FLOAT), a(24, R8X4, UNORM)]
             }
+            Pipe::Textured => alloc::vec![
+                a(0, R32X3, FLOAT),
+                a(12, R32X3, FLOAT),
+                a(24, R32X2, FLOAT),
+                a(32, R8X4, UNORM)
+            ],
         }
     }
 }
@@ -384,6 +418,166 @@ fn lit_fs() -> Vec<u64> {
     a.finish()
 }
 
+/// As `lit_vs`, with texture coordinates (attribute 2, two words) passed
+/// through to generic output 2.
+fn tex_vs() -> Vec<u64> {
+    let mut a = Asm::new();
+    a.emit(ald(0, A_GENERIC0, 3), sets(0)); // R0-R2 position
+    a.emit(ald(4, A_GENERIC1, 3), sets(1)); // R4-R6 normal
+    a.emit(ald(8, A_GENERIC2, 2), sets(2)); // R8-R9 texture coordinates
+    a.emit(ald(20, A_GENERIC3, 4), sets(3)); // R20-R23 color
+    let row = |a: &mut Asm, d: u8, s: u8, at: u32, w: bool, barrier: u8| {
+        a.emit(
+            fmul_c(d, s, UBO_SLOT, at),
+            Sched::stall(6).wait(1 << barrier),
+        );
+        a.emit(ffma_cb(d, s + 1, UBO_SLOT, at + 4, d), alu());
+        a.emit(ffma_cb(d, s + 2, UBO_SLOT, at + 8, d), alu());
+        if w {
+            a.emit(fadd_c(d, d, UBO_SLOT, at + 12), alu());
+        }
+    };
+    for r in 0..4u8 {
+        row(&mut a, 12 + r, 0, U_MVP + 0x10 * r as u32, true, 0);
+    }
+    for r in 0..3u8 {
+        row(&mut a, 16 + r, 4, U_NORMAL + 0x10 * r as u32, false, 1);
+    }
+    a.emit(ast(12, A_POSITION, 4), Sched::stall(1).rd(4));
+    a.emit(ast(16, A_GENERIC0, 3), Sched::stall(1).rd(5));
+    a.emit(ast(20, A_GENERIC1, 4), Sched::stall(1).rd(4).wait(1 << 3));
+    a.emit(ast(8, A_GENERIC2, 2), Sched::stall(1).rd(5).wait(1 << 2));
+    a.emit(exit(), Sched::stall(5).wait(0x3F));
+    a.finish()
+}
+
+/// color = vertex color * texel * (ambient + diffuse * saturate(N . L)).
+fn tex_fs() -> Vec<u64> {
+    let mut a = Asm::new();
+    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), sets(0));
+    a.emit(mufu_rcp(0, 0), sets(0).wait(1 << 0));
+    // Normal R4-R6, color R8-R11, texture coordinates R16-R17: TEX takes
+    // the coordinates, and the handle in a vector of its own (R20).
+    for (k, (d, addr)) in [
+        (4u8, A_GENERIC0),
+        (5, A_GENERIC0 + 4),
+        (6, A_GENERIC0 + 8),
+        (8, A_GENERIC1),
+        (9, A_GENERIC1 + 4),
+        (10, A_GENERIC1 + 8),
+        (11, A_GENERIC1 + 12),
+        (16, A_GENERIC2),
+        (17, A_GENERIC2 + 4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let s = sets(1);
+        a.emit(
+            ipa(d, addr, Interp::PassMulW, 0),
+            if k == 0 { s.wait(1 << 0) } else { s },
+        );
+    }
+    a.emit(mov_cb(20, UBO_SLOT, U_TEXTURE), alu().wait(1 << 1));
+    // The texel lands in R24-R27 (barrier 2) while the light is worked out.
+    a.emit(tex_b(24, 16, 20), sets(2).wait(1 << 1));
+    a.emit(
+        fmul_c(12, 4, UBO_SLOT, U_LIGHT),
+        Sched::stall(6).wait(1 << 1),
+    );
+    a.emit(ffma_cb(12, 5, UBO_SLOT, U_LIGHT + 4, 12), alu());
+    a.emit(ffma_cb(12, 6, UBO_SLOT, U_LIGHT + 8, 12), alu());
+    a.emit(mov32i(13, 1.0f32.to_bits()), alu());
+    a.emit(fmul(12, 12, 13, true), alu());
+    a.emit(mov_cb(14, UBO_SLOT, U_LIGHT + 12), alu());
+    a.emit(ffma_cb(12, 12, UBO_SLOT, U_DIFFUSE, 14), alu());
+    // Vertex color times light, then times the texel.
+    a.emit(fmul(8, 8, 12, false), alu());
+    a.emit(fmul(9, 9, 12, false), alu());
+    a.emit(fmul(10, 10, 12, false), alu());
+    a.emit(fmul(0, 8, 24, false), alu().wait(1 << 2));
+    a.emit(fmul(1, 9, 25, false), alu());
+    a.emit(fmul(2, 10, 26, false), alu());
+    a.emit(fmul(3, 11, 27, false), alu());
+    a.emit(exit(), Sched::stall(5).wait(0x3F));
+    a.finish()
+}
+
+fn bits(w: &mut [u32; 8], lo: usize, hi: usize, v: u32) {
+    let n = hi - lo + 1;
+    assert!(n == 32 || v < 1 << n);
+    for i in 0..n {
+        w[(lo + i) / 32] |= ((v >> i) & 1) << ((lo + i) % 32);
+    }
+}
+
+/// Texture header (TIC, `TEXHEAD_BL`, as NIL's `nvb097_fill_image_view_desc`
+/// writes it): RGBA8 unorm, block-linear, 2D, one level, normalized.
+fn tic(va: u64, width: u32, height: u32) -> [u32; 8] {
+    const A8B8G8R8: u32 = 8;
+    const UNORM: u32 = 2;
+    const SOURCE_R: u32 = 2;
+    const BLOCKLINEAR: u32 = 3;
+    const TWO_D: u32 = 1;
+    const BORDER_FROM_SAMPLER: u32 = 7;
+    assert!(va.is_multiple_of(512) && va >> 48 == 0);
+    let mut w = [0u32; 8];
+    bits(&mut w, 0, 6, A8B8G8R8);
+    for c in 0..4 {
+        bits(&mut w, 7 + 3 * c, 9 + 3 * c, UNORM);
+        bits(&mut w, 19 + 3 * c, 21 + 3 * c, SOURCE_R + c as u32);
+    }
+    bits(&mut w, 41, 63, (va >> 9) as u32 & 0x7F_FFFF);
+    bits(&mut w, 64, 79, (va >> 32) as u32);
+    bits(&mut w, 85, 87, BLOCKLINEAR);
+    // One GOB wide blocks, as tall as the image needs.
+    bits(&mut w, 99, 101, proto::tex_block_log2(height));
+    // LOD quality as NIL sets it.
+    bits(&mut w, 112, 114, 0b111);
+    bits(&mut w, 128, 143, width - 1);
+    bits(&mut w, 151, 154, TWO_D);
+    bits(&mut w, 157, 159, BORDER_FROM_SAMPLER);
+    bits(&mut w, 160, 175, height - 1);
+    bits(&mut w, 191, 191, 1); // normalized coordinates
+    bits(&mut w, 215, 216, 2); // aniso spread functions, as NIL
+    bits(&mut w, 217, 218, 1);
+    w
+}
+
+/// Sampler (TSC): filter and wrap mode, no mipmaps, transparent border.
+fn tsc(flags: u64) -> [u32; 8] {
+    const WRAP: u32 = 0;
+    const CLAMP_TO_EDGE: u32 = 2;
+    const POINT: u32 = 1;
+    const LINEAR: u32 = 2;
+    const MIP_NONE: u32 = 1;
+    const AUTO_SPAN_SEAM: u32 = 2;
+    let (filter, wrap) = (
+        if flags & proto::TEX_NEAREST != 0 {
+            POINT
+        } else {
+            LINEAR
+        },
+        if flags & proto::TEX_CLAMP != 0 {
+            CLAMP_TO_EDGE
+        } else {
+            WRAP
+        },
+    );
+    let mut w = [0u32; 8];
+    bits(&mut w, 0, 2, wrap);
+    bits(&mut w, 3, 5, wrap);
+    bits(&mut w, 6, 8, wrap);
+    bits(&mut w, 14, 16, 1); // font filter width and height: 2
+    bits(&mut w, 17, 19, 1);
+    bits(&mut w, 32, 34, filter); // magnification
+    bits(&mut w, 36, 37, filter); // minification
+    bits(&mut w, 38, 39, MIP_NONE);
+    bits(&mut w, 40, 41, AUTO_SPAN_SEAM);
+    bits(&mut w, 76, 87, 0xFFF); // LOD clamp up to the last level
+    w
+}
+
 /// Shaders in GPU memory, and the constant buffer data of a batch.
 pub struct Gfx {
     _prog: Dma,
@@ -391,6 +585,11 @@ pub struct Gfx {
     ubo: Dma,
     ubo_va: u64,
     ubo_pos: usize,
+    /// Texture header and sampler pools, written by the CPU.
+    tics: Dma,
+    tscs: Dma,
+    tics_va: u64,
+    tscs_va: u64,
 }
 
 impl Gfx {
@@ -399,6 +598,9 @@ impl Gfx {
         let lit_in = 0x7 | 0x7 << 4 | 0xF << 8;
         // Output words: normal in generic 0 (3), color in generic 1 (4).
         let lit_out = 0x7 | 0xF << 4;
+        // Textured: the same, and texture coordinates in generic 2.
+        let tex_in = 0x7 | 0x7 << 4 | 0x3 << 8 | 0xF << 12;
+        let tex_out = lit_out | 0x3 << 8;
         // Input interpolation: perspective (2) on normal words 0-2 and
         // color words 4-7 (generic 1 at word 4: attributes are 4 words).
         let persp = |words: u32| (0..16).fold(0u32, |m, i| m | (((words >> i) & 1) * 2) << (2 * i));
@@ -407,6 +609,8 @@ impl Gfx {
             (FLAT_FS, fs_header(0xFF), flat_fs()),
             (LIT_VS, vs_header(lit_in, lit_out), lit_vs()),
             (LIT_FS, fs_header(persp(0x7 | 0xF << 4)), lit_fs()),
+            (TEX_VS, vs_header(tex_in, tex_out), tex_vs()),
+            (TEX_FS, fs_header(persp(tex_out)), tex_fs()),
         ] {
             prog.words(at, &hdr);
             for (i, w) in code.iter().enumerate() {
@@ -416,13 +620,41 @@ impl Gfx {
         let prog_va = vm.map(&prog, false)?;
         let ubo = Dma::new(UBO_SIZE)?;
         let ubo_va = vm.map(&ubo, false)?;
+        let tics = Dma::new(MAX_TEXTURES * POOL_ENTRY)?;
+        let tscs = Dma::new(MAX_TEXTURES * POOL_ENTRY)?;
+        let tics_va = vm.map(&tics, false)?;
+        let tscs_va = vm.map(&tscs, false)?;
         Ok(Self {
             _prog: prog,
             prog_va,
             ubo,
             ubo_va,
             ubo_pos: 0,
+            tics,
+            tscs,
+            tics_va,
+            tscs_va,
         })
+    }
+
+    /// Texture `id`: its header and sampler written to the pools; the
+    /// image (RGBA8, block-linear, `va` on a 512-byte boundary) is the
+    /// caller's. The batch that follows sees them (`begin` invalidates the
+    /// caches).
+    pub fn set_texture(&self, id: usize, va: u64, width: u32, height: u32, flags: u64) {
+        self.tics.words(id * POOL_ENTRY, &tic(va, width, height));
+        self.tscs.words(id * POOL_ENTRY, &tsc(flags));
+    }
+
+    pub fn clear_texture(&self, id: usize) {
+        self.tics.words(id * POOL_ENTRY, &[0; 8]);
+        self.tscs.words(id * POOL_ENTRY, &[0; 8]);
+    }
+
+    /// The handle `TEX` takes for texture `id`: header index, then the
+    /// sampler of the same index.
+    pub fn texture_handle(id: usize) -> u32 {
+        id as u32 | (id as u32) << 20
     }
 
     /// Channel setup: the class bound, the state that stays.
@@ -441,6 +673,20 @@ impl Gfx {
         p.inc(SUBC_3D, SET_BLEND, &[0]);
         // All four channels written.
         p.inc(SUBC_3D, SET_CT_WRITE, &[0x1111]);
+        // Texture pools (offset high, low, last index); a handle names the
+        // sampler apart from the header.
+        let last = MAX_TEXTURES as u32 - 1;
+        p.inc(
+            SUBC_3D,
+            SET_TEX_HEADER_POOL_A,
+            &[(self.tics_va >> 32) as u32, self.tics_va as u32, last],
+        );
+        p.inc(
+            SUBC_3D,
+            SET_TEX_SAMPLER_POOL_A,
+            &[(self.tscs_va >> 32) as u32, self.tscs_va as u32, last],
+        );
+        p.inc(SUBC_3D, SET_SAMPLER_BINDING, &[0]);
     }
 
     /// Start of a batch: caches that may hold what the CPU rewrote, and
@@ -448,6 +694,10 @@ impl Gfx {
     pub fn begin(&mut self, p: &mut Push) {
         self.ubo_pos = 0;
         p.inc(SUBC_3D, INVALIDATE_SHADER_CACHES, &[1 | 1 << 4 | 1 << 12]);
+        // The pools too: lines of all three caches.
+        p.inc(SUBC_3D, INVALIDATE_SAMPLER_CACHE, &[0]);
+        p.inc(SUBC_3D, INVALIDATE_TEXTURE_HEADER_CACHE, &[0]);
+        p.inc(SUBC_3D, INVALIDATE_TEXTURE_DATA_CACHE, &[0]);
     }
 
     /// The render target, its depth buffer and the viewport.

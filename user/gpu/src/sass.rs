@@ -255,6 +255,17 @@ pub fn ipa(d: u8, addr: u32, how: Interp, inv_w: u8) -> u64 {
         | (how as u64) << 54
 }
 
+/// TEX.B (bindless, 2D, automatic LOD, all four channels): `d` = RGBA
+/// texel (four registers) of the texture named by the handle in `handle`,
+/// sampled at (`coords`, `coords` + 1), normalized. The handle is the
+/// header index, plus the sampler index << 20; it sits in a vector of its
+/// own (three registers, the others unused), as Gallium's gm107 emitter
+/// and register allocator place it (NAK puts it ahead of the coordinates).
+pub fn tex_b(d: u8, coords: u8, handle: u8) -> u64 {
+    const DIM_2D: u64 = 2;
+    op(0xDEB8) | reg(d, 0) | reg(coords, 8) | reg(handle, 20) | DIM_2D << 28 | 0xF << 31
+}
+
 /// A position in the code a branch can target.
 #[derive(Clone, Copy)]
 pub struct Label(usize);
@@ -401,6 +412,16 @@ mod tests {
         // From 8 to 40: 40 - 8 - 8 = 24.
         assert_eq!(w[1] >> 20 & 0xFF_FFFF, 24);
         assert_eq!(w[5], exit());
+    }
+
+    #[test]
+    fn texture_fields() {
+        // TEX.B R24..R27, R16, R20: opcode 0xdeb8, coordinates at 8, handle
+        // at 20, dim 2D at 28, mask RGBA at 31, automatic LOD.
+        assert_eq!(
+            tex_b(24, 16, 20),
+            0xDEB8_0000_0007_0018 | 16 << 8 | 20 << 20 | 2 << 28 | 0xF << 31
+        );
     }
 
     /// NAK's encodings for the forms envyas' library does not use.

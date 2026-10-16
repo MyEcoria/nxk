@@ -442,7 +442,8 @@ Then at the shell:
 ```text
 gpu             gpu on: chip 0x12b000a1, 76.8 MHz, rail 868 mV, speedo NNNN (ID 3)
 gpu test        2D fill and copy, fill / copy / SAXPY kernels, 3D clear,
-                a triangle, depth ordering and a lit indexed quad: 9/9 ok
+                a triangle, depth ordering, a lit indexed quad and a
+                textured quad (nearest and linear): 10/10 ok
 gpu bench       FFMA on both SMs for 1 s: at most 39.3 GFLOP/s at 76.8 MHz
 gpu clock 768   [gpu] GPU 76800 -> 768000 kHz at 987 mV, measured 768292 kHz
 gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
@@ -876,6 +877,20 @@ within 5 s.
     (a forced handshake gets no byte): not understood yet. `ktest` 29/29
     and `stdtest` 17/17 in the emulator, where `joycon` only logs
     `no handshake`.
+
+33. 16/10/2026, Erista, `gpu` 3D: **textures**. `gpu test` 10/10: a 16 x
+    16 block-linear RGBA8 texture (four colored quadrants) on a quad,
+    sampled nearest (hard seam) and linear (the seam pixels 0xff006c93
+    and 0xff00936c, the blend at the texel centers' distances), through
+    the texture header (TIC) and sampler (TSC) pools and `TEX.B`.
+    Starlane's ground is a 64 x 64 textured neon grid that scrolls with
+    the lane. Findings: the bindless `TEX` takes the coordinates in the
+    first source vector and the handle (header index | sampler index <<
+    20) in the second one, as Mesa's Gallium gm107 emitter has it; NAK's
+    handle-first vector ahead of the coordinates trapped the warp with
+    ILLEGAL_INSTR_ENCODING (MP warp error 0x9). `gr::report` now prints
+    the GPC/TPC traps (TPC exception 0x2 is the MP; warp and global
+    errors) behind a GR exception 0x1000000.
 
 ## Hardware test (once the SD card is back in the PC)
 

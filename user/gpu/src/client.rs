@@ -13,7 +13,7 @@ use libnx::abi::proto::gpu as proto;
 use libnx::mem::SharedMemory;
 use libnx::sys;
 
-use crate::gfx::{Color, Depth, Gfx, Pipe, Target, Tiled};
+use crate::gfx::{Color, Depth, Gfx, Pipe, Target, Tiled, LIT_UBO_WORDS, MAX_TEXTURES};
 use crate::mmu::{self, Vm, PAGE};
 use crate::push::Push;
 
@@ -59,10 +59,17 @@ struct Tgt {
     _held: Held,
 }
 
+struct Tex {
+    va: u64,
+    bytes: u64,
+    _held: Held,
+}
+
 #[derive(Default)]
 pub struct Client {
     bufs: Vec<Option<Buf>>,
     tgts: Vec<Option<Tgt>>,
+    texs: Vec<Option<Tex>>,
 }
 
 /// Physical pages of `len` bytes of a client's shm (DMA right).
@@ -180,8 +187,57 @@ impl Client {
         Ok(())
     }
 
+    /// `h`: the client's shm with the image, which this takes (closed on
+    /// error too). The pool entries go in `gfx`.
+    pub fn attach_texture(
+        &mut self,
+        vm: &mut Vm,
+        gfx: &Gfx,
+        h: u32,
+        width: u32,
+        height: u32,
+        flags: u64,
+    ) -> Res<u64> {
+        let held = Held::Raw(h);
+        if width == 0
+            || height == 0
+            || width > 8192
+            || height > 8192
+            || flags & !(proto::TEX_NEAREST | proto::TEX_CLAMP) != 0
+        {
+            return Err(-EINVAL);
+        }
+        let bytes = proto::tiled_bytes(width, height, proto::tex_block_log2(height)) as u64;
+        let pg = pages(h, bytes)?;
+        let i = slot(&mut self.texs, MAX_TEXTURES)?;
+        let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
+        vm.map_at_kind(va, &pg, false, mmu::KIND_GENERIC_16BX2)
+            .map_err(|(e, _)| -e)?;
+        gfx.set_texture(i, va, width, height, flags);
+        self.texs[i] = Some(Tex {
+            va,
+            bytes,
+            _held: held,
+        });
+        Ok(i as u64)
+    }
+
+    pub fn detach_texture(&mut self, vm: &mut Vm, gfx: &Gfx, id: u64) -> Res<()> {
+        let t = self
+            .texs
+            .get_mut(id as usize)
+            .and_then(|t| t.take())
+            .ok_or(-EINVAL)?;
+        gfx.clear_texture(id as usize);
+        let _ = vm.unmap(t.va, t.bytes);
+        Ok(())
+    }
+
     /// Everything went: handles and GPU mappings.
-    pub fn clear(&mut self, vm: &mut Vm) {
+    pub fn clear(&mut self, vm: &mut Vm, gfx: &Gfx) {
+        for id in 0..self.texs.len() as u64 {
+            let _ = self.detach_texture(vm, gfx, id);
+        }
         for id in 0..self.bufs.len() as u64 {
             let _ = self.detach_buffer(vm, id);
         }
@@ -246,6 +302,36 @@ impl Client {
         })
     }
 
+    /// The shaders' constant buffer, if the stream changed it since the
+    /// last draw: its words, and for `Textured` the handle of the bound
+    /// texture after the `LIT_UBO_WORDS`.
+    fn flush(
+        gfx: &mut Gfx,
+        p: &mut Push,
+        pipe: Pipe,
+        uniforms: &[u32],
+        texture: Option<u32>,
+        dirty: &mut bool,
+    ) -> Res<()> {
+        if !core::mem::take(dirty) || uniforms.is_empty() {
+            return Ok(());
+        }
+        let ok = if pipe == Pipe::Textured {
+            let id = texture.ok_or(-EINVAL)?;
+            let mut w = uniforms.to_vec();
+            w.resize(LIT_UBO_WORDS, 0);
+            w.push(Gfx::texture_handle(id as usize));
+            gfx.uniforms(p, &w)
+        } else {
+            gfx.uniforms(p, uniforms)
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(-ENOSPC)
+        }
+    }
+
     /// The batch for the stream `first..first + count` of buffer `id`,
     /// or why it is refused; nothing has run.
     pub fn build(&self, gfx: &mut Gfx, id: u32, first: u32, count: u32) -> Res<Push> {
@@ -255,6 +341,11 @@ impl Client {
         let mut at = 0;
         let mut target: Option<Target> = None;
         let mut pipe: Option<Pipe> = None;
+        // Uniforms are written before a draw, once they or the texture
+        // changed.
+        let mut uniforms: Vec<u32> = Vec::new();
+        let mut texture: Option<u32> = None;
+        let mut dirty = false;
         while at < w.len() {
             let (op, n) = (w[at] & 0xFFFF, (w[at] >> 16) as usize);
             let a = w.get(at + 1..at + 1 + n).ok_or(-EINVAL)?;
@@ -273,21 +364,32 @@ impl Client {
                     let k = match kind {
                         proto::PIPE_FLAT => Pipe::Flat,
                         proto::PIPE_LIT => Pipe::Lit,
+                        proto::PIPE_TEXTURED => Pipe::Textured,
                         _ => return Err(-EINVAL),
                     };
+                    dirty |= pipe != Some(k);
                     pipe = Some(k);
                     gfx.pipeline(&mut p, t, k, flags & proto::PF_CULL_BACK != 0);
                 }
                 (proto::CMD_UNIFORMS, u) if !u.is_empty() && u.len() <= MAX_UNIFORM_WORDS => {
-                    if !gfx.uniforms(&mut p, u) {
-                        return Err(-ENOSPC);
+                    uniforms.clear();
+                    uniforms.extend_from_slice(u);
+                    dirty = true;
+                }
+                (proto::CMD_TEXTURE, &[id]) => {
+                    let live = self.texs.get(id as usize).is_some_and(|t| t.is_some());
+                    if !live {
+                        return Err(-EINVAL);
                     }
+                    texture = Some(id);
+                    dirty = true;
                 }
                 (proto::CMD_DRAW, &[vb, off, vertices, f, c]) => {
                     let k = pipe.ok_or(-EINVAL)?;
                     if c == 0 || c % 3 != 0 || f as u64 + c as u64 > vertices as u64 {
                         return Err(-EINVAL);
                     }
+                    Self::flush(gfx, &mut p, k, &uniforms, texture, &mut dirty)?;
                     let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
                     gfx.draw(&mut p, k, va, vertices, f, c);
                 }
@@ -297,6 +399,7 @@ impl Client {
                     {
                         return Err(-EINVAL);
                     }
+                    Self::flush(gfx, &mut p, k, &uniforms, texture, &mut dirty)?;
                     let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
                     let iva = self.span(ib, ioff, indices as u64 * 2)?;
                     gfx.draw_indexed(&mut p, k, va, vertices, iva, indices, f, c);

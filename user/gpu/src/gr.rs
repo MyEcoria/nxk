@@ -182,6 +182,22 @@ pub fn report(r: &Regs, what: &str) {
         r.rd(0x40070C),
         r.rd(0x400110)
     );
+    // The GPC and TPC traps behind a GR exception (nouveau
+    // gf100_gr_trap_gpc / _tpc / _mp): GPC exception, then per TPC the
+    // exception, TEX, and MP warp and global errors.
+    println!("[gpu] {}: GPC trap {:#x}", what, r.rd(0x502C90));
+    for tpc in 0..2u32 {
+        let t = 0x504000 + tpc * 0x800;
+        println!(
+            "[gpu] {}: TPC {} exception {:#x} TEX {:#x} MP warp {:#x} global {:#x}",
+            what,
+            tpc,
+            r.rd(t + 0x508),
+            r.rd(t + 0x224),
+            r.rd(t + 0x648),
+            r.rd(t + 0x650)
+        );
+    }
 }
 
 /// Idle: disabled, or not busy (`gf100_gr_wait_idle`; the FIFO's context

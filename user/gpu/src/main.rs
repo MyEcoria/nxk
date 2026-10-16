@@ -662,7 +662,12 @@ fn attach(g: &mut Gpu, m: &Msg) -> core::result::Result<u64, i64> {
 
 /// `BUFFER_ATTACH` and `TARGET_ATTACH`: the client's shm is taken (and
 /// closed on any failure).
-fn attach_shared(g: &mut Gpu, m: &Msg, target: bool) -> core::result::Result<u64, i64> {
+fn attach_shared(
+    g: &mut Gpu,
+    m: &Msg,
+    target: bool,
+    texture: bool,
+) -> core::result::Result<u64, i64> {
     let h = ipc::received_handle(0);
     let regs = g.regs;
     let d = match g.dev(0) {
@@ -672,7 +677,11 @@ fn attach_shared(g: &mut Gpu, m: &Msg, target: bool) -> core::result::Result<u64
             return Err(e);
         }
     };
-    let id = if target {
+    let id = if texture {
+        let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
+        d.client
+            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1])
+    } else if target {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
             .attach_target(&mut d.vm, h, w, ht, m.mr[1], m.mr[2] as u32)
@@ -1110,8 +1119,115 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         pass |= proto::T3_LIT;
     }
 
+    // Textured quad: 16 x 16 texels in four quadrants (red, green / blue,
+    // white), lit by ambient alone so that the color is the texel's.
+    let tt = gfx::Tiled {
+        va: 0,
+        width: 16,
+        height: 16,
+        format: proto::FMT_A8B8G8R8 as u32,
+        block_log2: proto::tex_block_log2(16),
+    };
+    let tex = Dma::new(tt.bytes().next_multiple_of(4096)).map_err(e)?;
+    for y in 0..16 {
+        for x in 0..16 {
+            let c = match (x < 8, y < 8) {
+                (true, true) => rgba(255, 0, 0),
+                (false, true) => rgba(0, 255, 0),
+                (true, false) => rgba(0, 0, 255),
+                (false, false) => rgba(255, 255, 255),
+            };
+            tex.w32(tt.offset(x, y), c);
+        }
+    }
     let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    let texv = d.vm.map_kind(&tex, false, kind, 1 << 17).map_err(e)?;
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    // Nearest in the last slot, linear and clamped in the one before.
+    let (near_id, lin_id) = (gfx::MAX_TEXTURES - 1, gfx::MAX_TEXTURES - 2);
+    d.gfx.set_texture(near_id, texv, 16, 16, proto::TEX_NEAREST);
+    d.gfx.set_texture(lin_id, texv, 16, 16, proto::TEX_CLAMP);
+    let vertex = |x: f32, y: f32, u: f32, v: f32| -> [u8; 36] {
+        let mut b = [0u8; 36];
+        for (i, f) in [x, y, 0.0, 0.0, 0.0, 1.0, u, v].iter().enumerate() {
+            b[4 * i..4 * i + 4].copy_from_slice(&f.to_bits().to_le_bytes());
+        }
+        b[32..36].copy_from_slice(&[255, 255, 255, 255]);
+        b
+    };
+    let quad: Vec<u8> = [
+        (-0.8, -0.8, 0.0, 0.0),
+        (0.8, -0.8, 1.0, 0.0),
+        (0.8, 0.8, 1.0, 1.0),
+        (-0.8, 0.8, 0.0, 1.0),
+    ]
+    .iter()
+    .flat_map(|&(x, y, u, v)| vertex(x, y, u, v))
+    .collect();
+    vb.write(0, &quad);
+    let mut u = [0u32; gfx::TEX_UBO_WORDS];
+    for (k, v) in [
+        (0, 1.0f32),
+        (5, 1.0),
+        (10, 1.0),
+        (15, 1.0),
+        (16, 1.0),
+        (21, 1.0),
+        (26, 1.0),
+        (30, 1.0),
+        (31, 1.0),
+        (32, 0.0),
+    ] {
+        u[k] = v.to_bits();
+    }
+    let mut tex_ok = true;
+    for (label, id) in [("nearest", near_id), ("linear", lin_id)] {
+        u[33] = gfx::Gfx::texture_handle(id);
+        let d = g.dev.as_mut().ok_or(-ENODEV)?;
+        let mut p = Push::default();
+        d.gfx.begin(&mut p);
+        d.gfx.clear(&mut p, &deep, clear);
+        d.gfx.pipeline(&mut p, &deep, gfx::Pipe::Textured, false);
+        d.gfx.uniforms(&mut p, &u);
+        d.gfx
+            .draw_indexed(&mut p, gfx::Pipe::Textured, vbv, 4, ibv, 6, 0, 6);
+        ns += g.run(p, BATCH_TIMEOUT_US)?;
+        let quadrants = [
+            (38, 38, rgba(255, 0, 0)),
+            (90, 38, rgba(0, 255, 0)),
+            (38, 90, rgba(0, 0, 255)),
+            (90, 90, rgba(255, 255, 255)),
+        ];
+        println!(
+            "[gpu] 3D texture {}: {:#010x} {:#010x} {:#010x} {:#010x}, seam {:#010x} {:#010x}",
+            label,
+            tpx(38, 38),
+            tpx(90, 38),
+            tpx(38, 90),
+            tpx(90, 90),
+            tpx(63, 38),
+            tpx(64, 38),
+        );
+        let seam = |c: u32| (c & 0xFF) > 30 && (c >> 8 & 0xFF) > 30 && (c >> 16 & 0xFF) < 20;
+        let mut ok = quadrants.iter().all(|&(x, y, c)| near(tpx(x, y), c, 2));
+        ok &= near(tpx(4, 4), to_u8(clear), 1);
+        // Nearest: the seam is a hard edge; linear: a blend of the two.
+        ok &= if id == near_id {
+            !seam(tpx(63, 38)) && !seam(tpx(64, 38))
+        } else {
+            seam(tpx(63, 38)) && seam(tpx(64, 38))
+        };
+        tex_ok &= ok;
+    }
+    if tex_ok {
+        pass |= proto::T3_TEXTURE;
+    }
+
+    let d = g.dev.as_mut().ok_or(-ENODEV)?;
+    d.gfx.clear_texture(near_id);
+    d.gfx.clear_texture(lin_id);
     for (va, len) in [
+        (texv, tex.len()),
         (s.va, img.len()),
         (tiled.va, timg.len()),
         (zva, zbuf.len()),
@@ -1121,7 +1237,8 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         let _ = d.vm.unmap(va, len as u64);
     }
     let _ = mmu::invalidate(&regs, &d.vm);
-    let all = proto::T3_CLEAR | proto::T3_TRIANGLE | proto::T3_DEPTH | proto::T3_LIT;
+    let all =
+        proto::T3_CLEAR | proto::T3_TRIANGLE | proto::T3_DEPTH | proto::T3_LIT | proto::T3_TEXTURE;
     Ok((pass, all, ns))
 }
 
@@ -1283,14 +1400,17 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
                 Err(e) => Msg::error(e),
             }
         }
-        proto::BUFFER_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, false)),
-        proto::TARGET_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, true)),
-        proto::BUFFER_DETACH | proto::TARGET_DETACH => {
+        proto::BUFFER_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, false, false)),
+        proto::TARGET_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, true, false)),
+        proto::TEXTURE_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, false, true)),
+        proto::BUFFER_DETACH | proto::TARGET_DETACH | proto::TEXTURE_DETACH => {
             let regs = g.regs;
             reply(match g.dev.as_mut() {
                 Some(d) => {
                     let r = if m.label() == proto::BUFFER_DETACH {
                         d.client.detach_buffer(&mut d.vm, m.mr[0])
+                    } else if m.label() == proto::TEXTURE_DETACH {
+                        d.client.detach_texture(&mut d.vm, &d.gfx, m.mr[0])
                     } else {
                         d.client.detach_target(&mut d.vm, m.mr[0])
                     };
@@ -1304,7 +1424,7 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
         proto::RESET => {
             let regs = g.regs;
             if let Some(d) = g.dev.as_mut() {
-                d.client.clear(&mut d.vm);
+                d.client.clear(&mut d.vm, &d.gfx);
                 let _ = mmu::invalidate(&regs, &d.vm);
             }
             Msg::new(0, 0, 0)
