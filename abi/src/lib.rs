@@ -1178,12 +1178,16 @@ pub mod proto {
         /// PLLA 368.64 MHz and its 36.864 MHz output, the APE, AHUB and
         /// I2S1 clocks, EXTERN1 at 12.288 MHz (the codec's MCLK).
         pub const AUDIO: u64 = 30;
-        /// word 0 = `UARTB`, `UARTC` or `UARTD`, word 1 = `BAUD_1M` or `BAUD_3M`:
-        /// the UART's source clock divider, 16 times the baud rate
-        /// (hekate `clock_uart_use_src_div`). Reply: word 0 = state.
+        /// word 0 = `UARTB`, `UARTC` or `UARTD`, word 1 = `BAUD_1M`, `BAUD_3M`
+        /// (the source clock at 16 times the baud rate, divisor latch 1)
+        /// or `BAUD_115200` (hekate `clock_uart_use_src_div`). Reply: word
+        /// 0 = state.
         pub const UART_BAUD: u32 = 4;
         pub const BAUD_1M: u64 = 1_000_000;
         pub const BAUD_3M: u64 = 3_000_000;
+        /// PLLP / 2 without the 16x divider mode (hekate `uart_init`
+        /// below 1 Mbaud): the UART divides 408 MHz itself (221: 115200).
+        pub const BAUD_115200: u64 = 115_200;
     }
     /// Audio output (`audio`), published as "audio": 16-bit stereo PCM at
     /// 48 kHz to the speakers (the ALC5639 codec on I2S1, through the audio

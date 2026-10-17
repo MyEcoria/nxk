@@ -405,6 +405,8 @@ const AUDIO: [Clock; 5] = [
 const UART_DIV_EN: u32 = 1 << 24;
 const UART_DIV_1M: u32 = 49;
 const UART_DIV_3M: u32 = 15;
+/// hekate `CLK_SRC_DIV(2)` without `UART_DIV_EN`, for slow rates.
+const UART_DIV_PLLP: u32 = 2;
 const UARTB: [Clock; 1] = [Clock {
     bank: &L,
     bit: 7,
@@ -994,8 +996,9 @@ fn uart_baud(car: &Mmio, dev: u64, baud: u64) -> i64 {
     let (Some(d), Some(div)) = (
         table(dev).filter(|_| matches!(dev, proto::UARTB | proto::UARTC | proto::UARTD)),
         match baud {
-            proto::BAUD_1M => Some(UART_DIV_1M),
-            proto::BAUD_3M => Some(UART_DIV_3M),
+            proto::BAUD_1M => Some(UART_DIV_EN | UART_DIV_1M),
+            proto::BAUD_3M => Some(UART_DIV_EN | UART_DIV_3M),
+            proto::BAUD_115200 => Some(UART_DIV_PLLP),
             _ => None,
         },
     ) else {
@@ -1005,10 +1008,7 @@ fn uart_baud(car: &Mmio, dev: u64, baud: u64) -> i64 {
     if car.r32(c.bank.enb) & (1 << c.bit) == 0 {
         return ENODEV;
     }
-    car.w32(
-        c.source,
-        (car.r32(c.source) & 0xE000_0000) | UART_DIV_EN | div,
-    );
+    car.w32(c.source, (car.r32(c.source) & 0xE000_0000) | div);
     let _ = car.r32(c.source);
     0
 }
