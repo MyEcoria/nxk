@@ -362,7 +362,7 @@ fn touch(action: u8, finger: u8, x: u16, y: u16) -> Result<(), i64> {
 }
 
 fn button(code: u8, value: u8) -> Result<(), i64> {
-    if !(input::BTN_A..=input::BTN_CAPTURE).contains(&(code as u64)) {
+    if !(input::BTN_A..=input::BTN_VOL_DOWN).contains(&(code as u64)) {
         return Err(-EINVAL);
     }
     inject([input::KIND_BUTTON, code as u64, (value != 0) as u64, 0, 0])

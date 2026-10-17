@@ -294,7 +294,9 @@ pub fn press(c: u32, pressed: bool) -> u32 {
 /// level bar and the percentage.
 pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) {
     let p = pal();
-    let (w, h) = (380, 56);
+    // Sized for "100%" so the bar does not move with the level.
+    let tw = font::width(Face::Body, "100%");
+    let (w, h) = (76 + 200 + 20 + tw + 28, 56);
     let x = (crate::ui::W - w) / 2;
     s.shadow(x, y, w, h, h / 2, BLACK);
     s.fill_round(x, y, w, h, h / 2, p.text);
@@ -303,7 +305,7 @@ pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) {
         let (x0, y0) = ((x + 28) as i32, (y + 40) as i32);
         s.line(x0, y0, x0 + 24, y0 - 24, 3, p.bg);
     }
-    let (bx, bw) = (x + 76, w - 76 - 88);
+    let (bx, bw) = (x + 76, 200);
     let cy = y + h / 2;
     s.fill_round(bx, cy - 3, bw, 7, 3, p.dim);
     let fw = bw * pct.min(100) as usize / 100;
