@@ -366,8 +366,10 @@ tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
 ## Bluetooth controllers
 
 `bluetooth` starts at boot (init's driver list): the first run needs a
-boot image written with `mksd-hw.sh`, with `BCM4356A3.hcd` in the
-firmware directory (see "Wi-Fi firmware"). Then, over the USB-C console:
+boot image (`mksd-hw.sh`, or `--put` of `bl33.bin` with its `bl31.bin`
+as in "Driver updates over USB-C"), with `BCM4356A3.hcd` in the
+firmware directory (see "Wi-Fi firmware"); run 36 is the first one on a
+Switch. Then, over the USB-C console:
 
 ```text
 bt status     # state ready, adapter BCM4356A? ..., BCM4356A3.hcd loaded, ... at 3000000 baud
@@ -384,10 +386,11 @@ screen (Pair a Controller, Forget). Keys and the adapter's address are
 in `/config/bt.cfg`; `bt forget all` drops them (unpair on the
 controller side by pairing it with another console).
 
-When `bt status` says no adapter, its line names the step: no answer
-to the reset at 115200 baud (UART-D pads, BT_RST on PH4, the chip's
-32 kHz clock), a patch record refused, or 3 Mbaud failing (it then
-stays at 115200). `bt retry` power-cycles the core and starts again;
+When `bt status` says no adapter, its line names the step (no answer
+to the reset, a patch record refused, no answer after the patch at any
+speed or BT_WAKE level) and dumps what to look at: the RX / CTS pad
+levels, the PMIC's 32 kHz output, the UART registers and the first bytes
+received, the pads' pinmux and GPIO H. `bt retry` power-cycles the core and starts again;
 after a change, `./tools/usbterm.py --reload bluetooth -c "bt status"`.
 
 ## Fan
@@ -961,6 +964,31 @@ within 5 s.
     running console draws; the charge fell 250 -> 246 mAh), so the page
     says "input too weak, still draining" then. Not checked: the charge
     current on the official charger, the temperature against Horizon's.
+
+36. 17/10/2026, Erista, **Bluetooth**: `bluetooth` brings the BCM4356's
+    Bluetooth core up on UART-D (new boot image, then `--reload
+    bluetooth` / `--reload clk` while iterating) and pairs a Pro
+    Controller (9C:10:02:01:63:25, firmware 3.48, likely third-party).
+    What the hardware needed beyond Linux's sequence: (1) 115200 baud as
+    hekate's `uart_init` sets it, PLLP without the CAR's 16x divider
+    mode and divisor 221 (`clk` `BAUD_115200`): with `UART_DIV_EN` the
+    divisor latch is not honoured, the reset left at 3 Mbaud and each
+    command came back as one `0x00`; (2) BT_WAKE (PH3) low: the patched
+    firmware ignores the UART with it high (the ROM answers either way);
+    (3) a Remote Name Request before Create Connection: paged straight,
+    the controller ended every attempt with 0x10 after ~5 s, the
+    connection made right after the name page works; (4) a reconnecting
+    controller accepted as slave without our own authentication (both
+    sides authenticating left encryption pending until the 20 s setup
+    limit); (5) sniff mode at 15 ms after setup: until then the
+    controller answers each subcommand and sends no report, then it
+    streams full reports at ~60 Hz (1682 in 28 s), D-pad presses seen.
+    The pins (BT_RST PH4 high = on, PMIC 32 kHz on GPIO4 already
+    running) and the patch file (`BCM4356A3.hcd`, 193 records, LMP
+    subversion 0x2409) were right from the start. Pairing then
+    reconnection on HOME work. Not checked yet: a genuine Pro
+    Controller, Joy-Cons, several controllers at once, a game played
+    with it.
 
 ## Hardware test (once the SD card is back in the PC)
 
