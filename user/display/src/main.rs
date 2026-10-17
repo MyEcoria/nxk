@@ -502,12 +502,6 @@ fn give_back(dc: &Mmio, w: usize, pa: u32) {
     flip(dc, pa);
 }
 
-fn set_window_enabled(dc: &Mmio, en: bool) {
-    wr(dc, WIN_OPTIONS, if en { 1 << 30 } else { 0 });
-    wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
-    wr(dc, CMD_STATE_CONTROL, 1 | 2);
-}
-
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -656,7 +650,6 @@ fn main() -> i32 {
                 if let Some(b) = &bl {
                     b.off();
                 }
-                set_window_enabled(&dc, false);
                 pre_sleep_cpu = match &data.cpu {
                     stats::Seen::Value(c) => Some(c.step),
                     _ => None,
@@ -673,7 +666,6 @@ fn main() -> i32 {
         ($now:expr) => {{
             if sleeping {
                 sleeping = false;
-                set_window_enabled(&dc, true);
                 if let Some(b) = &bl {
                     b.set(ui.cfg.brightness);
                 }
@@ -681,6 +673,7 @@ fn main() -> i32 {
                     worker.jobs.lock().push_back(Job::SleepCpu(mhz));
                     worker.wake.notify_one();
                 }
+                scr.forget();
                 dirty = true;
                 next_refresh = 0;
                 last_input = $now;
