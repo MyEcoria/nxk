@@ -1,16 +1,28 @@
-//! Paletted RGB565 images from tools/mkcovers.py: the UI's own (app
-//! tiles, avatar), built in, and each game's cover, read from the card.
-//! `u8 count`, then per image `u16 w, u16 h, u32 offset`; at the offset
-//! 256 RGB565 colors, then one index per pixel.
+//! Paletted RGB565 images from tools/mkcovers.py: the UI's own (avatar,
+//! round buttons, header glyphs), built in, and each game's icon, read
+//! from the card. `u8 count`, then per image `u16 w, u16 h, u32 offset`;
+//! at the offset 256 RGB565 colors, then one index per pixel.
 
 pub const UI: &[u8] = include_bytes!("../../../build/uiart.bin");
-/// In `UI`: the tiles first (`home::TILES`' order), then the avatar at 64
-/// and 56 px.
-pub const AVATAR: usize = 6;
-pub const AVATAR_SMALL: usize = 7;
-/// In a cover: the selected card's art, then the other cards'.
-pub const COVER_BIG: usize = 0;
-pub const COVER_SMALL: usize = 1;
+/// In `UI`: the avatar, then the round buttons (`home::BUTTONS`' order)
+/// on the dark theme's disc and the light one's, then the same glyphs
+/// on each theme's background for the page headers.
+pub const AVATAR: usize = 0;
+const BUTTON: usize = 1;
+const HEAD: usize = 13;
+const KINDS: usize = 6;
+/// In a game's `cover.bin`: its square icon.
+pub const ICON: usize = 0;
+
+/// Round button `k` (`home::BUTTONS`) for the theme in force.
+pub fn button(k: usize) -> usize {
+    BUTTON + KINDS * crate::theme::is_light() as usize + k
+}
+
+/// Header glyph `k` (the round buttons' order) for the theme in force.
+pub fn head(k: usize) -> usize {
+    HEAD + KINDS * crate::theme::is_light() as usize + k
+}
 
 pub struct Image<'a> {
     pub w: usize,

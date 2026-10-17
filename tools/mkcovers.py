@@ -3,13 +3,14 @@
 
     mkcovers.py -o build/uiart.bin --games build/covers
 
-`-o`: the UI's own images, built into display: the home screen's app
-tiles (System, Network, Terminal, Logs, Settings, Power, 140x140) and the
-player avatar (64x64, then 56x56). `--games DIR`: one DIR/NAME.bin per game of jeux/
-(title and color from its game.txt), installed by tools/mksd.py as
-/games/NAME/cover.bin: the key art of the selected card (272x360) and of
-the other cards (200x297). A game without a drawing of its own gets its
-title on its color.
+`-o`: the UI's own images, built into display: the player avatar
+(64x64), the home screen's round buttons (System, Network, Terminal,
+Logs, System Settings, Power; 76x76, on the dark theme's disc, then on
+the light one's) and the same glyphs for the page headers (40x40, on
+each theme's background). `--games DIR`: one DIR/NAME.bin per game of
+jeux/ (title and color from its game.txt), installed by tools/mksd.py as
+/games/NAME/cover.bin: its square icon (256x256). A game without a
+drawing of its own gets its title on its color.
 
 File (little endian), read by user/display/src/art.rs:
     u8 count, then per image: u16 width, u16 height, u32 offset; at the
@@ -24,9 +25,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mklogo  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIG, SMALL = (272, 360), (200, 297)
-# The avatar of the tab row, and of a card's badge.
-TILE, AVATAR, AVATAR_BADGE = 140, 64, 56
+# A game's icon; the avatar, the home's round buttons, the header glyphs.
+ICON = 256
+AVATAR, BUTTON, HEAD = 64, 76, 40
 # Drawn this many times larger, then filtered down.
 SS = 3
 
@@ -214,32 +215,25 @@ def write(path, images):
 
 
 def sizes(master):
-    """The master cut to each card's shape (centered) and filtered down."""
-    out = []
-    for w, h in (BIG, SMALL):
-        mw, mh = master.size
-        cw = min(mw, mh * w // h)
-        ch = min(mh, mw * h // w)
-        x0, y0 = (mw - cw) // 2, (mh - ch) // 2
-        out.append(master.crop((x0, y0, x0 + cw, y0 + ch)).resize((w, h), Image.LANCZOS).convert("RGB"))
-    return out
+    """The square master filtered down to the icon."""
+    return [master.resize((ICON, ICON), Image.LANCZOS).convert("RGB")]
 
 
-# Game covers: masters at BIG x SS.
+# Game icons: square masters at ICON x SS.
 
 def cover_cube():
     """Cube: the lit six-color cube of the game, floating over the hills."""
-    w, h = BIG[0] * SS, BIG[1] * SS
+    w = h = ICON * SS
     rng = random.Random(7)
     img = gradient(w, h, [(0, (96, 170, 236)), (0.38, (176, 220, 246)), (0.56, (255, 220, 178)), (0.62, (252, 196, 150)), (1, (252, 196, 150))]).convert("RGBA")
     # Sun behind the cube, rays.
     sun = layer(img)
     sd = ImageDraw.Draw(sun)
-    cx, cy = w // 2, int(h * 0.50)
+    cx, cy = w // 2, int(h * 0.56)
     for i in range(18):
         a = i * math.pi / 9
         sd.polygon([(cx, cy), (cx + math.cos(a - 0.07) * w, cy + math.sin(a - 0.07) * w), (cx + math.cos(a + 0.07) * w, cy + math.sin(a + 0.07) * w)], fill=(255, 250, 225, 34))
-    sd.ellipse((cx - 150, cy - 150, cx + 150, cy + 150), fill=(255, 244, 200, 200))
+    sd.ellipse((cx - 130, cy - 130, cx + 130, cy + 130), fill=(255, 244, 200, 200))
     glow(img, sun, 40)
     # Clouds.
     cl = layer(img)
@@ -257,30 +251,30 @@ def cover_cube():
     # The game's face colors, red and blue toward the eye.
     colors = [(60, 150, 230), (180, 90, 220), (240, 200, 60), (90, 200, 100), (240, 240, 240), (230, 70, 60)]
     halo = layer(img)
-    ImageDraw.Draw(halo).ellipse((cx - 250, cy - 210, cx + 250, cy + 270), fill=(255, 236, 170, 150))
+    ImageDraw.Draw(halo).ellipse((cx - 210, cy - 170, cx + 210, cy + 230), fill=(255, 236, 170, 150))
     glow(img, halo, 60, 0.8)
     shadow = layer(img)
-    ImageDraw.Draw(shadow).ellipse((cx - 170, h * 0.86 - 26, cx + 170, h * 0.86 + 26), fill=(10, 40, 20, 150))
+    ImageDraw.Draw(shadow).ellipse((cx - 150, h * 0.9 - 22, cx + 150, h * 0.9 + 22), fill=(10, 40, 20, 150))
     glow(img, shadow, 18, 0.7)
-    cube3d(img, cx, cy + 40, 150, 0.62, -0.5, colors)
-    for x, y, s, yw, c in [(150, 470, 34, 1.1, (180, 90, 220)), (680, 400, 44, 0.3, (90, 200, 100)), (110, 800, 28, 0.8, (240, 200, 60)), (720, 760, 30, 1.4, (60, 150, 230))]:
+    cube3d(img, cx, cy + 50, 125, 0.62, -0.5, colors)
+    for x, y, s, yw, c in [(110, 420, 28, 1.1, (180, 90, 220)), (655, 380, 36, 0.3, (90, 200, 100)), (95, 675, 24, 0.8, (240, 200, 60)), (680, 650, 26, 1.4, (60, 150, 230))]:
         cube3d(img, x, y, s, yw, -0.45, [c] * 6, edge=200)
-    logo(img, "CUBE", cx, int(h * 0.17), 250, [(0, (255, 255, 255)), (1, (255, 214, 92))], (28, 42, 96), glow_c=(255, 255, 255))
+    logo(img, "CUBE", cx, int(h * 0.15), 220, [(0, (255, 255, 255)), (1, (255, 214, 92))], (28, 42, 96), glow_c=(255, 255, 255))
     ribbon = layer(img)
     rd = ImageDraw.Draw(ribbon)
-    rw, ry = 330, int(h * 0.29)
-    rd.rounded_rectangle((cx - rw, ry - 34, cx + rw, ry + 34), 34, fill=(28, 42, 96, 255))
-    rd.rounded_rectangle((cx - rw + 8, ry - 26, cx + rw - 8, ry + 26), 26, fill=(54, 140, 232, 255))
-    rd.text((cx, ry), "LIGHT  ·  COLOR  ·  3D", font=font("black", 40), fill=(255, 255, 255, 255), anchor="mm")
+    rw, ry = 290, int(h * 0.275)
+    rd.rounded_rectangle((cx - rw, ry - 30, cx + rw, ry + 30), 30, fill=(28, 42, 96, 255))
+    rd.rounded_rectangle((cx - rw + 7, ry - 23, cx + rw - 7, ry + 23), 23, fill=(54, 140, 232, 255))
+    rd.text((cx, ry), "LIGHT  ·  COLOR  ·  3D", font=font("black", 34), fill=(255, 255, 255, 255), anchor="mm")
     img.alpha_composite(ribbon)
     return img
 
 
 def cover_starlane():
     """Starlane: the ship down the neon lane at dusk, blocks and gems."""
-    w, h = BIG[0] * SS, BIG[1] * SS
+    w = h = ICON * SS
     rng = random.Random(11)
-    hy = int(h * 0.50)
+    hy = int(h * 0.55)
     img = gradient(w, h, [(0, (8, 10, 34)), (0.3, (46, 30, 92)), (0.5, (150, 66, 128)), (0.5, (20, 12, 44)), (1, (8, 6, 22))]).convert("RGBA")
     cx = w // 2
     # Stars.
@@ -293,16 +287,16 @@ def cover_starlane():
     glow(img, st, 3)
     # Striped sun on the horizon.
     sun = layer(img)
-    sr = 220
-    ImageDraw.Draw(sun).ellipse((cx - sr, hy - sr - 40, cx + sr, hy + sr - 40), fill=(255, 255, 255, 255))
+    sr = 180
+    ImageDraw.Draw(sun).ellipse((cx - sr, hy - sr - 30, cx + sr, hy + sr - 30), fill=(255, 255, 255, 255))
     grad = gradient(w, h, [(0, (255, 236, 120)), (0.3, (255, 236, 120)), (0.5, (255, 70, 150)), (1, (255, 70, 150))]).convert("RGBA")
     grad.putalpha(sun.getchannel("A"))
     cut = ImageDraw.Draw(grad)
     for i in range(7):
-        y = hy - 150 + i * 26
+        y = hy - 125 + i * 22
         cut.rectangle((0, y, w, y + 4 + i * 2), fill=(0, 0, 0, 0))
     halo = layer(img)
-    ImageDraw.Draw(halo).ellipse((cx - sr - 60, hy - sr - 100, cx + sr + 60, hy + sr + 20), fill=(255, 90, 170, 140))
+    ImageDraw.Draw(halo).ellipse((cx - sr - 50, hy - sr - 80, cx + sr + 50, hy + sr + 10), fill=(255, 90, 170, 140))
     glow(img, halo, 50, 0.9)
     img.alpha_composite(grad)
     floor = gradient(w, h - hy, [(0, (30, 14, 58)), (1, (6, 4, 18))]).convert("RGBA")
@@ -349,7 +343,7 @@ def cover_starlane():
         gd2.polygon([(x, y), (x + s, y), (x, y + s * 1.4)], fill=(30, 150, 230, 255))
         glow(img, gm, max(4, s / 2), 1.5)
     # The ship, from behind.
-    sx, sy = cx, int(h * 0.84)
+    sx, sy = cx, int(h * 0.83)
     eng = layer(img)
     ed = ImageDraw.Draw(eng)
     for dx in (-70, 70):
@@ -363,15 +357,15 @@ def cover_starlane():
     shp.polygon([(sx, sy - 70), (sx - 40, sy + 10), (sx, sy - 10)], fill=(150, 240, 255, 255))
     for dx in (-250, 250):
         shp.line((sx, sy - 120, sx + dx, sy + 60), fill=(255, 255, 255, 255), width=3)
-    logo(img, "STARLANE", cx, int(h * 0.15), 136, [(0, (255, 246, 170)), (0.55, (255, 120, 190)), (1, (120, 220, 255))], (24, 10, 52), kind="blackitalic", glow_c=(255, 90, 200))
+    logo(img, "STARLANE", cx, int(h * 0.13), 118, [(0, (255, 246, 170)), (0.55, (255, 120, 190)), (1, (120, 220, 255))], (24, 10, 52), kind="blackitalic", glow_c=(255, 90, 200))
     sub = ImageDraw.Draw(img)
-    sub.text((cx, int(h * 0.255)), "DODGE  ·  COLLECT  ·  FLY", font=font("black", 40), fill=(150, 236, 255, 255), anchor="mm", stroke_width=5, stroke_fill=(24, 10, 52))
+    sub.text((cx, int(h * 0.225)), "DODGE  ·  COLLECT  ·  FLY", font=font("black", 34), fill=(150, 236, 255, 255), anchor="mm", stroke_width=5, stroke_fill=(24, 10, 52))
     return img
 
 
 def cover_plain(title, color):
     """Any other game: its title on its color."""
-    w, h = BIG[0] * SS, BIG[1] * SS
+    w = h = ICON * SS
     dark = shade(color, 0.25)
     img = gradient(w, h, [(0, lighten(color, 0.2)), (0.6, color), (1, dark)]).convert("RGBA")
     rings = layer(img)
@@ -382,35 +376,25 @@ def cover_plain(title, color):
     words = title.split()
     lines, cur = [], ""
     for wd in words:
-        if cur and len(cur) + len(wd) > 9:
+        if cur and len(cur) + len(wd) > 7:
             lines.append(cur)
             cur = wd
         else:
             cur = (cur + " " + wd).strip()
     lines.append(cur)
     for i, ln in enumerate(lines[:3]):
-        logo(img, ln.upper(), w // 2, int(h * 0.2) + i * 190, 150, [(0, (255, 255, 255)), (1, lighten(color, 0.6))], dark)
+        logo(img, ln.upper(), w // 2, int(h * 0.22) + i * 170, 140, [(0, (255, 255, 255)), (1, lighten(color, 0.6))], dark)
     return img
 
 
 GAMES = {"cube": cover_cube, "starlane": cover_starlane}
 
 
-# The UI's own art.
+# The UI's own art: glyphs in `col`, about 0.55 x `s` across.
 
-def tile(bg, draw_icon):
-    s = TILE * SS
-    img = gradient(s, s, [(0, lighten(bg, 0.12)), (1, shade(bg, 0.82))]).convert("RGBA")
-    ic = layer(img)
-    draw_icon(ImageDraw.Draw(ic), s / 2, s / 2, s)
-    glow(img, ic, 10, 0.35)
-    return img.resize((TILE, TILE), Image.LANCZOS).convert("RGB")
-
-
-def ic_system(d, cx, cy, s):
-    W = (255, 255, 255, 255)
+def ic_system(d, cx, cy, s, col):
     a = s * 0.2
-    d.rounded_rectangle((cx - a, cy - a, cx + a, cy + a), s * 0.04, fill=W)
+    d.rounded_rectangle((cx - a, cy - a, cx + a, cy + a), s * 0.04, fill=col)
     d.rounded_rectangle((cx - a * 0.55, cy - a * 0.55, cx + a * 0.55, cy + a * 0.55), s * 0.02, fill=(0, 0, 0, 0))
     for i in (-0.6, 0, 0.6):
         for (x0, y0, x1, y1) in [
@@ -419,64 +403,92 @@ def ic_system(d, cx, cy, s):
             (cx - a * 1.45, cy + i * a, cx - a, cy + i * a),
             (cx + a, cy + i * a, cx + a * 1.45, cy + i * a),
         ]:
-            d.line((x0, y0, x1, y1), fill=W, width=int(s * 0.035))
+            d.line((x0, y0, x1, y1), fill=col, width=int(s * 0.045))
 
 
-def ic_network(d, cx, cy, s):
-    W = (255, 255, 255, 255)
-    r, t = s * 0.27, int(s * 0.032)
-    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=W, width=t)
-    d.ellipse((cx - r * 0.45, cy - r, cx + r * 0.45, cy + r), outline=W, width=t)
-    d.line((cx, cy - r, cx, cy + r), fill=W, width=t)
+def ic_network(d, cx, cy, s, col):
+    r, t = s * 0.27, int(s * 0.045)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), outline=col, width=t)
+    d.ellipse((cx - r * 0.45, cy - r, cx + r * 0.45, cy + r), outline=col, width=t)
+    d.line((cx, cy - r, cx, cy + r), fill=col, width=t)
     for k in (-0.5, 0, 0.5):
         hw = r * math.sqrt(1 - k * k)
-        d.line((cx - hw, cy + k * r, cx + hw, cy + k * r), fill=W, width=t)
+        d.line((cx - hw, cy + k * r, cx + hw, cy + k * r), fill=col, width=t)
 
 
-def ic_terminal(d, cx, cy, s):
-    W = (255, 255, 255, 255)
-    a, b = s * 0.3, s * 0.22
-    d.rounded_rectangle((cx - a, cy - b, cx + a, cy + b), s * 0.05, outline=W, width=int(s * 0.03))
-    d.line((cx - a, cy - b + s * 0.08, cx + a, cy - b + s * 0.08), fill=W, width=int(s * 0.03))
-    t = int(s * 0.04)
-    d.line((cx - a * 0.6, cy - b * 0.05, cx - a * 0.25, cy + b * 0.3), fill=W, width=t, joint="curve")
-    d.line((cx - a * 0.25, cy + b * 0.3, cx - a * 0.6, cy + b * 0.65), fill=W, width=t, joint="curve")
-    d.line((cx - a * 0.05, cy + b * 0.65, cx + a * 0.5, cy + b * 0.65), fill=W, width=t)
+def ic_terminal(d, cx, cy, s, col):
+    a, b = s * 0.3, s * 0.23
+    t = int(s * 0.045)
+    d.rounded_rectangle((cx - a, cy - b, cx + a, cy + b), s * 0.05, outline=col, width=t)
+    t = int(s * 0.055)
+    d.line((cx - a * 0.55, cy - b * 0.35, cx - a * 0.15, cy + b * 0.05), fill=col, width=t, joint="curve")
+    d.line((cx - a * 0.15, cy + b * 0.05, cx - a * 0.55, cy + b * 0.45), fill=col, width=t, joint="curve")
+    d.line((cx + a * 0.05, cy + b * 0.45, cx + a * 0.55, cy + b * 0.45), fill=col, width=t)
 
 
-def ic_logs(d, cx, cy, s):
-    W = (255, 255, 255, 255)
+def ic_logs(d, cx, cy, s, col):
     a, b = s * 0.21, s * 0.28
-    d.rounded_rectangle((cx - a, cy - b, cx + a, cy + b), s * 0.04, outline=W, width=int(s * 0.03))
-    for i, k in enumerate((0.55, 0.75, 0.75, 0.45)):
-        y = cy - b * 0.5 + i * b * 0.36
-        d.line((cx - a * 0.6, y, cx - a * 0.6 + a * 1.2 * k, y), fill=W, width=int(s * 0.03))
+    t = int(s * 0.045)
+    d.rounded_rectangle((cx - a, cy - b, cx + a, cy + b), s * 0.04, outline=col, width=t)
+    for i, k in enumerate((0.55, 0.8, 0.8, 0.45)):
+        y = cy - b * 0.5 + i * b * 0.34
+        d.line((cx - a * 0.55, y, cx - a * 0.55 + a * 1.1 * k, y), fill=col, width=t)
 
 
-def ic_settings(d, cx, cy, s):
-    M = (110, 234, 205, 255)
-    W = (255, 255, 255, 255)
-    for i, k in ((-1, -0.4), (0, 0.45), (1, -0.1)):
-        y = cy + i * s * 0.14
-        d.line((cx - s * 0.25, y, cx + s * 0.25, y), fill=W, width=int(s * 0.03))
-        x = cx + k * s * 0.25
-        d.rounded_rectangle((x - s * 0.04, y - s * 0.055, x + s * 0.04, y + s * 0.055), s * 0.015, fill=M)
+def ic_settings(d, cx, cy, s, col):
+    """A gear: eight teeth around a ring."""
+    ro, ri, tw = s * 0.29, s * 0.21, s * 0.075
+    for i in range(8):
+        a = i * math.pi / 4
+        ca, sa = math.cos(a), math.sin(a)
+        pts = [(cx + ca * r - sa * w, cy + sa * r + ca * w) for r, w in ((ri * 0.9, -tw), (ro, -tw * 0.8), (ro, tw * 0.8), (ri * 0.9, tw))]
+        d.polygon(pts, fill=col)
+    d.ellipse((cx - ri, cy - ri, cx + ri, cy + ri), fill=col)
+    h = s * 0.095
+    d.ellipse((cx - h, cy - h, cx + h, cy + h), fill=(0, 0, 0, 0))
 
 
-def ic_power(d, cx, cy, s):
-    R = (255, 96, 86, 255)
-    r, t = s * 0.22, int(s * 0.04)
-    d.arc((cx - r, cy - r, cx + r, cy + r), -60, 240, fill=R, width=t)
-    d.line((cx, cy - r * 1.25, cx, cy - r * 0.1), fill=R, width=t)
+def ic_power(d, cx, cy, s, col):
+    r, t = s * 0.23, int(s * 0.055)
+    d.arc((cx - r, cy - r, cx + r, cy + r), -55, 235, fill=col, width=t)
+    d.line((cx, cy - r * 1.2, cx, cy - r * 0.15), fill=col, width=t)
+
+
+# Home order: System, Network, Terminal, Logs, System Settings, Power.
+GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_settings, ic_power]
+# Glyph colors; None: the theme's grey.
+COLORS = [(232, 72, 62), (38, 128, 236), (140, 92, 240), (20, 172, 128), None, None]
+THEMES = {
+    # (page background, round button's disc, grey glyph)
+    "dark": ((0, 0, 0), (47, 47, 47), (222, 222, 222)),
+    "light": ((235, 235, 235), (255, 255, 255), (84, 84, 84)),
+}
+
+
+def glyph_img(size, bg, k, grey, scale):
+    s = size * SS
+    img = Image.new("RGBA", (s, s), bg + (255,))
+    ic = layer(img)
+    GLYPHS[k](ImageDraw.Draw(ic), s / 2, s / 2, s * scale, (COLORS[k] or grey) + (255,))
+    img.alpha_composite(ic)
+    return img.resize((size, size), Image.LANCZOS).convert("RGB")
+
+
+def buttons(theme):
+    """The round buttons, the whole square in the disc's color: the UI
+    draws them through a circle."""
+    _, disc, grey = THEMES[theme]
+    return [glyph_img(BUTTON, disc, k, grey, 0.8) for k in range(len(GLYPHS))]
+
+
+def heads(theme):
+    bg, _, grey = THEMES[theme]
+    return [glyph_img(HEAD, bg, k, grey, 1.45) for k in range(len(GLYPHS))]
 
 
 def avatar(size):
     s = AVATAR * SS * 2
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    bg = gradient(s, s, [(0, (255, 168, 76)), (1, (226, 84, 28))]).convert("RGBA")
-    disc = Image.new("L", (s, s), 0)
-    ImageDraw.Draw(disc).ellipse((0, 0, s - 1, s - 1), fill=255)
-    img.paste(bg, (0, 0), disc)
+    img = gradient(s, s, [(0, (255, 168, 76)), (1, (226, 84, 28))]).convert("RGBA")
     g = mklogo.icon()
     n = len(g)
     cell = s * 0.62 / n
@@ -487,11 +499,7 @@ def avatar(size):
         for x in range(n):
             if g[y][x]:
                 d.rectangle((x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell, y0 + (y + 1) * cell), fill=pal[g[y][x]] + (255,))
-    # Black around the disc: the UI draws it on its own black background
-    # and paints the corners back (art.rs draws images with a radius).
-    out = Image.new("RGB", (s, s), (0, 0, 0))
-    out.paste(img, (0, 0), img)
-    return out.resize((size, size), Image.LANCZOS)
+    return img.convert("RGB").resize((size, size), Image.LANCZOS)
 
 
 def game_info(path):
@@ -513,18 +521,12 @@ def game_info(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-o", required=True, help="the UI's art (tiles, avatar)")
+    ap.add_argument("-o", required=True, help="the UI's art (avatar, buttons, header glyphs)")
     ap.add_argument("--games", help="directory of the games' covers")
     a = ap.parse_args()
-    tiles = [
-        tile((224, 58, 62), ic_system),
-        tile((30, 91, 216), ic_network),
-        tile((122, 59, 235), ic_terminal),
-        tile((18, 165, 122), ic_logs),
-        tile((46, 46, 50), ic_settings),
-        tile((24, 24, 26), ic_power),
-    ]
-    n = write(a.o, tiles + [avatar(AVATAR), avatar(AVATAR_BADGE)])
+    # In art.rs' order: AVATAR, BUTTON (dark, light), HEAD (dark, light).
+    ui = [avatar(AVATAR)] + buttons("dark") + buttons("light") + heads("dark") + heads("light")
+    n = write(a.o, ui)
     print(f"mkcovers: {a.o}: {n} bytes")
     if a.games:
         src = os.path.join(ROOT, "jeux")

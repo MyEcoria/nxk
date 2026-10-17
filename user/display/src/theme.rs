@@ -1,6 +1,7 @@
 //! The dark and light palettes, chosen at run time (`set`): the UI asks
 //! `pal()` for every color it draws. Colors are A B G R, as `screen`'s.
-//! Dark follows the Switch's black home and its grey drawer.
+//! Basic Black and Basic White, as the Switch 2's: the selection frame
+//! and the selected item's name in its cyan.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,19 +34,17 @@ pub struct Palette {
     pub good: u32,
     pub warn: u32,
     pub bad: u32,
-    /// Outline of what the gamepad has selected.
+    /// The frame around what the gamepad has selected.
     pub focus: u32,
     /// Darkens what is behind a sheet.
     pub scrim: u32,
-    /// The L and R keys of the tab row.
-    pub key: u32,
 }
 
 pub const DARK: Palette = Palette {
     bg: rgb(0x000000),
     surface: rgb(0x1A1A1A),
     raised: rgb(0x262626),
-    rule: rgb(0x1E1E1E),
+    rule: rgb(0x3A3A3A),
     line: rgb(0x393939),
     track: rgb(0x5D5D5D),
     text: rgb(0xFFFFFF),
@@ -56,9 +55,8 @@ pub const DARK: Palette = Palette {
     good: rgb(0x6EEACD),
     warn: rgb(0xFFB84D),
     bad: rgb(0xFF5A50),
-    focus: rgb(0xF2F2F2),
+    focus: rgb(0x3BC3E3),
     scrim: rgb(0x000000),
-    key: rgb(0x5E5E5E),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -76,9 +74,8 @@ pub const LIGHT: Palette = Palette {
     good: rgb(0x00A88A),
     warn: rgb(0xC77700),
     bad: rgb(0xD93030),
-    focus: rgb(0x2D2D2D),
+    focus: rgb(0x0AB4DC),
     scrim: rgb(0x2D2D2D),
-    key: rgb(0x9A9A9A),
 };
 
 static LIGHT_ON: AtomicBool = AtomicBool::new(false);

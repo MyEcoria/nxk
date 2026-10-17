@@ -46,7 +46,7 @@ pub fn scan(mut old: Vec<GameInfo>) -> Vec<GameInfo> {
         let cover = kept.or_else(|| {
             fs::read(&format!("{}/{}/cover.bin", DIR, e.name))
                 .ok()
-                .filter(|c| art::get(c, art::COVER_SMALL).is_some())
+                .filter(|c| art::get(c, art::ICON).is_some_and(|i| i.w == i.h))
         });
         let mut g = GameInfo {
             name: e.name.clone(),

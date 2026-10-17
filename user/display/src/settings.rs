@@ -1,5 +1,5 @@
-//! System Settings: the categories on the left, the chosen one's rows on
-//! the right, as the Switch's.
+//! System Settings: the categories on the left with a vertical rule, the
+//! chosen category's rows on the right, as on the Switch 2.
 
 use alloc::format;
 use alloc::string::String;
@@ -13,26 +13,26 @@ use crate::screen::{logo_size, Bytes, Hms, Ipv4, Screen};
 use crate::stats::{Data, Seen};
 use crate::status::{cpu_text, eth_text, fan_text, gpu_text, wifi_short};
 use crate::theme::pal;
-use crate::ui::{Id, Ui, M, NETWORK, W};
+use crate::ui::{Id, Ui, HEADER_RULE_Y, LOGS, M, NETWORK, RULE_Y, SYSTEM, TERMINAL, W};
 use crate::widgets::{icon, press, slider, switch, Icon, Tone};
 
-const CATS: [&str; 6] = [
+pub const CATS: [&str; 6] = [
     "Display",
     "Sound",
-    "Network",
+    "Internet",
     "Performance",
     "Power",
-    "About",
+    "System",
 ];
 const SLEEP_LABELS: [&str; 5] = ["Never", "1 min", "5 min", "10 min", "30 min"];
-/// The list, and the chosen category's column.
-const LW: usize = 372;
-const X: usize = M + LW + 40;
+/// The left category sidebar, and the chosen category's right column.
+const LW: usize = 356;
+const X: usize = M + LW + 44;
 const XR: usize = W - M;
-/// First row's center line.
-const Y: usize = 254;
+/// First row's center line in the right pane.
+const Y: usize = 224;
 
-/// A row: its label, and its value on the right.
+/// A row: its label on the left, and its value on the right.
 fn row(s: &mut Screen, cy: usize, label: &str, value: &str, c: u32) {
     let p = pal();
     s.label(X, cy, label, Face::Body, p.text);
@@ -47,32 +47,38 @@ impl Ui {
     pub(crate) fn settings(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
         for (i, name) in CATS.iter().enumerate() {
-            let y = 160 + i * 68;
+            let y = 132 + i * 78;
             let on = self.cat == i;
             let down = self.pressed == Some(Id::Cat(i));
             if on || down {
-                s.fill_round(M, y, LW, 60, 6, press(p.surface, down));
+                s.fill_round(M, y, LW, 66, 6, press(p.surface, down));
             }
             if on {
-                s.fill_round(M + 10, y + 16, 4, 28, 2, p.good);
+                s.fill_round(M + 10, y + 17, 5, 32, 2, p.accent);
             }
             let (f, c) = if on {
-                (Face::BodyB, p.text)
+                (Face::BodyB, p.accent)
             } else {
                 (Face::Body, p.dim)
             };
-            s.label(M + 32, y + 30, name, f, c);
-            self.zone(Id::Cat(i), M, y, LW, 60, 6);
+            s.label(M + 32, y + 33, name, f, c);
+            self.zone(Id::Cat(i), M, y, LW, 66, 6);
         }
-        s.fill(M + LW + 20, 160, 1, 400, p.rule);
-        s.label(X, 186, CATS[self.cat], Face::TitleB, p.text);
+        s.fill(
+            M + LW + 22,
+            HEADER_RULE_Y,
+            1,
+            RULE_Y - HEADER_RULE_Y,
+            p.rule,
+        );
+        s.label(X, 162, CATS[self.cat], Face::TitleB, p.text);
         match self.cat {
             0 => self.cat_display(s),
             1 => cat_sound(s),
             2 => self.cat_network(s, d),
             3 => self.cat_performance(s, d),
             4 => self.cat_power(s, d),
-            _ => cat_about(s, d),
+            _ => self.cat_system(s, d),
         }
         self.page_hints(s);
     }
@@ -159,7 +165,6 @@ impl Ui {
             None => "offline".into(),
         };
         row(s, Y + 184, "IP Address", &ip, p.dim);
-        let label = "Open the Network page";
         self.button(
             s,
             Id::OpenPage(NETWORK),
@@ -167,7 +172,7 @@ impl Ui {
             Y + 228,
             320,
             56,
-            label,
+            "Open the Network page",
             Tone::Accent,
             true,
         );
@@ -266,6 +271,79 @@ impl Ui {
             p.dim,
         );
     }
+
+    fn cat_system(&mut self, s: &mut Screen, d: &Data) {
+        let p = pal();
+        let (lw, lh) = logo_size();
+        s.logo(XR - lw * 2, 162 - lh, 2);
+        let rows: [(&str, String); 6] = [
+            ("System", "nxk, AArch64 microkernel".into()),
+            ("SoC", "NVIDIA Tegra X1 (4x Cortex-A57)".into()),
+            ("Uptime", format!("{}", Hms(d.up_s))),
+            (
+                "Memory",
+                d.mem.map_or("-".into(), |m| {
+                    format!("{}", Bytes(m.total_pages * PAGE_SIZE))
+                }),
+            ),
+            (
+                "SD card",
+                match d.disk {
+                    Seen::Value((_, total)) => format!("{}", Bytes(total)),
+                    _ => "none".into(),
+                },
+            ),
+            ("Screen", {
+                let (w, h) = s.size();
+                format!(
+                    "{}x{}{}",
+                    w,
+                    h,
+                    if s.turned() { ", panel turned" } else { "" }
+                )
+            }),
+        ];
+        for (i, (k, v)) in rows.iter().enumerate() {
+            let cy = Y - 6 + i * 48;
+            row(s, cy, k, v, p.dim);
+            rule(s, cy + 24);
+        }
+        let bw = (XR - X - 32) / 3;
+        let by = Y + 308;
+        self.button(
+            s,
+            Id::OpenPage(SYSTEM),
+            X,
+            by,
+            bw,
+            56,
+            "System Monitor",
+            Tone::Plain,
+            true,
+        );
+        self.button(
+            s,
+            Id::OpenPage(TERMINAL),
+            X + bw + 16,
+            by,
+            bw,
+            56,
+            "USB-C Terminal",
+            Tone::Plain,
+            true,
+        );
+        self.button(
+            s,
+            Id::OpenPage(LOGS),
+            X + 2 * (bw + 16),
+            by,
+            bw,
+            56,
+            "System Logs",
+            Tone::Plain,
+            true,
+        );
+    }
 }
 
 fn cat_sound(s: &mut Screen) {
@@ -287,42 +365,4 @@ fn cat_sound(s: &mut Screen) {
         Face::Cap,
         p.dim,
     );
-}
-
-fn cat_about(s: &mut Screen, d: &Data) {
-    let p = pal();
-    let (lw, lh) = logo_size();
-    s.logo(XR - lw * 2, 186 - lh, 2);
-    let rows: [(&str, String); 6] = [
-        ("System", "nxk, AArch64 microkernel".into()),
-        ("SoC", "NVIDIA Tegra X1 (4x Cortex-A57)".into()),
-        ("Uptime", format!("{}", Hms(d.up_s))),
-        (
-            "Memory",
-            d.mem.map_or("-".into(), |m| {
-                format!("{}", Bytes(m.total_pages * PAGE_SIZE))
-            }),
-        ),
-        (
-            "SD card",
-            match d.disk {
-                Seen::Value((_, total)) => format!("{}", Bytes(total)),
-                _ => "none".into(),
-            },
-        ),
-        ("Screen", {
-            let (w, h) = s.size();
-            format!(
-                "{}x{}{}",
-                w,
-                h,
-                if s.turned() { ", panel turned" } else { "" }
-            )
-        }),
-    ];
-    for (i, (k, v)) in rows.iter().enumerate() {
-        let cy = Y + i * 54;
-        row(s, cy, k, v, p.dim);
-        rule(s, cy + 27);
-    }
 }

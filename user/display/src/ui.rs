@@ -1,14 +1,14 @@
-//! The Switch-style touch and gamepad UI: the frame every page shares
-//! (avatars and tab row between the L and R keys, status, hint bar), the
-//! selection the gamepad moves, and what a tap or a button does. The
-//! pages draw themselves: `home`, `quick` (the drawer), `settings`,
-//! `sheets` (sheets and confirmations) and `pages` (System, Network,
-//! Terminal, Logs).
+//! The Switch 2 touch and gamepad UI: the frame every page shares
+//! (player avatar on the home screen, icon + title header on inner pages,
+//! status cluster, bottom hint bar), the selection the gamepad moves, and
+//! what a tap or a button does. The pages draw themselves: `home`, `quick`
+//! (the drawer), `settings`, `sheets` (sheets and confirmations) and
+//! `pages` (System, Network, Terminal, Logs).
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::proto::{cpufreq, fan, gpu, input, power, usbcon as usb};
+use libnx::abi::proto::{cpufreq, fan, gpu, input, power};
 
 use crate::art;
 use crate::backlight::MIN_PCT;
@@ -17,36 +17,34 @@ use crate::font::{self, Face};
 use crate::games::GameInfo;
 use crate::playtime::Playtime;
 use crate::screen::{mix, Screen};
-use crate::stats::{Cpu, Data, Fan, Gpu, Now, Seen};
+use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
 use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
 use crate::theme::{self, pal};
-use crate::widgets::{button_glyph, icon, press, shoulder, tone_color, Icon, Tone};
+use crate::widgets::{button_glyph, icon, press, tone_color, Icon, Tone};
 use crate::Messages;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
 pub const W: usize = 1280;
 pub const H: usize = 720;
-/// Side margin, content top and bottom (between the tabs and the rule).
+/// Side margin, content top and bottom (between the header rule and the footer rule).
 pub const M: usize = 48;
-pub const CY: usize = 148;
-pub const CB: usize = 620;
+pub const CY: usize = 132;
+pub const CB: usize = 616;
 pub const CH: usize = CB - CY;
-/// Center lines of the status, the tab row and the hint bar; its rule.
-pub const STATUS_Y: usize = 28;
-pub const TABS_Y: usize = 100;
+/// Center lines of the top bar and the hint bar; the header and footer rules.
+pub const STATUS_Y: usize = 54;
+pub const HEADER_RULE_Y: usize = 104;
 pub const RULE_Y: usize = 640;
 pub const HINT_Y: usize = 679;
 
-// Pages (tabs of the top row).
+// Pages.
 pub const LIBRARY: usize = 0;
 pub const SYSTEM: usize = 1;
 pub const NETWORK: usize = 2;
 pub const TERMINAL: usize = 3;
 pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
-
-const TABS: [&str; 6] = ["Games", "System", "Network", "Terminal", "Logs", "Settings"];
 
 const TOAST_NS: u64 = 4_000_000_000;
 const FAN_STEP: u64 = 10;
@@ -55,13 +53,9 @@ const PAD_STEP: u8 = 5;
 #[derive(Clone, Copy, PartialEq)]
 pub enum Id {
     AvatarHome,
-    AvatarTheme,
-    Tab(usize),
-    BumperL,
-    BumperR,
-    /// A game's card, by index.
+    /// A game's square icon, by index.
     Game(usize),
-    /// An app tile of the home row (`home::TILES`).
+    /// A round button under the game row (`home::BUTTONS`).
     Tile(usize),
     /// The status at the top right (opens the drawer).
     StatusQuick,
@@ -195,8 +189,10 @@ pub struct Ui {
     pub(crate) focus: Option<Id>,
     focus_at: (usize, usize),
     pub(crate) games: Vec<GameInfo>,
-    /// The home row's selection: a game, then the tiles.
+    /// The home selection: a game (`0..games.len()`), then the round buttons.
     pub(crate) home: usize,
+    /// Last selected game slot on the home row.
+    pub(crate) last_game: usize,
     pub(crate) scroll: f32,
     pub(crate) scroll_to: f32,
     pub cfg: Config,
@@ -236,6 +232,7 @@ impl Ui {
             focus_at: (W / 2, H / 2),
             games: Vec::new(),
             home: 0,
+            last_game: 0,
             scroll: 0.0,
             scroll_to: 0.0,
             cfg: Config::new(),
@@ -337,6 +334,7 @@ impl Ui {
             None if old == 0 => 0,
             None => self.home - old + v.len(),
         };
+        self.last_game = self.home.min(v.len().saturating_sub(1));
         self.games = v;
     }
 
@@ -518,8 +516,28 @@ impl Ui {
             BTN_MINUS | BTN_PLUS if self.modal.is_none() && self.sheet.is_none() => {
                 self.toggle_quick()
             }
-            BTN_L | BTN_ZL if !open => self.go((self.page + TABS.len() - 1) % TABS.len()),
-            BTN_R | BTN_ZR if !open => self.go((self.page + 1) % TABS.len()),
+            BTN_L | BTN_ZL if !open => match self.page {
+                SYSTEM => self.sys_tab ^= 1,
+                SETTINGS => {
+                    let n = crate::settings::CATS.len();
+                    self.cat = (self.cat + n - 1) % n;
+                }
+                LIBRARY => {
+                    self.home = 0;
+                    self.last_game = 0;
+                }
+                _ => {}
+            },
+            BTN_R | BTN_ZR if !open => match self.page {
+                SYSTEM => self.sys_tab ^= 1,
+                SETTINGS => {
+                    self.cat = (self.cat + 1) % crate::settings::CATS.len();
+                }
+                LIBRARY => {
+                    self.home = self.games.len() + 4;
+                }
+                _ => {}
+            },
             _ => {}
         }
         None
@@ -558,18 +576,18 @@ impl Ui {
 
     pub(crate) fn tap(&mut self, id: Id) -> Option<Action> {
         match id {
+            Id::AvatarHome if self.page == LIBRARY => return self.set_theme(!self.cfg.light),
             Id::AvatarHome => self.go(LIBRARY),
-            Id::AvatarTheme => return self.set_theme(!self.cfg.light),
-            Id::Tab(i) => self.go(i),
-            Id::BumperL => self.go((self.page + TABS.len() - 1) % TABS.len()),
-            Id::BumperR => self.go((self.page + 1) % TABS.len()),
             Id::Scrim => {
                 self.quick = false;
                 self.sheet = None;
             }
             Id::StatusQuick => self.toggle_quick(),
             Id::Game(i) if self.home == i => return Some(Action::Launch(i)),
-            Id::Game(i) => self.home = i,
+            Id::Game(i) => {
+                self.home = i;
+                self.last_game = i;
+            }
             Id::Tile(k) => {
                 self.home = self.games.len() + k;
                 return self.open_tile(k);
@@ -799,52 +817,36 @@ impl Ui {
         x - s.label_r(x, cy, &t, Face::Small, p.text)
     }
 
-    /// Avatars, `[L] Games System ... Settings [R]`, the status.
+    /// On the home screen: the player avatar and the status cluster.
+    /// On an inner page: the page's icon and title above a horizontal rule.
     fn top_bar(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        let cy = TABS_Y;
-        if let Some(img) = art::get(art::UI, art::AVATAR) {
-            s.image(&img, 26, cy - 32, 64, 64, 32);
-        }
-        self.zone(Id::AvatarHome, 26, cy - 32, 64, 64, 32);
-        s.disc(141, cy, 32, p.raised);
-        let k = if self.cfg.light {
-            Icon::Sun
-        } else {
-            Icon::Moon
-        };
-        icon(s, k, 141, cy, p.text, p.raised);
-        self.zone(Id::AvatarTheme, 109, cy - 32, 64, 64, 32);
-
-        let mut x = 353;
-        shoulder(s, x, cy, "L");
-        self.zone(Id::BumperL, x - 6, cy - 22, 59, 44, 8);
-        x += 47 + 33;
-        for (i, &name) in TABS.iter().enumerate() {
-            let on = self.page == i;
-            let (f, c) = if on {
-                (Face::BodyB, p.text)
-            } else {
-                (Face::Body, p.dim)
-            };
-            let tw = s.label(x, cy, name, f, c);
-            let dot = match i {
-                NETWORK => wifi_connected(d).is_some(),
-                TERMINAL => matches!(d.usb, Now::Value(u) if u.state & usb::ST_TERMINAL != 0),
-                LOGS => self.unread > 0,
-                _ => false,
-            };
-            if dot {
-                s.disc(x + tw + 4, cy - 14, 3, p.good);
+        let cy = STATUS_Y;
+        if self.page == LIBRARY {
+            if let Some(img) = art::get(art::UI, art::AVATAR) {
+                s.image(&img, 64, cy - 30, 60, 60, 30);
             }
-            self.zone(Id::Tab(i), x - 14, cy - 24, tw + 28, 48, 8);
-            x += tw + 41;
+            s.ring(94, cy, 31, 2, p.rule);
+            self.zone(Id::AvatarHome, 64, cy - 30, 60, 60, 30);
+            let from = self.status(s, d, W - 64, cy, p.bg);
+            self.zone(Id::StatusQuick, from - 12, cy - 28, W - from + 12, 56, 8);
+        } else {
+            let k = match self.page {
+                SYSTEM => 0,
+                NETWORK => 1,
+                TERMINAL => 2,
+                LOGS => 3,
+                _ => 4,
+            };
+            if let Some(img) = art::get(art::UI, art::head(k)) {
+                s.image(&img, 58, cy - 20, 40, 40, 6);
+            }
+            let tw = s.label(112, cy, crate::home::BUTTONS[k], Face::Title, p.text);
+            self.zone(Id::AvatarHome, 46, cy - 32, tw + 80, 64, 8);
+            s.fill(30, HEADER_RULE_Y, W - 60, 1, p.rule);
+            let from = self.status(s, d, W - 58, cy, p.bg);
+            self.zone(Id::StatusQuick, from - 12, cy - 28, W - from + 12, 56, 8);
         }
-        shoulder(s, x - 8, cy, "R");
-        self.zone(Id::BumperR, x - 14, cy - 22, 59, 44, 8);
-
-        let from = self.status(s, d, W - 32, STATUS_Y, p.bg);
-        self.zone(Id::StatusQuick, from - 12, 0, W - from + 12, 56, 8);
     }
 
     /// The bottom: rule, handheld icon, button hints ending at `xr`.
@@ -857,10 +859,11 @@ impl Ui {
         items: &[(&str, &str)],
     ) {
         let p = pal();
+        let rx1 = if bg == p.bg { W - x0 } else { xr + 1 };
         s.fill(
             x0,
             RULE_Y,
-            xr + 1 - x0,
+            rx1 - x0,
             1,
             if bg == p.bg { p.rule } else { p.line },
         );
@@ -875,7 +878,7 @@ impl Ui {
 
     /// The hint bar of a page: back and select.
     pub(crate) fn page_hints(&self, s: &mut Screen) {
-        self.hints(s, 26, W - 31, pal().bg, &[("B", "Back"), ("A", "OK")]);
+        self.hints(s, 30, W - 54, pal().bg, &[("B", "Back"), ("A", "OK")]);
     }
 
     /// Button: filled in `tone`, or a raised one when `Plain`.

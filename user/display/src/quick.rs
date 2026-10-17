@@ -27,7 +27,7 @@ impl Ui {
             s.fill_alpha(X - 12 + i, 0, 1, H, BLACK, 4 + i * 6);
         }
         s.fill(X, 0, W - X, H, p.surface);
-        self.status(s, d, W - 32, crate::ui::STATUS_Y, p.surface);
+        self.status(s, d, W - 32, 40, p.surface);
 
         // Sleep Mode.
         let (y, h) = (95, 76);

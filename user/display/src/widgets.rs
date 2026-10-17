@@ -195,24 +195,10 @@ pub fn button_glyph(s: &mut Screen, cx: usize, cy: usize, b: &str, c: u32, bg: u
     }
 }
 
-/// The L or R key of the tab row, 47 x 22 centered on `cy`.
-pub fn shoulder(s: &mut Screen, x: usize, cy: usize, k: &str) {
-    let p = pal();
-    s.fill_round(x, cy - 11, 47, 22, 6, p.key);
-    s.label_c(
-        x + 24,
-        cy,
-        k,
-        Face::CapB,
-        if is_light() { WHITE } else { BLACK },
-    );
-}
-
 /// Icon kinds of the UI.
 #[derive(Clone, Copy)]
 pub enum Icon {
     Sliders,
-    Moon,
     Power,
     Bolt,
     Sun,
@@ -234,10 +220,6 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
                 s.line(x - 11, y + dy, x + 11, y + dy, 2, c);
                 s.fill_round((x + kx - 2) as usize, (y + dy - 4) as usize, 5, 9, 1, c);
             }
-        }
-        Icon::Moon => {
-            s.disc(cx, cy, 12, c);
-            s.disc(cx + 6, cy - 5, 10, bg);
         }
         Icon::Power => {
             s.ring(cx, cy + 1, 10, 2, c);

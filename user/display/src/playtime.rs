@@ -127,15 +127,6 @@ impl Playtime {
         e.week_time += secs;
     }
 
-    /// The game started last.
-    pub fn last(&self) -> Option<&str> {
-        self.games
-            .iter()
-            .filter(|e| e.order > 0)
-            .max_by_key(|e| e.order)
-            .map(|e| e.name.as_str())
-    }
-
     /// The home row's line above a game: this week's time, else the
     /// total, in capitals.
     pub fn label(&self, name: &str, wall_ns: u64) -> String {
