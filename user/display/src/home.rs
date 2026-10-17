@@ -37,17 +37,23 @@ const X0: usize = 104;
 /// between them, and the cyan selection frame around the chosen one.
 const ICON_Y: usize = 166;
 const ICON: usize = 256;
-const ICON_R: usize = 14;
+const ICON_R: usize = 22;
 const GAP: usize = 22;
 const FRAME: usize = 8;
 const FRAME_T: usize = 5;
 /// Center line of the selected game's title and play time above the row.
-const TITLE_Y: usize = 126;
-/// The centered row of round buttons underneath (`BUTTONS`).
+const TITLE_Y: usize = 124;
+/// The unified pill dock underneath (`BUTTONS`) and the protruding circle
+/// of the selected dock button.
 const BTN: usize = 76;
-const BTN_GAP: usize = 28;
-const BTN_CY: usize = 512;
-const BTN_LABEL_Y: usize = 592;
+const BTN_GAP: usize = 18;
+const DOCK_H: usize = 82;
+const DOCK_R: usize = DOCK_H / 2;
+const DOCK_PAD: usize = 24;
+const SEL_R: usize = 47;
+const BTN_CY: usize = 504;
+const BTN_TITLE_Y: usize = 572;
+const BTN_INFO_Y: usize = 602;
 
 impl Ui {
     /// What A or a tap on round button `k` opens.
@@ -103,7 +109,7 @@ impl Ui {
         Some(None)
     }
 
-    /// Short status shown next to the selected round button's name.
+    /// Short status shown below the selected dock button's name.
     fn button_info(&self, k: usize, d: &Data) -> String {
         match k {
             0 => {
@@ -161,14 +167,21 @@ impl Ui {
             self.scroll = self.scroll_to;
         }
         let off = self.scroll as i32;
+        let last_idx = self
+            .play
+            .last()
+            .and_then(|name| self.games.iter().position(|g| g.name == name))
+            .unwrap_or(0);
 
         // 1. Horizontal row of square game icons (and empty Switch slots).
         s.dx = -off;
         for i in 0..slots {
             let x = X0 + i * (ICON + GAP);
             if i < n {
-                s.shadow(x, ICON_Y, ICON, ICON, ICON_R, BLACK);
                 game_icon(s, &self.games[i], x, ICON_Y);
+                if i == last_idx {
+                    game_badge(s, x, ICON_Y);
+                }
                 if sel_btn.is_none() && self.home == i {
                     s.ring_round(
                         x - FRAME,
@@ -179,6 +192,7 @@ impl Ui {
                         FRAME_T,
                         p.focus,
                     );
+                    s.ring_round(x - 3, ICON_Y - 3, ICON + 6, ICON + 6, ICON_R + 2, 2, WHITE);
                 }
                 self.zone_at(Id::Game(i), x, ICON_Y, ICON, ICON, ICON_R, off);
             } else {
@@ -211,43 +225,56 @@ impl Ui {
             s.label(sx + 30 + tw + 20, TITLE_Y + 2, &play, Face::CapB, p.dim);
         }
 
-        // 3. Centered row of round system buttons underneath.
+        // 3. Switch 2 unified pill dock underneath.
         let total_w = BUTTONS.len() * BTN + (BUTTONS.len() - 1) * BTN_GAP;
         let bx0 = (W - total_w) / 2;
+        let dock_x = bx0 - DOCK_PAD;
+        let dock_w = total_w + 2 * DOCK_PAD;
+        let dock_bg = if crate::theme::is_light() {
+            WHITE
+        } else {
+            p.surface
+        };
+        s.fill_round(dock_x, BTN_CY - DOCK_R, dock_w, DOCK_H, DOCK_R, dock_bg);
+        if crate::theme::is_light() {
+            s.ring_round(dock_x, BTN_CY - DOCK_R, dock_w, DOCK_H, DOCK_R, 1, p.rule);
+        }
+        let r = BTN / 2;
         for k in 0..BUTTONS.len() {
             let bx = bx0 + k * (BTN + BTN_GAP);
-            let cx = bx + BTN / 2;
-            let r = BTN / 2;
-            s.shadow(bx, BTN_CY - r, BTN, BTN, r, BLACK);
-            if let Some(img) = art::get(art::UI, art::button(k)) {
-                s.image(&img, bx, BTN_CY - r, BTN, BTN, r);
-            } else {
-                s.disc(cx, BTN_CY, r, p.surface);
-            }
-            if crate::theme::is_light() {
-                s.ring(cx, BTN_CY, r, 1, p.rule);
-            }
-            if k == 3 && self.unread > 0 {
-                s.disc(cx + 24, BTN_CY - 24, 6, p.accent);
-            }
-            if sel_btn == Some(k) {
-                s.ring(cx, BTN_CY, r + 6, 4, p.focus);
+            let cx = bx + r;
+            if sel_btn != Some(k) {
+                if let Some(img) = art::get(art::UI, art::button(k, false)) {
+                    s.image(&img, bx, BTN_CY - r, BTN, BTN, r);
+                }
+                if k == 3 && self.unread > 0 {
+                    s.disc(cx + 22, BTN_CY - 22, 6, p.accent);
+                }
             }
             self.zone(Id::Tile(k), bx, BTN_CY - r, BTN, BTN, r);
         }
 
-        // 4. Selected round button's name and live status below the row.
+        // 4. Protruding circle, glowing ring, and centered title for the selected dock button.
         if let Some(k) = sel_btn {
-            let name = BUTTONS[k];
+            let bx = bx0 + k * (BTN + BTN_GAP);
+            let cx = bx + r;
+            let sel_bg = if crate::theme::is_light() {
+                WHITE
+            } else {
+                p.raised
+            };
+            s.disc(cx, BTN_CY, SEL_R, sel_bg);
+            if let Some(img) = art::get(art::UI, art::button(k, true)) {
+                s.image(&img, bx, BTN_CY - r, BTN, BTN, r);
+            }
+            if k == 3 && self.unread > 0 {
+                s.disc(cx + 22, BTN_CY - 22, 6, p.accent);
+            }
+            s.ring(cx, BTN_CY, SEL_R + 3, 4, p.focus);
+            s.ring(cx, BTN_CY, SEL_R, 2, WHITE);
+            s.label_c(cx, BTN_TITLE_Y, BUTTONS[k], Face::Body, p.accent);
             let info = self.button_info(k, d);
-            let nw = font::width(Face::BodyB, name);
-            let sep = "  \u{b7}  ";
-            let sw = font::width(Face::Small, sep);
-            let iw = font::width(Face::Small, &info);
-            let x = (W.saturating_sub(nw + sw + iw)) / 2;
-            s.label(x, BTN_LABEL_Y, name, Face::BodyB, p.accent);
-            s.label(x + nw, BTN_LABEL_Y, sep, Face::Small, p.dim);
-            s.label(x + nw + sw, BTN_LABEL_Y, &info, Face::Small, p.dim);
+            s.label_c(cx, BTN_INFO_Y, &info, Face::Cap, p.dim);
         }
 
         // 5. Bottom bar: controller icon on the left, button hints on the right.
@@ -295,4 +322,17 @@ fn game_icon(s: &mut Screen, g: &GameInfo, x: usize, y: usize) {
             s.label_c(x + ICON / 2, y + ICON / 2, &t, Face::TitleB, WHITE);
         }
     }
+}
+
+/// Switch 2 bottom-left avatar and black status pill on the last-played game card.
+fn game_badge(s: &mut Screen, x: usize, y: usize) {
+    let ay = y + ICON - 56;
+    if let Some(img) = art::get(art::UI, art::AVATAR_SMALL) {
+        s.image(&img, x + 12, ay, 44, 44, 22);
+    }
+    s.ring(x + 34, ay + 22, 22, 2, crate::theme::rgb(0x2E2E2E));
+    let (px, py, pw, ph) = (x + 64, ay + 2, 180, 40);
+    s.fill_round(px, py, pw, ph, 20, BLACK);
+    s.ring_round(px, py, pw, ph, 20, 2, crate::theme::rgb(0xD8D8D8));
+    s.label_c(px + pw / 2, py + ph / 2, "Last played", Face::Small, WHITE);
 }

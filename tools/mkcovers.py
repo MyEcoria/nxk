@@ -393,17 +393,18 @@ GAMES = {"cube": cover_cube, "starlane": cover_starlane}
 # The UI's own art: glyphs in `col`, about 0.55 x `s` across.
 
 def ic_system(d, cx, cy, s, col):
-    a = s * 0.2
-    d.rounded_rectangle((cx - a, cy - a, cx + a, cy + a), s * 0.04, fill=col)
-    d.rounded_rectangle((cx - a * 0.55, cy - a * 0.55, cx + a * 0.55, cy + a * 0.55), s * 0.02, fill=(0, 0, 0, 0))
-    for i in (-0.6, 0, 0.6):
+    a, t = s * 0.21, int(s * 0.05)
+    d.rounded_rectangle((cx - a, cy - a, cx + a, cy + a), s * 0.045, outline=col, width=t)
+    b = a * 0.46
+    d.rounded_rectangle((cx - b, cy - b, cx + b, cy + b), s * 0.02, outline=col, width=max(1, int(s * 0.04)))
+    for i in (-0.58, 0, 0.58):
         for (x0, y0, x1, y1) in [
-            (cx + i * a, cy - a * 1.45, cx + i * a, cy - a),
-            (cx + i * a, cy + a, cx + i * a, cy + a * 1.45),
-            (cx - a * 1.45, cy + i * a, cx - a, cy + i * a),
-            (cx + a, cy + i * a, cx + a * 1.45, cy + i * a),
+            (cx + i * a, cy - a * 1.42, cx + i * a, cy - a),
+            (cx + i * a, cy + a, cx + i * a, cy + a * 1.42),
+            (cx - a * 1.42, cy + i * a, cx - a, cy + i * a),
+            (cx + a, cy + i * a, cx + a * 1.42, cy + i * a),
         ]:
-            d.line((x0, y0, x1, y1), fill=col, width=int(s * 0.045))
+            d.line((x0, y0, x1, y1), fill=col, width=t)
 
 
 def ic_network(d, cx, cy, s, col):
@@ -436,16 +437,13 @@ def ic_logs(d, cx, cy, s, col):
 
 
 def ic_settings(d, cx, cy, s, col):
-    """A gear: eight teeth around a ring."""
-    ro, ri, tw = s * 0.29, s * 0.21, s * 0.075
+    """Switch settings sun-gear: a hollow ring with eight radial spokes."""
+    ri, ro, t = s * 0.175, s * 0.275, int(s * 0.052)
     for i in range(8):
         a = i * math.pi / 4
         ca, sa = math.cos(a), math.sin(a)
-        pts = [(cx + ca * r - sa * w, cy + sa * r + ca * w) for r, w in ((ri * 0.9, -tw), (ro, -tw * 0.8), (ro, tw * 0.8), (ri * 0.9, tw))]
-        d.polygon(pts, fill=col)
-    d.ellipse((cx - ri, cy - ri, cx + ri, cy + ri), fill=col)
-    h = s * 0.095
-    d.ellipse((cx - h, cy - h, cx + h, cy + h), fill=(0, 0, 0, 0))
+        d.line((cx + ca * (ri - t * 0.3), cy + sa * (ri - t * 0.3), cx + ca * ro, cy + sa * ro), fill=col, width=t)
+    d.ellipse((cx - ri, cy - ri, cx + ri, cy + ri), outline=col, width=int(s * 0.055))
 
 
 def ic_power(d, cx, cy, s, col):
@@ -457,11 +455,12 @@ def ic_power(d, cx, cy, s, col):
 # Home order: System, Network, Terminal, Logs, System Settings, Power.
 GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_settings, ic_power]
 # Glyph colors; None: the theme's grey.
-COLORS = [(232, 72, 62), (38, 128, 236), (140, 92, 240), (20, 172, 128), None, None]
+COLORS = [(240, 86, 62), (70, 136, 241), (58, 190, 192), (44, 182, 67), None, None]
 THEMES = {
-    # (page background, round button's disc, grey glyph)
-    "dark": ((0, 0, 0), (47, 47, 47), (222, 222, 222)),
-    "light": ((235, 235, 235), (255, 255, 255), (84, 84, 84)),
+    # (page background, dock surface, grey glyph)
+    "dark": ((28, 28, 28), (46, 46, 46), (196, 196, 196)),
+    "dark_sel": ((28, 28, 28), (60, 60, 60), (220, 220, 220)),
+    "light": ((235, 235, 235), (255, 255, 255), (88, 88, 88)),
 }
 
 
@@ -475,8 +474,7 @@ def glyph_img(size, bg, k, grey, scale):
 
 
 def buttons(theme):
-    """The round buttons, the whole square in the disc's color: the UI
-    draws them through a circle."""
+    """The dock buttons on the dock pill or selected circle background."""
     _, disc, grey = THEMES[theme]
     return [glyph_img(BUTTON, disc, k, grey, 0.8) for k in range(len(GLYPHS))]
 
@@ -524,8 +522,15 @@ def main():
     ap.add_argument("-o", required=True, help="the UI's art (avatar, buttons, header glyphs)")
     ap.add_argument("--games", help="directory of the games' covers")
     a = ap.parse_args()
-    # In art.rs' order: AVATAR, BUTTON (dark, light), HEAD (dark, light).
-    ui = [avatar(AVATAR)] + buttons("dark") + buttons("light") + heads("dark") + heads("light")
+    # In art.rs' order: AVATAR, AVATAR_SMALL, BUTTON (dark, dark_sel, light), HEAD (dark, light).
+    ui = (
+        [avatar(AVATAR), avatar(44)]
+        + buttons("dark")
+        + buttons("dark_sel")
+        + buttons("light")
+        + heads("dark")
+        + heads("light")
+    )
     n = write(a.o, ui)
     print(f"mkcovers: {a.o}: {n} bytes")
     if a.games:

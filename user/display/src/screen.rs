@@ -293,11 +293,10 @@ impl Screen {
         }
     }
 
-    /// Soft shadow under a rounded rectangle.
+    /// Soft shadow under a floating sheet or toast.
     pub fn shadow(&mut self, x: usize, y: usize, w: usize, h: usize, r: usize, c: u32) {
-        self.round_a(x, y + 10, w + 8, h + 4, r + 4, c, 22);
-        self.round_a(x + 2, y + 6, w + 4, h + 2, r + 2, c, 30);
-        self.round_a(x + 4, y + 3, w, h, r, c, 40);
+        self.round_a(x, y + 3, w, h + 2, r + 2, c, 20);
+        self.round_a(x + 1, y + 1, w.saturating_sub(2), h, r, c, 24);
     }
 
     /// Disc of radius `r` centered on (cx, cy).

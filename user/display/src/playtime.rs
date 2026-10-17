@@ -92,6 +92,15 @@ impl Playtime {
         self.games.iter().find(|e| e.name == name)
     }
 
+    /// Name of the most recently started game, if any.
+    pub fn last(&self) -> Option<&str> {
+        self.games
+            .iter()
+            .filter(|e| e.order > 0)
+            .max_by_key(|e| e.order)
+            .map(|e| e.name.as_str())
+    }
+
     fn entry(&mut self, name: &str) -> &mut Entry {
         let i = match self.games.iter().position(|e| e.name == name) {
             Some(i) => i,

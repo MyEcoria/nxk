@@ -8,18 +8,25 @@ pub const UI: &[u8] = include_bytes!("../../../build/uiart.bin");
 /// on the dark theme's disc and the light one's, then the same glyphs
 /// on each theme's background for the page headers.
 pub const AVATAR: usize = 0;
-const BUTTON: usize = 1;
-const HEAD: usize = 13;
+pub const AVATAR_SMALL: usize = 1;
+const BUTTON: usize = 2;
+const HEAD: usize = 20;
 const KINDS: usize = 6;
 /// In a game's `cover.bin`: its square icon.
 pub const ICON: usize = 0;
 
-/// Round button `k` (`home::BUTTONS`) for the theme in force.
-pub fn button(k: usize) -> usize {
-    BUTTON + KINDS * crate::theme::is_light() as usize + k
+/// Dock button `k` (`home::BUTTONS`) for the theme in force (`sel`: on the
+/// protruding selected circle).
+pub fn button(k: usize, sel: bool) -> usize {
+    let bank = if crate::theme::is_light() {
+        2
+    } else {
+        sel as usize
+    };
+    BUTTON + KINDS * bank + k
 }
 
-/// Header glyph `k` (the round buttons' order) for the theme in force.
+/// Header glyph `k` (the dock buttons' order) for the theme in force.
 pub fn head(k: usize) -> usize {
     HEAD + KINDS * crate::theme::is_light() as usize + k
 }

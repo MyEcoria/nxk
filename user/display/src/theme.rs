@@ -41,15 +41,15 @@ pub struct Palette {
 }
 
 pub const DARK: Palette = Palette {
-    bg: rgb(0x000000),
-    surface: rgb(0x1A1A1A),
-    raised: rgb(0x262626),
-    rule: rgb(0x3A3A3A),
-    line: rgb(0x393939),
+    bg: rgb(0x1C1C1C),
+    surface: rgb(0x2E2E2E),
+    raised: rgb(0x3C3C3C),
+    rule: rgb(0x444444),
+    line: rgb(0x404040),
     track: rgb(0x5D5D5D),
     text: rgb(0xFFFFFF),
     dim: rgb(0xC4C4C4),
-    faint: rgb(0x6A6A6A),
+    faint: rgb(0x787878),
     accent: rgb(0x3BC3E3),
     on_accent: rgb(0x000000),
     good: rgb(0x6EEACD),
