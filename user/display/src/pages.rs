@@ -1,5 +1,5 @@
-//! The full-screen pages opened from the dock: Network, System (overview
-//! and detail), Terminal and Logs.
+//! The pages of the tab row after Games: System (overview and details),
+//! Network, Terminal and Logs, as cards on the black page.
 
 use alloc::format;
 use alloc::string::String;
@@ -8,50 +8,61 @@ use alloc::vec::Vec;
 use libnx::abi::layout::PAGE_SIZE;
 use libnx::abi::proto::{usbcon as usb, wifi};
 
-use crate::font::{self, Face};
+use crate::font::Face;
 use crate::screen::{Bytes, Celsius, Hms, Ipv4, Screen, BAD, FG, TERM_BG};
 use crate::stats::{Data, Eth, Now, Seen};
+use crate::status::{
+    cpu_text, eth_text, fan_text, gpu_text, usb_short, usb_status, wifi_connected, wifi_short,
+};
 use crate::term::Term;
 use crate::theme::pal;
-use crate::ui::{
-    cpu_text, eth_text, fan_text, gpu_text, usb_short, usb_status, wifi_connected, wifi_short, Id,
-    Ui, CH, CY, H, LOGS, M, NETWORK, TERMINAL, W,
-};
+use crate::ui::{Id, Ui, CB, CH, CY, HINT_Y, M, NETWORK, W};
 use crate::widgets::{
-    badge, bar, bars_for, card, fit, kv, load_color, signal_bars, split_bar, titled, vc, Tone,
+    badge, bar, bars_for, card, fit, heading, kv, load_color, signal_bars, split_bar, titled, Tone,
 };
 use crate::Messages;
 
-/// A processor's load: name, bar and percentage, or off.
-fn load_row(s: &mut Screen, x: usize, w: usize, y: usize, name: &str, load: Option<u64>) {
+const GAP: usize = 16;
+
+/// A processor's load centered on `cy`: name, bar and percentage, or off.
+fn load_row(s: &mut Screen, x: usize, w: usize, cy: usize, name: &str, load: Option<u64>) {
     let p = pal();
-    s.text(
+    s.label(
         x + 24,
-        y,
+        cy,
         name,
-        Face::Body,
+        Face::Small,
         if load.is_some() { p.text } else { p.dim },
     );
+    bar(
+        s,
+        x + 104,
+        cy - 4,
+        w - 208,
+        8,
+        load.unwrap_or(0),
+        load.map_or(p.track, load_color),
+    );
     match load {
-        Some(v) => {
-            bar(s, x + 104, y + 6, w - 208, 12, v, load_color(v));
-            s.text_r(x + w - 24, y, &format!("{}%", v), Face::Body, p.text);
-        }
-        None => {
-            bar(s, x + 104, y + 6, w - 208, 12, 0, p.track);
-            s.text_r(x + w - 24, y, "off", Face::Body, p.dim);
-        }
+        Some(v) => s.label_r(x + w - 24, cy, &format!("{}%", v), Face::Small, p.text),
+        None => s.label_r(x + w - 24, cy, "off", Face::Small, p.dim),
+    };
+}
+
+/// ACTIVE on the link net uses, STANDBY on another usable one; returns its width.
+fn link_badge(s: &mut Screen, d: &Data, xr: usize, cy: usize, name: &str, usable: bool) -> usize {
+    let p = pal();
+    match d.active() {
+        Some(n) if n.link_name() == name => badge(s, xr, cy, "ACTIVE", p.good),
+        _ if usable => badge(s, xr, cy, "STANDBY", p.dim),
+        _ => 0,
     }
 }
 
-/// ACTIVE on the link net uses, STANDBY on another usable one; returns the width.
-fn link_badge(s: &mut Screen, d: &Data, xr: usize, y: usize, name: &str, usable: bool) -> usize {
-    let p = pal();
-    match d.active() {
-        Some(n) if n.link_name() == name => badge(s, xr, y, "ACTIVE", p.good),
-        _ if usable => badge(s, xr, y, "STANDBY", p.dim),
-        _ => 0,
-    }
+/// A big value with its unit after it, centered on `cy`.
+fn big(s: &mut Screen, x: usize, cy: usize, value: &str, unit: &str, c: u32) {
+    let w = s.label(x, cy, value, Face::Head, c);
+    s.label(x + w + 12, cy + 6, unit, Face::Small, pal().dim);
 }
 
 impl Ui {
@@ -61,105 +72,86 @@ impl Ui {
         } else {
             self.sys_detail(s, d);
         }
+        self.page_hints(s);
         let tx = W / 2 - 144;
-        self.pill(
-            s,
-            Id::SysTab(0),
-            tx,
-            H - 54,
-            136,
-            36,
-            "Overview",
-            self.sys_tab == 0,
-        );
-        self.pill(
-            s,
-            Id::SysTab(1),
-            tx + 148,
-            H - 54,
-            136,
-            36,
-            "Details",
-            self.sys_tab == 1,
-        );
-        self.hint_bar(s, &[("B", "Back"), ("A", "OK")]);
+        for (i, t) in ["Overview", "Details"].iter().enumerate() {
+            let on = self.sys_tab == i;
+            self.chip(
+                s,
+                Id::SysTab(i),
+                tx + i * 148,
+                HINT_Y - 18,
+                136,
+                36,
+                t,
+                on,
+                true,
+            );
+        }
     }
 
-    /// Four summary cards: CPU, Memory, Storage, Connectivity.
+    /// Four summary cards: processor, memory, storage, links.
     fn sys_overview(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        let gap = 20usize;
-        let (w, h) = ((W - 2 * M - gap) / 2, (CH - gap) / 2);
-        let (xl, xr) = (M, M + w + gap);
-        let (yt, yb) = (CY, CY + h + gap);
+        let (w, h) = ((W - 2 * M - GAP) / 2, (CH - GAP) / 2);
+        let (xl, xr) = (M, M + w + GAP);
+        let (yt, yb) = (CY, CY + h + GAP);
 
-        // CPU.
         self.tile_card(s, Id::SysTab(1), xl, yt, w, h, "Processor");
         let on: Vec<u64> = d.load.iter().flatten().copied().collect();
         let avg = on.iter().sum::<u64>() / (on.len() as u64).max(1);
-        s.text(
+        s.label(
             xl + 24,
-            yt + 60,
+            yt + 100,
             &format!("{}%", avg),
             Face::Big,
             load_color(avg),
         );
-        s.text(xl + 24, yt + 138, "average", Face::Cap, p.dim);
+        s.label(xl + 24, yt + 150, "average", Face::Cap, p.dim);
         for (k, v) in d.load.iter().enumerate() {
-            let y = yt + 52 + k * 34;
-            s.text(
-                xl + 240,
-                y,
+            let cy = yt + 66 + k * 30;
+            s.label(
+                xl + 220,
+                cy,
                 &format!("C{}", k),
                 Face::Cap,
                 if v.is_some() { p.text } else { p.dim },
             );
+            bar(
+                s,
+                xl + 260,
+                cy - 4,
+                w - 340,
+                8,
+                v.unwrap_or(0),
+                v.map_or(p.track, load_color),
+            );
             match v {
-                Some(pct) => {
-                    bar(s, xl + 280, y + 6, w - 360, 10, *pct, load_color(*pct));
-                    s.text_r(xl + w - 24, y, &format!("{}%", pct), Face::Cap, p.text);
-                }
-                None => {
-                    bar(s, xl + 280, y + 6, w - 360, 10, 0, p.track);
-                    s.text_r(xl + w - 24, y, "off", Face::Cap, p.dim);
-                }
-            }
+                Some(pct) => s.label_r(xl + w - 24, cy, &format!("{}%", pct), Face::Cap, p.text),
+                None => s.label_r(xl + w - 24, cy, "off", Face::Cap, p.dim),
+            };
         }
         let line = format!(
-            "{} cores   {} processes   up {}",
+            "{} cores \u{b7} {} processes \u{b7} up {}",
             on.len(),
             d.procs,
             Hms(d.up_s)
         );
-        s.text(xl + 24, yt + h - 40, &line, Face::Cap, p.dim);
+        s.label(xl + 24, yt + h - 28, &line, Face::Cap, p.dim);
 
-        // Memory.
         titled(s, xr, yt, w, h, "Memory");
         if let Some(m) = d.mem {
-            let b = |pages: u64| pages * PAGE_SIZE;
+            let b = |pages: u64| format!("{}", Bytes(pages * PAGE_SIZE));
             let used = m.total_pages - m.free_pages;
-            s.text_r(
-                xr + w - 24,
-                yt + 18,
-                &format!("{}", Bytes(b(m.total_pages))),
-                Face::Body,
-                p.dim,
-            );
-            let mw = s.text(
-                xr + 24,
-                yt + 60,
-                &format!("{}", Bytes(b(used))),
-                Face::Big,
-                p.text,
-            );
-            s.text(xr + 36 + mw, yt + 96, "used", Face::Body, p.dim);
             let user = used.saturating_sub(m.kernel_pages);
+            s.label_r(xr + w - 24, yt + 30, &b(m.total_pages), Face::Small, p.dim);
+            big(s, xr + 24, yt + 88, &b(used), "used", p.text);
             split_bar(
                 s,
                 xr + 24,
-                yt + 144,
+                yt + 128,
                 w - 48,
-                14,
+                10,
                 m.total_pages,
                 m.kernel_pages,
                 user,
@@ -167,84 +159,75 @@ impl Ui {
             kv(
                 s,
                 xr + 24,
-                xr + w / 2 - 8,
-                yt + 174,
+                xr + w / 2 - 12,
+                yt + 166,
                 "kernel",
-                &format!("{}", Bytes(b(m.kernel_pages))),
+                &b(m.kernel_pages),
                 Some(p.accent),
             );
             kv(
                 s,
-                xr + w / 2 + 8,
+                xr + w / 2 + 12,
                 xr + w - 24,
-                yt + 174,
+                yt + 166,
                 "programs",
-                &format!("{}", Bytes(b(user))),
+                &b(user),
                 Some(p.good),
             );
             kv(
                 s,
                 xr + 24,
                 xr + w - 24,
-                yt + 206,
+                yt + 198,
                 "free",
-                &format!("{}", Bytes(b(m.free_pages))),
+                &b(m.free_pages),
                 Some(p.track),
             );
         }
 
-        // Storage.
         titled(s, xl, yb, w, h, "Storage");
         match d.disk {
             Seen::Value((free, total)) => {
                 let used = total.saturating_sub(free);
                 let pct = used * 100 / total.max(1);
-                s.text_r(xl + w - 24, yb + 18, "SD card", Face::Body, p.dim);
-                let fw = s.text(
+                s.label_r(xl + w - 24, yb + 30, "SD card", Face::Small, p.dim);
+                big(
+                    s,
                     xl + 24,
-                    yb + 60,
+                    yb + 88,
                     &format!("{}", Bytes(free)),
-                    Face::Big,
+                    "free",
                     p.text,
                 );
-                s.text(xl + 36 + fw, yb + 96, "free", Face::Body, p.dim);
                 bar(
                     s,
                     xl + 24,
-                    yb + 144,
+                    yb + 128,
                     w - 48,
-                    14,
+                    10,
                     pct,
                     if pct >= 90 { p.bad } else { p.accent },
                 );
+                let u = format!("{} ({}%)", Bytes(used), pct);
+                kv(s, xl + 24, xl + w - 24, yb + 166, "used", &u, None);
                 kv(
                     s,
                     xl + 24,
                     xl + w - 24,
-                    yb + 174,
-                    "used",
-                    &format!("{} ({}%)", Bytes(used), pct),
-                    None,
-                );
-                kv(
-                    s,
-                    xl + 24,
-                    xl + w - 24,
-                    yb + 206,
+                    yb + 198,
                     "total",
                     &format!("{}", Bytes(total)),
                     None,
                 );
             }
             Seen::Missing => {
-                s.text(xl + 24, yb + 76, "no SD card", Face::Body, p.dim);
+                s.label(xl + 24, yb + 88, "no SD card", Face::Body, p.dim);
             }
             Seen::Unknown => {
-                s.text(xl + 24, yb + 76, "starting", Face::Body, p.dim);
+                s.label(xl + 24, yb + 88, "starting", Face::Body, p.dim);
             }
         }
 
-        // Connectivity & console.
         self.tile_card(s, Id::OpenPage(NETWORK), xr, yb, w, h, "Links");
         let ip = match d.active() {
             Some(n) if n.addr != 0 => {
@@ -253,56 +236,79 @@ impl Ui {
             Some(n) => format!("waiting for DHCP ({})", n.link_name()),
             None => "offline".into(),
         };
-        s.text(xr + 24, yb + 64, &ip, Face::Title, p.text);
+        s.label(xr + 24, yb + 80, &ip, Face::Title, p.text);
         let (wt, wc) = wifi_short(d);
-        s.text(xr + 24, yb + 116, "Wi-Fi", Face::Body, p.dim);
-        s.text_r(xr + w - 24, yb + 116, wt, Face::Body, wc);
         let (et, ec) = eth_text(d, true);
-        s.text(xr + 24, yb + 150, "Ethernet", Face::Body, p.dim);
-        s.text_r(xr + w - 24, yb + 150, et, Face::Body, ec);
         let (ut, uc) = usb_short(d);
-        s.text(xr + 24, yb + 184, "USB console", Face::Body, p.dim);
-        s.text_r(xr + w - 24, yb + 184, ut, Face::Body, uc);
+        for (i, (k, v, c)) in [
+            ("Wi-Fi", wt, wc),
+            ("Ethernet", et, ec),
+            ("USB console", ut, uc),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cy = yb + 132 + i * 30;
+            s.label(xr + 24, cy, k, Face::Small, p.dim);
+            s.label_r(xr + w - 24, cy, v, Face::Small, c);
+        }
     }
 
     /// Per-core load, clocks, activity, memory, temperatures, fan and power.
     fn sys_detail(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        let gap = 20usize;
-        let w = (W - 2 * M - gap) / 2;
-        let (xl, xr) = (M, M + w + gap);
+        let w = (W - 2 * M - GAP) / 2;
+        let (xl, xr) = (M, M + w + GAP);
         titled(s, xl, CY, w, CH, "Processor");
-        s.text_r(
+        s.label_r(
             xl + w - 24,
-            CY + 18,
+            CY + 30,
             &format!("up {}", Hms(d.up_s)),
-            Face::Body,
+            Face::Small,
             p.dim,
         );
         for (k, v) in d.load.iter().enumerate() {
-            load_row(s, xl, w, CY + 58 + k * 34, &format!("CPU{}", k), *v);
+            load_row(s, xl, w, CY + 66 + k * 30, &format!("CPU{}", k), *v);
         }
         let gpu_load = match d.gpu {
             Seen::Value(g) => g.load,
             _ => None,
         };
-        load_row(s, xl, w, CY + 194, "GPU", gpu_load);
+        load_row(s, xl, w, CY + 186, "GPU", gpu_load);
         // The clock rows open the CPU and GPU sheets.
         let (t, c) = match d.cpu {
             Seen::Value(c) => cpu_text(&c),
             Seen::Missing => ("no clock control".into(), p.dim),
             Seen::Unknown => ("starting".into(), p.dim),
         };
-        self.open_row(s, Id::CpuOpen, xl, w, CY + 236, "CPU clock", &t, c);
+        self.open_row(
+            s,
+            Id::CpuOpen,
+            xl + 16,
+            w - 32,
+            CY + 214,
+            "CPU clock",
+            &t,
+            c,
+        );
         let (t, c) = gpu_text(&d.gpu);
-        self.open_row(s, Id::GpuOpen, xl, w, CY + 292, "GPU clock", &t, c);
-        s.fill(xl + 24, CY + 354, w - 48, 1, p.line);
-        s.text(xl + 24, CY + 368, "Activity", Face::BodyB, p.dim);
-        s.text_r(
+        self.open_row(
+            s,
+            Id::GpuOpen,
+            xl + 16,
+            w - 32,
+            CY + 270,
+            "GPU clock",
+            &t,
+            c,
+        );
+        s.fill(xl + 24, CY + 334, w - 48, 1, p.line);
+        heading(s, xl + 24, CY + 358, "Activity");
+        s.label_r(
             xl + w - 24,
-            CY + 368,
+            CY + 358,
             &format!("{} processes", d.procs),
-            Face::Body,
+            Face::Small,
             p.dim,
         );
         let rows = [
@@ -315,26 +321,26 @@ impl Ui {
                 s,
                 xl + 24,
                 xl + w - 24,
-                CY + 404 + i * 32,
+                CY + 392 + i * 30,
                 n,
                 &format!("{}", v),
                 None,
             );
         }
 
-        let mh = 236usize;
+        let mh = 210usize;
         titled(s, xr, CY, w, mh, "Memory");
         if let Some(m) = d.mem {
             let b = |pages: u64| format!("{}", Bytes(pages * PAGE_SIZE));
             let used = m.total_pages - m.free_pages;
             let user = used.saturating_sub(m.kernel_pages);
-            s.text_r(xr + w - 24, CY + 18, &b(m.total_pages), Face::Body, p.dim);
+            s.label_r(xr + w - 24, CY + 30, &b(m.total_pages), Face::Small, p.dim);
             split_bar(
                 s,
                 xr + 24,
                 CY + 62,
                 w - 48,
-                18,
+                12,
                 m.total_pages,
                 m.kernel_pages,
                 user,
@@ -343,7 +349,7 @@ impl Ui {
                 s,
                 xr + 24,
                 xr + w - 24,
-                CY + 102,
+                CY + 110,
                 "kernel",
                 &b(m.kernel_pages),
                 Some(p.accent),
@@ -352,7 +358,7 @@ impl Ui {
                 s,
                 xr + 24,
                 xr + w - 24,
-                CY + 140,
+                CY + 142,
                 "programs",
                 &b(user),
                 Some(p.good),
@@ -361,14 +367,14 @@ impl Ui {
                 s,
                 xr + 24,
                 xr + w - 24,
-                CY + 178,
+                CY + 174,
                 "free",
                 &b(m.free_pages),
                 Some(p.track),
             );
         }
 
-        let (py, ph) = (CY + mh + gap, CH - mh - gap);
+        let (py, ph) = (CY + mh + GAP, CH - mh - GAP);
         titled(s, xr, py, w, ph, "Thermal & power");
         match d.temps {
             Seen::Value((chip, package)) => {
@@ -376,26 +382,33 @@ impl Ui {
                     s,
                     xr + 24,
                     xr + w - 24,
-                    py + 56,
+                    py + 66,
                     "chip temperature",
                     &format!("{}", Celsius(chip)),
                     None,
                 );
+                let t = format!("{}", Celsius(package));
                 kv(
                     s,
                     xr + 24,
                     xr + w - 24,
-                    py + 90,
+                    py + 96,
                     "package temperature",
-                    &format!("{}", Celsius(package)),
+                    &t,
                     None,
                 );
             }
             Seen::Missing => {
-                s.text(xr + 24, py + 56, "no temperature sensor", Face::Body, p.dim);
+                s.label(
+                    xr + 24,
+                    py + 66,
+                    "no temperature sensor",
+                    Face::Small,
+                    p.dim,
+                );
             }
             Seen::Unknown => {
-                s.text(xr + 24, py + 56, "starting", Face::Body, p.dim);
+                s.label(xr + 24, py + 66, "starting", Face::Small, p.dim);
             }
         }
         let (t, c) = match d.fan {
@@ -403,8 +416,8 @@ impl Ui {
             Seen::Missing => ("no fan control".into(), p.dim),
             Seen::Unknown => ("starting".into(), p.dim),
         };
-        self.open_row(s, Id::FanOpen, xr, w, py + 128, "Fan", &t, c);
-        let (bw, bh) = ((w - 64) / 2, 56);
+        self.open_row(s, Id::FanOpen, xr + 16, w - 32, py + 118, "Fan", &t, c);
+        let (bw, bh) = ((w - 64) / 2, 52);
         let by = py + ph - 20 - bh;
         self.button(
             s,
@@ -424,7 +437,7 @@ impl Ui {
             by,
             bw,
             bh,
-            "Power off",
+            "Power Off",
             Tone::Bad,
             true,
         );
@@ -432,11 +445,10 @@ impl Ui {
 
     pub(crate) fn network(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        self.page_head(s, "Network");
-        let gap = 20usize;
-        let w = (W - 2 * M - gap) / 2;
-        let (xl, xr) = (M, M + w + gap);
-        titled(s, M, CY, W - 2 * M, 176, "Internet");
+        let w = (W - 2 * M - GAP) / 2;
+        let (xl, xr) = (M, M + w + GAP);
+        let ih = 150;
+        titled(s, M, CY, W - 2 * M, ih, "Internet");
         match d.active() {
             Some(n) => {
                 let t = format!(
@@ -445,7 +457,7 @@ impl Ui {
                     Bytes(n.tx),
                     n.sockets
                 );
-                s.text_r(W - M - 24, CY + 18, &t, Face::Body, p.dim);
+                s.label_r(W - M - 24, CY + 30, &t, Face::Small, p.dim);
                 let dash = |a: u32| {
                     if a == 0 {
                         "-".into()
@@ -454,57 +466,51 @@ impl Ui {
                     }
                 };
                 if n.addr == 0 {
-                    s.text(M + 24, CY + 68, "waiting for DHCP", Face::Title, p.warn);
+                    s.label(M + 24, CY + 86, "waiting for DHCP", Face::Title, p.warn);
                 } else {
-                    let iw = s.text(
+                    big(
+                        s,
                         M + 24,
-                        CY + 58,
+                        CY + 86,
                         &format!("{}", Ipv4(n.addr)),
-                        Face::Head,
+                        &format!("/{}", n.prefix),
                         p.good,
                     );
-                    s.text(
-                        M + 28 + iw,
-                        CY + 74,
-                        &format!("/{}", n.prefix),
-                        Face::Body,
-                        p.dim,
-                    );
-                    s.text(M + 24, CY + 122, "online", Face::Body, p.good);
+                    s.label(M + 24, CY + 126, "online", Face::Small, p.good);
                 }
                 let via = format!("{}, {}", n.link_name(), n.link_label());
-                kv(s, xr + 24, W - M - 24, CY + 58, "via", &via, None);
+                kv(s, xr + 24, W - M - 24, CY + 66, "via", &via, None);
                 kv(
                     s,
                     xr + 24,
                     W - M - 24,
-                    CY + 94,
+                    CY + 96,
                     "gateway",
                     &dash(n.gateway),
                     None,
                 );
-                kv(s, xr + 24, W - M - 24, CY + 130, "DNS", &dash(n.dns), None);
+                kv(s, xr + 24, W - M - 24, CY + 126, "DNS", &dash(n.dns), None);
             }
             None => {
                 let t = match d.net {
                     Now::Busy => "busy",
                     _ => "no sharing on USB-C, no Wi-Fi network",
                 };
-                s.text(M + 24, CY + 58, "offline", Face::Head, p.dim);
-                s.text(M + 24, CY + 122, t, Face::Body, p.dim);
+                s.label(M + 24, CY + 82, "offline", Face::Head, p.dim);
+                s.label(M + 24, CY + 126, t, Face::Small, p.dim);
             }
         }
 
-        let (y0, h) = (CY + 176 + gap, CH - 176 - gap);
+        let (y0, h) = (CY + ih + GAP, CB - CY - ih - GAP);
         titled(s, xl, y0, w, h, "USB-C Ethernet");
         let name = if d.eth_name.is_empty() {
             "usb0"
         } else {
             d.eth_name
         };
-        link_badge(s, d, xl + w - 24, y0 + 14, name, d.eth == Eth::Up);
+        link_badge(s, d, xl + w - 24, y0 + 30, name, d.eth == Eth::Up);
         let (et, ec) = eth_text(d, false);
-        s.text(xl + 24, y0 + 62, et, Face::Body, ec);
+        s.label(xl + 24, y0 + 72, et, Face::Small, ec);
         if d.eth != Eth::Missing {
             let mac = d.eth_mac.to_le_bytes();
             let mac = if d.eth_mac == 0 {
@@ -525,9 +531,9 @@ impl Ui {
                 }
                 _ => "-",
             };
-            kv(s, xl + 24, xl + w - 24, y0 + 108, "interface", name, None);
+            kv(s, xl + 24, xl + w - 24, y0 + 114, "interface", name, None);
             kv(s, xl + 24, xl + w - 24, y0 + 144, "MAC", &mac, None);
-            kv(s, xl + 24, xl + w - 24, y0 + 180, "USB", speed, None);
+            kv(s, xl + 24, xl + w - 24, y0 + 174, "USB", speed, None);
         }
         let hint = match d.eth {
             Eth::NoSharing => Some([
@@ -539,31 +545,32 @@ impl Ui {
             _ => None,
         };
         for (i, t) in hint.iter().flatten().enumerate() {
-            s.text(xl + 24, y0 + 228 + i * 32, t, Face::Body, p.dim);
+            s.label(xl + 24, y0 + 226 + i * 28, t, Face::Small, p.dim);
         }
 
         titled(s, xr, y0, w, h, "Wi-Fi");
         let connected = wifi_connected(d);
-        let bw = link_badge(s, d, xr + w - 24, y0 + 14, "wlan0", connected.is_some());
-        let (by, btw) = (y0 + h - 20 - 56, (w - 80) / 3);
+        let bw = link_badge(s, d, xr + w - 24, y0 + 30, "wlan0", connected.is_some());
+        let (by, btw) = (y0 + h - 20 - 52, (w - 80) / 3);
         let state = match d.wifi {
             Seen::Value(wf) => wf.state,
             _ => wifi::ST_DOWN,
         };
         let adapter = matches!(d.wifi, Seen::Value(_))
             && !matches!(state, wifi::ST_DOWN | wifi::ST_RADIO_OFF);
+        let busy = self.busy;
         if let Some(nets) = &self.scan {
             let t = format!("{} networks", nets.len());
-            s.text_r(xr + w - 36 - bw, y0 + 18, &t, Face::Body, p.dim);
+            s.label_r(xr + w - 36 - bw, y0 + 30, &t, Face::Small, p.dim);
             for (i, n) in nets.iter().take(5).enumerate() {
-                let y = y0 + 58 + i * 36;
+                let cy = y0 + 72 + i * 30;
                 let cur = connected.is_some_and(|c| c.ssid() == n.ssid);
-                let ssid = fit(Face::Body, &n.ssid, 220);
-                s.text(
+                let ssid = fit(Face::Small, &n.ssid, 220);
+                s.label(
                     xr + 24,
-                    y,
+                    cy,
                     &ssid,
-                    Face::Body,
+                    Face::Small,
                     if cur { p.good } else { p.text },
                 );
                 let sec = match n.security {
@@ -574,16 +581,15 @@ impl Ui {
                     _ => "WPA3",
                 };
                 let t = format!("ch {:>2}   -{} dBm   {}", n.channel, n.signal, sec);
-                s.text_r(xr + w - 24, y, &t, Face::Body, p.dim);
+                s.label_r(xr + w - 24, cy, &t, Face::Small, p.dim);
             }
-            let busy = self.busy;
             self.button(
                 s,
                 Id::ScanBack,
                 xr + 24,
                 by,
                 btw,
-                56,
+                52,
                 "Back",
                 Tone::Plain,
                 true,
@@ -594,7 +600,7 @@ impl Ui {
                 xr + 40 + btw,
                 by,
                 btw,
-                56,
+                52,
                 "Scan",
                 Tone::Accent,
                 !busy,
@@ -610,10 +616,10 @@ impl Ui {
                 );
             }
             let (t, c) = wifi_short(d);
-            s.text(xr + 24, y0 + 62, t, Face::Body, c);
+            s.label(xr + 24, y0 + 72, t, Face::Small, c);
             if let Seen::Value(wf) = d.wifi {
                 if matches!(wf.state, wifi::ST_CONNECTED | wifi::ST_CONNECTING) {
-                    s.text(xr + 24, y0 + 96, wf.ssid(), Face::TitleB, p.text);
+                    s.label(xr + 24, y0 + 112, wf.ssid(), Face::TitleB, p.text);
                     self.ssid = wf.ssid().into();
                 }
                 if wf.state == wifi::ST_CONNECTED {
@@ -621,7 +627,7 @@ impl Ui {
                         s,
                         xr + 24,
                         xr + w - 24,
-                        y0 + 150,
+                        y0 + 156,
                         "channel",
                         &format!("{}", wf.channel),
                         None,
@@ -636,21 +642,18 @@ impl Ui {
                         None,
                     );
                 } else if wf.state == wifi::ST_IDLE {
-                    s.text(
+                    s.label(
                         xr + 24,
                         y0 + 108,
                         "join: wifi connect SSID (shell)",
-                        Face::Body,
+                        Face::Small,
                         p.dim,
                     );
                 } else if wf.state == wifi::ST_RADIO_OFF {
-                    s.text(xr + 24, y0 + 108, "Flight mode is on", Face::Body, p.dim);
+                    s.label(xr + 24, y0 + 108, "Flight Mode is on", Face::Small, p.dim);
                 }
             }
-            let (busy, joined) = (
-                self.busy,
-                matches!(state, wifi::ST_CONNECTED | wifi::ST_CONNECTING),
-            );
+            let joined = matches!(state, wifi::ST_CONNECTED | wifi::ST_CONNECTING);
             let scan_ok = adapter && state != wifi::ST_SCANNING && !busy;
             let retry_ok = !matches!(d.wifi, Seen::Missing | Seen::Unknown)
                 && state != wifi::ST_RADIO_OFF
@@ -661,7 +664,7 @@ impl Ui {
                 xr + 24,
                 by,
                 btw,
-                56,
+                52,
                 "Scan",
                 Tone::Accent,
                 scan_ok,
@@ -672,43 +675,43 @@ impl Ui {
                 xr + 40 + btw,
                 by,
                 btw,
-                56,
+                52,
                 "Retry",
                 Tone::Plain,
                 retry_ok,
             );
+            let lx = xr + 56 + 2 * btw;
             self.button(
                 s,
                 Id::Leave,
-                xr + 56 + 2 * btw,
+                lx,
                 by,
                 btw,
-                56,
+                52,
                 "Leave",
                 Tone::Warn,
                 joined && !busy,
             );
         }
-        self.hint_bar(s, &[("B", "Back"), ("A", "OK")]);
+        self.page_hints(s);
     }
 
     pub(crate) fn terminal(&mut self, s: &mut Screen, d: &Data, term: &Term, now: u64) {
         let p = pal();
-        self.page_head(s, "Terminal");
         let (x, y, w, h) = (M, CY, W - 2 * M, CH);
-        s.card_round(x, y, w, h, 16, 1, p.line, TERM_BG);
-        s.fill_round(x + 1, y + 1, w - 2, 56, 15, p.surface);
-        s.fill(x + 1, y + 56, w - 2, 1, p.line);
+        s.fill_round(x, y, w, h, 8, TERM_BG);
+        s.fill_round(x, y, w, 56, 8, p.surface);
+        s.fill(x, y + 48, w, 8, p.surface);
         let (ut, uc) = usb_status(d);
         s.disc(x + 28, y + 28, 6, uc);
-        s.text(
+        s.label(
             x + 46,
-            vc(Face::Body, y, 56),
+            y + 28,
             &ut,
-            Face::Body,
+            Face::Small,
             if uc == p.dim { p.dim } else { p.text },
         );
-        let bx = x + w - 16 - 136;
+        let bx = x + w - 12 - 136;
         let label = if self.term_scale == 1 {
             "Text x2"
         } else {
@@ -727,13 +730,13 @@ impl Ui {
         );
         if let Now::Value(u) = d.usb {
             let t = format!("in {}   out {}", Bytes(u.rx), Bytes(u.tx));
-            let tw = s.text_r(bx - 20, vc(Face::Body, y, 56), &t, Face::Body, p.dim);
+            let tw = s.label_r(bx - 20, y + 28, &t, Face::Small, p.dim);
             if u.errors != 0 {
-                s.text_r(
+                s.label_r(
                     bx - 40 - tw,
-                    vc(Face::Body, y, 56),
+                    y + 28,
                     &format!("{} errors", u.errors),
-                    Face::Body,
+                    Face::Small,
                     BAD,
                 );
             }
@@ -758,17 +761,16 @@ impl Ui {
                 s.fill(cx, ry, 8 * sc, 16 * sc, FG);
             }
         }
-        self.hint_bar(s, &[("B", "Back"), ("A", "OK")]);
-        let _ = TERMINAL;
+        self.page_hints(s);
     }
 
     pub(crate) fn logs(&mut self, s: &mut Screen, msgs: &Messages) {
         let p = pal();
         self.unread = 0;
-        self.page_head(s, "Logs");
         let (x, y, w, h) = (M, CY, W - 2 * M, CH);
         card(s, x, y, w, h);
-        let cx = x + w - 20 - 116;
+        heading(s, x + 24, y + 30, "Service and kernel messages");
+        let cx = x + w - 12 - 116;
         let label = if self.log_scale == 1 {
             "Text x2"
         } else {
@@ -778,9 +780,9 @@ impl Ui {
             s,
             Id::LogClear,
             cx,
-            y + 12,
+            y + 10,
             116,
-            44,
+            40,
             "Clear",
             Tone::Plain,
             !msgs.is_empty(),
@@ -789,9 +791,9 @@ impl Ui {
             s,
             Id::LogSize,
             cx - 12 - 136,
-            y + 12,
+            y + 10,
             136,
-            44,
+            40,
             label,
             Tone::Plain,
             true,
@@ -804,19 +806,16 @@ impl Ui {
             if wrapped.len() >= rows {
                 break;
             }
-            let mut parts: Vec<String> = Vec::new();
             let chars: Vec<char> = l.chars().collect();
-            if chars.is_empty() {
+            let mut parts: Vec<String> = chars.chunks(cols).map(|c| c.iter().collect()).collect();
+            if parts.is_empty() {
                 parts.push(String::new());
-            }
-            for chunk in chars.chunks(cols) {
-                parts.push(chunk.iter().collect());
             }
             wrapped.extend(parts.into_iter().rev());
         }
         wrapped.reverse();
         if wrapped.is_empty() {
-            s.text(x + 24, y + 72, "no messages", Face::Body, p.dim);
+            s.label(x + 24, y + 90, "no messages", Face::Body, p.dim);
         }
         for (r, t) in wrapped[wrapped.len().saturating_sub(rows)..]
             .iter()
@@ -824,7 +823,6 @@ impl Ui {
         {
             s.mono(x + 24, y + 68 + r * 16 * sc, t, sc, p.text, p.surface);
         }
-        self.hint_bar(s, &[("B", "Back"), ("A", "OK")]);
-        let _ = (LOGS, font::width);
+        self.page_hints(s);
     }
 }

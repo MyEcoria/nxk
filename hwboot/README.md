@@ -280,9 +280,11 @@ disappears and returns for `usbcon`.
 ## Games
 
 The library (GAMES, the first page of `display`) lists `/games/NAME`
-directories: the program `NAME` and `game.txt` (`title=`,
-`description=`, `color=RRGGBB`), re-read every 8 s. `mksd-hw.sh`
-installs the ones built from `jeux/`; for a card in the console,
+directories: the program `NAME`, `game.txt` (`title=`, `publisher=`,
+`version=`, `description=`, `color=RRGGBB`) and `cover.bin` (its art,
+`tools/mkcovers.py`), re-read every 8 s; the time played goes to
+`/config/playtime.cfg`. `mksd-hw.sh` installs the ones built from
+`jeux/`; for a card in the console,
 `./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
 `-c "mkdir /games/NAME"` in an earlier call).
 

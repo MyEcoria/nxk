@@ -12,13 +12,12 @@ use core::fmt;
 
 use libnx::mem::SharedMemory;
 
+use crate::art::Image;
 use crate::font::{self, Face};
 
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
 /// tools/mklogo.py --raw: width, height, 8 R G B A palette entries, indices.
 const LOGO: &[u8] = include_bytes!("../../../build/logo.bin");
-/// tools/mkcovers.py: paletted RGB565 cover art.
-const COVERS: &[u8] = include_bytes!("../../../build/covers.bin");
 
 // The terminal's colors, A B G R: it is dark in both themes.
 pub const FG: u32 = 0xFFD8_D8D8;
@@ -254,30 +253,6 @@ impl Screen {
         }
     }
 
-    /// Rounded outline `t` thick: `edge` around `inner`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn card_round(
-        &mut self,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-        r: usize,
-        t: usize,
-        edge: u32,
-        inner: u32,
-    ) {
-        self.fill_round(x, y, w, h, r, edge);
-        self.fill_round(
-            x + t,
-            y + t,
-            w - 2 * t,
-            h - 2 * t,
-            r.saturating_sub(t),
-            inner,
-        );
-    }
-
     /// Outline only, `t` thick, over what is there.
     #[allow(clippy::too_many_arguments)]
     pub fn ring_round(
@@ -335,6 +310,33 @@ impl Screen {
         self.ring_round(cx - r, cy - r, 2 * r, 2 * r, r, t, c);
     }
 
+    /// The upper quarter of a ring (between the diagonals), as the Wi-Fi
+    /// icon's waves.
+    pub fn arc_up(&mut self, cx: usize, cy: usize, r: usize, t: usize, c: u32) {
+        let (d, ri) = (2 * r, r.saturating_sub(t));
+        for py in 0..r {
+            for px in 0..d {
+                let (dx, dy) = (
+                    (2 * px as i32 + 1 - d as i32).abs(),
+                    d as i32 - 1 - 2 * py as i32,
+                );
+                if dx > dy {
+                    continue;
+                }
+                let out = rr_cov(px, py, d, d, r);
+                let inn = if px < t || py < t || px + t >= d {
+                    0
+                } else {
+                    rr_cov(px - t, py - t, d - 2 * t, d - 2 * t, ri)
+                };
+                let a = out * (255 - inn) / 255;
+                if a > 0 {
+                    self.plot((cx - r + px) as i32, (cy - r + py) as i32, c, a);
+                }
+            }
+        }
+    }
+
     /// Antialiased segment `t` thick with round ends, between pixel
     /// centres.
     #[allow(clippy::too_many_arguments)]
@@ -384,14 +386,20 @@ impl Screen {
         (pen - x as i32) as usize
     }
 
-    /// Text ending at `xr`.
-    pub fn text_r(&mut self, xr: usize, y: usize, s: &str, f: Face, c: u32) -> usize {
-        self.text(xr.saturating_sub(width(f, s)), y, s, f, c)
+    /// Text from `x` with its capitals centered on `cy`; returns its width.
+    pub fn label(&mut self, x: usize, cy: usize, s: &str, f: Face, c: u32) -> usize {
+        let top = (cy + font::cap(f).div_ceil(2)).saturating_sub(font::ascent(f));
+        self.text(x, top, s, f, c)
     }
 
-    /// Text centered on `cx`.
-    pub fn text_c(&mut self, cx: usize, y: usize, s: &str, f: Face, c: u32) -> usize {
-        self.text(cx.saturating_sub(width(f, s) / 2), y, s, f, c)
+    /// `label` ending at `xr`.
+    pub fn label_r(&mut self, xr: usize, cy: usize, s: &str, f: Face, c: u32) -> usize {
+        self.label(xr.saturating_sub(width(f, s)), cy, s, f, c)
+    }
+
+    /// `label` centered on `cx`.
+    pub fn label_c(&mut self, cx: usize, cy: usize, s: &str, f: Face, c: u32) -> usize {
+        self.label(cx.saturating_sub(width(f, s) / 2), cy, s, f, c)
     }
 
     /// Terminus glyph `ch` (Latin-1) at landscape pixel (x, y), `scale`
@@ -459,42 +467,29 @@ impl Screen {
         }
     }
 
-    /// Paletted RGB565 cover `idx` from `covers.bin` drawn in `(x0, y0, w, h)` with corner radius `r`.
-    pub fn cover(&mut self, idx: usize, x0: usize, y0: usize, w: usize, h: usize, r: usize) {
-        let count = COVERS[0] as usize;
-        if idx >= count || w == 0 || h == 0 {
-            return;
-        }
-        let rec = 1 + idx * 8;
-        let cw = u16::from_le_bytes([COVERS[rec], COVERS[rec + 1]]) as usize;
-        let ch = u16::from_le_bytes([COVERS[rec + 2], COVERS[rec + 3]]) as usize;
-        let off = u32::from_le_bytes([
-            COVERS[rec + 4],
-            COVERS[rec + 5],
-            COVERS[rec + 6],
-            COVERS[rec + 7],
-        ]) as usize;
-        let pal_slice = &COVERS[off..off + 512];
-        let pix = &COVERS[off + 512..off + 512 + cw * ch];
+    /// `img` scaled to (x0, y0, w, h), corners rounded to `r`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn image(&mut self, img: &Image, x0: usize, y0: usize, w: usize, h: usize, r: usize) {
         let r = r.min(w / 2).min(h / 2);
         for py in 0..h {
-            let sy = (py * ch / h).min(ch - 1);
-            let row = &pix[sy * cw..(sy + 1) * cw];
+            let sy = (py * img.h / h).min(img.h - 1);
             for px in 0..w {
                 let cov = rr_cov(px, py, w, h, r);
                 if cov == 0 {
                     continue;
                 }
-                let sx = (px * cw / w).min(cw - 1);
-                let pi = row[sx] as usize * 2;
-                let p565 = u16::from_le_bytes([pal_slice[pi], pal_slice[pi + 1]]);
-                self.plot(
-                    x0 as i32 + px as i32,
-                    y0 as i32 + py as i32,
-                    expand(p565),
-                    cov,
-                );
+                let sx = (px * img.w / w).min(img.w - 1);
+                let (x, y) = (x0 as i32 + px as i32, y0 as i32 + py as i32);
+                self.plot(x, y, expand(img.at(sx, sy)), cov);
             }
+        }
+    }
+
+    /// Black from transparent at the top to `a` of 255 at the bottom of
+    /// (x, y, w, h): text over art reads on it.
+    pub fn fade(&mut self, x: usize, y: usize, w: usize, h: usize, a: usize) {
+        for r in 0..h {
+            self.fill_alpha(x, y + r, w, 1, 0xFF00_0000, a * r / h.max(1));
         }
     }
 

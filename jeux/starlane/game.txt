@@ -1,7 +1,5 @@
-title=Starlane: Hollow
-subtitle=THIS WEEK: 4 HOURS
-studio=nxk Arcade · 60 fps
+title=Starlane
+publisher=nxk
 version=1.4.0
 description=Fly the neon lane, dodge the blocks, grab the gems
-color=2EE59D
-cover=1
+color=FF50C8

@@ -1,7 +1,5 @@
-title=Cube: Legends
-subtitle=THIS WEEK: 7 HOURS
-studio=nxk 3D · Maxwell GM20B
+title=Cube
+publisher=nxk
 version=1.2.0
-description=A lit 3D hyperprism turning on the Tegra X1 GPU
-color=24A8F8
-cover=0
+description=A lit six-color cube turning on the GPU; the pointer moves the light
+color=E64A3C

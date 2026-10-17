@@ -52,13 +52,15 @@ appdir="$cache/target-apps/aarch64-unknown-nxk/release"
 for prog in hello-std stdtest; do
     [ -x "$appdir/$prog" ] && cp "$appdir/$prog" "$sd/bin/$prog"
 done
-# Games (jeux/): /games/NAME/NAME and its game.txt, which the library lists.
+# Games (jeux/): /games/NAME/NAME, its game.txt and cover, for the library.
 for dir in "$root"/jeux/*/; do
     name="$(basename "$dir")"
     if [ -x "$appdir/$name" ] && [ -f "$dir/game.txt" ]; then
         mkdir -p "$sd/games/$name"
         cp "$appdir/$name" "$sd/games/$name/$name"
         cp "$dir/game.txt" "$sd/games/$name/game.txt"
+        cover="$root/build/covers/$name.bin"
+        if [ -f "$cover" ]; then cp "$cover" "$sd/games/$name/cover.bin"; fi
     fi
 done
 printf 'Welcome to nxk: this file comes from the SD card (FAT32).\n' > "$sd/motd-nxk.txt"

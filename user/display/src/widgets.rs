@@ -1,11 +1,12 @@
-//! Shapes the pages share: cards, bars, switches, sliders, badges and
-//! the few icons, all drawn from rounded rectangles, circles and lines.
+//! Shapes the pages share: cards, bars, switches, sliders, badges, the
+//! controller's button glyphs and the icons, all drawn from rounded
+//! rectangles, circles and lines.
 
 use alloc::string::String;
 
 use crate::font::{self, Face};
 use crate::screen::{mix, Screen};
-use crate::theme::pal;
+use crate::theme::{is_light, pal, BLACK, WHITE};
 
 /// What a button means: its color when it can be pressed.
 #[derive(Clone, Copy, PartialEq)]
@@ -26,11 +27,6 @@ pub fn tone_color(t: Tone) -> u32 {
     }
 }
 
-/// Top of a line of `f` centered in a box of height `h` from `top`.
-pub fn vc(f: Face, top: usize, h: usize) -> usize {
-    top + h.saturating_sub(font::line_height(f)) / 2
-}
-
 /// `s`, cut with dots to fit in `w` pixels.
 pub fn fit(f: Face, s: &str, w: usize) -> String {
     if font::width(f, s) <= w {
@@ -44,16 +40,21 @@ pub fn fit(f: Face, s: &str, w: usize) -> String {
     t
 }
 
-/// A card: surface with a hairline, rounded.
+/// A card: the surface, rounded.
 pub fn card(s: &mut Screen, x: usize, y: usize, w: usize, h: usize) {
-    let p = pal();
-    s.card_round(x, y, w, h, 10, 1, p.line, p.surface);
+    s.fill_round(x, y, w, h, 8, pal().surface);
 }
 
-/// Card with its title, small and dim, at the top left.
+/// Card with its heading, small capitals, at the top left.
 pub fn titled(s: &mut Screen, x: usize, y: usize, w: usize, h: usize, title: &str) {
     card(s, x, y, w, h);
-    s.text(x + 24, y + 18, title, Face::BodyB, pal().dim);
+    heading(s, x + 24, y + 30, title);
+}
+
+/// A small heading in capitals, as the home row's play time.
+pub fn heading(s: &mut Screen, x: usize, cy: usize, t: &str) -> usize {
+    let up: String = t.chars().map(|c| c.to_ascii_uppercase()).collect();
+    s.label(x, cy, &up, Face::CapB, pal().dim)
 }
 
 /// Bar of `pct` % in `c` on the track.
@@ -93,34 +94,28 @@ pub fn split_bar(
     let part = |n: u64| ((w as u64 * n / total.max(1)) as usize).max(h);
     let (ka, kb) = (part(a).min(w), part(b));
     s.fill_round(x, y, w, h, h / 2, p.track);
-    let both = (ka + kb).min(w);
-    s.fill_round(x, y, both, h, h / 2, p.good);
+    s.fill_round(x, y, (ka + kb).min(w), h, h / 2, p.good);
     s.fill_round(x, y, ka, h, h / 2, p.accent);
 }
 
-/// Legend dot.
-pub fn dot(s: &mut Screen, x: usize, y: usize, c: u32) {
-    s.disc(x + 6, y + 6, 6, c);
-}
-
-/// Label on the left, value on the right of one row, optionally led by a
-/// legend dot.
+/// Label on the left, value on the right of one row centered on `cy`,
+/// optionally led by a legend dot.
 pub fn kv(
     s: &mut Screen,
     mut x: usize,
     xr: usize,
-    y: usize,
+    cy: usize,
     name: &str,
     value: &str,
-    dot_c: Option<u32>,
+    dot: Option<u32>,
 ) {
     let p = pal();
-    if let Some(c) = dot_c {
-        dot(s, x, y + 8, c);
+    if let Some(c) = dot {
+        s.disc(x + 6, cy, 6, c);
         x += 22;
     }
-    s.text(x, y, name, Face::Body, p.dim);
-    s.text_r(xr, y, value, Face::Body, p.text);
+    s.label(x, cy, name, Face::Small, p.dim);
+    s.label_r(xr, cy, value, Face::Small, p.text);
 }
 
 /// Four signal bars from `x`, bottom at `y`; `n` of them lit.
@@ -142,124 +137,107 @@ pub fn bars_for(dbm: u64) -> usize {
     }
 }
 
-/// Outlined pill with a word, ending at `xr`; returns its width.
-pub fn badge(s: &mut Screen, xr: usize, y: usize, text: &str, c: u32) -> usize {
-    let w = font::width(Face::Cap, text) + 24;
-    s.ring_round(xr - w, y, w, 28, 14, 2, c);
-    s.text(xr - w + 12, vc(Face::Cap, y, 28), text, Face::Cap, c);
+/// Outlined pill with a word, ending at `xr`, centered on `cy`; returns
+/// its width.
+pub fn badge(s: &mut Screen, xr: usize, cy: usize, text: &str, c: u32) -> usize {
+    let w = font::width(Face::CapB, text) + 24;
+    s.ring_round(xr - w, cy - 14, w, 28, 14, 2, c);
+    s.label(xr - w + 12, cy, text, Face::CapB, c);
     w
 }
 
 /// Switch, 56 x 32.
-pub fn switch(s: &mut Screen, x: usize, y: usize, on: bool, enabled: bool) {
+pub fn switch(s: &mut Screen, x: usize, y: usize, on: bool) {
     let p = pal();
-    let bg = if !enabled {
-        p.track
-    } else if on {
-        p.good
-    } else {
-        p.line
-    };
-    s.fill_round(x, y, 56, 32, 16, bg);
-    let knob = if on { x + 56 - 16 - 4 } else { x + 16 + 4 };
-    s.disc(knob, y + 16, 12, if enabled { 0xFFFF_FFFF } else { p.dim });
+    s.fill_round(x, y, 56, 32, 16, if on { p.good } else { p.track });
+    let knob = if on { x + 56 - 16 } else { x + 16 };
+    s.disc(knob, y + 16, 12, WHITE);
 }
 
-/// Switch-style slider with a 4 px mint-green track and a 28x28 rounded-square white knob.
-pub fn slider(s: &mut Screen, x: usize, y: usize, w: usize, pct: u8, enabled: bool) {
+/// The drawer's slider: a thin track filled to `pct` and a square knob,
+/// centered on `cy`; grey when it cannot be moved.
+pub fn slider(s: &mut Screen, x: usize, cy: usize, w: usize, pct: u8, enabled: bool) {
     let p = pal();
-    let (fill, knob) = if enabled {
-        (p.good, 0xFFFF_FFFF)
-    } else {
-        (p.good, 0xFFF2_F4F8)
-    };
     let kx = x + w * pct.min(100) as usize / 100;
-    s.fill_round(x, y + 2, w, 4, 2, p.track);
+    s.fill_round(x, cy - 1, w, 3, 1, p.track);
     if kx > x {
-        s.fill_round(x, y + 2, kx - x, 4, 2, fill);
+        s.fill_round(
+            x,
+            cy - 1,
+            kx - x,
+            3,
+            1,
+            if enabled { p.good } else { p.faint },
+        );
     }
-    let bx = kx.saturating_sub(14);
-    let by = y.saturating_sub(10);
-    s.round_a(bx, by + 2, 28, 28, 6, 0xFF00_0000, 70);
-    s.fill_round(bx, by, 28, 28, 6, knob);
-    if crate::theme::is_light() {
-        s.ring_round(bx, by, 28, 28, 6, 1, p.line);
+    let (bx, by) = (kx.saturating_sub(20), cy - 20);
+    s.round_a(bx, by + 3, 40, 40, 6, BLACK, 90);
+    s.fill_round(bx, by, 40, 40, 6, if enabled { WHITE } else { p.faint });
+    if is_light() {
+        s.ring_round(bx, by, 40, 40, 6, 1, p.line);
     }
+}
+
+/// A controller button as the hint bar shows it: a disc with its letter
+/// (or the - and + of the small buttons).
+pub fn button_glyph(s: &mut Screen, cx: usize, cy: usize, b: &str, c: u32, bg: u32) {
+    s.disc(cx, cy, 11, c);
+    let (x, y) = (cx as i32, cy as i32);
+    match b {
+        "-" => s.line(x - 5, y, x + 5, y, 3, bg),
+        "+" => {
+            s.line(x - 5, y, x + 5, y, 3, bg);
+            s.line(x, y - 5, x, y + 5, 3, bg);
+        }
+        _ => {
+            s.label_c(cx + 1, cy, b, Face::CapB, bg);
+        }
+    }
+}
+
+/// The L or R key of the tab row, 47 x 22 centered on `cy`.
+pub fn shoulder(s: &mut Screen, x: usize, cy: usize, k: &str) {
+    let p = pal();
+    s.fill_round(x, cy - 11, 47, 22, 6, p.key);
+    s.label_c(
+        x + 24,
+        cy,
+        k,
+        Face::CapB,
+        if is_light() { WHITE } else { BLACK },
+    );
 }
 
 /// Icon kinds of the UI.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum Icon {
-    Gear,
     Sliders,
-    Globe,
-    Chip,
-    Terminal,
-    Logs,
     Moon,
     Power,
     Bolt,
     Sun,
     Speaker,
     Chevron,
-    Left,
     Plane,
-    WifiWave,
+    Wifi,
     Battery,
-    SwitchHandheld,
+    Handheld,
     GameCard,
 }
 
-/// An icon centered on (cx, cy).
+/// An icon centered on (cx, cy) in `c`, on `bg`.
 pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
     let (x, y) = (cx as i32, cy as i32);
     match k {
-        Icon::Gear => {
-            for a in 0..4 {
-                let (dx, dy) = [(0, 1), (1, 0), (1, 1), (1, -1)][a];
-                s.line(x - 11 * dx, y - 11 * dy, x + 11 * dx, y + 11 * dy, 5, c);
-            }
-            s.disc(cx, cy, 9, c);
-            s.disc(cx, cy, 4, bg);
-        }
         Icon::Sliders => {
-            for (i, kx) in [(-6, -4), (0, 5), (6, -2)] {
-                s.line(x - 10, y + i, x + 10, y + i, 2, c);
-                s.fill_round((x + kx - 2) as usize, (y + i - 3) as usize, 4, 7, 1, c);
-            }
-        }
-        Icon::Globe => {
-            s.ring(cx, cy, 14, 2, c);
-            s.line(x - 14, y, x + 14, y, 2, c);
-            s.line(x, y - 14, x, y + 14, 2, c);
-            s.ring_round(cx - 7, cy - 14, 14, 28, 7, 2, c);
-        }
-        Icon::Chip => {
-            s.fill_round(cx - 10, cy - 10, 20, 20, 4, c);
-            s.fill_round(cx - 5, cy - 5, 10, 10, 2, bg);
-            for i in [-6, 0, 6] {
-                s.line(x + i, y - 15, x + i, y - 11, 2, c);
-                s.line(x + i, y + 11, x + i, y + 15, 2, c);
-                s.line(x - 15, y + i, x - 11, y + i, 2, c);
-                s.line(x + 11, y + i, x + 15, y + i, 2, c);
-            }
-        }
-        Icon::Terminal => {
-            s.ring_round(cx - 14, cy - 11, 28, 22, 4, 2, c);
-            s.line(x - 8, y - 4, x - 3, y, 2, c);
-            s.line(x - 8, y + 4, x - 3, y, 2, c);
-            s.line(x + 1, y + 4, x + 8, y + 4, 2, c);
-        }
-        Icon::Logs => {
-            for i in 0..4 {
-                let w = if i == 3 { 12 } else { 24 };
-                s.fill_round(cx - 12, cy - 11 + i * 7, w, 3, 1, c);
+            for (dy, kx) in [(-7, 4), (0, -5), (7, 2)] {
+                s.line(x - 11, y + dy, x + 11, y + dy, 2, c);
+                s.fill_round((x + kx - 2) as usize, (y + dy - 4) as usize, 5, 9, 1, c);
             }
         }
         Icon::Moon => {
-            s.disc(cx, cy, 11, c);
-            s.disc(cx + 5, cy - 4, 9, bg);
+            s.disc(cx, cy, 12, c);
+            s.disc(cx + 6, cy - 5, 10, bg);
         }
         Icon::Power => {
             s.ring(cx, cy + 1, 10, 2, c);
@@ -267,22 +245,22 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
             s.line(x, y - 11, x, y + 1, 2, c);
         }
         Icon::Bolt => {
-            s.line(x + 2, y - 9, x - 4, y + 1, 2, c);
-            s.line(x - 4, y + 1, x + 3, y + 1, 2, c);
-            s.line(x + 3, y + 1, x - 2, y + 10, 2, c);
+            s.line(x + 2, y - 6, x - 3, y + 1, 2, c);
+            s.line(x - 3, y + 1, x + 3, y - 1, 2, c);
+            s.line(x + 3, y - 1, x - 2, y + 6, 2, c);
         }
         Icon::Sun => {
             s.disc(cx, cy, 5, c);
             for (dx, dy) in [(0, 1), (1, 0), (1, 1), (1, -1)] {
-                s.line(x - 10 * dx, y - 10 * dy, x - 7 * dx, y - 7 * dy, 2, c);
-                s.line(x + 7 * dx, y + 7 * dy, x + 10 * dx, y + 10 * dy, 2, c);
+                s.line(x - 11 * dx, y - 11 * dy, x - 8 * dx, y - 8 * dy, 2, c);
+                s.line(x + 8 * dx, y + 8 * dy, x + 11 * dx, y + 11 * dy, 2, c);
             }
         }
         Icon::Speaker => {
-            s.fill_round(cx - 9, cy - 4, 5, 8, 1, c);
-            s.line(x - 5, y - 4, x, y - 8, 3, c);
-            s.line(x - 5, y + 4, x, y + 8, 3, c);
-            s.line(x, y - 8, x, y + 8, 3, c);
+            s.fill_round(cx - 10, cy - 4, 5, 9, 1, c);
+            s.line(x - 6, y - 4, x, y - 9, 3, c);
+            s.line(x - 6, y + 4, x, y + 9, 3, c);
+            s.line(x, y - 9, x, y + 9, 3, c);
             s.line(x + 5, y - 4, x + 7, y, 2, c);
             s.line(x + 7, y, x + 5, y + 4, 2, c);
         }
@@ -290,45 +268,37 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
             s.line(x - 3, y - 7, x + 4, y, 2, c);
             s.line(x - 3, y + 7, x + 4, y, 2, c);
         }
-        Icon::Left => {
-            s.line(x + 3, y - 8, x - 4, y, 3, c);
-            s.line(x + 3, y + 8, x - 4, y, 3, c);
-        }
         Icon::Plane => {
-            s.line(x - 11, y + 2, x + 11, y - 6, 3, c);
-            s.line(x - 2, y - 1, x - 8, y + 10, 3, c);
-            s.line(x - 3, y - 6, x - 10, y - 11, 3, c);
+            s.line(x - 10, y + 2, x + 10, y - 5, 3, c);
+            s.line(x - 2, y - 1, x - 7, y + 9, 3, c);
+            s.line(x - 3, y - 5, x - 9, y - 10, 3, c);
         }
-        Icon::WifiWave => {
-            // Fan-shaped Wi-Fi icon: 2 top arcs + bottom dot.
-            s.line(x - 8, y - 3, x, y - 8, 2, c);
-            s.line(x, y - 8, x + 8, y - 3, 2, c);
-            s.line(x - 5, y + 1, x, y - 3, 2, c);
-            s.line(x, y - 3, x + 5, y + 1, 2, c);
-            s.disc(cx, cy + 5, 2, c);
+        Icon::Wifi => {
+            s.arc_up(cx, cy + 8, 16, 3, c);
+            s.arc_up(cx, cy + 8, 10, 3, c);
+            s.disc(cx, cy + 5, 3, c);
         }
         Icon::Battery => {
-            // Horizontal battery body + right terminal nub.
-            s.ring_round(cx - 13, cy - 7, 24, 14, 3, 2, c);
-            s.fill_round(cx - 10, cy - 4, 18, 8, 1, c);
-            s.fill_round(cx + 11, cy - 3, 3, 6, 1, c);
+            s.ring_round(cx - 14, cy - 8, 26, 16, 3, 2, c);
+            s.fill_round(cx - 11, cy - 5, 20, 10, 1, c);
+            s.fill_round(cx + 13, cy - 3, 3, 6, 1, c);
         }
-        Icon::SwitchHandheld => {
-            // Handheld Switch console icon (48 x 22).
-            s.ring_round(cx - 24, cy - 11, 48, 22, 5, 2, c);
-            s.fill_round(cx - 13, cy - 9, 26, 18, 1, c);
-            s.disc(cx - 19, cy - 3, 2, c);
-            s.disc(cx + 19, cy + 2, 2, c);
+        Icon::Handheld => {
+            // The Switch with its Joy-Con, 74 x 32.
+            s.fill_round(cx - 37, cy - 16, 74, 32, 9, c);
+            s.fill_round(cx - 25, cy - 14, 50, 28, 2, bg);
+            s.ring_round(cx - 22, cy - 11, 44, 22, 2, 2, c);
+            s.disc(cx - 31, cy - 6, 3, bg);
+            s.disc(cx + 31, cy + 5, 3, bg);
         }
         Icon::GameCard => {
-            // Blue game cartridge icon next to selected title (18 x 22).
-            s.fill_round(cx - 9, cy - 11, 18, 22, 4, c);
-            s.fill_round(cx - 4, cy - 4, 8, 10, 2, bg);
+            s.fill_round(cx - 10, cy - 13, 20, 26, 4, c);
+            s.fill_round(cx - 5, cy - 4, 10, 11, 2, bg);
         }
     }
 }
 
-/// Surface or raised background: `c` or a lighter `c` when pressed.
+/// A control's background: `c`, or tinted while pressed.
 pub fn press(c: u32, pressed: bool) -> u32 {
     if pressed {
         mix(c, pal().accent, 60)

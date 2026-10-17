@@ -1,5 +1,6 @@
 //! The dark and light palettes, chosen at run time (`set`): the UI asks
 //! `pal()` for every color it draws. Colors are A B G R, as `screen`'s.
+//! Dark follows the Switch's black home and its grey drawer.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,19 +8,28 @@ pub const fn rgb(c: u32) -> u32 {
     0xFF00_0000 | (c & 0xFF) << 16 | (c >> 8 & 0xFF) << 8 | c >> 16
 }
 
+pub const WHITE: u32 = 0xFFFF_FFFF;
+pub const BLACK: u32 = 0xFF00_0000;
+
 pub struct Palette {
-    /// Page background, cards on it, a raised or pressed control, outlines.
+    /// Page background; the drawer, sheets and cards on it; a button.
     pub bg: u32,
     pub surface: u32,
     pub raised: u32,
+    /// Rules: on the background, and on a surface.
+    pub rule: u32,
     pub line: u32,
     /// Empty part of a bar or slider.
     pub track: u32,
     pub text: u32,
     pub dim: u32,
+    /// Disabled controls.
+    pub faint: u32,
+    /// The selected item's name, links, the chosen option.
     pub accent: u32,
     /// Text on an accent-colored control.
     pub on_accent: u32,
+    /// "On", sliders, things that work.
     pub good: u32,
     pub warn: u32,
     pub bad: u32,
@@ -27,40 +37,48 @@ pub struct Palette {
     pub focus: u32,
     /// Darkens what is behind a sheet.
     pub scrim: u32,
+    /// The L and R keys of the tab row.
+    pub key: u32,
 }
 
 pub const DARK: Palette = Palette {
-    bg: rgb(0x08090B),
-    surface: rgb(0x141518),
-    raised: rgb(0x222429),
-    line: rgb(0x282A30),
-    track: rgb(0x383B42),
-    text: rgb(0xF5F6F8),
-    dim: rgb(0x8A8E96),
-    accent: rgb(0x20A4F3),
-    on_accent: rgb(0xFFFFFF),
-    good: rgb(0x2EE59D),
+    bg: rgb(0x000000),
+    surface: rgb(0x1A1A1A),
+    raised: rgb(0x262626),
+    rule: rgb(0x1E1E1E),
+    line: rgb(0x393939),
+    track: rgb(0x5D5D5D),
+    text: rgb(0xFFFFFF),
+    dim: rgb(0xC4C4C4),
+    faint: rgb(0x6A6A6A),
+    accent: rgb(0x3BC3E3),
+    on_accent: rgb(0x000000),
+    good: rgb(0x6EEACD),
     warn: rgb(0xFFB84D),
-    bad: rgb(0xFF5252),
-    focus: rgb(0xDCE0E8),
+    bad: rgb(0xFF5A50),
+    focus: rgb(0xF2F2F2),
     scrim: rgb(0x000000),
+    key: rgb(0x5E5E5E),
 };
 
 pub const LIGHT: Palette = Palette {
-    bg: rgb(0xF3F4F7),
-    surface: rgb(0xFFFFFF),
-    raised: rgb(0xE8EAEF),
-    line: rgb(0xD8DCE4),
-    track: rgb(0xCFD4DE),
-    text: rgb(0x14161A),
-    dim: rgb(0x6E737D),
-    accent: rgb(0x0084D6),
+    bg: rgb(0xEBEBEB),
+    surface: rgb(0xF7F7F7),
+    raised: rgb(0xFFFFFF),
+    rule: rgb(0xD2D2D2),
+    line: rgb(0xDADADA),
+    track: rgb(0xBDBDBD),
+    text: rgb(0x2D2D2D),
+    dim: rgb(0x606060),
+    faint: rgb(0xA8A8A8),
+    accent: rgb(0x0096C8),
     on_accent: rgb(0xFFFFFF),
-    good: rgb(0x0FA968),
+    good: rgb(0x00A88A),
     warn: rgb(0xC77700),
     bad: rgb(0xD93030),
-    focus: rgb(0x14161A),
-    scrim: rgb(0x14161A),
+    focus: rgb(0x2D2D2D),
+    scrim: rgb(0x2D2D2D),
+    key: rgb(0x9A9A9A),
 };
 
 static LIGHT_ON: AtomicBool = AtomicBool::new(false);

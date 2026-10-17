@@ -1,36 +1,44 @@
-//! Switch-style touch and gamepad UI: top navigation bar (user/theme
-//! avatars, L/R tabs for Games, System, Network, Terminal, Logs,
-//! Settings, and top-right status cluster), portrait game card carousel
-//! with cover art and 2x2 app grid, right-side Quick Settings drawer,
-//! 6-category Settings page, and hardware control sheets.
+//! The Switch-style touch and gamepad UI: the frame every page shares
+//! (avatars and tab row between the L and R keys, status, hint bar), the
+//! selection the gamepad moves, and what a tap or a button does. The
+//! pages draw themselves: `home`, `quick` (the drawer), `settings`,
+//! `sheets` (sheets and confirmations) and `pages` (System, Network,
+//! Terminal, Logs).
 
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::proto::{cpufreq, fan, gpu, input, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, fan, gpu, input, power, usbcon as usb};
 
+use crate::art;
 use crate::backlight::MIN_PCT;
 use crate::config::{Config, SLEEP_MIN};
 use crate::font::{self, Face};
 use crate::games::GameInfo;
-use crate::screen::{mix, Celsius, Screen};
-use crate::stats::{Cpu, Data, Eth, Fan, Gpu, Now, Seen};
+use crate::playtime::Playtime;
+use crate::screen::{mix, Screen};
+use crate::stats::{Cpu, Data, Fan, Gpu, Now, Seen};
+use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
-use crate::theme::{self, pal, rgb as rgb_hex};
-use crate::widgets::{card, fit, icon, press, slider, switch, tone_color, vc, Icon, Tone};
+use crate::theme::{self, pal};
+use crate::widgets::{button_glyph, icon, press, shoulder, tone_color, Icon, Tone};
 use crate::Messages;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
 pub const W: usize = 1280;
 pub const H: usize = 720;
-/// Side margin, content top and bottom (above the hint bar).
-pub const M: usize = 56;
-pub const CY: usize = 104;
-pub const CB: usize = 628;
+/// Side margin, content top and bottom (between the tabs and the rule).
+pub const M: usize = 48;
+pub const CY: usize = 148;
+pub const CB: usize = 620;
 pub const CH: usize = CB - CY;
+/// Center lines of the status, the tab row and the hint bar; its rule.
+pub const STATUS_Y: usize = 28;
+pub const TABS_Y: usize = 100;
+pub const RULE_Y: usize = 640;
+pub const HINT_Y: usize = 679;
 
-// Pages (top navigation tabs).
+// Pages (tabs of the top row).
 pub const LIBRARY: usize = 0;
 pub const SYSTEM: usize = 1;
 pub const NETWORK: usize = 2;
@@ -39,17 +47,6 @@ pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
 
 const TABS: [&str; 6] = ["Games", "System", "Network", "Terminal", "Logs", "Settings"];
-
-const CATS: [&str; 6] = [
-    "Display",
-    "Sound",
-    "Network",
-    "Performance",
-    "Power",
-    "About",
-];
-
-const SLEEP_LABELS: [&str; 5] = ["Never", "1 min", "5 min", "10 min", "30 min"];
 
 const TOAST_NS: u64 = 4_000_000_000;
 const FAN_STEP: u64 = 10;
@@ -64,24 +61,17 @@ pub enum Id {
     BumperR,
     /// A game's card, by index.
     Game(usize),
-    /// Left peek card.
-    PeekLeft,
-    /// Middle stacked card.
-    StackCard,
-    /// 2x2 + 2 square app tiles on the home screen.
-    AppTile(usize),
-    /// Status bar top-right cluster (opens quick settings).
+    /// An app tile of the home row (`home::TILES`).
+    Tile(usize),
+    /// The status at the top right (opens the drawer).
     StatusQuick,
     /// Closes what is on top (the dimmed area).
     Scrim,
-    // Quick settings drawer.
+    // The drawer.
     QSleep,
-    QAutoBright,
     QBright,
-    QVol,
     QFlight,
     QSettings,
-    QTheme,
     // Settings.
     Cat(usize),
     Theme(bool),
@@ -147,28 +137,29 @@ pub enum Action {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Sheet {
+pub(crate) enum Sheet {
     Fan,
     Cpu,
     Gpu,
     Power,
 }
 
-struct Zone {
-    id: Id,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    r: usize,
+/// A place a tap or the gamepad's A acts on.
+pub(crate) struct Zone {
+    pub id: Id,
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    pub r: usize,
 }
 
-struct Modal {
-    title: String,
-    lines: [String; 2],
-    ok: &'static str,
-    tone: Tone,
-    action: Action,
+pub(crate) struct Modal {
+    pub title: String,
+    pub lines: [String; 2],
+    pub ok: &'static str,
+    pub tone: Tone,
+    pub action: Action,
 }
 
 pub struct ScanNet {
@@ -181,7 +172,7 @@ pub struct ScanNet {
 pub struct Ui {
     pub page: usize,
     pub(crate) pressed: Option<Id>,
-    modal: Option<Modal>,
+    pub(crate) modal: Option<Modal>,
     toast: Option<(String, u64)>,
     pub scan: Option<Vec<ScanNet>>,
     pub busy: bool,
@@ -189,8 +180,8 @@ pub struct Ui {
     pub(crate) term_scale: usize,
     pub unread: usize,
     pub(crate) ssid: String,
-    sheet: Option<Sheet>,
-    /// Quick settings open on the right (opened by `-` or the status bar).
+    pub(crate) sheet: Option<Sheet>,
+    /// The drawer on the right (`+`, `-` or the status).
     pub quick: bool,
     pub(crate) fan: Seen<Fan>,
     fan_sent: usize,
@@ -200,209 +191,28 @@ pub struct Ui {
     pub(crate) gpu: Seen<Gpu>,
     pub(crate) gpu_sent: bool,
     zones: Vec<Zone>,
+    /// What the gamepad has selected outside the home row.
     pub(crate) focus: Option<Id>,
     focus_at: (usize, usize),
-    games: Vec<GameInfo>,
-    sel: usize,
-    scroll: f32,
+    pub(crate) games: Vec<GameInfo>,
+    /// The home row's selection: a game, then the tiles.
+    pub(crate) home: usize,
+    pub(crate) scroll: f32,
+    pub(crate) scroll_to: f32,
     pub cfg: Config,
+    pub play: Playtime,
     pub has_backlight: bool,
     pub(crate) cat: usize,
     pub(crate) sys_tab: usize,
     drag: Option<(Id, usize, usize)>,
-    wall: u64,
-    vol_pct: u8,
-    auto_bright: bool,
-}
-
-fn mhz(khz: u64) -> String {
-    match khz {
-        0 => "?".into(),
-        k => format!("{}", (k + 500) / 1000),
-    }
-}
-
-/// GPU clock in MHz, one decimal (sys-clk's steps are 76.8 MHz apart).
-pub fn gpu_mhz(khz: u64) -> String {
-    format!("{}.{}", khz / 1000, khz % 1000 / 100)
-}
-
-pub fn usb_status(d: &Data) -> (String, u32) {
-    let p = pal();
-    match d.usb {
-        Now::Missing => ("console not running".into(), p.dim),
-        Now::Busy => ("busy".into(), p.dim),
-        Now::Value(u) => {
-            let speed = if u.state & usb::ST_HIGH_SPEED != 0 {
-                "high speed"
-            } else {
-                "full speed"
-            };
-            if u.state & usb::ST_TERMINAL != 0 {
-                (format!("terminal open, {}", speed), p.good)
-            } else if u.state & usb::ST_CONFIGURED != 0 {
-                (format!("connected, {}, terminal closed", speed), p.warn)
-            } else if u.state & usb::ST_HOST != 0 {
-                ("host seen, not configured".into(), p.warn)
-            } else {
-                ("waiting for a PC".into(), p.dim)
-            }
-        }
-    }
-}
-
-pub fn usb_short(d: &Data) -> (&'static str, u32) {
-    let p = pal();
-    match d.usb {
-        Now::Missing => ("not running", p.dim),
-        Now::Busy => ("busy", p.dim),
-        Now::Value(u) if u.state & usb::ST_TERMINAL != 0 => ("open", p.good),
-        Now::Value(u) if u.state & usb::ST_CONFIGURED != 0 => ("closed", p.warn),
-        Now::Value(u) if u.state & usb::ST_HOST != 0 => ("host seen", p.warn),
-        Now::Value(_) => ("no PC", p.dim),
-    }
-}
-
-pub fn wifi_short(d: &Data) -> (&'static str, u32) {
-    let p = pal();
-    match d.wifi {
-        Seen::Unknown => ("starting", p.dim),
-        Seen::Missing => ("no Wi-Fi driver", p.dim),
-        Seen::Value(w) => match w.state {
-            wifi::ST_CONNECTED => ("connected", p.good),
-            wifi::ST_CONNECTING => ("joining", p.warn),
-            wifi::ST_SCANNING => ("scanning", p.warn),
-            wifi::ST_IDLE => ("not connected", p.dim),
-            wifi::ST_RADIO_OFF => ("radio off", p.warn),
-            _ => ("no adapter", p.bad),
-        },
-    }
-}
-
-pub fn eth_text(d: &Data, short: bool) -> (&'static str, u32) {
-    let p = pal();
-    match d.eth {
-        Eth::Up if d.eth_name == "usb0" => ("shared by the PC", p.good),
-        Eth::Up => ("connected", p.good),
-        Eth::Dhcp if short => ("waiting for DHCP", p.warn),
-        Eth::Dhcp => ("link up, waiting for DHCP", p.warn),
-        Eth::NoSharing if short => ("no DHCP answer", p.warn),
-        Eth::NoSharing => ("no DHCP: sharing off on the PC?", p.warn),
-        Eth::Off if short => ("off on the PC", p.dim),
-        Eth::Off => ("link not turned on by the PC", p.dim),
-        Eth::NoPc if short => ("no PC", p.dim),
-        Eth::NoPc => ("no PC on USB-C", p.dim),
-        Eth::Missing => ("not running", p.dim),
-    }
-}
-
-/// Fan state: its mode and value, and the color it shows in.
-pub fn fan_text(f: &Fan) -> (String, u32) {
-    let p = pal();
-    let (mode, c) = if f.state & fan::ST_HOT != 0 {
-        ("hot", p.warn)
-    } else if f.state & fan::ST_NO_SENSOR != 0 {
-        ("no sensor", p.warn)
-    } else if f.state & fan::ST_MANUAL != 0 {
-        ("manual", p.text)
-    } else {
-        ("auto", p.text)
-    };
-    let text = match (f.percent, f.rpm) {
-        (0, _) => format!("{}: off", mode),
-        (p, Some(rpm)) => format!("{}: {}%, {} rpm", mode, p, rpm),
-        (p, None) => format!("{}: {}%", mode, p),
-    };
-    (text, c)
-}
-
-/// CPU clock and rail, and the color they show in.
-pub fn cpu_text(c: &Cpu) -> (String, u32) {
-    let p = pal();
-    let rail = match c.uv {
-        0 => String::new(),
-        uv => format!(", {} mV", uv / 1000),
-    };
-    if c.state & cpufreq::ST_UNSUPPORTED != 0 {
-        (format!("{} MHz, boot only", mhz(c.khz)), p.dim)
-    } else if c.state & cpufreq::ST_HOT != 0 {
-        (format!("hot: {} MHz{}", mhz(c.khz), rail), p.warn)
-    } else if c.step == cpufreq::BOOT {
-        (format!("boot: {} MHz{}", mhz(c.khz), rail), p.text)
-    } else {
-        (format!("{} MHz{}", mhz(c.khz), rail), p.text)
-    }
-}
-
-/// The GPU row: off, powering up, its clock and rail (warning color when
-/// hot or forced past the cap), or where power-up failed.
-pub fn gpu_text(g: &Seen<Gpu>) -> (String, u32) {
-    const STAGES: [&str; 11] = [
-        "",
-        "rail",
-        "clocks",
-        "PLL",
-        "MMU",
-        "firmware",
-        "secure boot",
-        "FECS",
-        "context",
-        "channel",
-        "ready",
-    ];
-    let p = pal();
-    let stage = |g: &Gpu| *STAGES.get(g.stage as usize).unwrap_or(&"?");
-    match g {
-        Seen::Value(g) if g.state == gpu::ON => {
-            let clock = match g.khz {
-                0 => "bypass clock".into(),
-                k => format!("{} MHz", gpu_mhz(k)),
-            };
-            let text = format!("{}, {} mV", clock, g.uv / 1000);
-            if g.ck & gpu::CK_HOT != 0 {
-                (format!("hot: {}", text), p.warn)
-            } else if g.ck & gpu::CK_FORCED != 0 {
-                (text, p.warn)
-            } else {
-                (text, p.good)
-            }
-        }
-        Seen::Value(g) if g.state == gpu::FAILED => (format!("failed: {}", stage(g)), p.bad),
-        Seen::Value(g) if g.stage != 0 => (format!("powering up: {}", stage(g)), p.dim),
-        Seen::Value(_) => ("off".into(), p.dim),
-        Seen::Missing => ("no GPU service".into(), p.dim),
-        Seen::Unknown => ("starting".into(), p.dim),
-    }
-}
-
-pub fn wifi_connected(d: &Data) -> Option<crate::stats::Wifi> {
-    match d.wifi {
-        Seen::Value(w) if w.state == wifi::ST_CONNECTED => Some(w),
-        _ => None,
-    }
-}
-
-/// `10:25 PM` from the wall clock, or `10:25 PM` default when RTC is unset.
-fn clock_ampm(wall: u64) -> String {
-    let s = wall / 1_000_000_000;
-    if s < 978_307_200 {
-        return "10:25 PM".into();
-    }
-    let h24 = (s / 3600 % 24) as u32;
-    let min = (s / 60 % 60) as u32;
-    let (h12, ampm) = match h24 {
-        0 => (12, "AM"),
-        1..=11 => (h24, "AM"),
-        12 => (12, "PM"),
-        _ => (h24 - 12, "PM"),
-    };
-    format!("{}:{:02} {}", h12, min, ampm)
+    /// Wall clock of the frame being drawn.
+    pub(crate) wall: u64,
 }
 
 impl Ui {
     pub fn new() -> Self {
         Self {
-            page: 0,
+            page: LIBRARY,
             pressed: None,
             modal: None,
             toast: None,
@@ -425,16 +235,16 @@ impl Ui {
             focus: None,
             focus_at: (W / 2, H / 2),
             games: Vec::new(),
-            sel: 0,
+            home: 0,
             scroll: 0.0,
+            scroll_to: 0.0,
             cfg: Config::new(),
+            play: Playtime::default(),
             has_backlight: false,
             cat: 0,
             sys_tab: 0,
             drag: None,
             wall: 0,
-            vol_pct: 72,
-            auto_bright: true,
         }
     }
 
@@ -449,7 +259,7 @@ impl Ui {
         self.fan_sent = self.fan_sent.saturating_sub(1);
     }
 
-    fn cpu_step(&self) -> Option<u64> {
+    pub(crate) fn cpu_step(&self) -> Option<u64> {
         match self.cpu {
             Seen::Value(c) => Some(c.step),
             _ => None,
@@ -479,26 +289,26 @@ impl Ui {
         }
         let lines = if g.supply == power::SUPPLY_EXTERNAL {
             [
-                format!("Above the {} MHz cap on input power:", gpu_mhz(g.cap)),
+                alloc::format!("Above the {} MHz cap on input power:", gpu_mhz(g.cap)),
                 "the official charger or dock only.".into(),
             ]
         } else {
             [
-                format!("Above the {} MHz cap on battery, which", gpu_mhz(g.cap)),
+                alloc::format!("Above the {} MHz cap on battery, which", gpu_mhz(g.cap)),
                 "sys-clk keeps to spare the battery.".into(),
             ]
         };
         self.modal = Some(Modal {
-            title: format!("Overclock the GPU to {} MHz?", gpu_mhz(k)),
+            title: alloc::format!("Overclock the GPU to {} MHz?", gpu_mhz(k)),
             lines,
-            ok: "OVERCLOCK",
+            ok: "Overclock",
             tone: Tone::Warn,
             action: Action::Gpu(k, true),
         });
         None
     }
 
-    fn fan_manual(&self) -> Option<u64> {
+    pub(crate) fn fan_manual(&self) -> Option<u64> {
         if self.fan_sent > 0 {
             (self.fan_last != fan::AUTO).then_some(self.fan_last)
         } else {
@@ -515,9 +325,24 @@ impl Ui {
         Some(Action::Fan(v))
     }
 
-    pub fn set_games(&mut self, v: Vec<GameInfo>) {
-        self.sel = self.sel.min(v.len().saturating_sub(1));
+    /// A new game list: the last played first, as the Switch, and the
+    /// selection kept on the same game.
+    pub fn set_games(&mut self, mut v: Vec<GameInfo>) {
+        let kept = self.games.get(self.home).map(|g| g.name.clone());
+        let order = |g: &GameInfo| self.play.get(&g.name).map_or(0, |e| e.order);
+        v.sort_by(|a, b| order(b).cmp(&order(a)).then_with(|| a.title.cmp(&b.title)));
+        let old = self.games.len();
+        self.home = match kept {
+            Some(name) => v.iter().position(|g| g.name == name).unwrap_or(0),
+            None if old == 0 => 0,
+            None => self.home - old + v.len(),
+        };
         self.games = v;
+    }
+
+    /// The games, for `games::scan` to keep their covers.
+    pub fn take_games(&mut self) -> Vec<GameInfo> {
+        core::mem::take(&mut self.games)
     }
 
     pub fn game(&self, i: usize) -> Option<&GameInfo> {
@@ -525,7 +350,7 @@ impl Ui {
     }
 
     pub fn animating(&self) -> bool {
-        self.page == LIBRARY && (self.scroll - self.sel as f32).abs() > 0.004
+        self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5
     }
 
     pub fn toast(&mut self, text: String, now: u64) {
@@ -560,6 +385,7 @@ impl Ui {
             .map(|z| z.id)
     }
 
+    /// The zone nearest to the selection in the direction of `code`.
     fn step_focus(&mut self, code: u64) {
         let (dx, dy): (i64, i64) = match code {
             input::BTN_LEFT => (-1, 0),
@@ -594,7 +420,7 @@ impl Ui {
     }
 
     fn is_slider(id: Id) -> bool {
-        matches!(id, Id::QBright | Id::Bright | Id::QVol)
+        matches!(id, Id::QBright | Id::Bright)
     }
 
     fn set_brightness(&mut self, pct: u8) -> Option<Action> {
@@ -606,14 +432,13 @@ impl Ui {
         Some(Action::Brightness(pct))
     }
 
-    fn slide(&mut self, id: Id, x: usize, sx: usize, sw: usize) -> Option<Action> {
+    fn slide(&mut self, x: usize, sx: usize, sw: usize) -> Option<Action> {
         let rel = x.saturating_sub(sx).min(sw);
-        let pct = (MIN_PCT as usize + (100 - MIN_PCT as usize) * rel / sw.max(1)) as u8;
-        if id == Id::QVol {
-            self.vol_pct = (100 * rel / sw.max(1)) as u8;
-            return None;
-        }
-        self.set_brightness(pct)
+        self.set_brightness((MIN_PCT as usize + (100 - MIN_PCT as usize) * rel / sw.max(1)) as u8)
+    }
+
+    fn overlay(&self) -> bool {
+        self.modal.is_some() || self.sheet.is_some() || self.quick
     }
 
     pub fn touch(&mut self, code: u64, x: usize, y: usize) -> Option<Action> {
@@ -624,15 +449,15 @@ impl Ui {
                 self.pressed = hit;
                 if let Some(id) = hit.filter(|&id| Self::is_slider(id)) {
                     let z = self.zones.iter().find(|z| z.id == id)?;
-                    let (sx, sw) = (z.x + 14, z.w.saturating_sub(28));
+                    let (sx, sw) = (z.x + 20, z.w.saturating_sub(40));
                     self.drag = Some((id, sx, sw));
-                    return self.slide(id, x, sx, sw);
+                    return self.slide(x, sx, sw);
                 }
                 None
             }
             input::TOUCH_MOVE => {
-                if let Some((id, sx, sw)) = self.drag {
-                    return self.slide(id, x, sx, sw);
+                if let Some((_, sx, sw)) = self.drag {
+                    return self.slide(x, sx, sw);
                 }
                 if self.pressed != hit {
                     self.pressed = None;
@@ -640,9 +465,9 @@ impl Ui {
                 None
             }
             input::TOUCH_UP => {
-                if let Some((id, _, _)) = self.drag.take() {
+                if self.drag.take().is_some() {
                     self.pressed = None;
-                    return (id != Id::QVol).then_some(Action::Save);
+                    return Some(Action::Save);
                 }
                 let p = self.pressed.take()?;
                 if Some(p) == hit {
@@ -657,25 +482,14 @@ impl Ui {
 
     pub fn pad(&mut self, code: u64) -> Option<Action> {
         use input::*;
-        let open = self.modal.is_some() || self.sheet.is_some() || self.quick;
-        let first = matches!(code, BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_A);
-        if self.page == LIBRARY && !open && self.focus.is_none() && first && !self.games.is_empty()
-        {
-            self.focus = Some(Id::Game(self.sel));
-            if code != BTN_A {
-                return None;
+        let open = self.overlay();
+        if self.page == LIBRARY && !open {
+            if let Some(a) = self.home_pad(code) {
+                return a;
             }
         }
         if let (Some(f), BTN_LEFT | BTN_RIGHT) = (self.focus, code) {
             if Self::is_slider(f) && self.zones.iter().any(|z| z.id == f) {
-                if f == Id::QVol {
-                    self.vol_pct = if code == BTN_LEFT {
-                        self.vol_pct.saturating_sub(PAD_STEP)
-                    } else {
-                        (self.vol_pct + PAD_STEP).min(100)
-                    };
-                    return None;
-                }
                 let v = self.cfg.brightness;
                 let v = if code == BTN_LEFT {
                     v.saturating_sub(PAD_STEP)
@@ -686,17 +500,12 @@ impl Ui {
             }
         }
         match code {
-            BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT => {
-                self.step_focus(code);
-                if let Some(Id::Game(i)) = self.focus {
-                    self.sel = i;
-                }
-            }
+            BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT => self.step_focus(code),
             BTN_A => match self.focus {
                 Some(id) if self.zones.iter().any(|z| z.id == id) => return self.tap(id),
                 _ => self.step_focus(code),
             },
-            BTN_Y => return self.set_theme(!self.cfg.light),
+            BTN_Y if !open => return self.set_theme(!self.cfg.light),
             BTN_B if self.modal.is_some() => return self.tap(Id::No),
             BTN_B if self.sheet.is_some() => self.sheet = None,
             BTN_B if self.quick => self.quick = false,
@@ -706,9 +515,8 @@ impl Ui {
                 self.sheet = None;
                 self.go(LIBRARY);
             }
-            BTN_MINUS | BTN_PLUS if self.modal.is_some() == false && self.sheet.is_none() => {
-                self.quick = !self.quick;
-                self.focus = self.quick.then_some(Id::QSleep);
+            BTN_MINUS | BTN_PLUS if self.modal.is_none() && self.sheet.is_none() => {
+                self.toggle_quick()
             }
             BTN_L | BTN_ZL if !open => self.go((self.page + TABS.len() - 1) % TABS.len()),
             BTN_R | BTN_ZR if !open => self.go((self.page + 1) % TABS.len()),
@@ -717,7 +525,12 @@ impl Ui {
         None
     }
 
-    fn go(&mut self, page: usize) {
+    fn toggle_quick(&mut self) {
+        self.quick = !self.quick;
+        self.focus = self.quick.then_some(Id::QSleep);
+    }
+
+    pub(crate) fn go(&mut self, page: usize) {
         self.page = page;
         self.focus = None;
         self.scan = None;
@@ -726,7 +539,14 @@ impl Ui {
         }
     }
 
-    fn confirm(&mut self, title: &str, lines: [&str; 2], ok: &'static str, tone: Tone, a: Action) {
+    pub(crate) fn confirm(
+        &mut self,
+        title: &str,
+        lines: [&str; 2],
+        ok: &'static str,
+        tone: Tone,
+        a: Action,
+    ) {
         self.modal = Some(Modal {
             title: title.into(),
             lines: [lines[0].into(), lines[1].into()],
@@ -736,7 +556,7 @@ impl Ui {
         });
     }
 
-    fn tap(&mut self, id: Id) -> Option<Action> {
+    pub(crate) fn tap(&mut self, id: Id) -> Option<Action> {
         match id {
             Id::AvatarHome => self.go(LIBRARY),
             Id::AvatarTheme => return self.set_theme(!self.cfg.light),
@@ -747,38 +567,24 @@ impl Ui {
                 self.quick = false;
                 self.sheet = None;
             }
-            Id::StatusQuick => {
-                self.quick = !self.quick;
-                self.focus = self.quick.then_some(Id::QSleep);
+            Id::StatusQuick => self.toggle_quick(),
+            Id::Game(i) if self.home == i => return Some(Action::Launch(i)),
+            Id::Game(i) => self.home = i,
+            Id::Tile(k) => {
+                self.home = self.games.len() + k;
+                return self.open_tile(k);
             }
-            Id::PeekLeft | Id::StackCard => {
-                if !self.games.is_empty() {
-                    self.sel = (self.sel + 1) % self.games.len();
-                }
-            }
-            Id::AppTile(0) => self.go(SYSTEM),
-            Id::AppTile(1) => self.go(TERMINAL),
-            Id::AppTile(2) => self.go(NETWORK),
-            Id::AppTile(3) => self.go(LOGS),
-            Id::AppTile(4) => self.go(SETTINGS),
-            Id::AppTile(_) => self.sheet = Some(Sheet::Power),
             Id::OpenPage(p) => self.go(p),
-            Id::Game(i) if self.sel == i => return Some(Action::Launch(i)),
-            Id::Game(i) => self.sel = i,
             Id::QSleep | Id::SleepNow => {
                 self.quick = false;
                 self.sheet = None;
                 return Some(Action::Sleep);
             }
-            Id::QAutoBright => {
-                self.auto_bright = !self.auto_bright;
-            }
             Id::QSettings => {
                 self.quick = false;
                 self.go(SETTINGS);
             }
-            Id::QBright | Id::Bright | Id::QVol => {}
-            Id::QTheme => return self.set_theme(!self.cfg.light),
+            Id::QBright | Id::Bright => {}
             Id::Theme(light) => return self.set_theme(light),
             Id::QFlight | Id::Flight => {
                 self.cfg.flight = !self.cfg.flight;
@@ -829,9 +635,9 @@ impl Ui {
             Id::Reboot => {
                 self.sheet = None;
                 self.confirm(
-                    "Reboot the Switch?",
+                    "Restart the Switch?",
                     ["It goes back to RCM: inject nxk", "again from the PC."],
-                    "REBOOT",
+                    "Restart",
                     Tone::Warn,
                     Action::Power(power::REBOOT),
                 )
@@ -844,7 +650,7 @@ impl Ui {
                         "Power on goes to RCM (AutoRCM):",
                         "inject nxk again from the PC.",
                     ],
-                    "POWER OFF",
+                    "Power off",
                     Tone::Bad,
                     Action::Power(power::OFF),
                 )
@@ -852,12 +658,12 @@ impl Ui {
             Id::Leave => {
                 let ssid = self.ssid.clone();
                 self.modal = Some(Modal {
-                    title: format!("Leave {}?", ssid),
+                    title: alloc::format!("Leave {}?", ssid),
                     lines: [
                         "Rejoining needs the shell:".into(),
-                        format!("wifi connect {} PASSPHRASE", ssid),
+                        alloc::format!("wifi connect {} PASSPHRASE", ssid),
                     ],
-                    ok: "LEAVE",
+                    ok: "Leave",
                     tone: Tone::Warn,
                     action: Action::Leave,
                 })
@@ -887,7 +693,11 @@ impl Ui {
         None
     }
 
-    fn set_theme(&mut self, light: bool) -> Option<Action> {
+    pub(crate) fn open_power(&mut self) {
+        self.sheet = Some(Sheet::Power);
+    }
+
+    pub(crate) fn set_theme(&mut self, light: bool) -> Option<Action> {
         if self.cfg.light == light {
             return None;
         }
@@ -901,9 +711,12 @@ impl Ui {
         let p = pal();
         self.zones.clear();
         self.wall = libnx::time::realtime_ns();
+        self.fan = d.fan;
+        self.cpu = d.cpu;
+        self.gpu = d.gpu;
         s.clear(p.bg);
         match self.page {
-            LIBRARY => self.home(s, d),
+            LIBRARY => self.home_page(s, d),
             SETTINGS => self.settings(s, d),
             NETWORK => self.network(s, d),
             SYSTEM => self.system(s, d),
@@ -916,14 +729,11 @@ impl Ui {
         }
         if let Some((t, _)) = &self.toast {
             let w = font::width(Face::Body, t) + 56;
-            let (x, y) = ((W - w) / 2, CB - 52);
-            s.shadow(x, y, w, 44, 22, 0xFF00_0000);
-            s.fill_round(x, y, w, 44, 22, p.text);
-            s.text_c(W / 2, vc(Face::Body, y, 44), t, Face::Body, p.bg);
+            let (x, y) = ((W - w) / 2, RULE_Y - 64);
+            s.shadow(x, y, w, 48, 24, theme::BLACK);
+            s.fill_round(x, y, w, 48, 24, p.text);
+            s.label_c(W / 2, y + 24, t, Face::Body, p.bg);
         }
-        self.fan = d.fan;
-        self.cpu = d.cpu;
-        self.gpu = d.gpu;
         if self.quick {
             self.zones.clear();
             self.quick_panel(s, d);
@@ -941,6 +751,10 @@ impl Ui {
             self.zones.clear();
             self.modal(s);
         }
+        // The home row shows its own selection.
+        if self.page == LIBRARY && !self.overlay() {
+            return;
+        }
         if self
             .focus
             .is_some_and(|f| self.zones.iter().all(|z| z.id != f))
@@ -953,138 +767,118 @@ impl Ui {
             .map(|z| (z.x, z.y, z.w, z.h, z.r));
         if let Some((x, y, w, h, r)) = ring {
             self.focus_at = (x + w / 2, y + h / 2);
-            if !matches!(self.focus, Some(Id::Game(_) | Id::QSleep)) {
-                s.ring_round(x - 3, y - 3, w + 6, h + 6, r + 3, 2, p.focus);
-            }
+            s.ring_round(x - 4, y - 4, w + 8, h + 8, r + 4, 3, p.focus);
         }
     }
 
-    /// Draw a red circular player/nxk avatar centered on (cx, cy) with radius `r`.
-    fn draw_red_avatar(&self, s: &mut Screen, cx: usize, cy: usize, r: usize) {
-        let red = rgb_hex(0xE60012);
-        s.disc(cx, cy, r, red);
-        s.ring(cx, cy, r, 2, 0xFFFF_FFFF);
-        // Stylized character face / cap inside the red circle.
-        s.fill_round(cx - r / 2, cy - r / 2, r, r / 2, r / 4, rgb_hex(0xB8000E));
-        s.disc(cx, cy + 2, r * 9 / 20, rgb_hex(0xFFD2B4));
-        s.fill_round(cx - r / 2, cy - r / 3, r, r / 4, 3, red);
-        s.disc(cx, cy - r / 3, 3, 0xFFFF_FFFF);
-        s.disc(cx - 4, cy + 1, 2, rgb_hex(0x18181C));
-        s.disc(cx + 4, cy + 1, 2, rgb_hex(0x18181C));
-    }
-
-    /// Top status cluster (`10:25 PM  [wifi]  100% [battery]`) ending at `xr`, centered on `yc`.
-    fn status_cluster(&self, s: &mut Screen, d: &Data, xr: usize, yc: usize) -> usize {
+    /// Clock, Wi-Fi and power source ending at `xr`, centered on `cy`, on
+    /// `bg`; returns where it starts.
+    pub(crate) fn status(&self, s: &mut Screen, d: &Data, xr: usize, cy: usize, bg: u32) -> usize {
         let p = pal();
-        let mut x = xr;
-        // Battery icon at right.
-        icon(s, Icon::Battery, x - 14, yc, p.text, p.bg);
-        x -= 34;
-        // 100% text.
-        let pct_w = s.text_r(x, vc(Face::Cap, yc - 14, 28), "100%", Face::Cap, p.text);
-        x -= pct_w + 14;
-        // Wi-Fi wave or plane icon.
-        let (wt, _) = wifi_short(d);
-        if wt == "radio off" || self.cfg.flight {
-            icon(s, Icon::Plane, x - 8, yc, p.dim, p.bg);
-        } else {
-            icon(s, Icon::WifiWave, x - 8, yc, p.text, p.bg);
+        // No fuel gauge read yet: the source only, a bolt on input power.
+        let x = xr - 16;
+        icon(s, Icon::Battery, x, cy, p.text, bg);
+        if matches!(d.supply, Seen::Value(power::SUPPLY_EXTERNAL)) {
+            s.disc(x - 1, cy, 7, p.text);
+            icon(s, Icon::Bolt, x - 1, cy, bg, p.text);
         }
-        x -= 28;
-        // Time `10:25 PM`.
-        let clk = clock_ampm(self.wall);
-        let cw = s.text_r(x, vc(Face::Cap, yc - 14, 28), &clk, Face::Cap, p.text);
-        x - cw
+        let x = x - 16 - 26;
+        let (wt, _) = wifi_short(d);
+        if self.cfg.flight || wt == "radio off" {
+            icon(s, Icon::Plane, x, cy, p.text, bg);
+        } else {
+            let c = if wifi_connected(d).is_some() {
+                p.text
+            } else {
+                p.faint
+            };
+            icon(s, Icon::Wifi, x, cy - 2, c, bg);
+        }
+        let x = x - 16 - 14;
+        let t = clock(self.wall);
+        x - s.label_r(x, cy, &t, Face::Small, p.text)
     }
 
-    /// Top navigation bar: avatars on the left, `[L] Games System Network Terminal Logs Settings [R]` in the center, status cluster on the right.
+    /// Avatars, `[L] Games System ... Settings [R]`, the status.
     fn top_bar(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        let yc = 52usize;
+        let cy = TABS_Y;
+        if let Some(img) = art::get(art::UI, art::AVATAR) {
+            s.image(&img, 26, cy - 32, 64, 64, 32);
+        }
+        self.zone(Id::AvatarHome, 26, cy - 32, 64, 64, 32);
+        s.disc(141, cy, 32, p.raised);
+        let k = if self.cfg.light {
+            Icon::Sun
+        } else {
+            Icon::Moon
+        };
+        icon(s, k, 141, cy, p.text, p.raised);
+        self.zone(Id::AvatarTheme, 109, cy - 32, 64, 64, 32);
 
-        // Left: two circular avatars (Home red avatar + Theme avatar).
-        self.draw_red_avatar(s, M + 22, yc, 22);
-        self.zone(Id::AvatarHome, M, yc - 24, 48, 48, 24);
-
-        let ax2 = M + 62;
-        s.disc(ax2 + 22, yc, 22, p.raised);
-        s.ring(ax2 + 22, yc, 22, 1, p.line);
-        icon(
-            s,
-            if self.cfg.light {
-                Icon::Sun
-            } else {
-                Icon::Moon
-            },
-            ax2 + 22,
-            yc,
-            p.text,
-            p.raised,
-        );
-        self.zone(Id::AvatarTheme, ax2, yc - 24, 48, 48, 24);
-
-        // Center: `[ L ]` bumper + tabs + `[ R ]` bumper.
-        let mut tx = 296usize;
-        s.fill_round(tx, yc - 10, 34, 20, 6, p.dim);
-        s.text_c(tx + 17, vc(Face::Cap, yc - 10, 20), "L", Face::Cap, p.bg);
-        self.zone(Id::BumperL, tx - 4, yc - 18, 42, 36, 8);
-        tx += 52;
-
+        let mut x = 353;
+        shoulder(s, x, cy, "L");
+        self.zone(Id::BumperL, x - 6, cy - 22, 59, 44, 8);
+        x += 47 + 33;
         for (i, &name) in TABS.iter().enumerate() {
-            let active = self.page == i;
-            let f = if active { Face::BodyB } else { Face::Body };
-            let col = if active { p.text } else { p.dim };
-            let tw = s.text(tx, vc(f, yc - 18, 36), name, f, col);
-            let has_dot = match i {
+            let on = self.page == i;
+            let (f, c) = if on {
+                (Face::BodyB, p.text)
+            } else {
+                (Face::Body, p.dim)
+            };
+            let tw = s.label(x, cy, name, f, c);
+            let dot = match i {
                 NETWORK => wifi_connected(d).is_some(),
                 TERMINAL => matches!(d.usb, Now::Value(u) if u.state & usb::ST_TERMINAL != 0),
                 LOGS => self.unread > 0,
                 _ => false,
             };
-            if has_dot {
-                s.disc(tx + tw + 6, yc - 6, 3, p.good);
+            if dot {
+                s.disc(x + tw + 4, cy - 14, 3, p.good);
             }
-            self.zone(Id::Tab(i), tx - 10, yc - 22, tw + 20, 44, 8);
-            tx += tw + 34;
+            self.zone(Id::Tab(i), x - 14, cy - 24, tw + 28, 48, 8);
+            x += tw + 41;
         }
+        shoulder(s, x - 8, cy, "R");
+        self.zone(Id::BumperR, x - 14, cy - 22, 59, 44, 8);
 
-        s.fill_round(tx - 6, yc - 10, 34, 20, 6, p.dim);
-        s.text_c(tx + 11, vc(Face::Cap, yc - 10, 20), "R", Face::Cap, p.bg);
-        self.zone(Id::BumperR, tx - 10, yc - 18, 42, 36, 8);
-
-        // Right: clock, Wi-Fi, battery (opens Quick Settings).
-        let left_status = self.status_cluster(s, d, W - M, yc);
-        self.zone(
-            Id::StatusQuick,
-            left_status.saturating_sub(12),
-            yc - 24,
-            W - M - left_status + 24,
-            48,
-            10,
-        );
+        let from = self.status(s, d, W - 32, STATUS_Y, p.bg);
+        self.zone(Id::StatusQuick, from - 12, 0, W - from + 12, 56, 8);
     }
 
-    /// Bottom bar: handheld Switch icon on the left, button hints on the right.
-    fn hints(&self, s: &mut Screen, items: &[(&str, &str)]) {
+    /// The bottom: rule, handheld icon, button hints ending at `xr`.
+    pub(crate) fn hints(
+        &self,
+        s: &mut Screen,
+        x0: usize,
+        xr: usize,
+        bg: u32,
+        items: &[(&str, &str)],
+    ) {
         let p = pal();
-        let y = H - 46;
-        icon(s, Icon::SwitchHandheld, M + 24, y + 14, p.text, p.bg);
-        // When Quick Settings is open, place the main screen hints just left of the drawer (x = 700), exactly like the reference photo!
-        let mut x = if self.quick { 696 } else { W - M };
+        s.fill(
+            x0,
+            RULE_Y,
+            xr + 1 - x0,
+            1,
+            if bg == p.bg { p.rule } else { p.line },
+        );
+        icon(s, Icon::Handheld, x0 + 36, HINT_Y, p.text, bg);
+        let mut x = xr;
         for (b, t) in items.iter().rev() {
-            x -= font::width(Face::Cap, t);
-            s.text(x, vc(Face::Cap, y, 28), t, Face::Cap, p.text);
-            x -= 8 + 20;
-            s.disc(x + 10, y + 14, 10, p.text);
-            s.text_c(x + 10, vc(Face::Cap, y, 28), b, Face::Cap, p.bg);
-            x -= 24;
+            x -= s.label_r(x, HINT_Y, t, Face::Body, p.text);
+            button_glyph(s, x - 19, HINT_Y, b, p.text, bg);
+            x -= 19 + 11 + 30;
         }
     }
 
-    /// Back button and title of a sub-view (kept minimal since the top bar has tabs).
-    pub(crate) fn page_head(&mut self, _s: &mut Screen, _title: &str) {}
+    /// The hint bar of a page: back and select.
+    pub(crate) fn page_hints(&self, s: &mut Screen) {
+        self.hints(s, 26, W - 31, pal().bg, &[("B", "Back"), ("A", "OK")]);
+    }
 
-    /// Button: filled pill in `tone`, or raised surface when `Plain`.
+    /// Button: filled in `tone`, or a raised one when `Plain`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn button(
         &mut self,
@@ -1099,44 +893,24 @@ impl Ui {
         enabled: bool,
     ) {
         let p = pal();
-        let r = (h / 2).min(10);
         let down = enabled && self.pressed == Some(id);
         let (bg, fg) = if !enabled {
-            (p.raised, p.dim)
+            (p.raised, p.faint)
         } else if tone == Tone::Plain {
             (press(p.raised, down), p.text)
         } else {
             let c = tone_color(tone);
-            let bg = if down { mix(c, 0xFFFF_FFFF, 50) } else { c };
-            (bg, p.on_accent)
+            (if down { mix(c, theme::WHITE, 60) } else { c }, p.on_accent)
         };
-        s.fill_round(x, y, w, h, r, bg);
-        if tone == Tone::Plain {
-            s.ring_round(x, y, w, h, r, 1, p.line);
-        }
-        s.text_c(x + w / 2, vc(Face::BodyB, y, h), label, Face::BodyB, fg);
+        s.fill_round(x, y, w, h, 6, bg);
+        let f = if h >= 52 { Face::Body } else { Face::Small };
+        s.label_c(x + w / 2, y + h / 2, label, f, fg);
         if enabled {
-            self.zone(id, x, y, w, h, r);
+            self.zone(id, x, y, w, h, 6);
         }
     }
 
-    /// Pill choice (tabs, sleep delay, theme).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pill(
-        &mut self,
-        s: &mut Screen,
-        id: Id,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-        label: &str,
-        on: bool,
-    ) {
-        self.chip(s, id, x, y, w, h, label, on, true);
-    }
-
-    /// An option of a group: the chosen one is filled with the accent.
+    /// An option of a group: the chosen one in the accent.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn chip(
         &mut self,
@@ -1157,19 +931,16 @@ impl Ui {
         } else if on {
             (press(p.raised, down), p.text)
         } else {
-            (p.raised, mix(p.dim, p.raised, 140))
+            (p.raised, p.faint)
         };
-        s.fill_round(x, y, w, h, 8, bg);
-        if !chosen {
-            s.ring_round(x, y, w, h, 8, 1, p.line);
-        }
-        s.text_c(x + w / 2, vc(Face::Body, y, h), text, Face::Body, fg);
+        s.fill_round(x, y, w, h, 6, bg);
+        s.label_c(x + w / 2, y + h / 2, text, Face::Small, fg);
         if on {
-            self.zone(id, x, y, w, h, 8);
+            self.zone(id, x, y, w, h, 6);
         }
     }
 
-    /// A card row that opens a sheet: label, value, chevron.
+    /// A row that opens a sheet: label, value, chevron.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_row(
         &mut self,
@@ -1184,14 +955,14 @@ impl Ui {
     ) {
         let p = pal();
         let bg = press(p.raised, self.pressed == Some(id));
-        s.fill_round(x + 16, y, w - 32, 48, 8, bg);
-        s.text(x + 32, vc(Face::Body, y, 48), label, Face::Body, p.dim);
-        s.text_r(x + w - 64, vc(Face::Body, y, 48), text, Face::Body, c);
-        icon(s, Icon::Chevron, x + w - 40, y + 24, p.dim, bg);
-        self.zone(id, x + 16, y, w - 32, 48, 8);
+        s.fill_round(x, y, w, 48, 6, bg);
+        s.label(x + 16, y + 24, label, Face::Small, p.dim);
+        s.label_r(x + w - 40, y + 24, text, Face::Small, c);
+        icon(s, Icon::Chevron, x + w - 20, y + 24, p.dim, bg);
+        self.zone(id, x, y, w, 48, 6);
     }
 
-    /// A card that opens a page (the system overview's).
+    /// A card that opens something when tapped.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tile_card(
         &mut self,
@@ -1203,1035 +974,11 @@ impl Ui {
         h: usize,
         title: &str,
     ) {
-        let p = pal();
         crate::widgets::titled(s, x, y, w, h, title);
         if self.pressed == Some(id) {
-            s.ring_round(x, y, w, h, 10, 2, p.accent);
+            s.ring_round(x, y, w, h, 8, 2, pal().accent);
         }
-        self.zone(id, x, y, w, h, 10);
-    }
-
-    /// Home screen (`Games` tab) matching the reference Switch UI:
-    /// - Left peek card (`0..64`)
-    /// - Selected tall portrait game card (`82, 148, 272x388`) with cover art, silver-white border, and red avatar + `Playing` badge
-    /// - `(Y) Change User` below selected card
-    /// - Middle stacked `Retro Time  2` card (`374, 164, 228x352`)
-    /// - Right 2x2 square app tiles (`System`, `Terminal`, `Network`, `Logs`, plus `Settings` & `Power`)
-    /// - Selected game title in cyan with blue game-card icon below the right cards
-    fn home(&mut self, s: &mut Screen, d: &Data) {
-        let p = pal();
-        self.scroll += (self.sel as f32 - self.scroll) * 0.35;
-        if (self.scroll - self.sel as f32).abs() < 0.004 {
-            self.scroll = self.sel as f32;
-        }
-        let n = self.games.len();
-        let sel_cov = self.games.get(self.sel).map_or(0, |g| g.cover);
-        let subtitle: String = self
-            .games
-            .get(self.sel)
-            .map_or_else(|| "THIS WEEK: 7 HOURS".into(), |g| g.subtitle.clone());
-        let title_str: String = self.games.get(self.sel).map_or_else(
-            || "Pokémon Legends: Arceus / Cube".into(),
-            |g| g.title.clone(),
-        );
-
-        // Uppercase play-time header above the selected card.
-        s.text(84, 114, &subtitle, Face::Cap, p.dim);
-
-        // 1. Left-edge peeking card (x = 0..64, y = 164, w = 64, h = 352).
-        s.cover(3, 0, 164, 64, 352, 4);
-        self.zone(Id::PeekLeft, 0, 164, 64, 352, 4);
-
-        // 2. Selected Tall Portrait Game Card (x = 82, y = 148, w = 272, h = 388).
-        s.shadow(82, 148, 272, 388, 8, 0xFF00_0000);
-        s.fill_round(82, 148, 272, 388, 6, p.bg);
-        s.cover(sel_cov, 88, 154, 260, 376, 4);
-        s.ring_round(82, 148, 272, 388, 6, 2, p.focus);
-
-        // Bottom-left "Playing" badge inside the selected card.
-        s.round_a(98, 474, 142, 42, 21, 0xFF00_0000, 175);
-        self.draw_red_avatar(s, 119, 495, 19);
-        s.text(
-            146,
-            vc(Face::Cap, 474, 42),
-            "Playing",
-            Face::Cap,
-            0xFFFF_FFFF,
-        );
-        self.zone(Id::Game(self.sel), 82, 148, 272, 388, 6);
-
-        // Below the selected card: `(Y) Change User`.
-        s.disc(92, 558, 9, p.text);
-        s.text_c(92, vc(Face::Cap, 548, 20), "Y", Face::Cap, p.bg);
-        s.text(
-            108,
-            vc(Face::Cap, 548, 20),
-            "Change User",
-            Face::Cap,
-            p.text,
-        );
-        self.zone(Id::AvatarTheme, 82, 544, 160, 28, 6);
-
-        // 3. Middle Stacked Card: "Retro Time  2" + stacked cover art (x = 374, y = 164, w = 228, h = 352).
-        let (sx, sy, sw, sh) = (374, 164, 228, 352);
-        s.fill_round(sx, sy, sw, sh, 4, p.surface);
-        s.text(
-            sx + 10,
-            vc(Face::Cap, sy, 34),
-            "Retro Time",
-            Face::Cap,
-            p.text,
-        );
-        s.text_r(
-            sx + sw - 10,
-            vc(Face::Cap, sy, 34),
-            &format!("{}", n.max(2)),
-            Face::Cap,
-            p.text,
-        );
-        let stack_cov = if sel_cov == 0 { 2 } else { 0 };
-        s.cover(stack_cov, sx, sy + 34, sw, sh - 34, 4);
-        self.zone(Id::StackCard, sx, sy, sw, sh, 4);
-
-        // 4. Right 2x2 Grid of Square App Tiles (164 x 168 each, gap 16).
-        let (gx, gy, tw, th, gap) = (622, 164, 164, 168, 16);
-
-        // Tile 0 (Top-left): System (Netflix-black & red 'N' style).
-        s.fill_round(gx, gy, tw, th, 4, rgb_hex(0x050507));
-        s.fill_round(gx + 60, gy + 44, 12, 80, 2, rgb_hex(0xB80710));
-        s.fill_round(gx + 92, gy + 44, 12, 80, 2, rgb_hex(0xB80710));
-        s.line(
-            (gx + 66) as i32,
-            (gy + 46) as i32,
-            (gx + 98) as i32,
-            (gy + 122) as i32,
-            12,
-            rgb_hex(0xE50914),
-        );
-        self.zone(Id::AppTile(0), gx, gy, tw, th, 4);
-
-        // Tile 1 (Top-right): Terminal (Twitch-purple style).
-        let tx1 = gx + tw + gap;
-        s.fill_round(tx1, gy, tw, th, 4, rgb_hex(0x772CE8));
-        s.fill_round(tx1 + 48, gy + 44, 68, 64, 6, 0xFFFF_FFFF);
-        s.fill_round(tx1 + 56, gy + 52, 52, 46, 4, rgb_hex(0x0A0A0C));
-        s.fill_round(tx1 + 72, gy + 64, 6, 18, 1, 0xFFFF_FFFF);
-        s.fill_round(tx1 + 90, gy + 64, 6, 18, 1, 0xFFFF_FFFF);
-        self.zone(Id::AppTile(1), tx1, gy, tw, th, 4);
-
-        // Tile 2 (Bottom-left): Network (Disney+ royal blue style).
-        let ty2 = gy + th + gap;
-        s.fill_round(gx, ty2, tw, th, 4, rgb_hex(0x0A1E5E));
-        s.round_a(
-            gx + 18,
-            ty2 + 24,
-            tw - 36,
-            th - 48,
-            48,
-            rgb_hex(0x1E56C8),
-            110,
-        );
-        s.ring_round(gx + 34, ty2 + 48, 96, 46, 23, 2, rgb_hex(0x74C0FC));
-        s.fill_round(gx + 28, ty2 + 72, 108, 28, 4, rgb_hex(0x0A1E5E));
-        s.text_c(
-            gx + tw / 2,
-            vc(Face::TitleB, ty2 + 62, 48),
-            "net+",
-            Face::TitleB,
-            0xFFFF_FFFF,
-        );
-        self.zone(Id::AppTile(2), gx, ty2, tw, th, 4);
-
-        // Tile 3 (Bottom-right): Logs (Spotify emerald circle style).
-        s.fill_round(tx1, ty2, tw, th, 4, rgb_hex(0x121316));
-        let (scx, scy) = (tx1 + tw / 2, ty2 + th / 2);
-        s.disc(scx, scy, 46, rgb_hex(0x1ED760));
-        for (dy, hw) in [(-12i32, 24i32), (0, 20), (12, 15)] {
-            s.line(
-                scx as i32 - hw,
-                scy as i32 + dy,
-                scx as i32 + hw,
-                scy as i32 + dy + 2,
-                5,
-                rgb_hex(0x121316),
-            );
-        }
-        self.zone(Id::AppTile(3), tx1, ty2, tw, th, 4);
-
-        // Column 3 of tiles (Settings & Power, visible when Quick Settings is closed).
-        let tx2 = tx1 + tw + gap;
-        s.fill_round(tx2, gy, tw, th, 4, p.surface);
-        s.ring_round(tx2, gy, tw, th, 4, 1, p.line);
-        icon(
-            s,
-            Icon::Sliders,
-            tx2 + tw / 2,
-            gy + th / 2 - 12,
-            p.good,
-            p.surface,
-        );
-        s.text_c(tx2 + tw / 2, gy + th - 44, "Settings", Face::Cap, p.text);
-        self.zone(Id::AppTile(4), tx2, gy, tw, th, 4);
-
-        s.fill_round(tx2, ty2, tw, th, 4, p.surface);
-        s.ring_round(tx2, ty2, tw, th, 4, 1, p.line);
-        icon(
-            s,
-            Icon::Power,
-            tx2 + tw / 2,
-            ty2 + th / 2 - 12,
-            p.bad,
-            p.surface,
-        );
-        s.text_c(tx2 + tw / 2, ty2 + th - 44, "Power", Face::Cap, p.text);
-        self.zone(Id::AppTile(5), tx2, ty2, tw, th, 4);
-
-        // Selected game title in electric cyan-blue below the middle & right cards.
-        icon(s, Icon::GameCard, sx + 10, 548, p.accent, p.bg);
-        s.text(
-            sx + 28,
-            vc(Face::Title, 530, 36),
-            &fit(Face::Title, &title_str, W - sx - 80),
-            Face::Title,
-            p.accent,
-        );
-
-        let _ = d;
-        self.hints(s, &[("-", "Explore"), ("+", "Options")]);
-    }
-
-    /// A brightness slider row in Quick Settings or Settings.
-    fn bright_slider(&mut self, s: &mut Screen, id: Id, x: usize, y: usize, w: usize) {
-        let p = pal();
-        icon(s, Icon::Sun, x + 10, y + 4, p.text, p.surface);
-        let pct = self.cfg.brightness.max(MIN_PCT);
-        slider(s, x + 42, y, w - 46, pct, true);
-        self.zone(id, x + 28, y - 18, w - 28, 44, 8);
-    }
-
-    /// Right-side Quick Settings overlay matching the reference Switch photo:
-    /// - Top status cluster (`10:25 PM  [wifi]  100% [battery]`)
-    /// - Outlined `Sleep Mode` button (`r = 6`, gradient sheen + 2px border)
-    /// - `Automatic Brightness` (`On` in mint green)
-    /// - Brightness slider with white rounded-square knob
-    /// - Volume slider with white rounded-square knob
-    /// - `Flight Mode` (`Off`) + 2-line explanation caption
-    /// - `System Settings` with 3-slider icon
-    /// - Bottom bar with handheld Switch icon + `(B) Back   (A) OK`
-    fn quick_panel(&mut self, s: &mut Screen, d: &Data) {
-        let p = pal();
-        let (px, pw) = (720, 560);
-        // Lightly dim the left side so the home screen stays clearly visible underneath.
-        s.fill_alpha(0, 0, px, H, p.scrim, 75);
-        self.zone(Id::Scrim, 0, 0, px, H, 0);
-
-        s.fill(px, 0, pw, H, p.surface);
-        s.fill(px, 0, 1, H, p.line);
-
-        let (x, w) = (px + 36, pw - 72);
-
-        // Top-right status bar inside the drawer.
-        self.status_cluster(s, d, W - 36, 44);
-
-        // 1. Sleep Mode button (y = 84, h = 68, r = 6) with crisp focus border.
-        let sy = 84;
-        let down = self.pressed == Some(Id::QSleep);
-        s.fill_round(x, sy, w, 68, 6, press(p.raised, down));
-        s.ring_round(x, sy, w, 68, 6, 2, p.focus);
-        icon(
-            s,
-            Icon::Power,
-            x + 30,
-            sy + 34,
-            p.text,
-            press(p.raised, down),
-        );
-        s.text(
-            x + 52,
-            vc(Face::Body, sy, 68),
-            "Sleep Mode",
-            Face::Body,
-            p.text,
-        );
-        self.zone(Id::QSleep, x, sy, w, 68, 6);
-
-        // 2. Automatic Brightness row (y = 174).
-        let ay = 174;
-        s.text(
-            x + 6,
-            vc(Face::Body, ay, 36),
-            "Automatic Brightness",
-            Face::Body,
-            p.text,
-        );
-        s.text_r(
-            x + w - 6,
-            vc(Face::Body, ay, 36),
-            if self.auto_bright { "On" } else { "Off" },
-            Face::Body,
-            if self.auto_bright { p.good } else { p.dim },
-        );
-        self.zone(Id::QAutoBright, x, ay, w, 36, 6);
-
-        // 3. Brightness slider (y = 236).
-        self.bright_slider(s, Id::QBright, x + 4, 236, w - 8);
-
-        // 4. Volume slider (y = 298, visual-only as audio service is disabled).
-        icon(s, Icon::Speaker, x + 14, 302, p.text, p.surface);
-        slider(s, x + 46, 298, w - 54, self.vol_pct, false);
-        self.zone(Id::QVol, x + 32, 280, w - 32, 44, 8);
-
-        // Divider.
-        s.fill(x + 4, 348, w - 8, 1, p.line);
-
-        // 5. Flight Mode row + 2-line caption (y = 366).
-        let fy = 366;
-        s.text(
-            x + 6,
-            vc(Face::Body, fy, 36),
-            "Flight Mode",
-            Face::Body,
-            p.text,
-        );
-        s.text_r(
-            x + w - 6,
-            vc(Face::Body, fy, 36),
-            if self.cfg.flight { "On" } else { "Off" },
-            Face::Body,
-            if self.cfg.flight { p.good } else { p.dim },
-        );
-        s.text(
-            x + 6,
-            fy + 42,
-            "If you turn flight mode on, you will no longer",
-            Face::Cap,
-            p.dim,
-        );
-        s.text(
-            x + 6,
-            fy + 64,
-            "be able to use wireless controllers.",
-            Face::Cap,
-            p.dim,
-        );
-        self.zone(Id::QFlight, x, fy, w, 88, 6);
-
-        // Divider.
-        s.fill(x + 4, 468, w - 8, 1, p.line);
-
-        // 6. System Settings row (y = 486).
-        let ssy = 486;
-        if self.pressed == Some(Id::QSettings) {
-            s.fill_round(x, ssy, w, 46, 6, p.raised);
-        }
-        icon(s, Icon::Sliders, x + 16, ssy + 23, p.text, p.surface);
-        s.text(
-            x + 40,
-            vc(Face::Body, ssy, 46),
-            "System Settings",
-            Face::Body,
-            p.text,
-        );
-        self.zone(Id::QSettings, x, ssy, w, 46, 6);
-
-        // 7. Theme row (y = 540, quick Dark / Light toggle).
-        let ty = 540;
-        if self.pressed == Some(Id::QTheme) {
-            s.fill_round(x, ty, w, 44, 6, p.raised);
-        }
-        icon(
-            s,
-            if self.cfg.light {
-                Icon::Sun
-            } else {
-                Icon::Moon
-            },
-            x + 16,
-            ty + 22,
-            p.text,
-            p.surface,
-        );
-        s.text(x + 40, vc(Face::Body, ty, 44), "Theme", Face::Body, p.text);
-        s.text_r(
-            x + w - 6,
-            vc(Face::Body, ty, 44),
-            if self.cfg.light { "Light" } else { "Dark" },
-            Face::Body,
-            p.good,
-        );
-        self.zone(Id::QTheme, x, ty, w, 44, 6);
-
-        // Bottom bar inside the Quick Settings drawer.
-        let by = H - 46;
-        icon(s, Icon::SwitchHandheld, x + 24, by + 14, p.text, p.surface);
-        let mut bx = W - 36;
-        for (b, t) in [("B", "Back"), ("A", "OK")].iter().rev() {
-            bx -= font::width(Face::Cap, t);
-            s.text(bx, vc(Face::Cap, by, 28), t, Face::Cap, p.text);
-            bx -= 8 + 20;
-            s.disc(bx + 10, by + 14, 10, p.text);
-            s.text_c(bx + 10, vc(Face::Cap, by, 28), b, Face::Cap, p.surface);
-            bx -= 24;
-        }
-    }
-
-    /// Settings: categories on the left, the chosen one on the right.
-    fn settings(&mut self, s: &mut Screen, d: &Data) {
-        let p = pal();
-        let lw = 300usize;
-        for (i, name) in CATS.iter().enumerate() {
-            let y = CY + 8 + i * 72;
-            let (on, down) = (self.cat == i, self.pressed == Some(Id::Cat(i)));
-            let bg = if on { p.surface } else { press(p.bg, down) };
-            s.fill_round(M, y, lw, 60, 8, bg);
-            if on {
-                s.ring_round(M, y, lw, 60, 8, 1, p.line);
-                s.fill_round(M + 2, y + 14, 4, 32, 2, p.accent);
-            }
-            s.text(
-                M + 28,
-                vc(Face::Body, y, 60),
-                name,
-                if on { Face::BodyB } else { Face::Body },
-                if on { p.text } else { p.dim },
-            );
-            self.zone(Id::Cat(i), M, y, lw, 60, 8);
-        }
-        let (x, y, w, h) = (M + lw + 36, CY, W - 2 * M - lw - 36, CH);
-        card(s, x, y, w, h);
-        s.text(x + 32, y + 22, CATS[self.cat], Face::TitleB, p.text);
-        let (cx, cw) = (x + 32, w - 64);
-        match self.cat {
-            0 => self.cat_display(s, cx, y + 88, cw),
-            1 => {
-                s.text(cx, y + 96, "Volume", Face::Body, p.dim);
-                s.text_r(cx + cw, y + 96, "audio off", Face::Body, p.dim);
-                icon(s, Icon::Speaker, cx + 14, y + 156, p.dim, p.surface);
-                slider(s, cx + 58, y + 152, cw - 58, self.vol_pct, false);
-                s.text(
-                    cx,
-                    y + 208,
-                    "The audio path is not switched on yet.",
-                    Face::Body,
-                    p.dim,
-                );
-                s.text(
-                    cx,
-                    y + 238,
-                    "The speakers come back once it plays reliably.",
-                    Face::Body,
-                    p.dim,
-                );
-            }
-            2 => self.cat_network(s, d, cx, y + 88, cw),
-            3 => self.cat_performance(s, d, x, y + 88, w),
-            4 => self.cat_power(s, d, cx, y + 88, cw),
-            _ => self.cat_about(s, d, cx, y + 88, cw),
-        }
-        self.hints(s, &[("B", "Back"), ("A", "OK")]);
-    }
-
-    fn cat_display(&mut self, s: &mut Screen, x: usize, y: usize, w: usize) {
-        let p = pal();
-        s.text(x, y + 6, "Theme", Face::Body, p.dim);
-        let light = self.cfg.light;
-        let cw = 150;
-        self.chip(
-            s,
-            Id::Theme(false),
-            x + w - 2 * cw - 12,
-            y,
-            cw,
-            44,
-            "Dark",
-            !light,
-            true,
-        );
-        self.chip(
-            s,
-            Id::Theme(true),
-            x + w - cw,
-            y,
-            cw,
-            44,
-            "Light",
-            light,
-            true,
-        );
-        s.fill(x, y + 68, w, 1, p.line);
-        s.text(x, y + 92, "Brightness", Face::Body, p.dim);
-        let b = format!("{}%", self.cfg.brightness.max(MIN_PCT));
-        s.text_r(x + w, y + 92, &b, Face::Body, p.good);
-        self.bright_slider(s, Id::Bright, x, y + 156, w);
-        s.fill(x, y + 196, w, 1, p.line);
-        s.text(x, y + 220, "Sleep after", Face::Body, p.dim);
-        s.text(
-            x,
-            y + 252,
-            "Screen off when nothing is touched",
-            Face::Cap,
-            p.dim,
-        );
-        let bw = 92;
-        for (i, &label) in SLEEP_LABELS.iter().enumerate() {
-            let bx = x + w - (SLEEP_LABELS.len() - i) * (bw + 8) + 8;
-            self.chip(
-                s,
-                Id::AutoSleep(i),
-                bx,
-                y + 224,
-                bw,
-                40,
-                label,
-                self.cfg.sleep as usize == i,
-                true,
-            );
-        }
-    }
-
-    fn cat_network(&mut self, s: &mut Screen, d: &Data, x: usize, y: usize, w: usize) {
-        let p = pal();
-        s.text(x, y, "Flight Mode", Face::Body, p.text);
-        s.text(
-            x,
-            y + 30,
-            "Turns the Wi-Fi radio off: no scan, no join",
-            Face::Cap,
-            p.dim,
-        );
-        switch(s, x + w - 56, y + 4, self.cfg.flight, true);
-        self.zone(Id::Flight, x, y - 8, w, 64, 12);
-        s.fill(x, y + 66, w, 1, p.line);
-        let (wt, wc) = wifi_short(d);
-        s.text(x, y + 88, "Wi-Fi", Face::Body, p.dim);
-        s.text_r(x + w, y + 88, wt, Face::Body, wc);
-        let (et, ec) = eth_text(d, true);
-        s.text(x, y + 124, "USB-C Ethernet", Face::Body, p.dim);
-        s.text_r(x + w, y + 124, et, Face::Body, ec);
-        let ip = match d.active() {
-            Some(n) if n.addr != 0 => format!("{}/{}", crate::screen::Ipv4(n.addr), n.prefix),
-            Some(_) => "waiting for DHCP".into(),
-            None => "offline".into(),
-        };
-        s.text(x, y + 160, "Address", Face::Body, p.dim);
-        s.text_r(x + w, y + 160, &ip, Face::Body, p.text);
-        self.button(
-            s,
-            Id::OpenPage(NETWORK),
-            x,
-            y + 216,
-            280,
-            56,
-            "Open network page",
-            Tone::Accent,
-            true,
-        );
-    }
-
-    fn cat_performance(&mut self, s: &mut Screen, d: &Data, x: usize, y: usize, w: usize) {
-        let (t, c) = match d.cpu {
-            Seen::Value(c) => cpu_text(&c),
-            Seen::Missing => ("no clock control".into(), pal().dim),
-            Seen::Unknown => ("starting".into(), pal().dim),
-        };
-        self.open_row(s, Id::CpuOpen, x, w, y, "CPU clock", &t, c);
-        let (t, c) = gpu_text(&d.gpu);
-        self.open_row(s, Id::GpuOpen, x, w, y + 64, "GPU clock", &t, c);
-        let (t, c) = match d.fan {
-            Seen::Value(f) => fan_text(&f),
-            Seen::Missing => ("no fan control".into(), pal().dim),
-            Seen::Unknown => ("starting".into(), pal().dim),
-        };
-        self.open_row(s, Id::FanOpen, x, w, y + 128, "Fan", &t, c);
-        s.text(
-            x + 32,
-            y + 208,
-            "Clocks and the fan fall back to safe values when the SoC is hot.",
-            Face::Cap,
-            pal().dim,
-        );
-    }
-
-    fn cat_power(&mut self, s: &mut Screen, d: &Data, x: usize, y: usize, w: usize) {
-        let p = pal();
-        let src = match d.supply {
-            Seen::Value(power::SUPPLY_EXTERNAL) => "input power on the USB-C port",
-            Seen::Value(_) => "battery",
-            _ => "unknown",
-        };
-        s.text(x, y, "Power source", Face::Body, p.dim);
-        s.text_r(x + w, y, src, Face::Body, p.text);
-        s.fill(x, y + 44, w, 1, p.line);
-        let bw = (w - 32) / 3;
-        self.button(
-            s,
-            Id::SleepNow,
-            x,
-            y + 72,
-            bw,
-            64,
-            "Sleep",
-            Tone::Plain,
-            true,
-        );
-        self.button(
-            s,
-            Id::Reboot,
-            x + bw + 16,
-            y + 72,
-            bw,
-            64,
-            "Restart",
-            Tone::Warn,
-            true,
-        );
-        self.button(
-            s,
-            Id::PowerOff,
-            x + 2 * (bw + 16),
-            y + 72,
-            bw,
-            64,
-            "Power off",
-            Tone::Bad,
-            true,
-        );
-        s.text(
-            x,
-            y + 168,
-            "Sleep turns the screen off and slows the CPU; touch or a button wakes it.",
-            Face::Cap,
-            p.dim,
-        );
-        s.text(
-            x,
-            y + 194,
-            "Power off and restart go back to RCM: inject nxk again from the PC.",
-            Face::Cap,
-            p.dim,
-        );
-    }
-
-    fn cat_about(&mut self, s: &mut Screen, d: &Data, x: usize, y: usize, w: usize) {
-        let p = pal();
-        let (lw, lh) = crate::screen::logo_size();
-        s.logo(
-            x + w - lw * 2,
-            y - 66 + (48usize.saturating_sub(lh * 2)) / 2,
-            2,
-        );
-        let (sw, sh) = s.size();
-        let rows: [(&str, String); 6] = [
-            ("System", "nxk, AArch64 microkernel".into()),
-            ("SoC", "NVIDIA Tegra X1 (4x Cortex-A57)".into()),
-            (
-                "Screen",
-                format!(
-                    "{}x{}{}",
-                    sw,
-                    sh,
-                    if s.turned() { ", panel turned" } else { "" }
-                ),
-            ),
-            ("Uptime", format!("{}", crate::screen::Hms(d.up_s))),
-            (
-                "Memory",
-                d.mem.map_or("-".into(), |m| {
-                    format!(
-                        "{}",
-                        crate::screen::Bytes(m.total_pages * libnx::abi::layout::PAGE_SIZE)
-                    )
-                }),
-            ),
-            (
-                "SD card",
-                match d.disk {
-                    Seen::Value((_, total)) => format!("{}", crate::screen::Bytes(total)),
-                    _ => "none".into(),
-                },
-            ),
-        ];
-        for (i, (k, v)) in rows.iter().enumerate() {
-            let ry = y + i * 44;
-            s.text(x, ry, k, Face::Body, p.dim);
-            s.text_r(x + w, ry, v, Face::Body, p.text);
-            s.fill(x, ry + 34, w, 1, p.line);
-        }
-    }
-
-    /// A centered sheet over the dimmed page, with its title.
-    fn sheet_frame(&mut self, s: &mut Screen, title: &str) -> (usize, usize, usize, usize) {
-        let p = pal();
-        s.fill_alpha(0, 0, W, H, p.scrim, 150);
-        let (x, y, w, h) = (160, 64, 960, 592);
-        self.zone(Id::Scrim, 0, 0, W, H, 0);
-        s.shadow(x, y, w, h, 14, 0xFF00_0000);
-        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
-        s.text(x + 40, y + 30, title, Face::TitleB, p.text);
-        (x, y, w, h)
-    }
-
-    fn close_button(&mut self, s: &mut Screen, x: usize, y: usize, w: usize, h: usize) {
-        self.button(
-            s,
-            Id::SheetClose,
-            x + w - 40 - 220,
-            y + h - 40 - 60,
-            220,
-            60,
-            "Close",
-            Tone::Plain,
-            true,
-        );
-    }
-
-    fn fan_sheet(&mut self, s: &mut Screen) {
-        let p = pal();
-        let (x, y, w, h) = self.sheet_frame(s, "Fan");
-        if let Seen::Value(f) = self.fan {
-            let mut state = String::new();
-            if let Some(t) = f.temp {
-                state = format!("SoC {}", Celsius(t));
-            }
-            if let Some(rpm) = f.rpm {
-                state = format!("{}   {} rpm", state, rpm);
-            }
-            s.text_r(x + w - 40, y + 38, &state, Face::Body, p.text);
-            let manual = self.fan_manual();
-            let bw = (w - 104) / 2;
-            self.chip(
-                s,
-                Id::FanAuto,
-                x + 40,
-                y + 108,
-                bw,
-                56,
-                "Auto",
-                manual.is_none(),
-                true,
-            );
-            self.chip(
-                s,
-                Id::FanManual,
-                x + 64 + bw,
-                y + 108,
-                bw,
-                56,
-                "Manual",
-                manual.is_some(),
-                true,
-            );
-            let forced = f.state & (fan::ST_HOT | fan::ST_NO_SENSOR) != 0;
-            let shown = manual.unwrap_or(f.percent);
-            let can = |ok: bool| manual.is_some() && ok;
-            self.button(
-                s,
-                Id::FanDown,
-                x + 40,
-                y + 208,
-                160,
-                120,
-                "-10%",
-                Tone::Plain,
-                can(shown > 0),
-            );
-            self.button(
-                s,
-                Id::FanUp,
-                x + w - 40 - 160,
-                y + 208,
-                160,
-                120,
-                "+10%",
-                Tone::Plain,
-                can(shown < 100),
-            );
-            let c = if forced { p.warn } else { p.text };
-            s.text_c(x + w / 2, y + 220, &format!("{}%", shown), Face::Big, c);
-            crate::widgets::bar(
-                s,
-                x + 240,
-                y + 316,
-                w - 480,
-                12,
-                f.percent,
-                if forced { p.warn } else { p.good },
-            );
-            let (note, nc) = if f.state & fan::ST_HOT != 0 {
-                ("SoC hot: full speed until below 57\u{b0}C", p.warn)
-            } else if f.state & fan::ST_NO_SENSOR != 0 {
-                ("No temperature: at least 43%", p.warn)
-            } else if manual.is_some() {
-                ("Full speed anyway from 60\u{b0}C", p.dim)
-            } else {
-                ("Follows the SoC temperature", p.dim)
-            };
-            s.text(x + 40, y + 372, note, Face::Body, nc);
-        } else {
-            let t = match self.fan {
-                Seen::Missing => "no fan control",
-                _ => "starting",
-            };
-            s.text(x + 40, y + 108, t, Face::Body, p.dim);
-        }
-        self.close_button(s, x, y, w, h);
-    }
-
-    fn cpu_sheet(&mut self, s: &mut Screen) {
-        let p = pal();
-        let (x, y, w, h) = self.sheet_frame(s, "CPU clock");
-        match self.cpu {
-            Seen::Value(c) if c.state & cpufreq::ST_UNSUPPORTED == 0 => {
-                let (t, tone) = cpu_text(&c);
-                s.text_r(x + w - 40, y + 38, &t, Face::Body, tone);
-                let (cols, gap) = (6, 14);
-                let (bw, bh) = ((w - 80 - (cols - 1) * gap) / cols, 64);
-                let mut top = 0;
-                for (i, &m) in cpufreq::STEPS_MHZ.iter().enumerate() {
-                    let (bx, by) = (
-                        x + 40 + (i % cols) * (bw + gap),
-                        y + 108 + (i / cols) * (bh + gap),
-                    );
-                    let runs = c.allowed & 1 << i != 0;
-                    if runs {
-                        top = m;
-                    }
-                    let on = runs && !self.cpu_sent;
-                    self.chip(
-                        s,
-                        Id::CpuStep(i),
-                        bx,
-                        by,
-                        bw,
-                        bh,
-                        &format!("{}", m),
-                        c.step == m,
-                        on,
-                    );
-                }
-                let by = y + 108 + 2 * (64 + gap) + 8;
-                self.chip(
-                    s,
-                    Id::CpuBoot,
-                    x + 40,
-                    by,
-                    200,
-                    56,
-                    "Boot",
-                    c.step == cpufreq::BOOT,
-                    !self.cpu_sent,
-                );
-                s.text(
-                    x + 264,
-                    vc(Face::Body, by, 56),
-                    "the loader's clock",
-                    Face::Body,
-                    p.dim,
-                );
-                let (note, nc) = if c.state & cpufreq::ST_HOT != 0 {
-                    ("SoC hot: back to BOOT", p.warn)
-                } else {
-                    ("Back to BOOT at 80\u{b0}C", p.dim)
-                };
-                s.text(x + 40, y + 400, note, Face::Body, nc);
-                s.text(
-                    x + 40,
-                    y + 436,
-                    &format!("speedo {}: {} MHz max", c.speedo, top),
-                    Face::Body,
-                    p.dim,
-                );
-            }
-            Seen::Value(c) => {
-                s.text(
-                    x + 40,
-                    y + 108,
-                    &format!("{} MHz", mhz(c.khz)),
-                    Face::Head,
-                    p.text,
-                );
-                s.text(
-                    x + 40,
-                    y + 176,
-                    "Boot clock only on this console",
-                    Face::Body,
-                    p.dim,
-                );
-            }
-            Seen::Missing | Seen::Unknown => {
-                let t = match self.cpu {
-                    Seen::Missing => "no clock control",
-                    _ => "starting",
-                };
-                s.text(x + 40, y + 108, t, Face::Body, p.dim);
-            }
-        }
-        self.close_button(s, x, y, w, h);
-    }
-
-    fn gpu_sheet(&mut self, s: &mut Screen) {
-        let p = pal();
-        let (x, y, w, h) = self.sheet_frame(s, "GPU clock");
-        match self.gpu {
-            Seen::Value(g) if g.steps != 1 => {
-                let (t, tone) = gpu_text(&self.gpu);
-                s.text_r(x + w - 40, y + 38, &t, Face::Body, tone);
-                let (cols, gap) = (6, 14);
-                let (bw, bh) = ((w - 80 - (cols - 1) * gap) / cols, 64);
-                let mut top = 0;
-                for (i, &k) in gpu::STEPS_KHZ.iter().enumerate() {
-                    let (bx, by) = (
-                        x + 40 + (i % cols) * (bw + gap),
-                        y + 108 + (i / cols) * (bh + gap),
-                    );
-                    if g.steps & 1 << i != 0 {
-                        top = k;
-                    }
-                    let runs = g.steps == 0 || g.steps & 1 << i != 0;
-                    let set = g.step == k;
-                    let on = runs && !self.gpu_sent;
-                    self.chip(s, Id::GpuStep(i), bx, by, bw, bh, &gpu_mhz(k), set, on);
-                    if k > g.cap && !set && on {
-                        s.ring_round(bx, by, bw, bh, 8, 2, p.warn);
-                    }
-                }
-                let source = match g.supply {
-                    power::SUPPLY_EXTERNAL => "on input power",
-                    gpu::NO_SUPPLY => "(charger unread)",
-                    _ => "on battery",
-                };
-                let mut cap = format!("cap {} MHz {}", gpu_mhz(g.cap), source);
-                if g.ck & gpu::CK_FORCED != 0 {
-                    cap.push_str(", forced past it");
-                }
-                let tone = if g.ck & gpu::CK_FORCED != 0 {
-                    p.warn
-                } else {
-                    p.text
-                };
-                s.text(x + 40, y + 280, &cap, Face::Body, tone);
-                let clock: String = match (g.state, g.measured) {
-                    (gpu::ON, 0) => "not measured yet".into(),
-                    (gpu::ON, m) => format!("measured {} MHz after the last change", gpu_mhz(m)),
-                    _ => "off: the step applies at power-up".into(),
-                };
-                s.text(x + 40, y + 316, &clock, Face::Body, p.dim);
-                let (note, nc) = if g.ck & gpu::CK_HOT != 0 {
-                    ("SoC hot: back to 76.8 MHz", p.warn)
-                } else if g.ck & gpu::CK_CAPPED != 0 {
-                    ("Power source changed: down to its cap", p.warn)
-                } else {
-                    ("Back to 76.8 MHz at 80\u{b0}C", p.dim)
-                };
-                s.text(x + 40, y + 352, note, Face::Body, nc);
-                if top != 0 {
-                    s.text(
-                        x + 40,
-                        y + h - 40 - 60 + 16,
-                        &format!("{} MHz max on this chip", gpu_mhz(top)),
-                        Face::Body,
-                        p.dim,
-                    );
-                }
-            }
-            Seen::Value(_) => {
-                s.text(x + 40, y + 108, "76.8 MHz", Face::Head, p.text);
-                s.text(
-                    x + 40,
-                    y + 176,
-                    "Lowest step only on this console",
-                    Face::Body,
-                    p.dim,
-                );
-            }
-            Seen::Missing | Seen::Unknown => {
-                let t = match self.gpu {
-                    Seen::Missing => "no GPU service",
-                    _ => "starting",
-                };
-                s.text(x + 40, y + 108, t, Face::Body, p.dim);
-            }
-        }
-        self.close_button(s, x, y, w, h);
-    }
-
-    fn power_sheet(&mut self, s: &mut Screen) {
-        let p = pal();
-        let (x, y, w, h) = (360, 150, 560, 420);
-        s.fill_alpha(0, 0, W, H, p.scrim, 150);
-        self.zone(Id::Scrim, 0, 0, W, H, 0);
-        s.shadow(x, y, w, h, 14, 0xFF00_0000);
-        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
-        s.text(x + 40, y + 30, "Power", Face::TitleB, p.text);
-        self.button(
-            s,
-            Id::SleepNow,
-            x + 40,
-            y + 100,
-            w - 80,
-            64,
-            "Sleep",
-            Tone::Plain,
-            true,
-        );
-        self.button(
-            s,
-            Id::Reboot,
-            x + 40,
-            y + 180,
-            w - 80,
-            64,
-            "Restart",
-            Tone::Warn,
-            true,
-        );
-        self.button(
-            s,
-            Id::PowerOff,
-            x + 40,
-            y + 260,
-            w - 80,
-            64,
-            "Power off",
-            Tone::Bad,
-            true,
-        );
-        self.button(
-            s,
-            Id::SheetClose,
-            x + 40,
-            y + 340,
-            w - 80,
-            56,
-            "Cancel",
-            Tone::Plain,
-            true,
-        );
-    }
-
-    fn modal(&mut self, s: &mut Screen) {
-        let Some(m) = self.modal.take() else { return };
-        let p = pal();
-        s.fill_alpha(0, 0, W, H, p.scrim, 170);
-        let (x, y, w, h) = (240, 190, 800, 340);
-        s.shadow(x, y, w, h, 14, 0xFF00_0000);
-        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
-        let tc = match m.tone {
-            Tone::Plain => p.text,
-            t => tone_color(t),
-        };
-        s.text(x + 40, y + 34, &m.title, Face::TitleB, tc);
-        for (i, t) in m.lines.iter().enumerate() {
-            s.text(x + 40, y + 100 + i * 36, t, Face::Body, p.text);
-        }
-        let (bw, by) = ((w - 104) / 2, y + h - 40 - 64);
-        self.button(s, Id::No, x + 40, by, bw, 64, "Cancel", Tone::Plain, true);
-        self.button(s, Id::Yes, x + 64 + bw, by, bw, 64, m.ok, m.tone, true);
-        self.modal = Some(m);
-    }
-
-    pub(crate) fn hint_bar(&self, s: &mut Screen, items: &[(&str, &str)]) {
-        self.hints(s, items);
+        self.zone(id, x, y, w, h, 8);
     }
 
     pub(crate) fn sleep_minutes(&self) -> u8 {

@@ -1,7 +1,8 @@
 //! display: Tegra X1 DC-A screen; window A on a shared image, drawn as
-//! the Switch-style touch UI of `ui`: home screen with horizontal game
-//! tiles and bottom dock, quick settings overlay, settings, system,
-//! network, USB-C terminal and logs. Redrawn every second and on input.
+//! the Switch-style touch UI of `ui`: home row of games and app tiles,
+//! quick settings drawer, settings, system, network, USB-C terminal and
+//! logs. Redrawn every second and on input. Counts the time played in
+//! the games it starts.
 //! Panel init is left to the bootloader; only the window is changed. A
 //! portrait panel (Switch) is drawn turned.
 
@@ -10,13 +11,20 @@
 
 extern crate alloc;
 
+mod art;
 mod backlight;
 mod config;
 mod font;
 mod games;
+mod home;
 mod pages;
+mod playtime;
+mod quick;
 mod screen;
+mod settings;
+mod sheets;
 mod stats;
+mod status;
 mod term;
 mod theme;
 mod ui;
@@ -164,6 +172,8 @@ type Event = (u64, u64, u64, u64, u64);
 enum Job {
     Act(Action),
     Save(config::Config),
+    /// `playtime.cfg`'s new text.
+    SavePlay(String),
     SleepCpu(u64),
 }
 
@@ -199,10 +209,12 @@ struct Game {
     waiter: Option<(u64, u64)>,
 }
 
-/// The game the library started.
+/// The game the library started: its play time counts from `since`.
 struct Running {
     handle: u32,
     title: String,
+    name: String,
+    since: u64,
 }
 
 /// Starts games and learns when they end (a thread waits on each).
@@ -213,16 +225,18 @@ struct Launcher {
 }
 
 impl Launcher {
-    fn launch(&mut self, ui: &mut Ui, i: usize) {
+    /// Start game `i`; true if it runs (it is now the last played).
+    fn launch(&mut self, ui: &mut Ui, i: usize) -> bool {
         let now = time::now_ns();
-        let Some(g) = ui.game(i).cloned() else {
-            return;
+        let Some(g) = ui.game(i) else {
+            return false;
         };
+        let (exe, title, name) = (g.exe.clone(), g.title.clone(), g.name.clone());
         if let Some(r) = &self.running {
             ui.toast(format!("{} is running", r.title), now);
-            return;
+            return false;
         }
-        match libnx::process::spawn_args(&[&g.exe]) {
+        match libnx::process::spawn_args(&[&exe]) {
             Ok(h) => {
                 let (q, notif) = (self.exits.clone(), self.notif);
                 let spawned = thread::spawn(move || {
@@ -233,12 +247,21 @@ impl Launcher {
                 if spawned.is_err() {
                     ui.toast("cannot watch the game".into(), now);
                 }
+                ui.play.started(&name);
+                let games = ui.take_games();
+                ui.set_games(games);
                 self.running = Some(Running {
                     handle: h,
-                    title: g.title,
+                    title,
+                    name,
+                    since: now,
                 });
+                true
             }
-            Err(e) => ui.toast(format!("{}: {}", g.title, libnx::abi::err::name(e)), now),
+            Err(e) => {
+                ui.toast(format!("{}: {}", title, libnx::abi::err::name(e)), now);
+                false
+            }
         }
     }
 
@@ -307,6 +330,10 @@ fn work(w: &Worker, notif: u32) -> ! {
             Job::Act(a) => a,
             Job::Save(cfg) => {
                 let _ = cfg.save();
+                continue;
+            }
+            Job::SavePlay(text) => {
+                let _ = playtime::save(&text);
                 continue;
             }
             Job::SleepCpu(mhz) => {
@@ -554,6 +581,7 @@ fn main() -> i32 {
         ui.cfg.brightness = b.percent();
     }
     let mut cfg_loaded = false;
+    let mut play_loaded = false;
     let mut save_at: u64 = 0;
     let mut sleeping = false;
     let mut pre_sleep_cpu: Option<u64> = None;
@@ -676,8 +704,15 @@ fn main() -> i32 {
                     dirty = true;
                 }
             }
+            // Read once the card is: saving before would lose its lines.
+            if !play_loaded && now >= next_scan {
+                if let Some(pt) = playtime::Playtime::load() {
+                    ui.play = pt;
+                    play_loaded = true;
+                }
+            }
             if ui.page == ui::LIBRARY && now >= next_scan {
-                let found = games::scan();
+                let found = games::scan(ui.take_games());
                 next_scan = now
                     + if found.is_empty() {
                         3_000_000_000
@@ -852,7 +887,12 @@ fn main() -> i32 {
                     };
                     match action {
                         Some(Action::ClearLogs) => msgs.clear(),
-                        Some(Action::Launch(i)) => launcher.launch(&mut ui, i),
+                        Some(Action::Launch(i)) => {
+                            if launcher.launch(&mut ui, i) && play_loaded {
+                                worker.jobs.lock().push_back(Job::SavePlay(ui.play.text()));
+                                worker.wake.notify_one();
+                            }
+                        }
                         Some(Action::Brightness(pct)) => {
                             if let Some(b) = &bl {
                                 b.set(pct);
@@ -887,14 +927,16 @@ fn main() -> i32 {
             if ev & EV_EXIT != 0 {
                 let ended: Vec<(u32, i64)> = launcher.exits.lock().drain(..).collect();
                 for (h, code) in ended {
-                    let title = launcher
-                        .running
-                        .as_ref()
-                        .filter(|r| r.handle == h)
-                        .map(|r| r.title.clone());
-                    if title.is_some() {
-                        launcher.running = None;
+                    let run = launcher.running.take_if(|r| r.handle == h);
+                    if let Some(r) = &run {
+                        let secs = (now - r.since) / 1_000_000_000;
+                        ui.play.ended(&r.name, secs, time::realtime_ns());
+                        if play_loaded {
+                            worker.jobs.lock().push_back(Job::SavePlay(ui.play.text()));
+                            worker.wake.notify_one();
+                        }
                     }
+                    let title = run.map(|r| r.title);
                     let _ = sys::handle_close(h);
                     dirty = true;
                     if game.is_some() {

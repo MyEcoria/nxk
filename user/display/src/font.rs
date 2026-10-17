@@ -1,21 +1,30 @@
-//! The UI's proportional font: `build/uifont.bin` (tools/mkuifont.py),
-//! antialiased 4-bit glyphs in a few faces. Static data, no copy in RAM.
+//! The UI's proportional font: `build/uifont.bin` (tools/mkuifont.py,
+//! Lato by default), antialiased 4-bit glyphs in a few faces. Static
+//! data, no copy in RAM.
 
 const DATA: &[u8] = include_bytes!("../../../build/uifont.bin");
 /// Glyph records per face: ASCII 32..=126, then `°` `·` `•` `×` `‹` `›`.
 const SLOTS: usize = 101;
 const RECORD: usize = 12;
 
+/// In the order of mkuifont.py's `FACES`.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Face {
-    /// Captions.
+    /// Captions (18 px), and their semibold for small headings.
     Cap,
+    CapB,
+    /// Status row and dense data (21 px).
+    Small,
+    /// Menus, rows, buttons (26 px), and the selected tab's semibold.
     Body,
     BodyB,
+    /// The selected item's name under the home row (31 px).
     Title,
+    /// Page and sheet headings (30 px bold).
     TitleB,
+    /// Big values (48 px bold).
     Head,
-    /// Numerals only (digits, `.:%-°` and a few unit letters).
+    /// Numerals only (digits, `.:%-°` and a few unit letters), 64 px.
     Big,
 }
 
@@ -39,12 +48,13 @@ fn block(f: Face) -> usize {
     le32(1 + 8 * f as usize + 4)
 }
 
-pub fn line_height(f: Face) -> usize {
-    DATA[1 + 8 * f as usize] as usize
-}
-
 pub fn ascent(f: Face) -> usize {
     DATA[1 + 8 * f as usize + 1] as usize
+}
+
+/// Height of the capitals: text is centered on them.
+pub fn cap(f: Face) -> usize {
+    DATA[1 + 8 * f as usize + 2] as usize
 }
 
 fn slot(c: char) -> usize {
