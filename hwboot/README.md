@@ -990,6 +990,15 @@ within 5 s.
     Controller, Joy-Cons, several controllers at once, a game played
     with it.
 
+37. 18/10/2026, Erista, the **Controllers page**: `input`, `joycon`,
+    `bluetooth` and `display` reloaded with the event source word. The
+    page lists the left Joy-Con on its rail and the Bluetooth Pro
+    Controller; the Test tab shows one card each, and their buttons light
+    up and stick dots move when pressed (checked by hand on the screen;
+    the debug channel's captures missed the presses). The left stick
+    moves through the menus; Starlane was played with the Pro
+    Controller.
+
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
