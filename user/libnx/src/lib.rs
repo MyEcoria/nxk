@@ -15,6 +15,7 @@ pub mod env;
 pub mod fs;
 pub mod i2c;
 pub mod ipc;
+pub mod jc;
 pub mod mem;
 pub mod net;
 pub mod ns;

@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use libnx::abi::proto::{clk, fan, input};
 use libnx::drv::{self, Mmio};
 use libnx::ipc::Msg;
+use libnx::jc;
 use libnx::ns::Service;
 use libnx::{println, time};
 
@@ -93,8 +94,6 @@ const CMD_HID_CONN: u8 = 0x10;
 const CMD_HID_DISC: u8 = 0x11;
 const CMD_SET_HIDRATE: u8 = 0x12;
 const CMD_SET_BRATE: u8 = 0x20;
-const HID_INPUT: u8 = 0x30;
-const HID_SUBCMD_REPLY: u8 = 0x21;
 const HID_OUTPUT: u8 = 0x01;
 const HID_RUMBLE: u8 = 0x10;
 const SUBCMD_RUMBLE_CTL: u8 = 0x48;
@@ -133,43 +132,6 @@ const PAD_STATUS: [u8; 13] = [
 const RUMBLE_MUTE: [u8; 8] = [0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40];
 const RUMBLE_INIT: [u8; 8] = [0xC2, 0xC8, 0x03, 0x72, 0xC2, 0xC8, 0x03, 0x72];
 
-/// Buttons in the report's 24 bits (right half in 0-7, shared in 8-15,
-/// left in 16-23), for each side.
-const MASK_L: u32 = 0xFF_2900;
-const MASK_R: u32 = 0x00_56FF;
-const BUTTONS: [(u32, u64); 18] = [
-    (1 << 0, input::BTN_Y),
-    (1 << 1, input::BTN_X),
-    (1 << 2, input::BTN_B),
-    (1 << 3, input::BTN_A),
-    (1 << 6, input::BTN_R),
-    (1 << 7, input::BTN_ZR),
-    (1 << 8, input::BTN_MINUS),
-    (1 << 9, input::BTN_PLUS),
-    (1 << 10, input::BTN_RSTICK),
-    (1 << 11, input::BTN_LSTICK),
-    (1 << 12, input::BTN_HOME),
-    (1 << 13, input::BTN_CAPTURE),
-    (1 << 16, input::BTN_DOWN),
-    (1 << 17, input::BTN_UP),
-    (1 << 18, input::BTN_RIGHT),
-    (1 << 19, input::BTN_LEFT),
-    (1 << 22, input::BTN_L),
-    (1 << 23, input::BTN_ZL),
-];
-
-/// Sticks: 12-bit positions around a centre near 2048. The range of a
-/// Joy-Con's stick is about +-1100 from it (not read from the unit's
-/// calibration); a dead zone of 170 swallows the rest position's jitter.
-const STICK_CENTER: i64 = 2048;
-const STICK_RANGE: i64 = 1150;
-const STICK_DEAD: i64 = 170;
-const STICK_STEP: i64 = 600;
-const CENTER_SAMPLES: i64 = 8;
-const CENTER_JITTER: i64 = 60;
-/// Reports (about 2 s) before the rest position is assumed.
-const CENTER_GIVE_UP: u32 = 140;
-
 const POLL_NS: u64 = 15_000_000;
 /// Longest wait for the reply to a poll.
 const REPLY_NS: u64 = 12_000_000;
@@ -179,7 +141,6 @@ const RETRY_NS: u64 = 1_000_000_000;
 /// Samples of the rail detect lines in a row before a change counts.
 const DEBOUNCE: u8 = 3;
 const RAIL_REFRESH_NS: u64 = 5_000_000_000;
-const TRACE_BUTTONS: u32 = 40;
 const STATS_POLLS: u32 = 600;
 
 static FAN: Service = Service::new("fan", 10_000_000_000);
@@ -210,16 +171,10 @@ impl Side {
             Side::Left => fan::RAIL_JC_L,
         }
     }
-    fn mask(self) -> u32 {
+    fn pad(self) -> jc::Pad {
         match self {
-            Side::Right => MASK_R,
-            Side::Left => MASK_L,
-        }
-    }
-    fn stick(self) -> u64 {
-        match self {
-            Side::Right => input::STICK_R,
-            Side::Left => input::STICK_L,
+            Side::Right => jc::Pad::right(),
+            Side::Left => jc::Pad::left(),
         }
     }
 }
@@ -424,59 +379,12 @@ impl Rx {
     }
 }
 
-/// One input report: buttons, sticks, battery.
-struct Report {
-    buttons: u32,
-    left: (i64, i64),
-    right: (i64, i64),
-    battery: u8,
-}
-
-fn report(rx: &Rx) -> Option<Report> {
+/// An input report (or subcommand reply) in a wired HID packet.
+fn report(rx: &Rx) -> Option<jc::Report> {
     if rx.cmd() != WIRED_HID {
         return None;
     }
-    let p = rx.payload();
-    if p.len() < 12 || p[0] != HID_INPUT && p[0] != HID_SUBCMD_REPLY {
-        return None;
-    }
-    let pair = |i: usize| {
-        (
-            (p[i] as i64) | ((p[i + 1] as i64 & 0xF) << 8),
-            (p[i + 1] as i64 >> 4) | ((p[i + 2] as i64) << 4),
-        )
-    };
-    Some(Report {
-        buttons: p[3] as u32 | (p[4] as u32) << 8 | (p[5] as u32) << 16,
-        left: pair(6),
-        right: pair(9),
-        battery: p[2] >> 4,
-    })
-}
-
-fn isqrt(n: i64) -> i64 {
-    if n <= 0 {
-        return 0;
-    }
-    let (mut x, mut y) = (n, (n + 1) / 2);
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
-}
-
-/// Position from the centre, with the dead zone taken off the length,
-/// as -`STICK_MAX`..=`STICK_MAX`.
-fn stick_value(raw: (i64, i64), center: (i64, i64)) -> (i64, i64) {
-    let (dx, dy) = (raw.0 - center.0, raw.1 - center.1);
-    let m = isqrt(dx * dx + dy * dy);
-    if m <= STICK_DEAD {
-        return (0, 0);
-    }
-    let out =
-        ((m - STICK_DEAD) * input::STICK_MAX / (STICK_RANGE - STICK_DEAD)).min(input::STICK_MAX);
-    (dx * out / m, dy * out / m)
+    jc::parse(rx.payload())
 }
 
 struct Jc {
@@ -495,17 +403,9 @@ struct Jc {
     retry_at: u64,
     fails: u32,
     awaiting: Option<u64>,
-    /// Buttons down (this side's), traced so far.
-    buttons: u32,
-    traced: u32,
+    /// This side's buttons and stick.
+    pad: jc::Pad,
     announced: bool,
-    center: (i64, i64),
-    sum: (i64, i64),
-    lo: (i64, i64),
-    hi: (i64, i64),
-    samples: i64,
-    waited: u32,
-    sent: (i64, i64),
     polls: u32,
     replies: u32,
     latency_us: u64,
@@ -527,16 +427,8 @@ impl Jc {
             retry_at: 0,
             fails: 0,
             awaiting: None,
-            buttons: 0,
-            traced: 0,
+            pad: side.pad(),
             announced: false,
-            center: (STICK_CENTER, STICK_CENTER),
-            sum: (0, 0),
-            lo: (0, 0),
-            hi: (0, 0),
-            samples: 0,
-            waited: 0,
-            sent: (0, 0),
             polls: 0,
             replies: 0,
             latency_us: 0,
@@ -688,89 +580,11 @@ impl Jc {
 
     /// Back to nothing held and a centred stick.
     fn release(&mut self, out: &mut Vec<[u64; 5]>) {
-        for &(_, code) in BUTTONS.iter().filter(|b| b.0 & self.buttons != 0) {
-            out.push([input::KIND_BUTTON, code, 0, 0, 0]);
-        }
-        self.buttons = 0;
-        if self.sent != (0, 0) {
-            out.push([input::KIND_STICK, self.side.stick(), 0, 0, 0]);
-        }
-        self.sent = (0, 0);
-        self.sum = (0, 0);
-        self.samples = 0;
-        self.waited = 0;
-        self.center = (STICK_CENTER, STICK_CENTER);
+        self.pad.release(out);
     }
 
-    fn apply(&mut self, r: &Report, out: &mut Vec<[u64; 5]>) {
-        let now = r.buttons & self.side.mask();
-        let changed = now ^ self.buttons;
-        for &(bit, code) in BUTTONS.iter().filter(|b| b.0 & changed != 0) {
-            out.push([input::KIND_BUTTON, code, (now & bit != 0) as u64, 0, 0]);
-        }
-        if changed != 0 && self.traced < TRACE_BUTTONS {
-            self.traced += 1;
-            println!(
-                "[joycon] {}: buttons {:#08x} (was {:#08x})",
-                self.side.name(),
-                now,
-                self.buttons
-            );
-        }
-        self.buttons = now;
-
-        let raw = match self.side {
-            Side::Left => r.left,
-            Side::Right => r.right,
-        };
-        if self.samples < CENTER_SAMPLES {
-            // The rest position (units differ by hundreds): a run of
-            // reports that hardly move, else the middle after a while.
-            let (lo, hi) = (self.lo, self.hi);
-            let (lo, hi) = if self.samples == 0 {
-                (raw, raw)
-            } else {
-                (
-                    (lo.0.min(raw.0), lo.1.min(raw.1)),
-                    (hi.0.max(raw.0), hi.1.max(raw.1)),
-                )
-            };
-            let steady = hi.0 - lo.0 <= CENTER_JITTER && hi.1 - lo.1 <= CENTER_JITTER;
-            self.waited += 1;
-            if steady {
-                (self.lo, self.hi) = (lo, hi);
-                self.sum = (self.sum.0 + raw.0, self.sum.1 + raw.1);
-                self.samples += 1;
-            } else {
-                self.samples = 0;
-                self.sum = (0, 0);
-            }
-            if self.samples == CENTER_SAMPLES {
-                let c = (self.sum.0 / CENTER_SAMPLES, self.sum.1 / CENTER_SAMPLES);
-                self.center = c;
-                println!("[joycon] {}: stick centre {:?}", self.side.name(), c);
-            } else if self.waited == CENTER_GIVE_UP {
-                self.samples = CENTER_SAMPLES;
-                println!(
-                    "[joycon] {}: stick never at rest, centre assumed",
-                    self.side.name()
-                );
-            }
-            return;
-        }
-        let v = stick_value(raw, self.center);
-        let moved = (v.0 - self.sent.0).abs() + (v.1 - self.sent.1).abs() >= STICK_STEP;
-        let rest = v == (0, 0) && self.sent != (0, 0);
-        if moved || rest {
-            self.sent = v;
-            out.push([
-                input::KIND_STICK,
-                self.side.stick(),
-                0,
-                v.0 as u64,
-                v.1 as u64,
-            ]);
-        }
+    fn apply(&mut self, r: &jc::Report, out: &mut Vec<[u64; 5]>) {
+        self.pad.apply(r, "joycon", self.side.name(), out);
     }
 }
 
@@ -849,7 +663,7 @@ fn main() -> i32 {
                 println!("[joycon] {}: attached", jc.side.name());
                 jc.retry_at = 0;
                 jc.fails = 0;
-                jc.traced = 0;
+                jc.pad.retrace();
             } else {
                 println!("[joycon] {}: detached", jc.side.name());
                 jc.ready = false;
