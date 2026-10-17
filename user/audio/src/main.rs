@@ -46,15 +46,21 @@ const PM_PULL_DOWN: u32 = 1 << 2;
 const PM_TRISTATE: u32 = 1 << 4;
 const PM_INPUT: u32 = 1 << 6;
 
-/// GPIO port Z (25), pin 4: LDO1_EN of the codec.
+/// GPIO port B (1, pins 0..3 = DAP1), port Z (25, pin 4 = codec LDO1_EN),
+/// and port BB (27, pin 0 = AUD_MCLK).
+const PORT_B: usize = 1;
 const PORT_Z: usize = 25;
+const PORT_BB: usize = 27;
 const GPIO_CNF: usize = 0x00;
 const GPIO_OE: usize = 0x10;
 const GPIO_OUT: usize = 0x20;
 const fn port(reg: usize, p: usize) -> usize {
     reg + (p >> 2) * 0x100 + (p & 3) * 4
 }
+const DAP1_PINS: u32 = 0xF;
+const MCLK_PIN: u32 = 1 << 0;
 const LDO1_EN: u32 = 1 << 4;
+const PM_DRIVE_4X: u32 = 3 << 13;
 
 /// Audio hub (tegra210_{ahub,admaif,i2s}.h): crossbar at +0x800 (one
 /// register per destination, a bit per source), ADMAIF at +0, TX channels
@@ -174,16 +180,31 @@ impl Audio {
 
     fn pads(&self) {
         let pm = &self.pinmux;
+        let g = &self.gpio;
+        let cnf_b = g.r32(port(GPIO_CNF, PORT_B));
+        let cnf_bb = g.r32(port(GPIO_CNF, PORT_BB));
+        // Release DAP1 (PB0..PB3) and AUD_MCLK (PBB0) from GPIO override into SFIO mode.
+        g.modify(port(GPIO_CNF, PORT_B), DAP1_PINS, 0);
+        g.modify(port(GPIO_CNF, PORT_BB), MCLK_PIN, 0);
+        println!(
+            "[audio] pads: GPIO_CNF B {:#x}->{:#x}, BB {:#x}->{:#x}",
+            cnf_b,
+            g.r32(port(GPIO_CNF, PORT_B)),
+            cnf_bb,
+            g.r32(port(GPIO_CNF, PORT_BB))
+        );
         // MCLK (function AUD), I2S1's clocks and data out: outputs; data
-        // in an input (as the DT).
-        pm.w32(PM_AUD_MCLK, PM_PULL_DOWN);
+        // in an input (as hekate `pinmux_config_i2s` and the DT).
+        pm.w32(PM_AUD_MCLK, PM_DRIVE_4X | PM_PULL_DOWN);
         for p in [PM_DAP1_FS, PM_DAP1_DOUT, PM_DAP1_SCLK] {
-            pm.w32(p, PM_PULL_DOWN);
+            pm.w32(p, PM_DRIVE_4X | PM_PULL_DOWN);
         }
-        pm.w32(PM_DAP1_DIN, PM_PULL_DOWN | PM_TRISTATE | PM_INPUT);
+        pm.w32(
+            PM_DAP1_DIN,
+            PM_DRIVE_4X | PM_PULL_DOWN | PM_TRISTATE | PM_INPUT,
+        );
         // Codec LDO1 enable: pz4 as a GPIO output, high.
         pm.w32(PM_PZ4, PM_PULL_DOWN | 1);
-        let g = &self.gpio;
         g.modify(port(GPIO_CNF, PORT_Z), 0, LDO1_EN);
         g.modify(port(GPIO_OUT, PORT_Z), 0, LDO1_EN);
         g.modify(port(GPIO_OE, PORT_Z), 0, LDO1_EN);
@@ -667,6 +688,13 @@ impl Pump {
         if !time::poll(10_000, || a.r32(I2S1 + I2S_RX_SOFT_RESET) & 1 == 0) {
             println!("[audio] I2S1 RX reset did not finish");
         }
+        a.w32(
+            I2S1 + I2S_CTRL,
+            I2S_CTRL_MASTER | I2S_BITS_16 | I2S_FSYNC_WIDTH_31,
+        );
+        a.w32(I2S1 + I2S_RX_CTRL, I2S_DATA_OFFSET);
+        a.w32(I2S1 + I2S_TIMING, 15);
+        a.w32(I2S1 + I2S_RX_CIF_CTRL, cif(3));
         a.w32(I2S1 + I2S_RX_ENABLE, 1);
         a.w32(ADMAIF_TX1 + ADMAIF_TX_CIF_CTRL, ADMAIF_PACK16 | cif(0));
         a.w32(ADMAIF_TX1 + ADMAIF_TX_ENABLE, 1);

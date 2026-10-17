@@ -51,6 +51,12 @@ const AUDIO_PAD: u32 = 1 << 17;
 const AUDIO_HV_PAD: u32 = 1 << 29;
 const AUDIO_HV_3V3: u32 = 1 << 18;
 const IO_DPD_OFF: u32 = 1 << 30;
+/// External clock output (`clk_out_1` on `AUD_MCLK`, Linux `pmc.c`
+/// `tegra_pmc_clks_data`): source in bits 7:6 (3 = `extern1`), force
+/// enable in bit 2.
+const PMC_CLK_OUT_CNTRL: usize = 0x400 + 0x1A8;
+const CLK_OUT1_MASK: u32 = (3 << 6) | (1 << 2);
+const CLK_OUT1_EXTERN1: u32 = (3 << 6) | (1 << 2);
 const PEX_PADS: u32 = 0x7 << 4;
 
 /// CAR bank (L, H, U, V, W, X): state in RST_DEVICES_x and CLK_OUT_ENB_x,
@@ -390,7 +396,7 @@ const AUDIO: [Clock; 5] = [
         source: 0x3EC,
         keep: 0,
         src: 2 * 2 - 2,
-        reset: false,
+        reset: true,
     },
 ];
 
@@ -750,6 +756,13 @@ fn audio_up(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>) -> i64 {
     }
     let _ = car.r32(V.rst);
     time::sleep_us(5);
+    let clk_out = pmc.r32(PMC_CLK_OUT_CNTRL);
+    pmc.modify(PMC_CLK_OUT_CNTRL, CLK_OUT1_MASK, CLK_OUT1_EXTERN1);
+    println!(
+        "[clk] PMC_CLK_OUT_CNTRL {:#x} -> {:#x}",
+        clk_out,
+        pmc.r32(PMC_CLK_OUT_CNTRL)
+    );
     // MBIST workaround (clk-tegra210.c `tegra210_ape_mbist_war`).
     if let Some(ahub) = ahub {
         let (c, e) = (car.r32(LVL2_CLK_GATE_OVRC), car.r32(LVL2_CLK_GATE_OVRE));
@@ -853,6 +866,17 @@ fn pcie_link(car: &Mmio, pmc: Option<&Mmio>, label: u32) -> (i64, u64) {
 fn enable(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>, d: &Device) -> i64 {
     if d.needs == Needs::Audio {
         if status(car, pmc, d) == proto::ST_READY {
+            if let Some(p) = pmc {
+                let before = p.r32(PMC_CLK_OUT_CNTRL);
+                if before & CLK_OUT1_MASK != CLK_OUT1_EXTERN1 {
+                    p.modify(PMC_CLK_OUT_CNTRL, CLK_OUT1_MASK, CLK_OUT1_EXTERN1);
+                    println!(
+                        "[clk] PMC_CLK_OUT_CNTRL {:#x} -> {:#x}",
+                        before,
+                        p.r32(PMC_CLK_OUT_CNTRL)
+                    );
+                }
+            }
             return 0;
         }
         let r = audio_up(car, pmc, ahub);

@@ -387,7 +387,7 @@ fn work(w: &Worker, notif: u32) -> ! {
             ),
             Action::Tone => Done::Audio(
                 AUDIO
-                    .call(&Msg::from_words(audio::TONE, &[440, 2000]))
+                    .call(&Msg::from_words(audio::TONE, &[440, 2000, 50]))
                     .map(|_| Some("playing 440 Hz tone (2 s)")),
             ),
             Action::ClearLogs
