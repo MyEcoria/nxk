@@ -384,7 +384,6 @@ fn hud(c: &mut Canvas, game: &Game, t: f32) {
             );
         }
         State::Over => {
-            c.rect(0.0, 215.0, WIDTH as f32, 250.0, [0.02, 0.02, 0.08, 0.0]);
             c.text_center(
                 WIDTH as f32 / 2.0,
                 230.0,

@@ -63,6 +63,9 @@ pub fn rgb(r: u8, g: u8, b: u8) -> Rgba {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
 }
 
+/// Flat triangles with no blending, all at depth `z` and a strict depth
+/// test: the first primitive drawn at a pixel stays, so draw what is on
+/// top first and never put a rectangle over text.
 pub struct Canvas {
     pub(crate) verts: Vec<FlatVertex>,
     /// Depth of what is drawn next, in clip space (-1 in front, 1 behind
