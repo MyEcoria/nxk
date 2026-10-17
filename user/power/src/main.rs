@@ -1,5 +1,5 @@
 //! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
-//! PCIe and touchscreen rails, the charger's input status.
+//! PCIe and touchscreen rails, the charger's input status, the fuel gauge.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
 //! The TMP451 is started again as hekate's `tmp451_init` does.
 
@@ -21,6 +21,21 @@ const TMP451: u8 = 0x4C;
 const BQ24193: u8 = 0x6B;
 const BQ24193_STATUS: u8 = 0x08;
 const BQ24193_PG: u8 = 1 << 2;
+const BQ24193_CHRG_SHIFT: u8 = 4;
+/// Battery fuel gauge on I2C1 (hekate bdk/power/max17050.c). The board's
+/// sense resistor is 5 mOhm and the gauge's current gain 2: LSB 156.25 uA,
+/// 0.5 mAh.
+const MAX17050: u8 = 0x36;
+const MAX_REPCAP: u8 = 0x05;
+const MAX_REPSOC: u8 = 0x06;
+const MAX_AGE: u8 = 0x07;
+const MAX_TEMP: u8 = 0x08;
+const MAX_VCELL: u8 = 0x09;
+const MAX_CURRENT: u8 = 0x0A;
+const MAX_AVGCURRENT: u8 = 0x0B;
+const MAX_FULLCAP: u8 = 0x10;
+const MAX_CYCLES: u8 = 0x17;
+const MAX_DESIGNCAP: u8 = 0x18;
 /// TMP451 registers (hekate bdk/thermal/tmp451.h): configuration and
 /// conversion rate are written at 0x09, 0x0A, read back at 0x03, 0x04.
 const TMP451_CONFIG: u8 = 0x09;
@@ -154,6 +169,41 @@ fn temperature(i2c: &I2c, hi: u8, lo: u8) -> Result<i64, i64> {
     Ok(h * 1000 + l * 1000 / 16)
 }
 
+/// A 16-bit little-endian fuel gauge register.
+fn gauge(i2c: &I2c, reg: u8) -> Result<u16, i64> {
+    let mut r = [0u8; 2];
+    i2c.transfer(1, MAX17050, &[reg], &mut r)?;
+    Ok(u16::from_le_bytes(r))
+}
+
+/// Gauge current register, in uA.
+fn gauge_current(i2c: &I2c, reg: u8) -> Result<u64, i64> {
+    Ok((gauge(i2c, reg)? as i16 as i64 * 15_625 / 100) as u64)
+}
+
+/// Gauge charge register (0.5 mAh units), in mAh.
+fn gauge_mah(i2c: &I2c, reg: u8) -> Result<u64, i64> {
+    Ok(gauge(i2c, reg)? as u64 / 2)
+}
+
+fn battery(i2c: &I2c) -> Result<Msg, i64> {
+    let soc = gauge(i2c, MAX_REPSOC)? as u64;
+    let mv = (gauge(i2c, MAX_VCELL)? >> 3) as u64 * 625 / 1000;
+    let avg = gauge_current(i2c, MAX_AVGCURRENT)?;
+    let temp = (gauge(i2c, MAX_TEMP)? as i16 as i64 * 1000 / 256) as u64;
+    let caps = gauge_mah(i2c, MAX_REPCAP)? | gauge_mah(i2c, MAX_FULLCAP)? << 32;
+    let chg = i2c.read_reg(1, BQ24193, BQ24193_STATUS)? >> BQ24193_CHRG_SHIFT & 3;
+    Ok(Msg::from_words(0, &[soc, mv, avg, temp, caps, chg as u64]))
+}
+
+fn battery_health(i2c: &I2c) -> Result<Msg, i64> {
+    let age = (gauge(i2c, MAX_AGE)? >> 8) as u64;
+    let cycles = gauge(i2c, MAX_CYCLES)? as u64;
+    let design = gauge_mah(i2c, MAX_DESIGNCAP)?;
+    let now = gauge_current(i2c, MAX_CURRENT)?;
+    Ok(Msg::from_words(0, &[age, cycles, design, now]))
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -241,6 +291,8 @@ fn main() -> i32 {
                 }
                 Err(e) => Msg::error(e),
             },
+            proto::BATTERY => battery(&i2c).unwrap_or_else(Msg::error),
+            proto::BATTERY_HEALTH => battery_health(&i2c).unwrap_or_else(Msg::error),
             _ => Msg::error(-EINVAL),
         })
     })

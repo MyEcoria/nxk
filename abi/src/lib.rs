@@ -1259,6 +1259,22 @@ pub mod proto {
         /// Input power on the USB-C port: a PC, a charger or the dock,
         /// not told apart (that takes the USB-PD controller).
         pub const SUPPLY_EXTERNAL: u64 = 1;
+        /// Fuel gauge (MAX17050) and charger. Reply: word 0 = state of
+        /// charge (1/256 %), word 1 = cell voltage (mV), word 2 = average
+        /// current (µA, signed, negative: discharging), word 3 = battery
+        /// temperature (millidegrees C, signed), word 4 = remaining charge
+        /// (mAh) | full charge (mAh) << 32, word 5 = `CHARGE_*`. Fails
+        /// when the gauge does not answer.
+        pub const BATTERY: u32 = 9;
+        /// Reply: word 0 = age (% of design capacity), word 1 = charge
+        /// cycles (1/100 cycle), word 2 = design capacity (mAh), word 3 =
+        /// instantaneous current (µA, signed).
+        pub const BATTERY_HEALTH: u32 = 10;
+        /// The charger's state (BQ24193 REG08 CHRG_STAT bits 5:4).
+        pub const CHARGE_NONE: u64 = 0;
+        pub const CHARGE_PRE: u64 = 1;
+        pub const CHARGE_FAST: u64 = 2;
+        pub const CHARGE_DONE: u64 = 3;
     }
     /// Fan: speed from the SoC temperature, or set by hand.
     pub mod fan {

@@ -207,7 +207,6 @@ pub enum Icon {
     Chevron,
     Plane,
     Wifi,
-    Battery,
     Handheld,
     GameCard,
 }
@@ -261,11 +260,6 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
             s.arc_up(cx, cy + 8, 10, 3, c);
             s.disc(cx, cy + 5, 3, c);
         }
-        Icon::Battery => {
-            s.ring_round(cx - 14, cy - 8, 26, 16, 3, 2, c);
-            s.fill_round(cx - 11, cy - 5, 20, 10, 1, c);
-            s.fill_round(cx + 13, cy - 3, 3, 6, 1, c);
-        }
         Icon::Handheld => {
             // The Switch with its Joy-Con, 74 x 32.
             s.fill_round(cx - 37, cy - 16, 74, 32, 9, c);
@@ -277,6 +271,19 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
         Icon::GameCard => {
             s.fill_round(cx - 10, cy - 13, 20, 26, 4, c);
             s.fill_round(cx - 5, cy - 4, 10, 11, 2, bg);
+        }
+    }
+}
+
+/// The battery centered on (cx, cy), its inside filled `pct` % in `fill`;
+/// `None`: level unknown, left empty.
+pub fn battery(s: &mut Screen, cx: usize, cy: usize, pct: Option<u64>, c: u32, fill: u32) {
+    s.ring_round(cx - 14, cy - 8, 26, 16, 3, 2, c);
+    s.fill_round(cx + 13, cy - 3, 3, 6, 1, c);
+    if let Some(p) = pct {
+        let w = (p.min(100) as usize * 20).div_ceil(100);
+        if w > 0 {
+            s.fill_round(cx - 11, cy - 5, w, 10, if w > 2 { 1 } else { 0 }, fill);
         }
     }
 }

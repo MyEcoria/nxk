@@ -72,6 +72,35 @@ impl<T> Seen<T> {
     }
 }
 
+/// The battery as the fuel gauge and the charger report it.
+#[derive(Clone, Copy)]
+pub struct Battery {
+    /// State of charge, in 1/256 %.
+    pub soc: u64,
+    /// Cell voltage (mV).
+    pub mv: u64,
+    /// Average current (µA): positive charging, negative discharging.
+    pub ua: i64,
+    /// Battery temperature (millidegrees C).
+    pub mc: i64,
+    /// Remaining and full charge (mAh).
+    pub rep_mah: u64,
+    pub full_mah: u64,
+    /// `power::CHARGE_*`.
+    pub charge: u64,
+    /// Wear: age (%), cycles (1/100) and design capacity (mAh).
+    pub age: u64,
+    pub cycles: u64,
+    pub design_mah: u64,
+}
+
+impl Battery {
+    /// Charge level, 0..=100 %.
+    pub fn percent(&self) -> u64 {
+        (self.soc >> 8).min(100)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Fan {
     /// Duty, % of full speed.
@@ -276,6 +305,7 @@ pub struct Data {
     pub temps: Seen<(i64, i64)>,
     /// `power::SUPPLY_*`: battery, or input power on the USB-C port.
     pub supply: Seen<u64>,
+    pub battery: Seen<Battery>,
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
@@ -318,6 +348,7 @@ impl Data {
             mem: None,
             temps: Seen::Unknown,
             supply: Seen::Unknown,
+            battery: Seen::Unknown,
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
@@ -380,6 +411,7 @@ impl Data {
         });
         self.supply
             .poll(&POWER, power::SUPPLY, n, force, |m| m.mr[0]);
+        self.battery_refresh(n, force);
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
@@ -426,6 +458,39 @@ impl Data {
             Now::Missing => Now::Missing,
         };
         self.wired(n, force);
+    }
+
+    /// The fuel gauge: a gauge that does not answer (no battery, or
+    /// not emulated) shows as missing.
+    fn battery_refresh(&mut self, n: u64, force: bool) {
+        if matches!(self.battery, Seen::Value(_)) && !force && !n.is_multiple_of(SLOW) {
+            return;
+        }
+        let (b, h) = (
+            ask(&POWER, power::BATTERY),
+            ask(&POWER, power::BATTERY_HEALTH),
+        );
+        let (Now::Value(b), Now::Value(h)) = (b, h) else {
+            if matches!((b, h), (Now::Busy, _) | (_, Now::Busy)) {
+                return;
+            }
+            if time::now_ns() > BOOT_NS {
+                self.battery = Seen::Missing;
+            }
+            return;
+        };
+        self.battery = Seen::Value(Battery {
+            soc: b.mr[0],
+            mv: b.mr[1],
+            ua: b.mr[2] as i64,
+            mc: b.mr[3] as i64,
+            rep_mah: b.mr[4] & 0xFFFF_FFFF,
+            full_mah: b.mr[4] >> 32,
+            charge: b.mr[5],
+            age: h.mr[0],
+            cycles: h.mr[1],
+            design_mah: h.mr[2],
+        });
     }
 
     /// The GPU from its stats page, asked for with the slow sources: the

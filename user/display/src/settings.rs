@@ -10,18 +10,19 @@ use libnx::abi::proto::power;
 use crate::backlight::MIN_PCT;
 use crate::font::Face;
 use crate::screen::{logo_size, Bytes, Hms, Ipv4, Screen};
-use crate::stats::{Data, Seen};
+use crate::stats::{Battery, Data, Seen};
 use crate::status::{cpu_text, eth_text, fan_text, gpu_text, wifi_short};
 use crate::theme::pal;
 use crate::ui::{Id, Ui, HEADER_RULE_Y, LOGS, M, NETWORK, RULE_Y, SYSTEM, TERMINAL, W};
-use crate::widgets::{icon, press, slider, switch, Icon, Tone};
+use crate::widgets::{battery, icon, press, slider, switch, Icon, Tone};
 
-pub const CATS: [&str; 6] = [
+pub const CATS: [&str; 7] = [
     "Display",
     "Sound",
     "Internet",
     "Performance",
     "Power",
+    "Battery",
     "System",
 ];
 const SLEEP_LABELS: [&str; 5] = ["Never", "1 min", "5 min", "10 min", "30 min"];
@@ -43,26 +44,37 @@ fn rule(s: &mut Screen, y: usize) {
     s.fill(X, y, XR - X, 1, pal().line);
 }
 
+/// The color of the charge level: red when low and not charging.
+fn battery_color(b: &Battery, charging: bool) -> u32 {
+    let p = pal();
+    match b.percent() {
+        _ if charging => p.good,
+        0..=15 => p.bad,
+        16..=30 => p.warn,
+        _ => p.text,
+    }
+}
+
 impl Ui {
     pub(crate) fn settings(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
         for (i, name) in CATS.iter().enumerate() {
-            let y = 132 + i * 78;
+            let y = 126 + i * 70;
             let on = self.cat == i;
             let down = self.pressed == Some(Id::Cat(i));
             if on || down {
-                s.fill_round(M, y, LW, 66, 6, press(p.surface, down));
+                s.fill_round(M, y, LW, 60, 6, press(p.surface, down));
             }
             if on {
-                s.fill_round(M + 10, y + 17, 5, 32, 2, p.accent);
+                s.fill_round(M + 10, y + 14, 5, 32, 2, p.accent);
             }
             let (f, c) = if on {
                 (Face::BodyB, p.accent)
             } else {
                 (Face::Body, p.dim)
             };
-            s.label(M + 32, y + 33, name, f, c);
-            self.zone(Id::Cat(i), M, y, LW, 66, 6);
+            s.label(M + 32, y + 30, name, f, c);
+            self.zone(Id::Cat(i), M, y, LW, 60, 6);
         }
         s.fill(
             M + LW + 22,
@@ -78,6 +90,7 @@ impl Ui {
             2 => self.cat_network(s, d),
             3 => self.cat_performance(s, d),
             4 => self.cat_power(s, d),
+            5 => self.cat_battery(s, d),
             _ => self.cat_system(s, d),
         }
         self.page_hints(s);
@@ -327,6 +340,88 @@ impl Ui {
             Face::Cap,
             p.dim,
         );
+    }
+
+    fn cat_battery(&mut self, s: &mut Screen, d: &Data) {
+        let p = pal();
+        let charging = matches!(d.supply, Seen::Value(power::SUPPLY_EXTERNAL));
+        let b = match d.battery {
+            Seen::Value(b) => b,
+            Seen::Unknown => {
+                s.label(X, Y, "Reading the fuel gauge...", Face::Body, p.dim);
+                return;
+            }
+            Seen::Missing => {
+                row(s, Y, "Fuel gauge", "no answer", p.warn);
+                s.label(
+                    X,
+                    Y + 44,
+                    "The MAX17050 on I2C1 did not reply: no battery",
+                    Face::Cap,
+                    p.dim,
+                );
+                s.label(X, Y + 70, "level or health to show.", Face::Cap, p.dim);
+                return;
+            }
+        };
+        let pct = b.percent();
+        let level_c = battery_color(&b, charging);
+        battery(s, XR - 20, 162, Some(pct), p.text, level_c);
+        s.label_r(XR - 52, 162, &format!("{}%", pct), Face::TitleB, level_c);
+        let bar = XR - X;
+        s.fill_round(X, Y - 36, bar, 14, 7, p.track);
+        let fw = (bar * pct as usize / 100).max(14);
+        s.fill_round(X, Y - 36, fw, 14, 7, level_c);
+        let (st, sc) = match (charging, b.charge) {
+            (true, power::CHARGE_PRE) => ("charging (pre-charge)", p.good),
+            (true, power::CHARGE_FAST) => ("charging", p.good),
+            (true, power::CHARGE_DONE) => ("fully charged", p.good),
+            (true, _) => ("on input power, not charging", p.warn),
+            (false, _) => ("discharging", p.dim),
+        };
+        let mah = |v: u64| format!("{} mAh", v);
+        let cur = {
+            let (sign, a) = if b.ua < 0 { ("-", -b.ua) } else { ("+", b.ua) };
+            format!("{}{} mA", sign, a / 1000)
+        };
+        let temp = {
+            let (sign, a) = if b.mc < 0 { ("-", -b.mc) } else { ("", b.mc) };
+            format!("{}{}.{} \u{b0}C", sign, a / 1000, a % 1000 / 100)
+        };
+        let rows: [(&str, String, u32); 7] = [
+            ("Status", st.into(), sc),
+            (
+                "Charge",
+                format!("{} of {}", mah(b.rep_mah), mah(b.full_mah)),
+                p.dim,
+            ),
+            (
+                "Cell voltage",
+                format!("{}.{:03} V", b.mv / 1000, b.mv % 1000),
+                p.dim,
+            ),
+            ("Current", cur, p.dim),
+            (
+                "Temperature",
+                temp,
+                if b.mc >= 45_000 { p.warn } else { p.dim },
+            ),
+            (
+                "Health",
+                format!("{}% of the {} design capacity", b.age, mah(b.design_mah)),
+                if b.age < 80 { p.warn } else { p.dim },
+            ),
+            (
+                "Charge cycles",
+                format!("{}.{:02}", b.cycles / 100, b.cycles % 100),
+                p.dim,
+            ),
+        ];
+        for (i, (k, v, c)) in rows.iter().enumerate() {
+            let cy = Y + 24 + i * 48;
+            row(s, cy, k, v, *c);
+            rule(s, cy + 24);
+        }
     }
 
     fn cat_system(&mut self, s: &mut Screen, d: &Data) {

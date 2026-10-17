@@ -134,8 +134,17 @@ impl Ui {
                 self.cfg.brightness.max(crate::backlight::MIN_PCT)
             ),
             _ => match d.supply {
-                Seen::Value(power::SUPPLY_EXTERNAL) => "on input power".into(),
-                Seen::Value(_) => "on battery".into(),
+                Seen::Value(src) => {
+                    let how = if src == power::SUPPLY_EXTERNAL {
+                        "on input power"
+                    } else {
+                        "on battery"
+                    };
+                    match d.battery {
+                        Seen::Value(b) => format!("{}% \u{b7} {}", b.percent(), how),
+                        _ => how.into(),
+                    }
+                }
                 _ => "sleep, restart, power off".into(),
             },
         }

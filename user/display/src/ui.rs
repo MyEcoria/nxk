@@ -21,7 +21,7 @@ use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
 use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
 use crate::theme::{self, pal};
-use crate::widgets::{button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
+use crate::widgets::{battery, button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
 use crate::Messages;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
@@ -869,14 +869,30 @@ impl Ui {
     /// `bg`; returns where it starts.
     pub(crate) fn status(&self, s: &mut Screen, d: &Data, xr: usize, cy: usize, bg: u32) -> usize {
         let p = pal();
-        // No fuel gauge read yet: the source only, a bolt on input power.
         let x = xr - 16;
-        icon(s, Icon::Battery, x, cy, p.text, bg);
-        if matches!(d.supply, Seen::Value(power::SUPPLY_EXTERNAL)) {
-            s.disc(x - 1, cy, 7, p.text);
-            icon(s, Icon::Bolt, x - 1, cy, bg, p.text);
+        let level = match d.battery {
+            Seen::Value(b) => Some(b.percent()),
+            _ => None,
+        };
+        let charging = matches!(d.supply, Seen::Value(power::SUPPLY_EXTERNAL));
+        let low = level.is_some_and(|l| l <= 15) && !charging;
+        battery(s, x, cy, level, p.text, if low { p.bad } else { p.text });
+        let mut left = x - 14;
+        if let Some(l) = level {
+            let t = alloc::format!("{}%", l);
+            left -= 8 + s.label_r(
+                left - 8,
+                cy,
+                &t,
+                Face::Small,
+                if low { p.bad } else { p.text },
+            );
         }
-        let x = x - 16 - 26;
+        if charging {
+            icon(s, Icon::Bolt, left - 12, cy, p.text, bg);
+            left -= 24;
+        }
+        let x = left - 28;
         let (wt, _) = wifi_short(d);
         if self.cfg.flight || wt == "radio off" {
             icon(s, Icon::Plane, x, cy, p.text, bg);
