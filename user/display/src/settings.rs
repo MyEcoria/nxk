@@ -373,6 +373,9 @@ impl Ui {
         let fw = (bar * pct as usize / 100).max(14);
         s.fill_round(X, Y - 36, fw, 14, 7, level_c);
         let (st, sc) = match (charging, b.charge) {
+            (true, power::CHARGE_PRE | power::CHARGE_FAST) if b.ua < -50_000 => {
+                ("input too weak, still draining", p.warn)
+            }
             (true, power::CHARGE_PRE) => ("charging (pre-charge)", p.good),
             (true, power::CHARGE_FAST) => ("charging", p.good),
             (true, power::CHARGE_DONE) => ("fully charged", p.good),

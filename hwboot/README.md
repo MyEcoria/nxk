@@ -918,6 +918,17 @@ within 5 s.
     service said the tone was heard before it was: it was not (the I2S
     was stuck in reset, only codec pops reached the speakers).
 
+35. 17/10/2026, Erista, the **battery**: `power` reads the MAX17050 fuel
+    gauge (I2C1 0x36) and the BQ24193 charge state, installed with
+    `--reload power` / `--reload display`. The status icon is filled to the
+    level with its percentage, and Settings has a Battery page. Read on
+    the PC-powered console: 5%, 3.508 V, 35.8 C, 4485 mAh full, health 96%
+    of the 4667 mAh design, 4.16 cycles. The charger said charging while
+    the average current was -440 mA (the PC's port gives less than the
+    running console draws; the charge fell 250 -> 246 mAh), so the page
+    says "input too weak, still draining" then. Not checked: the charge
+    current on the official charger, the temperature against Horizon's.
+
 ## Hardware test (once the SD card is back in the PC)
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
