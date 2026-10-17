@@ -13,7 +13,7 @@ use libnx::abi::proto::bt;
 use libnx::jc;
 use libnx::{println, time};
 
-use crate::bcm::Chip;
+use crate::bcm::{self, Chip};
 use crate::hci::{self, le16, Hci, Packet, PB_CONT};
 use crate::store::{addr_str, Addr, Store};
 
@@ -61,11 +61,30 @@ const SUB_DEVICE_INFO: u8 = 0x02;
 const SUB_REPORT_MODE: u8 = 0x03;
 const SUB_PLAYER_LIGHTS: u8 = 0x30;
 /// Setup: device info, full reports, player 1 light.
-const SETUP: [(u8, u8); 3] = [
-    (SUB_DEVICE_INFO, 0),
-    (SUB_REPORT_MODE, jc::REPORT_FULL),
-    (SUB_PLAYER_LIGHTS, 0x01),
+/// Setup, in the console's order (dekuNukem's notes, Linux
+/// `hid-nintendo`): device info, shipment state, SPI reads (serial,
+/// colours, calibration), full reports, motion, vibration, lights.
+const SETUP: [(u8, &[u8]); 11] = [
+    (SUB_DEVICE_INFO, &[]),
+    (SUB_SHIPMENT, &[0x00]),
+    (SUB_SPI_READ, &[0x00, 0x60, 0x00, 0x00, 0x10]),
+    (SUB_SPI_READ, &[0x50, 0x60, 0x00, 0x00, 0x0D]),
+    (SUB_REPORT_MODE, &[jc::REPORT_FULL]),
+    (SUB_SPI_READ, &[0x3D, 0x60, 0x00, 0x00, 0x12]),
+    (SUB_SPI_READ, &[0x10, 0x80, 0x00, 0x00, 0x18]),
+    (SUB_IMU, &[0x01]),
+    (SUB_VIBRATION, &[0x01]),
+    (SUB_PLAYER_LIGHTS, &[0x01]),
+    (SUB_HOME_LIGHT, &[0x01, 0xF0, 0xF0, 0x00]),
 ];
+const SUB_SHIPMENT: u8 = 0x08;
+const SUB_SPI_READ: u8 = 0x10;
+const SUB_HOME_LIGHT: u8 = 0x38;
+/// Motion sensors and vibration on, as Linux `hid-nintendo` sets them up.
+const SUB_IMU: u8 = 0x40;
+const SUB_VIBRATION: u8 = 0x48;
+/// Sniff interval: 24 slots, 15 ms.
+const SNIFF_SLOTS: u16 = 24;
 const SUBCMD_RETRY_NS: u64 = 300_000_000;
 const SUBCMD_TRIES: u8 = 3;
 /// A connection that has not reached HID reports by then is dropped.
@@ -74,6 +93,10 @@ const SETUP_LIMIT_NS: u64 = 20_000_000_000;
 /// after this long, we do.
 const OPEN_FALLBACK_NS: u64 = 1_500_000_000;
 const INQUIRY_PAUSE_NS: u64 = 200_000_000;
+/// Inquiry scan and page scan while pairing.
+const SCAN_INQUIRY_PAGE: u8 = 0x03;
+/// Connection attempts to one controller per pairing window.
+const PAGE_TRIES: usize = 4;
 
 struct Chan {
     psm: u16,
@@ -110,6 +133,10 @@ struct Conn {
     pad: jc::Pad,
     battery: u8,
     reports: u64,
+    /// Last output report sent.
+    out_at: u64,
+    /// A disconnect was asked: timers leave it alone.
+    closing: bool,
 }
 
 impl Conn {
@@ -138,6 +165,8 @@ impl Conn {
             pad: jc::Pad::pro(),
             battery: bt::BATTERY_UNKNOWN,
             reports: 0,
+            out_at: 0,
+            closing: false,
         }
     }
 
@@ -217,6 +246,8 @@ fn eir_name(mut eir: &[u8]) -> Option<String> {
 pub struct Pairing {
     pub until: u64,
     tried: Vec<Addr>,
+    /// Devices the inquiry found, logged once each.
+    seen: Vec<Addr>,
 }
 
 pub struct Host {
@@ -230,6 +261,9 @@ pub struct Host {
     inquiring: bool,
     inquiry_at: u64,
     connecting: Option<Addr>,
+    /// Create Connection parameters waiting for a name request, and when
+    /// it was sent.
+    naming: Option<([u8; 13], u64)>,
     /// For `input`.
     pub events: Vec<[u64; 5]>,
     /// Paired during the current window: address, name.
@@ -250,6 +284,7 @@ impl Host {
             inquiring: false,
             inquiry_at: 0,
             connecting: None,
+            naming: None,
             events: Vec::new(),
             paired: Vec::new(),
         }
@@ -303,7 +338,12 @@ impl Host {
                 self.pairing = Some(Pairing {
                     until,
                     tried: Vec::new(),
+                    seen: Vec::new(),
                 });
+                // Found and connectable too: in sync mode a controller also
+                // looks for a console and connects to it (Horizon's way).
+                self.hci
+                    .command(hci::OP_WRITE_SCAN_ENABLE, &[SCAN_INQUIRY_PAGE]);
             }
         }
     }
@@ -311,6 +351,8 @@ impl Host {
     pub fn stop_pairing(&mut self) {
         if self.pairing.take().is_some() {
             println!("[bt] pairing over, {} paired", self.paired.len());
+            self.hci
+                .command(hci::OP_WRITE_SCAN_ENABLE, &[bcm::SCAN_PAGE]);
         }
         if self.inquiring {
             self.hci.command(hci::OP_INQUIRY_CANCEL, &[]);
@@ -333,6 +375,9 @@ impl Host {
     }
 
     fn disconnect(&mut self, handle: u16, reason: u8) {
+        if let Some(c) = self.conns.iter_mut().find(|c| c.handle == handle) {
+            c.closing = true;
+        }
         self.hci.command(
             hci::OP_DISCONNECT,
             &[handle as u8, (handle >> 8) as u8, reason],
@@ -374,8 +419,18 @@ impl Host {
         let mut drop = Vec::new();
         for i in 0..self.conns.len() {
             let c = &self.conns[i];
+            if c.closing {
+                continue;
+            }
             if !c.ready && now - c.since > SETUP_LIMIT_NS {
-                println!("[bt] {}: no HID reports, disconnecting", c.label());
+                println!(
+                    "[bt] {}: no HID reports, disconnecting (channels {:?})",
+                    c.label(),
+                    c.chans
+                        .iter()
+                        .map(|ch| (ch.psm, ch.open))
+                        .collect::<Vec<_>>()
+                );
                 drop.push(c.handle);
                 continue;
             }
@@ -429,6 +484,23 @@ impl Host {
                             self.inquiry_at = time::now_ns() + 1_000_000_000;
                         }
                         hci::OP_CREATE_CONN => self.connecting = None,
+                        // Unknown handle: the link is gone already.
+                        hci::OP_DISCONNECT if p[0] == 0x02 => {
+                            let gone: Vec<u16> = self
+                                .conns
+                                .iter()
+                                .filter(|c| c.closing)
+                                .map(|c| c.handle)
+                                .collect();
+                            for h in gone {
+                                self.gone(h, p[0]);
+                            }
+                        }
+                        hci::OP_REMOTE_NAME => {
+                            if let Some((n, _)) = self.naming {
+                                self.named(&n[..6], p[0], "");
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -498,12 +570,14 @@ impl Host {
                 }
             }
             hci::EV_REMOTE_NAME if p.len() >= 7 => {
-                if p[0] != 0 {
-                    return;
-                }
                 let raw = &p[7..];
                 let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
                 let name = String::from_utf8_lossy(&raw[..end]).into_owned();
+                let a = p[1..7].to_vec();
+                self.named(&a, p[0], &name);
+                if p[0] != 0 {
+                    return;
+                }
                 if let Some(c) = self.conns.iter_mut().find(|c| c.addr[..] == p[1..7]) {
                     if c.kind == bt::KIND_UNKNOWN {
                         c.kind = kind_of(&name);
@@ -598,13 +672,24 @@ impl Host {
         let Some(pairing) = self.pairing.as_mut() else {
             return;
         };
+        if !pairing.seen.contains(&a) {
+            pairing.seen.push(a);
+            println!(
+                "[bt] seen {} class {:#08x} page scan R{} {}",
+                addr_str(&a),
+                class,
+                psrm,
+                name.as_deref().unwrap_or("(no name in the inquiry)")
+            );
+        }
         if self.connecting.is_some()
-            || pairing.tried.iter().filter(|t| **t == a).count() >= 2
+            || pairing.tried.iter().filter(|t| **t == a).count() >= PAGE_TRIES
             || self.conns.iter().any(|c| c.addr == a)
             || !is_gamepad(class, name.as_deref())
         {
             return;
         }
+        let attempt = pairing.tried.iter().filter(|t| **t == a).count();
         pairing.tried.push(a);
         println!(
             "[bt] found {} ({}, class {:#08x})",
@@ -619,12 +704,46 @@ impl Host {
         let mut p = [0u8; 13];
         p[..6].copy_from_slice(&a);
         p[6..8].copy_from_slice(&PACKET_TYPES.to_le_bytes());
-        p[8] = psrm;
-        p[10..12].copy_from_slice(&(clock | 0x8000).to_le_bytes());
-        // Allow_Role_Switch 0: we stay master, several pads share the piconet.
-        p[12] = 0;
-        self.hci.command(hci::OP_CREATE_CONN, &p);
+        // Every other attempt pages blind (R2, no clock offset): both
+        // trains in full, for a controller that scans rarely.
+        if attempt % 2 == 0 {
+            p[8] = psrm;
+            p[10..12].copy_from_slice(&(clock | 0x8000).to_le_bytes());
+        } else {
+            p[8] = 0x02;
+        }
+        // Allow_Role_Switch, as BlueZ sets it.
+        p[12] = 1;
+        // Its name first, as BlueZ resolves names before connecting: a
+        // Pro Controller paged straight by Create Connection refuses with
+        // 0x10 (Erista), the connection riding on the name page works.
+        let mut r = [0u8; 10];
+        r[..6].copy_from_slice(&a);
+        r[6] = p[8];
+        r[8..10].copy_from_slice(&p[10..12]);
+        self.hci.command(hci::OP_REMOTE_NAME, &r);
+        self.naming = Some((p, time::now_ns()));
         self.connecting = Some(a);
+    }
+
+    /// The name request before a connection is over: connect.
+    fn named(&mut self, a: &[u8], status: u8, name: &str) {
+        let Some((p, since)) = self.naming else {
+            return;
+        };
+        if p[..6] != *a {
+            return;
+        }
+        self.naming = None;
+        println!(
+            "[bt] name request to {}: status {:#04x} after {} ms{}{}",
+            addr_str(&p[..6].try_into().unwrap_or([0; 6])),
+            status,
+            (time::now_ns() - since) / 1_000_000,
+            if name.is_empty() { "" } else { ", name " },
+            name
+        );
+        self.hci.command(hci::OP_CREATE_CONN, &p);
     }
 
     fn conn_request(&mut self, p: &[u8]) {
@@ -635,7 +754,9 @@ impl Host {
         if p[9] == 1 && (known || self.pairing.is_some() && is_gamepad(class, None)) {
             let mut r = [0u8; 7];
             r[..6].copy_from_slice(&a);
-            // Role 0: become master.
+            // Role 1: stay slave, as BlueZ does: a reconnecting controller
+            // leads (role, authentication, encryption, channels).
+            r[6] = 0x01;
             self.hci.command(hci::OP_ACCEPT_CONN, &r);
         } else {
             println!(
@@ -692,9 +813,14 @@ impl Host {
             r[6] = 0x01;
             self.hci.command(hci::OP_REMOTE_NAME, &r);
         }
+        let incoming = c.incoming;
         self.conns.push(c);
-        self.hci
-            .command(hci::OP_AUTH_REQUESTED, &[h as u8, (h >> 8) as u8]);
+        // Pairing: we authenticate. A reconnecting controller does it
+        // itself; asking too collides with it.
+        if !incoming {
+            self.hci
+                .command(hci::OP_AUTH_REQUESTED, &[h as u8, (h >> 8) as u8]);
+        }
     }
 
     fn gone(&mut self, handle: u16, reason: u8) {
@@ -952,7 +1078,7 @@ impl Host {
 
     // --- HID ---
 
-    fn subcmd(&mut self, i: usize, sub: u8, arg: u8) {
+    fn subcmd(&mut self, i: usize, sub: u8, args: &[u8]) {
         let c = &mut self.conns[i];
         let Some(remote) = c
             .chan(PSM_HID_INTERRUPT)
@@ -961,23 +1087,26 @@ impl Host {
         else {
             return;
         };
-        let mut r = [0u8; 14];
+        let mut r = [0u8; 50];
         r[0] = HID_DATA_OUT;
         r[1] = OUT_SUBCMD;
         r[2] = c.counter & 0xF;
         c.counter = c.counter.wrapping_add(1);
         r[3..11].copy_from_slice(&RUMBLE_OFF);
         r[11] = sub;
-        r[12] = arg;
-        self.l2cap_out(i, remote, &r[..13]);
+        let n = args.len().min(r.len() - 12);
+        r[12..12 + n].copy_from_slice(&args[..n]);
+        c.out_at = time::now_ns();
+        // The console sends 49-byte output reports.
+        self.l2cap_out(i, remote, &r);
     }
 
     fn send_step(&mut self, i: usize) {
-        let (sub, arg) = SETUP[self.conns[i].step];
+        let (sub, args) = SETUP[self.conns[i].step];
         let c = &mut self.conns[i];
         c.tries += 1;
         c.step_at = time::now_ns();
-        self.subcmd(i, sub, arg);
+        self.subcmd(i, sub, args);
     }
 
     fn next_step(&mut self, i: usize) {
@@ -990,6 +1119,16 @@ impl Host {
             return;
         }
         c.ready = true;
+        // Sniff at 15 ms, as the console holds its controllers: a
+        // third-party Pro Controller streams no report until then.
+        let h = c.handle;
+        let mut sn = [0u8; 10];
+        sn[..2].copy_from_slice(&h.to_le_bytes());
+        sn[2..4].copy_from_slice(&SNIFF_SLOTS.to_le_bytes());
+        sn[4..6].copy_from_slice(&SNIFF_SLOTS.to_le_bytes());
+        sn[6..8].copy_from_slice(&1u16.to_le_bytes());
+        self.hci.command(hci::OP_SNIFF_MODE, &sn);
+        let c = &mut self.conns[i];
         println!(
             "[bt] {}: ready, {}{}",
             c.label(),
@@ -1046,7 +1185,8 @@ impl Host {
         let c = &mut self.conns[i];
         let Some(rep) = jc::parse(r) else { return };
         c.reports += 1;
-        let battery = rep.battery >> 1;
+        // Some controllers report a level past full (8).
+        let battery = (rep.battery >> 1).min(4);
         if c.battery != battery {
             if c.battery == bt::BATTERY_UNKNOWN {
                 println!("[bt] {}: battery {}/4", c.label(), battery);

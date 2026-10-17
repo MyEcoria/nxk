@@ -17,20 +17,26 @@ use crate::store::{addr_str, Addr};
 const BROADCOM: u16 = 0x000F;
 pub const BAUD_INIT: u64 = 115_200;
 pub const BAUD_FAST: u64 = 3_000_000;
+/// Speeds tried when the chip does not answer at 115200.
+const PROBE: [u64; 4] = [3_000_000, 1_000_000, 921_600, 460_800];
 const FIRMWARE_DIR: &str = "/firmware/brcm";
 /// `hwboot/nxfw-extract.py bluetooth` names it so.
 const FIRMWARE: &str = "BCM4356A3.hcd";
 /// Linux `btbcm_patchram`: after the minidriver, after the launch.
 const MINIDRIVER_MS: u64 = 50;
-const LAUNCH_MS: u64 = 250;
+const LAUNCH_MS: u64 = 500;
 /// Event mask: everything up to Secure Simple Pairing (Linux default).
 const EVENT_MASK: [u8; 8] = [0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D];
 /// Class of device: computer, handheld.
 const CLASS: [u8; 3] = [0x10, 0x01, 0x00];
 /// Role switch and sniff allowed (link policy settings).
 const LINK_POLICY: u16 = 0x0005;
-/// Page timeout: 0x2000 slots, 5.12 s.
-const PAGE_TIMEOUT: u16 = 0x2000;
+/// Page timeout: 0x8000 slots, 20.48 s (a controller alternates its
+/// scans in sync mode).
+const PAGE_TIMEOUT: u16 = 0x8000;
+/// Connection accept timeout: 0x7D00 slots, 20 s, as Linux sets it
+/// (the 5 s default ends a controller's connection with 0x10).
+const ACCEPT_TIMEOUT: u16 = 0x7D00;
 /// Page scan only: paired controllers reconnect, nobody finds us.
 pub const SCAN_PAGE: u8 = 0x02;
 
@@ -158,9 +164,22 @@ fn download(hci: &mut Hci, data: &[u8]) -> Result<usize, String> {
 }
 
 /// Power-cycled chip to a configured adapter at `addr`.
-pub fn bring_up(hci: &mut Hci, addr: Addr) -> Result<Chip, String> {
+pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, String> {
     hci.uart.set_baud(BAUD_INIT);
-    reset(hci, 6)?;
+    if let Err(e) = reset(hci, 6) {
+        // A chip left at another speed: the 48 MHz divisors.
+        let found = PROBE.iter().copied().find(|&b| {
+            hci.uart.set_baud(b);
+            reset(hci, 2).is_ok()
+        });
+        match found {
+            Some(b) => println!("[bt] no answer at 115200, the chip answers at {} baud", b),
+            None => {
+                hci.uart.set_baud(BAUD_INIT);
+                return Err(e);
+            }
+        }
+    }
     let (_, subver) = version(hci)?;
     let name = local_name(hci);
     println!("[bt] {} answers, LMP subversion {:#06x}", name, subver);
@@ -169,11 +188,34 @@ pub fn bring_up(hci: &mut Hci, addr: Addr) -> Result<Chip, String> {
     let firmware = match firmware_file(&name) {
         Some((file, data)) => {
             let n = download(hci, &data)?;
-            // The patch restarts the chip at its default speed.
-            hci.uart.set_baud(BAUD_INIT);
-            if reset(hci, 3).is_err() && fast {
-                hci.uart.set_baud(BAUD_FAST);
-                reset(hci, 2)?;
+            // The patch restarts the chip at its default speed, or at
+            // one the file sets: each is tried.
+            let _ = fast;
+            let speeds = [BAUD_INIT, BAUD_FAST, 1_000_000, 921_600, 460_800];
+            let mut at = None;
+            'found: for level in [false, true] {
+                wake(level);
+                time::sleep_ms(20);
+                for b in speeds {
+                    hci.uart.set_baud(b);
+                    if reset(hci, 2).is_ok() {
+                        at = Some((b, level));
+                        break 'found;
+                    }
+                }
+            }
+            match at {
+                Some((b, w)) => println!(
+                    "[bt] patched firmware answers at {} baud, BT_WAKE {}",
+                    b,
+                    if w { "high" } else { "low" }
+                ),
+                None => {
+                    return Err(format!(
+                        "no answer after {} ({} records) at 115200, 3M, 1M, 921600 or 460800 baud",
+                        file, n
+                    ))
+                }
             }
             println!("[bt] {} loaded ({} records)", file, n);
             format!("{} loaded", file)
@@ -220,10 +262,24 @@ pub fn bring_up(hci: &mut Hci, addr: Addr) -> Result<Chip, String> {
         500,
     )?;
     hci.call(
+        hci::OP_WRITE_CONN_ACCEPT_TIMEOUT,
+        &[ACCEPT_TIMEOUT as u8, (ACCEPT_TIMEOUT >> 8) as u8],
+        500,
+    )?;
+    hci.call(
         hci::OP_WRITE_PAGE_TIMEOUT,
         &[PAGE_TIMEOUT as u8, (PAGE_TIMEOUT >> 8) as u8],
         500,
     )?;
+    if let Ok(t) = hci.call(hci::OP_READ_PAGE_TIMEOUT, &[], 500) {
+        if t.len() >= 2 && le16(&t) != PAGE_TIMEOUT {
+            println!(
+                "[bt] page timeout {:#06x}, not {:#06x}",
+                le16(&t),
+                PAGE_TIMEOUT
+            );
+        }
+    }
     hci.call(hci::OP_WRITE_SCAN_ENABLE, &[SCAN_PAGE], 500)?;
     hci.flush();
     Ok(Chip {

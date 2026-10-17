@@ -29,11 +29,14 @@ pub const OP_SET_ENCRYPTION: u16 = 0x0413;
 pub const OP_REMOTE_NAME: u16 = 0x0419;
 pub const OP_IO_CAP_REPLY: u16 = 0x042B;
 pub const OP_USER_CONFIRM_REPLY: u16 = 0x042C;
+pub const OP_SNIFF_MODE: u16 = 0x0803;
 pub const OP_DEFAULT_LINK_POLICY: u16 = 0x080F;
 pub const OP_SET_EVENT_MASK: u16 = 0x0C01;
 pub const OP_RESET: u16 = 0x0C03;
 pub const OP_WRITE_LOCAL_NAME: u16 = 0x0C13;
 pub const OP_READ_LOCAL_NAME: u16 = 0x0C14;
+pub const OP_WRITE_CONN_ACCEPT_TIMEOUT: u16 = 0x0C16;
+pub const OP_READ_PAGE_TIMEOUT: u16 = 0x0C17;
 pub const OP_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
 pub const OP_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
 pub const OP_WRITE_CLASS: u16 = 0x0C24;
@@ -98,7 +101,13 @@ pub struct Hci {
     /// Bytes dropped to find the start of a packet again.
     pub resyncs: u64,
     pub tx_stalls: u64,
+    /// Bytes received since the start (a dead line shows 0).
+    pub rx_seen: u64,
+    /// The first bytes received, for a failure report.
+    pub rx_log: Vec<u8>,
 }
+
+const RX_LOG: usize = 24;
 
 impl Hci {
     pub fn new(uart: Uart) -> Self {
@@ -110,6 +119,8 @@ impl Hci {
             pending: VecDeque::new(),
             resyncs: 0,
             tx_stalls: 0,
+            rx_seen: 0,
+            rx_log: Vec::new(),
         }
     }
 
@@ -123,7 +134,12 @@ impl Hci {
 
     /// Bytes from the UART, cut into packets.
     pub fn pump(&mut self) {
-        self.uart.read(&mut self.raw);
+        let at = self.raw.len();
+        let n = self.uart.read(&mut self.raw);
+        self.rx_seen += n as u64;
+        let room = RX_LOG.saturating_sub(self.rx_log.len());
+        self.rx_log
+            .extend_from_slice(&self.raw[at..at + n.min(room)]);
         while let Some(&t) = self.raw.first() {
             let need = match t {
                 H4_EVT if self.raw.len() >= 3 => 3 + self.raw[2] as usize,

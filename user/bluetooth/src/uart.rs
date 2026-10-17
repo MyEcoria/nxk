@@ -1,10 +1,12 @@
 //! UART-D, the HCI transport (H4): 8N1, RTS/CTS handled by the UART
 //! itself (Tegra MCR `CTS_EN` / `RTS_EN`, as Linux `serial-tegra` with
-//! CRTSCTS), receive interrupt. Its source clock runs at 48 MHz (`clk`
-//! `BAUD_3M`) and is divided here: 1 for 3 Mbaud, 26 for 115200.
+//! CRTSCTS), receive interrupt. Clocks as hekate's `uart_init`: 1 and 3
+//! Mbaud from `clk`'s 16x divider (divisor latch 1), slower rates from
+//! PLLP's 408 MHz divided here (221 for 115200).
 
 use alloc::vec::Vec;
 
+use libnx::abi::proto::clk;
 use libnx::drv::Mmio;
 use libnx::time;
 
@@ -15,6 +17,7 @@ const FCR: usize = 0x08;
 const LCR: usize = 0x0C;
 const MCR: usize = 0x10;
 const LSR: usize = 0x14;
+const MSR: usize = 0x18;
 const SPR: usize = 0x1C;
 const IRDA_CSR: usize = 0x20;
 const LCR_8N1: u32 = 3;
@@ -36,7 +39,8 @@ const LSR_TMTY: u32 = 1 << 6;
 const IER_RHR: u32 = 1;
 const IER_RLS: u32 = 1 << 2;
 const IER_RX_TIMEOUT: u32 = 1 << 4;
-const CLOCK_HZ: u64 = 48_000_000;
+/// PLLP, the UART's clock outside the 16x divider mode.
+const PLLP_HZ: u64 = 408_000_000;
 /// Bytes written per wait for an empty FIFO (Tegra's holds 32, the
 /// emulator's 16).
 const TX_CHUNK: usize = 16;
@@ -70,7 +74,14 @@ impl Uart {
     /// and flow control by the UART. The FIFOs are emptied.
     pub fn set_baud(&mut self, baud: u64) {
         self.tx_idle();
-        let div = ((CLOCK_HZ / 16 + baud / 2) / baud).max(1) as u32;
+        let (src, div) = match baud {
+            clk::BAUD_3M | clk::BAUD_1M => (baud, 1),
+            _ => (clk::BAUD_115200, (PLLP_HZ + 8 * baud) / (16 * baud)),
+        };
+        if let Err(e) = libnx::clk::uart_baud(clk::UARTD, src) {
+            libnx::println!("[bt] UART-D clock for {} baud: error {}", baud, e);
+        }
+        let div = div as u32;
         let m = &self.m;
         let ier = m.r32(IER);
         m.w32(IER, 0);
@@ -88,6 +99,19 @@ impl Uart {
         let _ = m.r32(SPR);
         m.w32(IER, ier);
         self.baud = baud;
+    }
+
+    /// Registers for a failure report: LCR, MCR, LSR, MSR (CTS in bit 4),
+    /// IER, IRDA_CSR.
+    pub fn regs(&self) -> [u32; 6] {
+        [
+            self.m.r32(LCR),
+            self.m.r32(MCR),
+            self.m.r32(LSR),
+            self.m.r32(MSR),
+            self.m.r32(IER),
+            self.m.r32(IRDA_CSR),
+        ]
     }
 
     /// Receive interrupts on (data, timeout, line errors).

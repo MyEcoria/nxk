@@ -60,6 +60,7 @@ const BT_WAKE_AP: u32 = 1 << 5;
 const GPIO_CNF: usize = 0x00;
 const GPIO_OE: usize = 0x10;
 const GPIO_OUT: usize = 0x20;
+const GPIO_IN: usize = 0x30;
 const fn port(reg: usize, p: usize) -> usize {
     reg + (p >> 2) * 0x100 + (p & 3) * 4
 }
@@ -98,11 +99,13 @@ impl Pads {
         pm(PM_UART4_RX, PM_INPUT_ENABLE | PM_PULL_DOWN);
         pm(PM_UART4_RTS, 0);
         pm(PM_UART4_CTS, PM_INPUT_ENABLE | PM_PULL_DOWN);
-        pm(PM_AP_WAKE_BT, 0);
-        pm(PM_BT_RST, 0);
+        // Input buffers on too: GPIO_IN then reads the level driven.
+        pm(PM_AP_WAKE_BT, PM_INPUT_ENABLE);
+        pm(PM_BT_RST, PM_INPUT_ENABLE);
         pm(PM_BT_WAKE_AP, PM_INPUT_ENABLE);
-        // Wake line low (Atmosphere's initial value; sleep mode is off),
-        // the chip's host wake an input.
+        // Wake line: device-wakeup, active high (p2180 / smaug device
+        // trees, the same H3 / H4 / H5 wiring); Linux hci_bcm raises it
+        // with the power. The chip's host wake is an input.
         self.set(GPIO_OUT, AP_WAKE_BT, false);
         self.set(GPIO_CNF, AP_WAKE_BT, true);
         self.set(GPIO_OE, AP_WAKE_BT, true);
@@ -112,14 +115,46 @@ impl Pads {
         self.set(GPIO_OE, BT_RST, true);
     }
 
+    /// Pinmux of the UART and control pads, GPIO H CNF / OE / OUT / IN.
+    fn regs(&self) -> ([u32; 7], [u32; 4]) {
+        let pm = [
+            PM_UART4_TX,
+            PM_UART4_RX,
+            PM_UART4_RTS,
+            PM_UART4_CTS,
+            PM_AP_WAKE_BT,
+            PM_BT_RST,
+            PM_BT_WAKE_AP,
+        ]
+        .map(|o| self.pinmux.r32(o));
+        let g = [GPIO_CNF, GPIO_OE, GPIO_OUT, GPIO_IN].map(|r| self.gpio.r32(port(r, PORT_H)));
+        (pm, g)
+    }
+
+    /// RX and CTS pad levels (PI5, PI7) read as GPIO inputs for a moment:
+    /// an idle chip holds its TX high, a ready one its RTS low.
+    fn line_levels(&self) -> u32 {
+        const PORT_I: usize = 8;
+        const PINS: u32 = (1 << 5) | (1 << 7);
+        let g = &self.gpio;
+        g.modify(port(GPIO_OE, PORT_I), PINS, 0);
+        g.modify(port(GPIO_CNF, PORT_I), 0, PINS);
+        time::sleep_us(50);
+        let v = g.r32(port(GPIO_IN, PORT_I));
+        g.modify(port(GPIO_CNF, PORT_I), PINS, 0);
+        v
+    }
+
     /// BT_RST: low holds the Bluetooth core off (Wi-Fi has its own line).
     fn power(&self, on: bool) {
+        // BT_WAKE is active low for the patched firmware (Erista).
+        self.set(GPIO_OUT, AP_WAKE_BT, false);
         self.set(GPIO_OUT, BT_RST, on);
     }
 }
 
 enum Adapter {
-    Down(Hci, Store, String),
+    Down(Box<Hci>, Store, String),
     Up(Box<Host>),
 }
 
@@ -131,23 +166,49 @@ fn start(mut hci: Hci, mut store: Store, pads: &Pads) -> Adapter {
     pads.power(true);
     time::sleep_ms(POWER_ON_MS);
     let addr = store.local_addr();
-    match bcm::bring_up(&mut hci, addr) {
+    match bcm::bring_up(&mut hci, addr, &|on| pads.set(GPIO_OUT, AP_WAKE_BT, on)) {
         Ok(chip) => {
             println!("[bt] ready: {}", chip.describe());
             hci.uart.irq_on();
             Adapter::Up(Box::new(Host::new(hci, chip, store)))
         }
         Err(why) => {
+            // What the pins and the UART look like, for a run on hardware.
+            let (pm, g) = pads.regs();
+            let lines = pads.line_levels();
+            // The 32 kHz clock: MAX77620 CNFG1_32K, AME_GPIO, GPIO4 (I2C5).
+            let pmic: Vec<i64> = libnx::i2c::I2c::connect()
+                .map(|i| {
+                    [0x03u8, 0x40, 0x3A]
+                        .iter()
+                        .map(|&r| i.read_reg(5, 0x3C, r).map_or(-1, |v| v as i64))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let why = alloc::format!(
+                "{} [port I in {:#x} (RX bit 5, CTS bit 7); pmic 32k/ame/gpio4 {:x?}; uart lcr/mcr/lsr/msr/ier/irda {:x?}, rx bytes {} (first {:02x?}), resyncs {}, tx stalls {}, errors {}; pinmux tx/rx/rts/cts/wake/rst/hostwake {:x?}; gpio H cnf/oe/out/in {:x?}]",
+                why,
+                lines,
+                pmic,
+                hci.uart.regs(),
+                hci.rx_seen,
+                hci.rx_log,
+                hci.resyncs,
+                hci.tx_stalls,
+                hci.uart.errors,
+                pm,
+                g
+            );
             println!("[bt] no adapter: {}", why);
             pads.power(false);
-            Adapter::Down(hci, store, why)
+            Adapter::Down(Box::new(hci), store, why)
         }
     }
 }
 
 fn restart(a: Adapter, pads: &Pads) -> Adapter {
     match a {
-        Adapter::Down(hci, store, _) => start(hci, store, pads),
+        Adapter::Down(hci, store, _) => start(*hci, store, pads),
         Adapter::Up(h) => {
             let h = *h;
             start(h.hci, h.store, pads)
@@ -219,10 +280,7 @@ fn main() -> i32 {
             None
         }
     };
-    // 48 MHz source: the UART divides it for 115200 and 3 Mbaud.
-    if let Err(e) =
-        libnx::clk::enable(clk::UARTD).and_then(|_| libnx::clk::uart_baud(clk::UARTD, clk::BAUD_3M))
-    {
+    if let Err(e) = libnx::clk::enable(clk::UARTD) {
         println!("[bt] UART-D clock: error {}", err::name(e));
         return 1;
     }
@@ -287,7 +345,7 @@ fn main() -> i32 {
                 let a = core::mem::replace(
                     &mut adapter,
                     Adapter::Down(
-                        Hci::new(Uart::new(uarts.offset(UARTD))),
+                        Box::new(Hci::new(Uart::new(uarts.offset(UARTD)))),
                         Store::default(),
                         String::new(),
                     ),
