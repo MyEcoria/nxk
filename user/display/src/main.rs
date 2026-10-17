@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV};
 use libnx::abi::proto::gpu as gpuproto;
-use libnx::abi::proto::{console as con, cpufreq, display as proto, fan, gpu, input, wifi};
+use libnx::abi::proto::{audio, console as con, cpufreq, display as proto, fan, gpu, input, wifi};
 use libnx::abi::rights::{DMA, DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
@@ -112,6 +112,7 @@ static POWER: Service = Service::optional("power");
 static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
+static AUDIO: Service = Service::optional("audio");
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -190,6 +191,8 @@ enum Done {
     Cpu(Result<stats::Cpu, i64>),
     /// A GPU `CLOCK` change (the stats page shows the result).
     Gpu(Result<(), i64>),
+    /// An audio volume/melody/tone call (`Some(toast)` when user-triggered playback).
+    Audio(Result<Option<&'static str>, i64>),
 }
 
 /// A game that took the screen: the images it draws on (block-linear,
@@ -372,6 +375,21 @@ fn work(w: &Worker, notif: u32) -> ! {
                         .map(|_| ()),
                 )
             }
+            Action::Volume(pct) => Done::Audio(
+                AUDIO
+                    .call(&Msg::from_words(audio::VOLUME, &[pct as u64]))
+                    .map(|_| None),
+            ),
+            Action::Music => Done::Audio(
+                AUDIO
+                    .call(&Msg::new(audio::MUSIC, 0, 0))
+                    .map(|_| Some("playing test melody")),
+            ),
+            Action::Tone => Done::Audio(
+                AUDIO
+                    .call(&Msg::from_words(audio::TONE, &[440, 2000]))
+                    .map(|_| Some("playing 440 Hz tone (2 s)")),
+            ),
             Action::ClearLogs
             | Action::Launch(_)
             | Action::Brightness(_)
@@ -696,10 +714,16 @@ fn main() -> i32 {
                     } else {
                         cfg.brightness = ui.cfg.brightness;
                     }
-                    if cfg.flight {
-                        worker.jobs.lock().push_back(Job::Act(Action::Flight(true)));
-                        worker.wake.notify_one();
+                    {
+                        let mut q = worker.jobs.lock();
+                        if cfg.flight {
+                            q.push_back(Job::Act(Action::Flight(true)));
+                        }
+                        if cfg.volume != audio::DEFAULT_VOL as u8 {
+                            q.push_back(Job::Act(Action::Volume(cfg.volume)));
+                        }
                     }
+                    worker.wake.notify_one();
                     ui.apply_config(cfg);
                     dirty = true;
                 }
@@ -899,6 +923,14 @@ fn main() -> i32 {
                             }
                             save_at = now + 800_000_000;
                         }
+                        Some(Action::Volume(pct)) => {
+                            save_at = now + 800_000_000;
+                            let mut q = worker.jobs.lock();
+                            q.retain(|j| !matches!(j, Job::Act(Action::Volume(_))));
+                            q.push_back(Job::Act(Action::Volume(pct)));
+                            drop(q);
+                            worker.wake.notify_one();
+                        }
                         Some(Action::Save) => {
                             save_at = 0;
                             worker.jobs.lock().push_back(Job::Save(ui.cfg));
@@ -954,7 +986,11 @@ fn main() -> i32 {
                 for d in batch {
                     if !matches!(
                         d,
-                        Done::Fan(_) | Done::Cpu(_) | Done::Gpu(_) | Done::Flight(_)
+                        Done::Fan(_)
+                            | Done::Cpu(_)
+                            | Done::Gpu(_)
+                            | Done::Flight(_)
+                            | Done::Audio(_)
                     ) {
                         ui.busy = false;
                     }
@@ -988,6 +1024,11 @@ fn main() -> i32 {
                                     .toast(format!("gpu clock: {}", libnx::abi::err::name(e)), now),
                             }
                         }
+                        Done::Audio(r) => match r {
+                            Ok(Some(msg)) => ui.toast(msg.into(), now),
+                            Ok(None) => {}
+                            Err(e) => ui.toast(format!("audio: {}", libnx::abi::err::name(e)), now),
+                        },
                         Done::Flight(r) => match r {
                             Ok(true) => ui.toast("flight mode on (radio off)".into(), now),
                             Ok(false) => ui.toast("flight mode off".into(), now),

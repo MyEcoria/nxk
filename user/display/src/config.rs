@@ -4,6 +4,7 @@
 use alloc::format;
 use alloc::string::String;
 
+use libnx::abi::proto::audio::DEFAULT_VOL;
 use libnx::fs;
 
 const DIR: &str = "/config";
@@ -16,6 +17,8 @@ pub struct Config {
     pub light: bool,
     /// Backlight, % (`backlight::MIN_PCT`..=100); 0: leave what the loader set.
     pub brightness: u8,
+    /// Speaker volume, % (0..=100).
+    pub volume: u8,
     /// The Wi-Fi radio is off.
     pub flight: bool,
     /// Index in `SLEEP_MIN`.
@@ -27,6 +30,7 @@ impl Config {
         Self {
             light: false,
             brightness: 0,
+            volume: DEFAULT_VOL,
             flight: false,
             sleep: 0,
         }
@@ -49,6 +53,7 @@ impl Config {
             match k.trim() {
                 "theme" => c.light = v == "light",
                 "brightness" => c.brightness = v.parse().unwrap_or(0).min(100),
+                "volume" => c.volume = v.parse().unwrap_or(DEFAULT_VOL).min(100),
                 "flight" => c.flight = v == "on",
                 "sleep" => c.sleep = v.parse().unwrap_or(0).min(SLEEP_MIN.len() as u8 - 1),
                 _ => {}
@@ -62,9 +67,10 @@ impl Config {
         fs::write(
             FILE,
             format!(
-                "theme={}\nbrightness={}\nflight={}\nsleep={}\n",
+                "theme={}\nbrightness={}\nvolume={}\nflight={}\nsleep={}\n",
                 if self.light { "light" } else { "dark" },
                 self.brightness,
+                self.volume,
                 if self.flight { "on" } else { "off" },
                 self.sleep
             )

@@ -100,9 +100,12 @@ const CODEC_BUS: u8 = 1;
 const CODEC_ADDR: u8 = 0x1C;
 const RT_RESET: u8 = 0x00;
 const RT_SPK_VOL: u8 = 0x01;
-/// Speaker volume: both channels muted, then a step 13.5 dB below full.
+const RT_DAC1_DIG_VOL: u8 = 0x19;
+/// Speaker volume: both channels muted (`0xC8C8`); unmuted attenuation in
+/// bits 13:8 (left) and 5:0 (right), 1.5 dB per step.
 const SPK_MUTED: u16 = 0xC8C8;
-const SPK_ON: u16 = 0x0909;
+/// DAC1 digital volume: 0xA0 (-5.6 dB) on both channels for clean headroom.
+const DAC1_VOL: u16 = 0xA0A0;
 const RT_AD_DA_MIXER: u8 = 0x29;
 const RT_STO_DAC_MIXER: u8 = 0x2A;
 const RT_SPK_L_MIXER: u8 = 0x46;
@@ -123,6 +126,25 @@ const RT_MICBIAS: u8 = 0x93;
 const RT_DSP_PATH2: u8 = 0x2E;
 const RT_VENDOR_ID: u8 = 0xFD;
 const RT_VENDOR_ID2: u8 = 0xFE;
+
+/// Map `0..=100`% volume to `RT_SPK_VOL`: muted at 0, steps 28 (-42 dB)
+/// down to 6 (-9 dB) for 1..=100%.
+fn spk_vol_reg(vol: u8) -> u16 {
+    if vol == 0 {
+        return SPK_MUTED;
+    }
+    let att = (28 - (vol.min(100) as u16 * 22 / 100)).clamp(6, 31);
+    att << 8 | att
+}
+
+/// Software amplitude scale (0..=256) for fine steps at low volume.
+fn sw_gain(vol: u8) -> i32 {
+    if vol == 0 {
+        0
+    } else {
+        64 + (vol.min(100) as i32 * 192 / 100)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Audio {
@@ -196,7 +218,15 @@ impl Audio {
     /// Codec after reset, for the speakers: DAC from I2S1, slave on
     /// MCLK = 256 fs, the mixers on the Speaker path unmuted.
     fn codec(&self) -> Result<(), i64> {
-        self.codec_write(RT_RESET, 0)?;
+        let mut reset_res = Err(-libnx::abi::err::EIO);
+        for _ in 0..5 {
+            reset_res = self.codec_write(RT_RESET, 0);
+            if reset_res.is_ok() {
+                break;
+            }
+            time::sleep_ms(10);
+        }
+        reset_res?;
         time::sleep_ms(20);
         let (v1, v2) = (
             self.codec_read(RT_VENDOR_ID)?,
@@ -239,6 +269,7 @@ impl Audio {
         self.codec_write(RT_I2S1_SDP, 1 << 15)?;
         self.codec_write(RT_GLB_CLK, 0)?;
         self.codec_update(RT_ADDA_CLK1, 7 << 12, 0)?;
+        self.codec_write(RT_DAC1_DIG_VOL, DAC1_VOL)?;
         // Path: INF1 -> DAC MIX -> Stereo DAC MIX -> SPK MIX -> SPKVOL ->
         // SPO MIX. Only these switches are opened.
         self.codec_update(RT_AD_DA_MIXER, 1 << 14 | 1 << 6, 0)?;
@@ -247,7 +278,6 @@ impl Audio {
         self.codec_update(RT_SPK_R_MIXER, 1 << 3, 0)?;
         self.codec_update(RT_SPO_L_MIXER, 1 << 12, 0)?;
         self.codec_update(RT_SPO_R_MIXER, 1 << 12, 0)?;
-        // Speaker volume: unmuted both ways, 12 steps (1.5 dB) below full.
         // The speakers stay muted until a stream runs: an amplifier left
         // on without a bit clock hisses and buzzes.
         self.codec_write(RT_SPK_VOL, SPK_MUTED)?;
@@ -294,10 +324,9 @@ impl Audio {
 
     /// Hub, pads and codec, once.
     fn up(&self) -> Result<(), i64> {
-        libnx::clk::enable(clk::I2C1).inspect_err(|e| println!("[audio] I2C1 clock: {}", e))?;
         libnx::clk::enable(clk::AUDIO).inspect_err(|e| println!("[audio] clk AUDIO: {}", e))?;
         self.pads();
-        time::sleep_ms(10);
+        time::sleep_ms(25);
         self.codec()
             .inspect_err(|e| println!("[audio] codec: {}", e))?;
         self.hub();
@@ -334,6 +363,26 @@ const ADMA_CONFIG: u32 = (PERIODS - 1) << 28 | 5 << 20 | 1;
 const ADMA_FIFO_CTRL: u32 = 3 << 8;
 /// Silent for this long, the DMA stops until something plays.
 const IDLE_NS: u64 = 3_000_000_000;
+
+/// Parabolic sine approximation: `phase` in 0..65536 -> `-32768..=32768`.
+fn sin16(phase: u32) -> i32 {
+    let p = phase & 0xFFFF;
+    let half = p & 0x7FFF;
+    let v = ((half * (32768 - half)) >> 13) as i32;
+    if p & 0x8000 == 0 {
+        v
+    } else {
+        -v
+    }
+}
+
+/// Scale packed stereo 16-bit frame `w` by `gain` (0..=256).
+fn scale_frame(w: u32, gain: i32) -> u32 {
+    let l = ((w as u16 as i16 as i32) * gain >> 8).clamp(-32768, 32767) as i16 as u16 as u32;
+    let r =
+        (((w >> 16) as u16 as i16 as i32) * gain >> 8).clamp(-32768, 32767) as i16 as u16 as u32;
+    l | r << 16
+}
 
 /// A client's ring (`proto::RING_*`).
 struct Client {
@@ -383,21 +432,142 @@ struct Tone {
 
 impl Tone {
     fn frame(&mut self) -> u32 {
-        // Parabolic sine: t (32768 - t) peaks at 2^28.
-        let p = self.phase & 0xFFFF;
+        let v = sin16(self.phase);
         self.phase = self.phase.wrapping_add(self.step);
-        let half = p & 0x7FFF;
-        let v = ((half * (32768 - half)) >> 13) as i32;
-        let v = if p & 0x8000 == 0 { v } else { -v };
         let s = (v * self.amp / 32768) as i16 as u16 as u32;
         s | s << 16
     }
 }
 
-#[derive(Default)]
+/// Built-in 2-voice polyphonic melody: `(melody_hz, bass_hz, eighth_notes)`.
+const NOTE_FRAMES: u32 = proto::RATE * 135 / 1000;
+const SCORE: &[(u16, u16, u8)] = &[
+    // Bar 1: C major arpeggio
+    (523, 262, 1),
+    (659, 262, 1),
+    (784, 330, 1),
+    (1047, 392, 2),
+    (988, 392, 1),
+    (784, 330, 2),
+    // Bar 2: A minor -> G major
+    (880, 220, 1),
+    (1047, 220, 1),
+    (1319, 330, 2),
+    (1175, 294, 1),
+    (988, 247, 1),
+    (784, 392, 2),
+    // Bar 3: F major -> C major
+    (698, 349, 1),
+    (880, 349, 1),
+    (1047, 440, 2),
+    (784, 262, 1),
+    (659, 330, 1),
+    (523, 262, 2),
+    // Bar 4: D minor -> G7 turnaround
+    (587, 294, 1),
+    (698, 294, 1),
+    (880, 349, 1),
+    (784, 392, 1),
+    (659, 330, 1),
+    (784, 392, 1),
+    (988, 494, 2),
+    // Bar 5: Repeat theme higher
+    (1047, 262, 1),
+    (988, 262, 1),
+    (880, 330, 1),
+    (784, 392, 2),
+    (659, 330, 1),
+    (784, 392, 2),
+    // Bar 6: F major -> E minor -> D minor -> C majorfinale
+    (880, 349, 1),
+    (784, 330, 1),
+    (698, 294, 1),
+    (659, 262, 1),
+    (587, 294, 2),
+    (784, 392, 2),
+    (1047, 523, 4),
+];
+
+struct Music {
+    idx: usize,
+    pos: u32,
+    len: u32,
+    p_mel: u32,
+    p_bass: u32,
+    s_mel: u32,
+    s_bass: u32,
+}
+
+impl Music {
+    fn new() -> Self {
+        let mut m = Self {
+            idx: 0,
+            pos: 0,
+            len: 0,
+            p_mel: 0,
+            p_bass: 0,
+            s_mel: 0,
+            s_bass: 0,
+        };
+        m.load_note();
+        m
+    }
+
+    fn total_ms() -> u64 {
+        let eighths: u64 = SCORE.iter().map(|n| n.2 as u64).sum();
+        eighths * 135
+    }
+
+    fn load_note(&mut self) {
+        if let Some(&(mel, bass, dur)) = SCORE.get(self.idx) {
+            self.pos = 0;
+            self.len = dur as u32 * NOTE_FRAMES;
+            self.s_mel = (((mel as u64) << 16) / proto::RATE as u64) as u32;
+            self.s_bass = (((bass as u64) << 16) / proto::RATE as u64) as u32;
+        }
+    }
+
+    fn frame(&mut self) -> Option<u32> {
+        if self.idx >= SCORE.len() {
+            return None;
+        }
+        // Smooth 8 ms attack and 8 ms release envelope to eliminate note clicks.
+        let ramp = 384u32;
+        let rem = self.len.saturating_sub(self.pos);
+        let env = if self.pos < ramp {
+            self.pos * 256 / ramp
+        } else if rem < ramp {
+            rem * 256 / ramp
+        } else {
+            let decay = rem * 180 / self.len.max(1);
+            76 + decay
+        } as i32;
+
+        // Warm chime: fundamental sine + 25% 2nd harmonic.
+        let mel = sin16(self.p_mel) + (sin16(self.p_mel << 1) >> 2);
+        let bass = sin16(self.p_bass) + (sin16(self.p_bass << 1) >> 3);
+        self.p_mel = self.p_mel.wrapping_add(self.s_mel);
+        self.p_bass = self.p_bass.wrapping_add(self.s_bass);
+
+        let m = (mel * env >> 8) * 11 / 32;
+        let b = (bass * env >> 8) * 9 / 32;
+        let l = (m * 3 / 4 + b).clamp(-32768, 32767) as i16 as u16 as u32;
+        let r = (m + b * 3 / 4).clamp(-32768, 32767) as i16 as u16 as u32;
+
+        self.pos += 1;
+        if self.pos >= self.len {
+            self.idx += 1;
+            self.load_note();
+        }
+        Some(l | r << 16)
+    }
+}
+
 struct Shared {
     client: Option<Client>,
     tone: Option<Tone>,
+    music: Option<Music>,
+    volume: u8,
     ready: bool,
     playing: bool,
     underruns: u32,
@@ -406,6 +576,23 @@ struct Shared {
     /// went a whole lap (the ring played again: a late pump).
     max_step: u32,
     laps: u32,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            client: None,
+            tone: None,
+            music: None,
+            volume: proto::DEFAULT_VOL,
+            ready: false,
+            playing: false,
+            underruns: 0,
+            periods: 0,
+            max_step: 0,
+            laps: 0,
+        }
+    }
 }
 
 /// The pump: owns the DMA ring and the ADMA channel.
@@ -427,7 +614,16 @@ impl Pump {
     fn fill(&mut self, sh: &mut Shared, n: u32) -> bool {
         let mut buf = [0u32; PERIOD_FRAMES as usize];
         let mut got = 0u32;
-        if let Some(t) = sh.tone.as_mut() {
+        if let Some(m) = sh.music.as_mut() {
+            while got < PERIOD_FRAMES {
+                let Some(w) = m.frame() else {
+                    sh.music = None;
+                    break;
+                };
+                buf[got as usize] = w;
+                got += 1;
+            }
+        } else if let Some(t) = sh.tone.as_mut() {
             while got < PERIOD_FRAMES && t.frames > 0 {
                 buf[got as usize] = t.frame();
                 got += 1;
@@ -443,10 +639,16 @@ impl Pump {
                 sh.underruns = sh.underruns.wrapping_add(1);
             }
         }
+        let gain = sw_gain(sh.volume);
         let at = (n % PERIODS * PERIOD_BYTES) as usize;
         let dst = unsafe { self.ring.as_ptr().add(at) as *mut u32 };
         for (i, w) in buf.iter().enumerate() {
-            unsafe { core::ptr::write_volatile(dst.add(i), *w) };
+            let scaled = if i < got as usize {
+                scale_frame(*w, gain)
+            } else {
+                0
+            };
+            unsafe { core::ptr::write_volatile(dst.add(i), scaled) };
         }
         got > 0
     }
@@ -488,7 +690,7 @@ impl Pump {
         // The stream is running: let it through (the pops of the
         // amplifier go by while the first periods play).
         time::sleep_ms(2);
-        let _ = self.hw.codec_write(RT_SPK_VOL, SPK_ON);
+        let _ = self.hw.codec_write(RT_SPK_VOL, spk_vol_reg(sh.volume));
         sh.playing = true;
     }
 
@@ -510,7 +712,9 @@ impl Pump {
 
     /// One look, every millisecond or so.
     fn tick(&mut self, sh: &mut Shared) {
-        let active = sh.tone.is_some() || sh.client.as_ref().is_some_and(|c| c.pending());
+        let active = sh.music.is_some()
+            || sh.tone.is_some()
+            || sh.client.as_ref().is_some_and(|c| c.pending());
         if !sh.playing {
             if active {
                 self.begin(sh);
@@ -572,6 +776,9 @@ fn main() -> i32 {
         let handle =
             (m.label() == proto::OPEN && m.handles() == 1).then(|| ipc::received_handle(0));
         let mut sh = shared.lock();
+        if m.label() == proto::VOLUME && m.mr[0] == proto::VOL_GET {
+            return Some(Msg::from_words(0, &[sh.volume as u64]));
+        }
         if !sh.ready {
             let r = hw.up().and_then(|_| {
                 // The DMA ring (a few frames, below 4 GiB, uncached) and
@@ -642,6 +849,7 @@ fn main() -> i32 {
             }
             proto::TONE => {
                 let (hz, ms, level) = (m.mr[0] as u32, m.mr[1], m.mr[2] as u32);
+                sh.music = None;
                 sh.tone = Some(Tone {
                     phase: 0,
                     step: (((hz.min(20_000) as u64) << 16) / proto::RATE as u64) as u32,
@@ -650,11 +858,27 @@ fn main() -> i32 {
                 });
                 Some(Msg::from_words(0, &[ms]))
             }
+            proto::MUSIC => {
+                sh.tone = None;
+                sh.music = Some(Music::new());
+                Some(Msg::from_words(0, &[Music::total_ms()]))
+            }
+            proto::VOLUME => {
+                if m.mr[0] != proto::VOL_GET {
+                    sh.volume = (m.mr[0] as u8).min(100);
+                    if sh.playing {
+                        let _ = hw.codec_write(RT_SPK_VOL, spk_vol_reg(sh.volume));
+                    }
+                }
+                Some(Msg::from_words(0, &[sh.volume as u64]))
+            }
             proto::STATUS => {
                 println!(
-                    "[audio] client {}, tone {}, playing {}, underruns {}, periods {}, max step {}, laps {}",
+                    "[audio] client {}, tone {}, music {}, vol {}%, playing {}, underruns {}, periods {}, max step {}, laps {}",
                     sh.client.is_some(),
                     sh.tone.is_some(),
+                    sh.music.is_some(),
+                    sh.volume,
                     sh.playing,
                     sh.underruns,
                     sh.periods,
@@ -668,6 +892,7 @@ fn main() -> i32 {
                         proto::ST_READY | if sh.playing { proto::ST_PLAYING } else { 0 },
                         sh.underruns as u64,
                         sh.periods as u64,
+                        sh.volume as u64,
                     ],
                 ))
             }

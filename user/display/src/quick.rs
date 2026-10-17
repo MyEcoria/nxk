@@ -47,9 +47,9 @@ impl Ui {
         slider(s, SX, 292, R - 23 - SX, span as u8, true);
         self.zone(Id::QBright, SX - 20, 292 - 26, R - 23 - SX + 40, 52, 8);
 
-        // The codec's volume is not controlled yet: shown, not movable.
-        icon(s, Icon::Speaker, IX, 372, p.faint, p.surface);
-        slider(s, SX, 372, R - 23 - SX, 50, false);
+        icon(s, Icon::Speaker, IX, 372, p.text, p.surface);
+        slider(s, SX, 372, R - 23 - SX, self.cfg.volume, true);
+        self.zone(Id::QVolume, SX - 20, 372 - 26, R - 23 - SX + 40, 52, 8);
 
         let fy = 451;
         s.label(TX, fy, "Flight Mode", Face::Body, p.text);

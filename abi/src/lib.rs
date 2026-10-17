@@ -1199,8 +1199,17 @@ pub mod proto {
         /// both speakers, with no client (the reply comes at once).
         pub const TONE: u32 = 1;
         /// Reply: word 0 = `ST_*` bits, word 1 = underruns (periods the
-        /// ring could not fill), word 2 = periods played.
+        /// ring could not fill), word 2 = periods played, word 3 = speaker
+        /// volume (0..=100 %).
         pub const STATUS: u32 = 2;
+        /// word 0 = speaker volume 0..=100 (%, 0 mutes the speakers), or
+        /// `VOL_GET` to read without changing. Reply: word 0 = volume (0..=100).
+        pub const VOLUME: u32 = 5;
+        /// Start the built-in polyphonic test melody on both speakers.
+        /// Reply: word 0 = duration (ms).
+        pub const MUSIC: u32 = 6;
+        pub const VOL_GET: u64 = u64::MAX;
+        pub const DEFAULT_VOL: u8 = 70;
         /// Codec and hub up.
         pub const ST_READY: u64 = 1;
         /// The DMA is running.

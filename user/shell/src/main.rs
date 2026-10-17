@@ -230,7 +230,9 @@ fn help() {
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
-    println!("  audio [tone [HZ [MS [LEVEL]]]]  codec state; a test tone on the speakers");
+    println!(
+        "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
+    );
     println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels, 3D clear and triangle");
     println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
     println!(
@@ -973,15 +975,31 @@ fn gpu_sweep(argv: &[&str]) {
     let _ = sys::handle_close(h);
 }
 
-/// `audio`: bring the codec up and show the hub; `audio tone [HZ [MS
-/// [LEVEL]]]`: a sine on the speakers (440 Hz, 1000 ms, level 10).
+/// `audio`: bring the codec up and show the hub; `audio volume [PCT]`:
+/// speaker volume (0..100%); `audio music`: polyphonic test melody;
+/// `audio tone [HZ [MS [LEVEL]]]`: a sine on the speakers (440 Hz, 1000 ms, level 25).
 fn audio_cmd(argv: &[&str]) {
     let num = |i: usize, d: u64| argv.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
     let req = match argv.get(1).copied() {
         None | Some("status") => Msg::new(audio::STATUS, 0, 0),
-        Some("tone") => Msg::from_words(audio::TONE, &[num(2, 440), num(3, 1000), num(4, 10)]),
+        Some("music") => Msg::new(audio::MUSIC, 0, 0),
+        Some("volume") | Some("vol") => {
+            let v = match argv.get(2) {
+                None => audio::VOL_GET,
+                Some(s) => match s.parse::<u64>() {
+                    Ok(v) if v <= 100 => v,
+                    _ => {
+                        println!("usage: audio volume [0..100]");
+                        fail(-err::EINVAL);
+                        return;
+                    }
+                },
+            };
+            Msg::from_words(audio::VOLUME, &[v])
+        }
+        Some("tone") => Msg::from_words(audio::TONE, &[num(2, 440), num(3, 1000), num(4, 25)]),
         _ => {
-            println!("usage: audio [status|tone [HZ [MS [LEVEL]]]]");
+            println!("usage: audio [status|volume [0..100]|music|tone [HZ [MS [LEVEL]]]]");
             fail(-err::EINVAL);
             return;
         }
@@ -989,6 +1007,8 @@ fn audio_cmd(argv: &[&str]) {
     let Some(h) = service("audio") else { return };
     match ipc::call(h, &req).and_then(ipc::checked) {
         Ok(m) if req.label() == audio::TONE => println!("audio: tone for {} ms", m.mr[0]),
+        Ok(m) if req.label() == audio::MUSIC => println!("audio: playing melody ({} ms)", m.mr[0]),
+        Ok(m) if req.label() == audio::VOLUME => println!("audio: volume {}%", m.mr[0]),
         Ok(m) => {
             let ready = if m.mr[0] & audio::ST_READY != 0 {
                 "ready"
@@ -1001,8 +1021,8 @@ fn audio_cmd(argv: &[&str]) {
                 ""
             };
             println!(
-                "audio: {}{}, {} underruns, {} periods played",
-                ready, playing, m.mr[1], m.mr[2]
+                "audio: {}{}, volume {}%, {} underruns, {} periods played",
+                ready, playing, m.mr[3], m.mr[1], m.mr[2]
             );
         }
         Err(e) => {

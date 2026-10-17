@@ -64,12 +64,17 @@ pub enum Id {
     // The drawer.
     QSleep,
     QBright,
+    QVolume,
     QFlight,
     QSettings,
     // Settings.
     Cat(usize),
     Theme(bool),
     Bright,
+    Volume,
+    Mute,
+    PlayMusic,
+    PlayTone,
     AutoSleep(usize),
     Flight,
     OpenPage(usize),
@@ -122,6 +127,12 @@ pub enum Action {
     Gpu(u64, bool),
     /// Backlight, %.
     Brightness(u8),
+    /// Speaker volume, % (0..=100).
+    Volume(u8),
+    /// Play the built-in polyphonic test melody.
+    Music,
+    /// Play a 440 Hz reference sine tone.
+    Tone,
     /// A setting changed: write the file soon.
     Save,
     /// Screen off.
@@ -418,7 +429,11 @@ impl Ui {
     }
 
     fn is_slider(id: Id) -> bool {
-        matches!(id, Id::QBright | Id::Bright)
+        matches!(id, Id::QBright | Id::Bright | Id::QVolume | Id::Volume)
+    }
+
+    fn is_volume(id: Id) -> bool {
+        matches!(id, Id::QVolume | Id::Volume)
     }
 
     fn set_brightness(&mut self, pct: u8) -> Option<Action> {
@@ -430,9 +445,24 @@ impl Ui {
         Some(Action::Brightness(pct))
     }
 
-    fn slide(&mut self, x: usize, sx: usize, sw: usize) -> Option<Action> {
+    fn set_volume(&mut self, pct: u8) -> Option<Action> {
+        let pct = pct.min(100);
+        if self.cfg.volume == pct {
+            return None;
+        }
+        self.cfg.volume = pct;
+        Some(Action::Volume(pct))
+    }
+
+    fn slide(&mut self, id: Id, x: usize, sx: usize, sw: usize) -> Option<Action> {
         let rel = x.saturating_sub(sx).min(sw);
-        self.set_brightness((MIN_PCT as usize + (100 - MIN_PCT as usize) * rel / sw.max(1)) as u8)
+        if Self::is_volume(id) {
+            self.set_volume((100 * rel / sw.max(1)) as u8)
+        } else {
+            self.set_brightness(
+                (MIN_PCT as usize + (100 - MIN_PCT as usize) * rel / sw.max(1)) as u8,
+            )
+        }
     }
 
     fn overlay(&self) -> bool {
@@ -449,13 +479,13 @@ impl Ui {
                     let z = self.zones.iter().find(|z| z.id == id)?;
                     let (sx, sw) = (z.x + 20, z.w.saturating_sub(40));
                     self.drag = Some((id, sx, sw));
-                    return self.slide(x, sx, sw);
+                    return self.slide(id, x, sx, sw);
                 }
                 None
             }
             input::TOUCH_MOVE => {
-                if let Some((_, sx, sw)) = self.drag {
-                    return self.slide(x, sx, sw);
+                if let Some((id, sx, sw)) = self.drag {
+                    return self.slide(id, x, sx, sw);
                 }
                 if self.pressed != hit {
                     self.pressed = None;
@@ -488,6 +518,15 @@ impl Ui {
         }
         if let (Some(f), BTN_LEFT | BTN_RIGHT) = (self.focus, code) {
             if Self::is_slider(f) && self.zones.iter().any(|z| z.id == f) {
+                if Self::is_volume(f) {
+                    let v = self.cfg.volume;
+                    let v = if code == BTN_LEFT {
+                        v.saturating_sub(PAD_STEP)
+                    } else {
+                        v.saturating_add(PAD_STEP)
+                    };
+                    return self.set_volume(v).or(Some(Action::Save));
+                }
                 let v = self.cfg.brightness;
                 let v = if code == BTN_LEFT {
                     v.saturating_sub(PAD_STEP)
@@ -602,7 +641,17 @@ impl Ui {
                 self.quick = false;
                 self.go(SETTINGS);
             }
-            Id::QBright | Id::Bright => {}
+            Id::QBright | Id::Bright | Id::QVolume | Id::Volume => {}
+            Id::Mute => {
+                let next = if self.cfg.volume == 0 {
+                    libnx::abi::proto::audio::DEFAULT_VOL
+                } else {
+                    0
+                };
+                return self.set_volume(next);
+            }
+            Id::PlayMusic => return Some(Action::Music),
+            Id::PlayTone => return Some(Action::Tone),
             Id::Theme(light) => return self.set_theme(light),
             Id::QFlight | Id::Flight => {
                 self.cfg.flight = !self.cfg.flight;

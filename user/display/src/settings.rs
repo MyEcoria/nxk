@@ -74,13 +74,70 @@ impl Ui {
         s.label(X, 162, CATS[self.cat], Face::TitleB, p.text);
         match self.cat {
             0 => self.cat_display(s),
-            1 => cat_sound(s),
+            1 => self.cat_sound(s),
             2 => self.cat_network(s, d),
             3 => self.cat_performance(s, d),
             4 => self.cat_power(s, d),
             _ => self.cat_system(s, d),
         }
         self.page_hints(s);
+    }
+
+    fn cat_sound(&mut self, s: &mut Screen) {
+        let p = pal();
+        let vol = self.cfg.volume;
+        let (vtext, vc) = if vol == 0 {
+            ("Muted".into(), p.warn)
+        } else {
+            (format!("{}%", vol), p.good)
+        };
+        row(s, Y, "Speaker Volume", &vtext, vc);
+        icon(s, Icon::Speaker, X + 14, Y + 56, p.text, p.bg);
+        slider(s, X + 52, Y + 56, XR - X - 196, vol, true);
+        self.zone(Id::Volume, X + 32, Y + 30, XR - X - 176, 52, 8);
+        self.chip(
+            s,
+            Id::Mute,
+            XR - 120,
+            Y + 34,
+            120,
+            44,
+            if vol == 0 { "Unmute" } else { "Mute" },
+            vol == 0,
+            true,
+        );
+        rule(s, Y + 104);
+        s.label(X, Y + 140, "Sound Test", Face::Body, p.text);
+        s.label_r(
+            XR,
+            Y + 140,
+            "48 kHz 16-bit stereo via ALC5639 (I2S1)",
+            Face::Cap,
+            p.dim,
+        );
+        let bw = (XR - X - 16) / 2;
+        self.button(
+            s,
+            Id::PlayMusic,
+            X,
+            Y + 174,
+            bw,
+            56,
+            "Play Test Melody",
+            Tone::Accent,
+            true,
+        );
+        self.button(
+            s,
+            Id::PlayTone,
+            X + bw + 16,
+            Y + 174,
+            bw,
+            56,
+            "440 Hz Reference Tone",
+            Tone::Plain,
+            true,
+        );
     }
 
     fn cat_display(&mut self, s: &mut Screen) {
@@ -344,25 +401,4 @@ impl Ui {
             true,
         );
     }
-}
-
-fn cat_sound(s: &mut Screen) {
-    let p = pal();
-    row(s, Y, "Volume", "not adjustable yet", p.dim);
-    icon(s, Icon::Speaker, X + 14, Y + 56, p.faint, p.bg);
-    slider(s, X + 52, Y + 56, XR - X - 72, 50, false);
-    s.label(
-        X,
-        Y + 116,
-        "The audio service plays at a fixed level: the codec's",
-        Face::Cap,
-        p.dim,
-    );
-    s.label(
-        X,
-        Y + 142,
-        "volume control is not written yet.",
-        Face::Cap,
-        p.dim,
-    );
 }
