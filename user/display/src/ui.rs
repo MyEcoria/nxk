@@ -89,6 +89,10 @@ pub enum Id {
     Retry,
     Leave,
     ScanBack,
+    // Controllers.
+    BtPair,
+    /// A paired controller, by its index in `bt_pads`.
+    BtForget(usize),
     LogSize,
     LogClear,
     TermSize,
@@ -140,6 +144,10 @@ pub enum Action {
     Sleep,
     /// Flight mode on or off (`wifi::RADIO`).
     Flight(bool),
+    /// Bluetooth pairing window opened (true) or closed (`bt::PAIR`).
+    BtPair(bool),
+    /// Forget the controller at this address (`bt::FORGET`).
+    BtForget(u64),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -188,6 +196,10 @@ pub struct Ui {
     pub(crate) term_scale: usize,
     pub unread: usize,
     pub(crate) ssid: String,
+    /// The Controllers page as last drawn: pairing under way, and the
+    /// paired controllers' addresses and names.
+    pub(crate) bt_pairing: bool,
+    pub(crate) bt_pads: Vec<(u64, String)>,
     pub(crate) sheet: Option<Sheet>,
     /// The drawer on the right (`+`, `-` or the status).
     pub quick: bool,
@@ -233,6 +245,8 @@ impl Ui {
             term_scale: 1,
             unread: 0,
             ssid: String::new(),
+            bt_pairing: false,
+            bt_pads: Vec::new(),
             sheet: None,
             quick: false,
             fan: Seen::Unknown,
@@ -765,6 +779,20 @@ impl Ui {
                 return Some(Action::Retry);
             }
             Id::ScanBack => self.scan = None,
+            Id::BtPair => return Some(Action::BtPair(!self.bt_pairing)),
+            Id::BtForget(i) => {
+                let (addr, name) = self.bt_pads.get(i)?.clone();
+                self.modal = Some(Modal {
+                    title: alloc::format!("Forget {}?", name),
+                    lines: [
+                        "Pair it again to use it:".into(),
+                        "Pair a Controller, then its sync button.".into(),
+                    ],
+                    ok: "Forget",
+                    tone: Tone::Warn,
+                    action: Action::BtForget(addr),
+                })
+            }
             Id::No => self.modal = None,
             Id::Yes => {
                 let a = self.modal.take().map(|m| m.action);

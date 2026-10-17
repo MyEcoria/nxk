@@ -3,9 +3,12 @@
 //! values: a refresh never waits more than `CALL_NS` on one. The GPU's
 //! come from its stats page, read without asking the service.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{cpufreq, eth, fan, fs, gpu, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{bt, cpufreq, eth, fan, fs, gpu, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::seqpage::SeqPage;
@@ -30,6 +33,7 @@ static USB0: Service = Service::optional("usb0");
 static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
+static BT: Service = Service::optional("bt");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -68,6 +72,57 @@ impl<T> Seen<T> {
             Now::Value(m) => *self = Seen::Value(f(&m)),
             Now::Missing if time::now_ns() > BOOT_NS => *self = Seen::Missing,
             _ => {}
+        }
+    }
+}
+
+/// A paired Bluetooth controller (`bt::LIST`).
+pub struct BtPad {
+    pub addr: u64,
+    pub connected: bool,
+    /// 0..4, or `bt::BATTERY_UNKNOWN`.
+    pub battery: u8,
+    pub name: String,
+}
+
+/// The Bluetooth adapter (`bt::STATUS`) and its controllers.
+pub struct Bt {
+    /// `bt::ST_*`.
+    pub state: u64,
+    /// What the adapter is, or why there is none.
+    pub what: String,
+    pub pads: Vec<BtPad>,
+}
+
+impl Bt {
+    fn from_replies(st: &Msg, list: &Msg) -> Self {
+        let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
+        let n = ipc::unpack_at(st, 4, &mut buf);
+        let what = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let count = ipc::header(list, 0) as usize;
+        let n = ipc::unpack_at(list, 1, &mut buf);
+        let mut pads = Vec::new();
+        let mut at = 0;
+        for _ in 0..count {
+            let Some(rec) = buf[..n].get(at..at + bt::RECORD) else {
+                break;
+            };
+            let len = rec[9] as usize;
+            let Some(name) = buf[..n].get(at + bt::RECORD..at + bt::RECORD + len) else {
+                break;
+            };
+            pads.push(BtPad {
+                addr: rec[..6].iter().rev().fold(0, |w, &b| w << 8 | b as u64),
+                connected: rec[7] != 0,
+                battery: rec[8],
+                name: String::from_utf8_lossy(name).into_owned(),
+            });
+            at += bt::RECORD + len;
+        }
+        Bt {
+            state: ipc::header(st, 0),
+            what,
+            pads,
         }
     }
 }
@@ -306,6 +361,8 @@ pub struct Data {
     /// `power::SUPPLY_*`: battery, or input power on the USB-C port.
     pub supply: Seen<u64>,
     pub battery: Seen<Battery>,
+    /// Asked every refresh: pairing and connections change quickly.
+    pub bt: Seen<Bt>,
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
@@ -349,6 +406,7 @@ impl Data {
             temps: Seen::Unknown,
             supply: Seen::Unknown,
             battery: Seen::Unknown,
+            bt: Seen::Unknown,
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
@@ -412,6 +470,7 @@ impl Data {
         self.supply
             .poll(&POWER, power::SUPPLY, n, force, |m| m.mr[0]);
         self.battery_refresh(n, force);
+        self.bt_refresh();
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
@@ -458,6 +517,16 @@ impl Data {
             Now::Missing => Now::Missing,
         };
         self.wired(n, force);
+    }
+
+    /// The adapter and its controllers. A busy service (bring-up, at
+    /// boot) keeps what was seen.
+    fn bt_refresh(&mut self) {
+        match (ask(&BT, bt::STATUS), ask(&BT, bt::LIST)) {
+            (Now::Value(st), Now::Value(l)) => self.bt = Seen::Value(Bt::from_replies(&st, &l)),
+            (Now::Missing, _) if time::now_ns() > BOOT_NS => self.bt = Seen::Missing,
+            _ => {}
+        }
     }
 
     /// The fuel gauge: a gauge that does not answer (no battery, or

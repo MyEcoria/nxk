@@ -5,7 +5,7 @@ use alloc::format;
 use alloc::string::String;
 
 use libnx::abi::layout::PAGE_SIZE;
-use libnx::abi::proto::power;
+use libnx::abi::proto::{bt, power};
 
 use crate::backlight::MIN_PCT;
 use crate::font::Face;
@@ -16,10 +16,11 @@ use crate::theme::pal;
 use crate::ui::{Id, Ui, HEADER_RULE_Y, LOGS, M, NETWORK, RULE_Y, SYSTEM, TERMINAL, W};
 use crate::widgets::{battery, icon, press, slider, switch, Icon, Tone};
 
-pub const CATS: [&str; 7] = [
+pub const CATS: [&str; 8] = [
     "Display",
     "Sound",
     "Internet",
+    "Controllers",
     "Performance",
     "Power",
     "Battery",
@@ -59,22 +60,22 @@ impl Ui {
     pub(crate) fn settings(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
         for (i, name) in CATS.iter().enumerate() {
-            let y = 126 + i * 70;
+            let y = 120 + i * 64;
             let on = self.cat == i;
             let down = self.pressed == Some(Id::Cat(i));
             if on || down {
-                s.fill_round(M, y, LW, 60, 6, press(p.surface, down));
+                s.fill_round(M, y, LW, 56, 6, press(p.surface, down));
             }
             if on {
-                s.fill_round(M + 10, y + 14, 5, 32, 2, p.accent);
+                s.fill_round(M + 10, y + 12, 5, 32, 2, p.accent);
             }
             let (f, c) = if on {
                 (Face::BodyB, p.accent)
             } else {
                 (Face::Body, p.dim)
             };
-            s.label(M + 32, y + 30, name, f, c);
-            self.zone(Id::Cat(i), M, y, LW, 60, 6);
+            s.label(M + 32, y + 28, name, f, c);
+            self.zone(Id::Cat(i), M, y, LW, 56, 6);
         }
         s.fill(
             M + LW + 22,
@@ -88,9 +89,10 @@ impl Ui {
             0 => self.cat_display(s),
             1 => self.cat_sound(s),
             2 => self.cat_network(s, d),
-            3 => self.cat_performance(s, d),
-            4 => self.cat_power(s, d),
-            5 => self.cat_battery(s, d),
+            3 => self.cat_controllers(s, d),
+            4 => self.cat_performance(s, d),
+            5 => self.cat_power(s, d),
+            6 => self.cat_battery(s, d),
             _ => self.cat_system(s, d),
         }
         self.page_hints(s);
@@ -246,6 +248,117 @@ impl Ui {
             Tone::Accent,
             true,
         );
+    }
+
+    fn cat_controllers(&mut self, s: &mut Screen, d: &Data) {
+        let p = pal();
+        self.bt_pairing = false;
+        self.bt_pads.clear();
+        let b = match &d.bt {
+            Seen::Value(b) => b,
+            Seen::Unknown => {
+                s.label(X, Y, "Starting Bluetooth...", Face::Body, p.dim);
+                return;
+            }
+            Seen::Missing => {
+                row(s, Y, "Bluetooth", "no service", p.warn);
+                return;
+            }
+        };
+        let (st, sc) = match b.state {
+            bt::ST_READY => ("on", p.good),
+            bt::ST_PAIRING => ("looking for controllers", p.accent),
+            bt::ST_STARTING => ("starting", p.dim),
+            _ => ("no adapter", p.warn),
+        };
+        row(s, Y, "Bluetooth", st, sc);
+        // The chip and its firmware, or why there is no adapter.
+        let what: String = b
+            .what
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(84)
+            .collect();
+        s.label(X, Y + 32, &what, Face::Cap, p.dim);
+        let up = b.state == bt::ST_READY || b.state == bt::ST_PAIRING;
+        self.bt_pairing = b.state == bt::ST_PAIRING;
+        self.button(
+            s,
+            Id::BtPair,
+            X,
+            Y + 64,
+            320,
+            56,
+            if self.bt_pairing {
+                "Stop Pairing"
+            } else {
+                "Pair a Controller"
+            },
+            if self.bt_pairing {
+                Tone::Warn
+            } else {
+                Tone::Accent
+            },
+            up,
+        );
+        let hint = if self.bt_pairing {
+            "Hold the sync button: on the rail side of a Joy-Con,"
+        } else {
+            "Joy-Con and Pro Controller: pair once, then any"
+        };
+        let hint2 = if self.bt_pairing {
+            "next to the USB-C port of a Pro Controller."
+        } else {
+            "button press reconnects them."
+        };
+        s.label(X + 344, Y + 82, hint, Face::Cap, p.dim);
+        s.label(X + 344, Y + 106, hint2, Face::Cap, p.dim);
+        rule(s, Y + 140);
+        if b.pads.is_empty() {
+            s.label(X, Y + 176, "No controller paired yet.", Face::Body, p.dim);
+            return;
+        }
+        const ROWS: usize = 4;
+        for (i, pad) in b.pads.iter().take(ROWS).enumerate() {
+            let cy = Y + 176 + i * 52;
+            s.label(X, cy, &pad.name, Face::Body, p.text);
+            let state = match (pad.connected, pad.battery) {
+                (true, bt::BATTERY_UNKNOWN) => "connected".into(),
+                (true, b) => format!("connected, battery {}/4", b),
+                (false, _) => String::from("paired"),
+            };
+            s.label_r(
+                XR - 140,
+                cy,
+                &state,
+                Face::Small,
+                if pad.connected { p.good } else { p.dim },
+            );
+            self.bt_pads.push((pad.addr, pad.name.clone()));
+            self.chip(
+                s,
+                Id::BtForget(i),
+                XR - 120,
+                cy - 20,
+                120,
+                40,
+                "Forget",
+                false,
+                true,
+            );
+            rule(s, cy + 26);
+        }
+        if b.pads.len() > ROWS {
+            s.label(
+                X,
+                Y + 176 + ROWS * 52,
+                &format!("and {} more (bt list in the shell)", b.pads.len() - ROWS),
+                Face::Cap,
+                p.dim,
+            );
+        }
     }
 
     fn cat_performance(&mut self, s: &mut Screen, d: &Data) {

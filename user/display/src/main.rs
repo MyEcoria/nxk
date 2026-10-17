@@ -38,7 +38,9 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV};
 use libnx::abi::proto::gpu as gpuproto;
-use libnx::abi::proto::{audio, console as con, cpufreq, display as proto, fan, gpu, input, wifi};
+use libnx::abi::proto::{
+    audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, wifi,
+};
 use libnx::abi::rights::{DMA, DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
@@ -113,6 +115,7 @@ static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
 static AUDIO: Service = Service::optional("audio");
+static BT: Service = Service::optional("bt");
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -193,6 +196,8 @@ enum Done {
     Gpu(Result<(), i64>),
     /// An audio volume/melody/tone call (`Some(toast)` when user-triggered playback).
     Audio(Result<Option<&'static str>, i64>),
+    /// A Bluetooth call, with the toast it gives when it worked.
+    Bt(Result<&'static str, i64>),
 }
 
 /// A game that took the screen: the images it draws on (block-linear,
@@ -389,6 +394,23 @@ fn work(w: &Worker, notif: u32) -> ! {
                 AUDIO
                     .call(&Msg::from_words(audio::TONE, &[440, 2000, 50]))
                     .map(|_| Some("playing 440 Hz tone (2 s)")),
+            ),
+            Action::BtPair(on) => Done::Bt(
+                BT.call(&Msg::from_words(
+                    bt::PAIR,
+                    &[if on { bt::PAIR_DEFAULT_NS } else { 0 }, 0],
+                ))
+                .map(|_| {
+                    if on {
+                        "Bluetooth: hold the controller's sync button"
+                    } else {
+                        "Bluetooth: pairing stopped"
+                    }
+                }),
+            ),
+            Action::BtForget(addr) => Done::Bt(
+                BT.call(&Msg::from_words(bt::FORGET, &[addr]))
+                    .map(|_| "Bluetooth: controller forgotten"),
             ),
             Action::ClearLogs
             | Action::Launch(_)
@@ -1069,6 +1091,10 @@ fn main() -> i32 {
                                 Err(e) => ui
                                     .toast(format!("gpu clock: {}", libnx::abi::err::name(e)), now),
                             }
+                        }
+                        Done::Bt(Ok(msg)) => ui.toast(msg.into(), now),
+                        Done::Bt(Err(e)) => {
+                            ui.toast(format!("Bluetooth: {}", libnx::abi::err::name(e)), now)
                         }
                         Done::Audio(r) => match r {
                             Ok(Some(msg)) => ui.toast(msg.into(), now),
