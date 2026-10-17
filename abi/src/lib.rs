@@ -1812,6 +1812,10 @@ pub mod proto {
         pub const BTN_RSTICK: u64 = 16;
         pub const BTN_HOME: u64 = 17;
         pub const BTN_CAPTURE: u64 = 18;
+        /// The console's own volume buttons (+ and -); a press repeats
+        /// while held. `display` takes them: they never reach a game.
+        pub const BTN_VOL_UP: u64 = 19;
+        pub const BTN_VOL_DOWN: u64 = 20;
         /// Raw touch coordinates (hekate bdk/input/touch.c): landscape
         /// 1280x720 with the edges cut.
         pub const TOUCH_EDGE: u64 = 15;

@@ -216,14 +216,16 @@ impl TouchIrq {
 
 /// The volume buttons as a gamepad: GPIO X6 (up) and X7 (down), active
 /// low (hekate bdk/input/btn.c), on the same interrupt bank as the
-/// touchscreen's line. Up is LEFT, down is RIGHT; both at once are A.
-/// A button alone waits `CHORD_NS` for the other before it counts, so a
-/// chord does not move first.
+/// touchscreen's line. Up is VOL_UP, down is VOL_DOWN (repeating while
+/// held); both at once are A. A button alone waits `CHORD_NS` for the
+/// other before it counts, so a chord does not change the volume first.
 const VOL_UP: u32 = 1 << 6;
 const VOL_DOWN: u32 = 1 << 7;
 const VOLS: u32 = VOL_UP | VOL_DOWN;
 const GPIO_IN: usize = 0x30;
 const CHORD_NS: u64 = 120_000_000;
+const REPEAT_DELAY_NS: u64 = 450_000_000;
+const REPEAT_NS: u64 = 130_000_000;
 
 struct Keys {
     gpio: Mmio,
@@ -232,6 +234,8 @@ struct Keys {
     cur: u32,
     since: u64,
     emitted: Option<u64>,
+    /// When a held volume button repeats next (0: no repeat).
+    rep: u64,
     /// A chord is held: nothing else until all are up.
     latched: bool,
     /// Buttons that read down at the start (held at boot, or no such pin:
@@ -257,6 +261,7 @@ impl Keys {
             cur: 0,
             since: 0,
             emitted: None,
+            rep: 0,
             latched: false,
             stuck: down,
         }
@@ -291,6 +296,7 @@ impl Keys {
             );
             self.cur = m;
             self.since = now;
+            self.rep = 0;
             if let Some(c) = self.emitted.take() {
                 out.push_back(Self::event(c, false));
             }
@@ -305,19 +311,26 @@ impl Keys {
         if !self.latched && self.emitted.is_none() && self.cur != 0 && now >= self.since + CHORD_NS
         {
             let c = if self.cur == VOL_UP {
-                proto::BTN_LEFT
+                proto::BTN_VOL_UP
             } else {
-                proto::BTN_RIGHT
+                proto::BTN_VOL_DOWN
             };
             self.emitted = Some(c);
+            self.rep = now + REPEAT_DELAY_NS;
+            out.push_back(Self::event(c, true));
+        }
+        if let (Some(c), true) = (self.emitted, self.rep != 0 && now >= self.rep) {
+            self.rep = now + REPEAT_NS;
             out.push_back(Self::event(c, true));
         }
     }
 
-    /// ns until a lone button counts (0: nothing waits).
+    /// ns until a lone button counts or repeats (0: nothing waits).
     fn deadline(&self, now: u64) -> u64 {
         if !self.latched && self.emitted.is_none() && self.cur != 0 {
             (self.since + CHORD_NS).saturating_sub(now).max(1)
+        } else if self.rep != 0 {
+            self.rep.saturating_sub(now).max(1)
         } else {
             0
         }

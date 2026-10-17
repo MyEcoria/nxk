@@ -2,6 +2,7 @@
 //! controller's button glyphs and the icons, all drawn from rounded
 //! rectangles, circles and lines.
 
+use alloc::format;
 use alloc::string::String;
 
 use crate::font::{self, Face};
@@ -287,4 +288,27 @@ pub fn press(c: u32, pressed: bool) -> u32 {
     } else {
         c
     }
+}
+
+/// The volume indicator: a pill at the top center with the speaker, the
+/// level bar and the percentage.
+pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) {
+    let p = pal();
+    let (w, h) = (380, 56);
+    let x = (crate::ui::W - w) / 2;
+    s.shadow(x, y, w, h, h / 2, BLACK);
+    s.fill_round(x, y, w, h, h / 2, p.text);
+    icon(s, Icon::Speaker, x + 40, y + h / 2, p.bg, p.text);
+    if pct == 0 {
+        let (x0, y0) = ((x + 28) as i32, (y + 40) as i32);
+        s.line(x0, y0, x0 + 24, y0 - 24, 3, p.bg);
+    }
+    let (bx, bw) = (x + 76, w - 76 - 88);
+    let cy = y + h / 2;
+    s.fill_round(bx, cy - 3, bw, 7, 3, p.dim);
+    let fw = bw * pct.min(100) as usize / 100;
+    if fw > 0 {
+        s.fill_round(bx, cy - 3, fw.max(7), 7, 3, p.bg);
+    }
+    s.label_r(x + w - 28, cy, &format!("{}%", pct), Face::Body, p.bg);
 }

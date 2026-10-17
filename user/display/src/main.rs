@@ -638,6 +638,17 @@ fn main() -> i32 {
             last_input = time::now_ns();
         }};
     }
+    // Latest volume wins in the worker's queue; the config is saved a bit later.
+    macro_rules! set_volume {
+        ($pct:expr, $now:expr) => {{
+            save_at = $now + 800_000_000;
+            let mut q = worker.jobs.lock();
+            q.retain(|j| !matches!(j, Job::Act(Action::Volume(_))));
+            q.push_back(Job::Act(Action::Volume($pct)));
+            drop(q);
+            worker.wake.notify_one();
+        }};
+    }
     macro_rules! enter_sleep {
         () => {{
             if !sleeping {
@@ -853,6 +864,27 @@ fn main() -> i32 {
                         release_game!();
                     }
                 }
+                // The volume buttons are the console's: the game never sees them.
+                let vol = |e: &Event| {
+                    e.0 == input::KIND_BUTTON
+                        && e.2 == 1
+                        && matches!(e.1, input::BTN_VOL_UP | input::BTN_VOL_DOWN)
+                };
+                let vol_keys: Vec<bool> = batch
+                    .iter()
+                    .filter(|e| vol(e))
+                    .map(|e| e.1 == input::BTN_VOL_UP)
+                    .collect();
+                batch.retain(|e| {
+                    !(e.0 == input::KIND_BUTTON
+                        && matches!(e.1, input::BTN_VOL_UP | input::BTN_VOL_DOWN))
+                });
+                for up in vol_keys {
+                    if let Some(Action::Volume(pct)) = ui.volume_step(up, now) {
+                        set_volume!(pct, now);
+                    }
+                    dirty = true;
+                }
                 if let Some(g) = game.as_mut() {
                     for e in batch {
                         let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]);
@@ -924,12 +956,7 @@ fn main() -> i32 {
                             save_at = now + 800_000_000;
                         }
                         Some(Action::Volume(pct)) => {
-                            save_at = now + 800_000_000;
-                            let mut q = worker.jobs.lock();
-                            q.retain(|j| !matches!(j, Job::Act(Action::Volume(_))));
-                            q.push_back(Job::Act(Action::Volume(pct)));
-                            drop(q);
-                            worker.wake.notify_one();
+                            set_volume!(pct, now);
                         }
                         Some(Action::Save) => {
                             save_at = 0;

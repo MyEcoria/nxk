@@ -21,7 +21,7 @@ use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
 use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
 use crate::theme::{self, pal};
-use crate::widgets::{button_glyph, icon, press, tone_color, Icon, Tone};
+use crate::widgets::{button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
 use crate::Messages;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
@@ -49,6 +49,7 @@ pub const SETTINGS: usize = 5;
 const TOAST_NS: u64 = 4_000_000_000;
 const FAN_STEP: u64 = 10;
 const PAD_STEP: u8 = 5;
+const VOL_HUD_NS: u64 = 1_800_000_000;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Id {
@@ -179,6 +180,8 @@ pub struct Ui {
     pub(crate) pressed: Option<Id>,
     pub(crate) modal: Option<Modal>,
     toast: Option<(String, u64)>,
+    /// When the volume indicator hides (0: not shown).
+    vol_hud: u64,
     pub scan: Option<Vec<ScanNet>>,
     pub busy: bool,
     pub(crate) log_scale: usize,
@@ -223,6 +226,7 @@ impl Ui {
             pressed: None,
             modal: None,
             toast: None,
+            vol_hud: 0,
             scan: None,
             busy: false,
             log_scale: 1,
@@ -367,7 +371,23 @@ impl Ui {
     }
 
     pub fn deadline(&self) -> Option<u64> {
-        self.toast.as_ref().map(|t| t.1)
+        let hud = (self.vol_hud != 0).then_some(self.vol_hud);
+        match (self.toast.as_ref().map(|t| t.1), hud) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A volume button: one step and the indicator (the level may already
+    /// be at its end; the indicator still shows).
+    pub fn volume_step(&mut self, up: bool, now: u64) -> Option<Action> {
+        self.vol_hud = now + VOL_HUD_NS;
+        let v = self.cfg.volume;
+        self.set_volume(if up {
+            v.saturating_add(PAD_STEP)
+        } else {
+            v.saturating_sub(PAD_STEP)
+        })
     }
 
     pub(crate) fn zone(&mut self, id: Id, x: usize, y: usize, w: usize, h: usize, r: usize) {
@@ -817,6 +837,13 @@ impl Ui {
         if self.modal.is_some() {
             self.zones.clear();
             self.modal(s);
+        }
+        if self.vol_hud != 0 {
+            if now >= self.vol_hud {
+                self.vol_hud = 0;
+            } else {
+                volume_hud(s, HEADER_RULE_Y + 16, self.cfg.volume);
+            }
         }
         // The home row shows its own selection.
         if self.page == LIBRARY && !self.overlay() {
