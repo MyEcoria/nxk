@@ -337,6 +337,98 @@ impl Keys {
     }
 }
 
+/// The Power button is not a GPIO: the PMIC reports it in ONOFFSTAT bit
+/// EN0 (MAX77620, I2C5, hekate bdk/utils/btn.c), polled.
+const PMIC_BUS: u8 = 5;
+const PMIC_ADDR: u8 = 0x3C;
+const PMIC_ONOFFSTAT: u8 = 0x15;
+const ONOFFSTAT_EN0: u8 = 1 << 2;
+const PWR_POLL_NS: u64 = 100_000_000;
+/// While it is down, to catch the long press close to its time.
+const PWR_HELD_NS: u64 = 50_000_000;
+/// Failed reads in a row before giving up (no PMIC answering).
+const PWR_FAILS: u32 = 5;
+
+/// Power button: a short press makes `BTN_POWER` when it comes up, a press
+/// held `POWER_LONG_MS` makes `BTN_POWER_LONG` at once (and nothing on
+/// release).
+struct PowerKey {
+    down: bool,
+    since: u64,
+    long: bool,
+    /// Read down at the start (held at boot): ignored until it reads up.
+    stuck: bool,
+    fails: u32,
+    /// When to read next (`u64::MAX`: given up).
+    next: u64,
+}
+
+impl PowerKey {
+    fn new(i2c: &I2c) -> Self {
+        let st = i2c.read_reg(PMIC_BUS, PMIC_ADDR, PMIC_ONOFFSTAT);
+        let (stuck, next) = match st {
+            Ok(v) => (v & ONOFFSTAT_EN0 != 0, 0),
+            Err(e) => {
+                println!("[input] power button unreadable ({})", err::name(e));
+                (false, u64::MAX)
+            }
+        };
+        Self {
+            down: false,
+            since: 0,
+            long: false,
+            stuck,
+            fails: 0,
+            next,
+        }
+    }
+
+    fn update(&mut self, i2c: &I2c, now: u64, out: &mut VecDeque<Event>) {
+        if now < self.next {
+            return;
+        }
+        let Ok(st) = i2c.read_reg(PMIC_BUS, PMIC_ADDR, PMIC_ONOFFSTAT) else {
+            self.fails += 1;
+            self.next = if self.fails >= PWR_FAILS {
+                println!("[input] power button: PMIC does not answer, given up");
+                u64::MAX
+            } else {
+                now + PWR_POLL_NS
+            };
+            return;
+        };
+        self.fails = 0;
+        let raw = st & ONOFFSTAT_EN0 != 0;
+        if !raw {
+            self.stuck = false;
+        }
+        let pressed = raw && !self.stuck;
+        if pressed && !self.down {
+            println!("[input] power button: pressed");
+            self.since = now;
+            self.long = false;
+        } else if !pressed && self.down {
+            println!("[input] power button: released");
+            if !self.long {
+                out.push_back(Keys::event(proto::BTN_POWER, true));
+            }
+        } else if pressed && !self.long && now >= self.since + proto::POWER_LONG_MS * 1_000_000 {
+            self.long = true;
+            out.push_back(Keys::event(proto::BTN_POWER_LONG, true));
+        }
+        self.down = pressed;
+        self.next = now + if pressed { PWR_HELD_NS } else { PWR_POLL_NS };
+    }
+
+    /// ns until the next read (0: given up).
+    fn deadline(&self, now: u64) -> u64 {
+        match self.next {
+            u64::MAX => 0,
+            n => n.saturating_sub(now).max(1),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Event([u64; 5]);
 
@@ -407,6 +499,7 @@ fn main() -> i32 {
             None
         }
     };
+    let mut power_key = PowerKey::new(&i2c);
     let ep = drv::publish("input").expect("input: publish");
     if touch {
         println!(
@@ -451,6 +544,10 @@ fn main() -> i32 {
         {
             wait = if wait == 0 { d } else { wait.min(d) };
         }
+        let d = power_key.deadline(time::now_ns());
+        if d != 0 {
+            wait = if wait == 0 { d } else { wait.min(d) };
+        }
         let mut rx: Option<Received> = match ipc::recv_timeout(ep, wait) {
             Ok(r) => Some(r),
             Err(e) if e == -ETIMEDOUT => None,
@@ -464,6 +561,7 @@ fn main() -> i32 {
         if let Some(k) = keys.as_mut() {
             k.update(time::now_ns(), &mut queue);
         }
+        power_key.update(&i2c, time::now_ns(), &mut queue);
         if polled || irq && line.is_some() {
             let n = q0.min(queue.len());
             down = poll_touch(&i2c, &mut queue, down);

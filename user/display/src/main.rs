@@ -878,6 +878,32 @@ fn main() -> i32 {
                     }
                     dirty = true;
                 }
+                // The Power button is the console's too: a short press
+                // sleeps, a long one opens the Power sheet. A game or a
+                // program owning the screen keeps the screen to itself.
+                let power: Vec<u64> = batch
+                    .iter()
+                    .filter(|e| {
+                        e.0 == input::KIND_BUTTON
+                            && e.2 == 1
+                            && matches!(e.1, input::BTN_POWER | input::BTN_POWER_LONG)
+                    })
+                    .map(|e| e.1)
+                    .collect();
+                batch.retain(|e| {
+                    !(e.0 == input::KIND_BUTTON
+                        && matches!(e.1, input::BTN_POWER | input::BTN_POWER_LONG))
+                });
+                if game.is_none() && !owned {
+                    for code in power {
+                        if code == input::BTN_POWER_LONG {
+                            ui.power_menu();
+                        } else {
+                            enter_sleep!();
+                        }
+                        dirty = true;
+                    }
+                }
                 if let Some(g) = game.as_mut() {
                     for e in batch {
                         let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]);

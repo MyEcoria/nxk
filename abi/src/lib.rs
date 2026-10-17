@@ -1832,6 +1832,12 @@ pub mod proto {
         /// while held. `display` takes them: they never reach a game.
         pub const BTN_VOL_UP: u64 = 19;
         pub const BTN_VOL_DOWN: u64 = 20;
+        /// The Power button (PMIC), sent with value 1 only: `BTN_POWER`
+        /// when released after a short press, `BTN_POWER_LONG` once it
+        /// has been held `POWER_LONG_MS`. `display` takes them too.
+        pub const BTN_POWER: u64 = 21;
+        pub const BTN_POWER_LONG: u64 = 22;
+        pub const POWER_LONG_MS: u64 = 3000;
         /// Raw touch coordinates (hekate bdk/input/touch.c): landscape
         /// 1280x720 with the edges cut.
         pub const TOUCH_EDGE: u64 = 15;

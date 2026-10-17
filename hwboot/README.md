@@ -294,7 +294,13 @@ button counts after 120 ms, so a chord does not move first). The port
 reads 0xC0 at rest on the Switch; **not yet checked with a finger on the
 buttons** (the pins are hekate's `btn.c`'s, from memory: `[input] volume
 buttons: ...` lines on the LOGS page show each press). The Power button
-(PMIC) is not read yet.
+is the PMIC's (MAX77620 ONOFFSTAT bit EN0 on I2C5, as hekate's `btn.c`),
+polled every 100 ms: a short press puts the console to sleep (it wakes
+on the next press or touch), held 3 s it opens the Power sheet (Sleep
+Mode, Restart, Power Off). **Not yet checked on hardware** (`[input]
+power button: pressed/released` lines on the LOGS page); in the
+emulator, `nxdbg.py button POWER` and `POWER_LONG` stand in for it. A
+game or program owning the screen ignores it.
 
 Gamepad (or `nxdbg.py button`): left and right choose a card, A plays;
 touch: a tap chooses, a second tap plays. In a game `display` hands out

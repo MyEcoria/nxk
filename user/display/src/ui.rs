@@ -784,6 +784,15 @@ impl Ui {
         self.sheet = Some(Sheet::Power);
     }
 
+    /// The Power button held: the Power sheet over whatever is open, its
+    /// first button (Sleep Mode) focused for the pad.
+    pub(crate) fn power_menu(&mut self) {
+        self.quick = false;
+        self.modal = None;
+        self.open_power();
+        self.focus = Some(Id::SleepNow);
+    }
+
     pub(crate) fn set_theme(&mut self, light: bool) -> Option<Action> {
         if self.cfg.light == light {
             return None;

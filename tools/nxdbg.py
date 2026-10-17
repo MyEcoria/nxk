@@ -12,7 +12,7 @@ Standard library only.
     nxdbg.py swipe 1000 300 200 300 400   # x1 y1 x2 y2 [ms]
     nxdbg.py button A                     # A B X Y L R ZL ZR PLUS MINUS
                                           # UP DOWN LEFT RIGHT LSTICK RSTICK
-                                          # HOME CAPTURE VOL_UP VOL_DOWN, [hold ms]
+                                          # HOME CAPTURE VOL_UP VOL_DOWN POWER POWER_LONG, [hold ms]
     nxdbg.py tap 640 360 wait 0.5 shot after.png    # chained, in order
     nxdbg.py --emu /tmp/usb.sock shot out.png       # tegra_qemu's USB port
 """
@@ -28,7 +28,8 @@ DONE, MORE, ERROR = 0, 1, 2
 # nxk_abi::proto::input
 TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP = 1, 2, 3
 BUTTONS = ["A", "B", "X", "Y", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "UP",
-           "DOWN", "LEFT", "RIGHT", "LSTICK", "RSTICK", "HOME", "CAPTURE", "VOL_UP", "VOL_DOWN"]
+           "DOWN", "LEFT", "RIGHT", "LSTICK", "RSTICK", "HOME", "CAPTURE", "VOL_UP", "VOL_DOWN",
+           "POWER", "POWER_LONG"]
 # Bytes held back by usbcon after the terminal opens (100 ms), and a margin.
 SETTLE = 0.3
 
