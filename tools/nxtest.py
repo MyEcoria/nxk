@@ -8,6 +8,7 @@
     nxtest.py --dbg "tap 640 670 shot net.png"   # debug channel (nxdbg.py) over the USB-C console
     nxtest.py --tap 640,670:home.ppm     # touch the screen at (x, y), then capture it
     nxtest.py --usb-net share --usb-cmd "nettest ping 10.42.0.1"   # the PC shares its connection
+    nxtest.py --bt -c "bt pair 10" -c "bt list"   # emulated BCM4356 and Pro Controller on UART-D
 
 UART-A console is bound to a socket: the script reads everything from the
 first kernel byte and types commands like a user. Exit code 1 if a command
@@ -20,6 +21,7 @@ sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True
 import usbterm  # noqa: E402  (console output filter, USB-C host)
 import nxdbg  # noqa: E402  (debug channel: screen capture, touch, gamepad)
+import btfake  # noqa: E402  (emulated Bluetooth controller on UART-D)
 # UART output shown without the console's log marks (logs kept).
 SHOWN = usbterm.Logs(True)
 ROOT = os.path.dirname(HERE)
@@ -223,6 +225,8 @@ def main():
                          "connection (10.42.0.1), or answers nothing")
     ap.add_argument("--tap", action="append", default=[], metavar="X,Y[:OUT.ppm]",
                     help="touch the screen at landscape (X, Y) after the commands, then capture it")
+    ap.add_argument("--bt", action="store_true",
+                    help="emulated BCM4356 on UART-D with a Pro Controller in pairing mode (btfake.py)")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
@@ -230,6 +234,7 @@ def main():
     usb = os.path.join(tmp, "usb.sock")
     mon = os.path.join(tmp, "mon.sock")
     qmp = os.path.join(tmp, "qmp.sock")
+    bt = os.path.join(tmp, "bt.sock")
     cmd = [
         QEMU, "-machine", a.machine, "-m", "4G", "-display", "none",
         "-device", f"loader,file={a.kernel}",
@@ -242,10 +247,12 @@ def main():
         "-global", "driver=tegra.evp,property=cpu-reset-vector,value=0x80000000",
     ]) + [
         "-chardev", f"socket,id=uarta,path={uart},server=on,wait=on",
-        "-serial", "chardev:uarta", "-serial", "null", "-serial", "null", "-serial", "null",
+        "-serial", "chardev:uarta", "-serial", "null", "-serial", "null",
+        "-serial", "chardev:uartd" if a.bt else "null",
         "-monitor", f"unix:{mon},server,nowait",
         "-qmp", f"unix:{qmp},server,nowait",
-    ] + (["-drive", f"if=sd,index=0,format=raw,file={a.sd}"] if a.sd else []) \
+    ] + (["-chardev", f"socket,id=uartd,path={bt},server=on,wait=off"] if a.bt else []) \
+      + (["-drive", f"if=sd,index=0,format=raw,file={a.sd}"] if a.sd else []) \
       + (["-global", "driver=tegra.xusb,property=slots,value=8"] if a.usb_kbd or a.net is not None else []) \
       + (["-device", "usb-kbd,bus=usb-bus.2"] if a.usb_kbd else []) \
       + (["-chardev", f"socket,id=usbotg,path={usb},server=on,wait=off"]
@@ -256,6 +263,10 @@ def main():
     log = open(os.path.join(tmp, "qemu.log"), "wb")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     ok = True
+    fake = None
+    if a.bt:
+        fake = btfake.Fake(bt)
+        fake.start()
     try:
         s = socket.socket(socket.AF_UNIX)
         for _ in range(100):
@@ -331,6 +342,8 @@ def main():
                 time.sleep(0.5)
         if a.screendump:
             screendump(mon, a.screendump)
+        if fake:
+            print(f"[nxtest] emulated Bluetooth controller: {fake.summary()}")
     finally:
         try:
             m = socket.socket(socket.AF_UNIX)
