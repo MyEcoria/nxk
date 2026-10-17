@@ -192,6 +192,10 @@ class Fake:
             ok = bytes(p[6:22]) == KEY
             self.stats["key_ok"] = ok
             self.event(0x06, bytes([0 if ok else 0x06]) + struct.pack("<H", HANDLE))
+            if ok and self.incoming:
+                # A reconnecting pad encrypts and opens its channels itself.
+                self.event(0x08, b"\x00" + struct.pack("<H", HANDLE) + b"\x01")
+                self.later(0.1, lambda: self.open(0x11))
         elif op == 0x040C:   # no key: Secure Simple Pairing
             self.complete(op, b"\x00" + PAD_ADDR)
             self.event(0x31, PAD_ADDR)
@@ -208,8 +212,10 @@ class Fake:
         elif op == 0x0413:   # encryption on
             self.status(op)
             self.event(0x08, b"\x00" + struct.pack("<H", HANDLE) + b"\x01")
-            if self.incoming:
-                self.later(0.1, lambda: self.open(0x11))
+        elif op == 0x0803:   # sniff mode: granted at the asked interval
+            self.status(op)
+            self.event(0x14, b"\x00" + struct.pack("<H", HANDLE) + b"\x02" + bytes(p[2:4]))
+            self.stats["sniff"] = self.stats.get("sniff", 0) + 1
         elif op == 0x0406:   # disconnect
             self.status(op)
             self.dropped(p[2])
@@ -220,6 +226,9 @@ class Fake:
         self.reset_state()
         self.connected = True
         self.event(0x03, b"\x00" + struct.pack("<H", HANDLE) + PAD_ADDR + b"\x01\x00")
+        if self.incoming:
+            # A paired pad authenticates its host: link key asked.
+            self.later(0.02, lambda: self.event(0x17, PAD_ADDR))
 
     def dropped(self, reason):
         if self.connected:
@@ -340,4 +349,4 @@ class Fake:
         s = self.stats
         return (f"bytes {s.get('bytes', 0)}, commands {s['commands']}, patch records {s['patch']}, paired {s['pairs']}, "
                 f"reports {s['reports']}, subcommands {[hex(x) for x in s['subcmds']]}, "
-                f"reconnects {s['reconnects']}, link key {'checked' if s['key_ok'] else s['key_ok']}")
+                f"reconnects {s['reconnects']}, sniff {s.get('sniff', 0)}, link key {'checked' if s['key_ok'] else s['key_ok']}")
