@@ -59,7 +59,7 @@ git ignores.
 3. Firmware: `./hwboot/nxfw-extract.py wlan <that main> -o firmware`,
    and the same with `bluetooth` for `BCM4356A3.hcd`.
 4. Card: `./hwboot/mksd-hw.sh /mount/point firmware` copies them to
-   `/firmware/brcm`, where `wlan` looks for them.
+   `/firmware/brcm`, where `wlan` and `bluetooth` look for them.
 
 `main` is the title's NSO image and `nxfw-extract.py` reads it directly,
 so neither hactool nor nx2elf is needed; the markers it looks for come
@@ -69,7 +69,7 @@ from nx-fwextract (perillamint, GPL-3.0). What comes out:
 |---|---|
 | `brcmfmac4356-pcie.bin` | firmware, ~570 KiB, version `4356a3-roml/pcie-ag-msgbuf-...` |
 | `brcmfmac4356-pcie.txt` | NVRAM of the board (`boardtype=0x074a` on an Erista) |
-| `BCM4356A3.hcd` | Bluetooth firmware, unused so far |
+| `BCM4356A3.hcd` | Bluetooth patch RAM, loaded by `bluetooth` over UART-D |
 
 That version string is also the answer to two design questions: the chip
 talks over PCIe, and its data path is Broadcom's msgbuf ring protocol.
@@ -362,6 +362,33 @@ for it (`mkbl31.py`): the monitor copies the kernel with the size baked
 into it, and a larger kernel loaded by an older `bl31.bin` loses its
 tail (run 18: a kernel panic in `objtab.rs`). A 2 MB kernel takes about
 5 s (each 512-character line is echoed back before the next).
+
+## Bluetooth controllers
+
+`bluetooth` starts at boot (init's driver list): the first run needs a
+boot image written with `mksd-hw.sh`, with `BCM4356A3.hcd` in the
+firmware directory (see "Wi-Fi firmware"). Then, over the USB-C console:
+
+```text
+bt status     # state ready, adapter BCM4356A? ..., BCM4356A3.hcd loaded, ... at 3000000 baud
+bt pair       # 30 s: hold the controller's sync button
+bt list       # paired controllers, connected or not, battery
+```
+
+The sync button is the small one on a Joy-Con's rail side, between SL
+and SR, and on top of a Pro Controller next to its USB-C port; the
+player lights sweep while it looks for a console, and the first one
+stays lit once paired. A paired controller reconnects when one of its
+buttons is pressed. System Settings, Controllers does the same from the
+screen (Pair a Controller, Forget). Keys and the adapter's address are
+in `/config/bt.cfg`; `bt forget all` drops them (unpair on the
+controller side by pairing it with another console).
+
+When `bt status` says no adapter, its line names the step: no answer
+to the reset at 115200 baud (UART-D pads, BT_RST on PH4, the chip's
+32 kHz clock), a patch record refused, or 3 Mbaud failing (it then
+stays at 115200). `bt retry` power-cycles the core and starts again;
+after a change, `./tools/usbterm.py --reload bluetooth -c "bt status"`.
 
 ## Fan
 
