@@ -1,0 +1,8 @@
+[package]
+name = "bluetooth"
+version = "0.1.0"
+edition = "2021"
+description = "Bluetooth controllers: the BCM4356 on UART-D, Joy-Cons and Pro Controllers"
+
+[dependencies]
+libnx = { path = "../libnx" }

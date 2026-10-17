@@ -231,6 +231,22 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 6,
     },
+    // Bluetooth: UART-D (the UART page), pinmux and GPIO (BT_RST H4, wake
+    // lines H3 / H5); IRQ: SPI 90 (UART-D). Clock through clk, firmware
+    // and pairing keys through fs.
+    Driver {
+        name: "bluetooth",
+        mmio: &[
+            (0x7000_6000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+        ],
+        ro_mmio: &[],
+        irqs: &[122],
+        sysctl: false,
+        console: 0,
+        prio: 8,
+    },
     // GPU: BAR0 (priv registers), the start of BAR1 (the channel's
     // USERD); fuses (SKU, GPU speedo, PLL calibration) and APB_MISC
     // (chip revision) read-only. IRQs: SPI 157 (stall), 158 (nonstall).

@@ -1741,6 +1741,46 @@ pub mod proto {
         pub const BADGE_LINK: u64 = 1;
         pub const BADGE_CTRL: u64 = 2;
     }
+    /// Bluetooth controllers (`bluetooth`), published as "bt": the
+    /// BCM4356's Bluetooth half on UART-D, Joy-Cons and Pro Controllers
+    /// paired with their sync button. Addresses are the 6 bytes of a
+    /// BD_ADDR in a word, the first byte printed (most significant) in
+    /// bits 40-47.
+    pub mod bt {
+        /// Reply: words = state (`ST_*`), controllers connected,
+        /// controllers paired, the adapter's address; bytes = what the
+        /// adapter is (chip, firmware), or the step where bring-up stopped.
+        pub const STATUS: u32 = 1;
+        /// Look for controllers in pairing mode (sync button held) for
+        /// word 0 ns (0: `PAIR_DEFAULT_NS`; with word 1 = 0, a window of
+        /// 0 ends pairing). Word 1 = 1: reply once one is paired (word 0 =
+        /// its address, bytes = its name) or with `ETIMEDOUT`; 0: reply at
+        /// once, `LIST` tells what was paired.
+        pub const PAIR: u32 = 2;
+        /// Paired controllers. Reply: word 0 = count; bytes = that many
+        /// records: `RECORD` bytes (address, `KIND_*`, connected, battery
+        /// 0..4 or `BATTERY_UNKNOWN`, name length) then the name.
+        pub const LIST: u32 = 3;
+        /// Forget the controller at address word 0 (0: all of them): its
+        /// link key is dropped, a connection closed.
+        pub const FORGET: u32 = 4;
+        /// Run the bring-up again (power cycle, firmware). Reply as STATUS.
+        pub const RETRY: u32 = 5;
+        pub const PAIR_DEFAULT_NS: u64 = 30_000_000_000;
+        /// No adapter (no answer on UART-D, or bring-up failed).
+        pub const ST_DOWN: u64 = 0;
+        pub const ST_STARTING: u64 = 1;
+        pub const ST_READY: u64 = 2;
+        pub const ST_PAIRING: u64 = 3;
+        pub const RECORD: usize = 10;
+        pub const KIND_UNKNOWN: u8 = 0;
+        pub const KIND_JOYCON_L: u8 = 1;
+        pub const KIND_JOYCON_R: u8 = 2;
+        pub const KIND_PRO: u8 = 3;
+        pub const BATTERY_UNKNOWN: u8 = 0xFF;
+        /// Longest name kept (Bluetooth names go up to 248 bytes).
+        pub const MAX_NAME: usize = 32;
+    }
     /// TCP/IP stack (IPv4). 32-bit addresses, `a.b.c.d` = `a << 24 | ...`
     /// (like `u32::from(Ipv4Addr)`). Timeouts in ns (0: no limit).
     pub mod net {
