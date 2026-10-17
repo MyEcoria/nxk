@@ -13,9 +13,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use libnx::abi::proto::joycon as proto;
 use libnx::abi::proto::{clk, fan, input};
 use libnx::drv::{self, Mmio};
-use libnx::ipc::Msg;
+use libnx::ipc::{self, Msg};
 use libnx::jc;
 use libnx::ns::Service;
 use libnx::{println, time};
@@ -173,8 +174,8 @@ impl Side {
     }
     fn pad(self) -> jc::Pad {
         match self {
-            Side::Right => jc::Pad::right(),
-            Side::Left => jc::Pad::left(),
+            Side::Right => jc::Pad::right().source(input::SRC_RAIL_R),
+            Side::Left => jc::Pad::left().source(input::SRC_RAIL_L),
         }
     }
 }
@@ -406,6 +407,8 @@ struct Jc {
     /// This side's buttons and stick.
     pad: jc::Pad,
     announced: bool,
+    /// Last battery level read (0..4, `joycon::BATTERY_UNKNOWN`).
+    battery: u64,
     polls: u32,
     replies: u32,
     latency_us: u64,
@@ -429,6 +432,7 @@ impl Jc {
             awaiting: None,
             pad: side.pad(),
             announced: false,
+            battery: proto::BATTERY_UNKNOWN,
             polls: 0,
             replies: 0,
             latency_us: 0,
@@ -579,11 +583,20 @@ impl Jc {
     }
 
     /// Back to nothing held and a centred stick.
-    fn release(&mut self, out: &mut Vec<[u64; 5]>) {
+    fn release(&mut self, out: &mut Vec<[u64; input::WORDS]>) {
         self.pad.release(out);
+        self.battery = proto::BATTERY_UNKNOWN;
     }
 
-    fn apply(&mut self, r: &jc::Report, out: &mut Vec<[u64; 5]>) {
+    fn state(&self) -> u64 {
+        match (self.present, self.ready) {
+            (false, _) => proto::ST_ABSENT,
+            (true, false) => proto::ST_ATTACHED,
+            (true, true) => proto::ST_READY,
+        }
+    }
+
+    fn apply(&mut self, r: &jc::Report, out: &mut Vec<[u64; input::WORDS]>) {
         self.pad.apply(r, "joycon", self.side.name(), out);
     }
 }
@@ -593,7 +606,7 @@ fn set_rail(side: Side, on: bool) -> Result<(), i64> {
         .map(|_| ())
 }
 
-fn flush(out: &mut Vec<[u64; 5]>) {
+fn flush(out: &mut Vec<[u64; input::WORDS]>) {
     for e in out.drain(..) {
         let _ = INPUT.call_timeout(&Msg::from_words(input::INJECT, &e), 100_000_000);
     }
@@ -636,8 +649,9 @@ fn main() -> i32 {
         }
     }
     println!("[joycon] rails on, waiting for Joy-Cons");
+    let ep = drv::publish("joycon").ok();
 
-    let mut out: Vec<[u64; 5]> = Vec::new();
+    let mut out: Vec<[u64; input::WORDS]> = Vec::new();
     let mut rail_at = time::now_ns() + RAIL_REFRESH_NS;
     let mut raw_last = (false, false);
     loop {
@@ -731,6 +745,7 @@ fn main() -> i32 {
                     jc.replies += 1;
                     jc.last_rx = now;
                     jc.awaiting = None;
+                    jc.battery = (rep.battery as u64 >> 1).min(4);
                     if !jc.announced {
                         jc.announced = true;
                         println!(
@@ -772,10 +787,29 @@ fn main() -> i32 {
         }
         flush(&mut out);
 
+        // Until the next poll, STATUS requests (the screen's controller
+        // list) are answered.
         let next = tick + POLL_NS;
-        let now = time::now_ns();
-        if next > now {
-            time::sleep_us((next - now) / 1000);
+        loop {
+            let now = time::now_ns();
+            if now >= next {
+                break;
+            }
+            let Some(ep) = ep else {
+                time::sleep_us((next - now) / 1000);
+                break;
+            };
+            let Ok(rx) = ipc::recv_timeout(ep, next - now) else {
+                continue;
+            };
+            let reply = match rx.msg.label() {
+                proto::STATUS => {
+                    let (r, l) = (&jcs[0], &jcs[1]);
+                    Msg::from_words(0, &[l.state(), r.state(), l.battery, r.battery])
+                }
+                _ => Msg::error(-libnx::abi::err::EINVAL),
+            };
+            let _ = ipc::reply_to(rx.token, &reply);
         }
     }
 }

@@ -258,7 +258,7 @@ fn list(a: &Adapter) -> Msg {
     ipc::pack_at(0, &[n], &b)
 }
 
-fn flush(events: &mut Vec<[u64; 5]>) {
+fn flush(events: &mut Vec<[u64; input::WORDS]>) {
     for e in events.drain(..) {
         let _ = INPUT.call_timeout(&Msg::from_words(input::INJECT, &e), 100_000_000);
     }

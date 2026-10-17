@@ -129,14 +129,14 @@ impl Stick {
         }
     }
 
-    fn release(&mut self, out: &mut Vec<[u64; 5]>) {
+    fn release(&mut self, src: u64, out: &mut Vec<[u64; input::WORDS]>) {
         if self.sent != (0, 0) {
-            out.push([input::KIND_STICK, self.code, 0, 0, 0]);
+            out.push([input::KIND_STICK, self.code, 0, 0, 0, src]);
         }
         *self = Stick::new(self.code);
     }
 
-    fn feed(&mut self, raw: (i64, i64), tag: &str, who: &str, out: &mut Vec<[u64; 5]>) {
+    fn feed(&mut self, raw: (i64, i64), src: u64, tag: &str, who: &str, out: &mut Vec<[u64; input::WORDS]>) {
         if self.samples < CENTER_SAMPLES {
             // The rest position (units differ by hundreds): a run of
             // reports that hardly move, else the middle after a while.
@@ -173,7 +173,7 @@ impl Stick {
         let rest = v == (0, 0) && self.sent != (0, 0);
         if moved || rest {
             self.sent = v;
-            out.push([input::KIND_STICK, self.code, 0, v.0 as u64, v.1 as u64]);
+            out.push([input::KIND_STICK, self.code, 0, v.0 as u64, v.1 as u64, src]);
         }
     }
 }
@@ -186,6 +186,8 @@ pub struct Pad {
     right: Option<Stick>,
     buttons: u32,
     traced: u32,
+    /// `input::SRC_*` stamped on the events.
+    src: u64,
 }
 
 impl Pad {
@@ -204,7 +206,14 @@ impl Pad {
             },
             buttons: 0,
             traced: 0,
+            src: input::SRC_NONE,
         }
+    }
+
+    /// The controller these events come from (`input::SRC_*`).
+    pub const fn source(mut self, src: u64) -> Self {
+        self.src = src;
+        self
     }
 
     /// Left Joy-Con, right Joy-Con, or both halves (Pro Controller).
@@ -228,23 +237,31 @@ impl Pad {
     }
 
     /// Back to nothing held and centred sticks (centres found again).
-    pub fn release(&mut self, out: &mut Vec<[u64; 5]>) {
+    pub fn release(&mut self, out: &mut Vec<[u64; input::WORDS]>) {
         for &(_, code) in BUTTONS.iter().filter(|b| b.0 & self.buttons != 0) {
-            out.push([input::KIND_BUTTON, code, 0, 0, 0]);
+            out.push([input::KIND_BUTTON, code, 0, 0, 0, self.src]);
         }
         self.buttons = 0;
+        let src = self.src;
         for s in [&mut self.left, &mut self.right].into_iter().flatten() {
-            s.release(out);
+            s.release(src, out);
         }
     }
 
     /// Events for what changed since the last report; `tag` and `who`
     /// name the controller in the log.
-    pub fn apply(&mut self, r: &Report, tag: &str, who: &str, out: &mut Vec<[u64; 5]>) {
+    pub fn apply(&mut self, r: &Report, tag: &str, who: &str, out: &mut Vec<[u64; input::WORDS]>) {
         let now = r.buttons & self.mask;
         let changed = now ^ self.buttons;
         for &(bit, code) in BUTTONS.iter().filter(|b| b.0 & changed != 0) {
-            out.push([input::KIND_BUTTON, code, (now & bit != 0) as u64, 0, 0]);
+            out.push([
+                input::KIND_BUTTON,
+                code,
+                (now & bit != 0) as u64,
+                0,
+                0,
+                self.src,
+            ]);
         }
         if changed != 0 && self.traced < TRACE_BUTTONS {
             self.traced += 1;
@@ -254,11 +271,12 @@ impl Pad {
             );
         }
         self.buttons = now;
+        let src = self.src;
         if let Some(s) = self.left.as_mut() {
-            s.feed(r.left, tag, who, out);
+            s.feed(r.left, src, tag, who, out);
         }
         if let Some(s) = self.right.as_mut() {
-            s.feed(r.right, tag, who, out);
+            s.feed(r.right, src, tag, who, out);
         }
     }
 }

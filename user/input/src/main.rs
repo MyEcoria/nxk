@@ -272,7 +272,7 @@ impl Keys {
     }
 
     fn event(code: u64, down: bool) -> Event {
-        Event([proto::KIND_BUTTON, code, down as u64, 0, 0])
+        Event([proto::KIND_BUTTON, code, down as u64, 0, 0, proto::SRC_NONE])
     }
 
     /// Read the buttons; the events they make go to `out`.
@@ -430,7 +430,7 @@ impl PowerKey {
 }
 
 #[derive(Clone, Copy)]
-struct Event([u64; 5]);
+struct Event([u64; proto::WORDS]);
 
 /// `e` is of a kind in `mask` (`1 << KIND_*`; 0: all).
 fn wants(mask: u64, e: &Event) -> bool {
@@ -438,8 +438,8 @@ fn wants(mask: u64, e: &Event) -> bool {
 }
 
 fn reply(e: Event) -> Msg {
-    let mut m = Msg::new(0, 5, 0);
-    m.mr[..5].copy_from_slice(&e.0);
+    let mut m = Msg::new(0, proto::WORDS, 0);
+    m.mr[..proto::WORDS].copy_from_slice(&e.0);
     m
 }
 
@@ -464,7 +464,7 @@ fn poll_touch(i2c: &I2c, out: &mut VecDeque<Event>, mut down: bool) -> bool {
         let x = (ev[1] as u64) << 4 | (ev[3] >> 4) as u64;
         let y = (ev[2] as u64) << 4 | (ev[3] & 0xF) as u64;
         down = code != proto::TOUCH_UP;
-        out.push_back(Event([proto::KIND_TOUCH, code, finger, x, y]));
+        out.push_back(Event([proto::KIND_TOUCH, code, finger, x, y, proto::SRC_NONE]));
     }
     down
 }
@@ -606,8 +606,10 @@ fn main() -> i32 {
                     }
                 }
                 proto::INJECT => {
-                    let mut e = [0u64; 5];
-                    e.copy_from_slice(&rx.msg.mr[..5]);
+                    // Older drivers send five words: no source.
+                    let mut e = [0u64; proto::WORDS];
+                    let n = rx.msg.words().min(proto::WORDS);
+                    e[..n].copy_from_slice(&rx.msg.mr[..n]);
                     queue.push_back(Event(e));
                     let _ = ipc::reply(&Msg::new(0, 0, 0));
                 }

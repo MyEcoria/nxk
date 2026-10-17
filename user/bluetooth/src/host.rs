@@ -9,13 +9,13 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::proto::bt;
+use libnx::abi::proto::{bt, input};
 use libnx::jc;
 use libnx::{println, time};
 
 use crate::bcm::{self, Chip};
 use crate::hci::{self, le16, Hci, Packet, PB_CONT};
-use crate::store::{addr_str, Addr, Store};
+use crate::store::{addr_str, addr_word, Addr, Store};
 
 /// General inquiry access code, 0x9E8B33.
 const GIAC: [u8; 3] = [0x33, 0x8B, 0x9E];
@@ -211,12 +211,13 @@ pub fn kind_name(k: u8) -> &'static str {
 }
 
 /// The buttons and sticks a kind owns; unknown ones get both halves.
-fn pad_for(kind: u8) -> jc::Pad {
-    match kind {
+fn pad_for(kind: u8, addr: &Addr) -> jc::Pad {
+    let pad = match kind {
         bt::KIND_JOYCON_L => jc::Pad::left(),
         bt::KIND_JOYCON_R => jc::Pad::right(),
         _ => jc::Pad::pro(),
-    }
+    };
+    pad.source(input::SRC_BT | addr_word(addr))
 }
 
 /// Peripheral, joystick or gamepad (class of device), or a name that
@@ -265,7 +266,7 @@ pub struct Host {
     /// it was sent.
     naming: Option<([u8; 13], u64)>,
     /// For `input`.
-    pub events: Vec<[u64; 5]>,
+    pub events: Vec<[u64; input::WORDS]>,
     /// Paired during the current window: address, name.
     pub paired: Vec<(Addr, String)>,
 }
@@ -1069,7 +1070,7 @@ impl Host {
         } else if psm == PSM_HID_INTERRUPT {
             let c = &mut self.conns[i];
             c.open_at = 0;
-            c.pad = pad_for(c.kind);
+            c.pad = pad_for(c.kind, &c.addr);
             c.step = 0;
             c.tries = 0;
             self.send_step(i);
@@ -1169,7 +1170,7 @@ impl Host {
                     if k != c.kind {
                         c.pad.release(&mut self.events);
                         c.kind = k;
-                        c.pad = pad_for(k);
+                        c.pad = pad_for(k, &c.addr);
                     }
                     println!(
                         "[bt] {}: {}, firmware {}.{:02x}",

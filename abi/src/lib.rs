@@ -1651,7 +1651,7 @@ pub mod proto {
         /// The game is done: the UI comes back (also when it exits).
         pub const RELEASE: u32 = 6;
         /// The next input event routed to the game (`input::READ`'s
-        /// reply: kind, code, value, x, y; raw touch coordinates), waiting
+        /// reply: kind, code, value, x, y, source; raw touch coordinates), waiting
         /// up to word 0 ns (0: no limit). While a game has the screen the
         /// UI reads none.
         pub const EVENT: u32 = 7;
@@ -1745,6 +1745,17 @@ pub mod proto {
         pub const BADGE_LINK: u64 = 1;
         pub const BADGE_CTRL: u64 = 2;
     }
+    /// Joy-Cons on the rails (`joycon`), published as "joycon".
+    pub mod joycon {
+        /// Reply: words = left state, right state (`ST_*`), left
+        /// battery, right battery (0..4 or `BATTERY_UNKNOWN`).
+        pub const STATUS: u32 = 1;
+        pub const ST_ABSENT: u64 = 0;
+        /// Attached, handshake not done (or failing).
+        pub const ST_ATTACHED: u64 = 1;
+        pub const ST_READY: u64 = 2;
+        pub const BATTERY_UNKNOWN: u64 = 0xFF;
+    }
     /// Bluetooth controllers (`bluetooth`), published as "bt": the
     /// BCM4356's Bluetooth half on UART-D, Joy-Cons and Pro Controllers
     /// paired with their sync button. Addresses are the 6 bytes of a
@@ -1831,12 +1842,24 @@ pub mod proto {
     }
     /// Input events.
     pub mod input {
-        /// Wait for the next event. Reply: kind, code, value, x, y.
+        /// Wait for the next event. Reply: kind, code, value, x, y, source
+        /// (`SRC_*`: the controller it came from).
         /// Request word 0: timeout ns (0: no limit); word 1: kinds
         /// wanted, `1 << KIND_*` each (0 or absent: all).
         pub const READ: u32 = 1;
-        /// Event from another driver (USB keyboard...): same words.
+        /// Event from another driver (USB keyboard...): same words; a
+        /// sixth word missing is `SRC_NONE`.
         pub const INJECT: u32 = 2;
+        /// Source word: not a controller (touch, keyboard, the console's
+        /// own buttons, the debug channel).
+        pub const SRC_NONE: u64 = 0;
+        /// The Joy-Cons on the rails.
+        pub const SRC_RAIL_L: u64 = 1;
+        pub const SRC_RAIL_R: u64 = 2;
+        /// A Bluetooth controller: `SRC_BT` | its address (`bt` word).
+        pub const SRC_BT: u64 = 1 << 63;
+        /// Words in an event.
+        pub const WORDS: usize = 6;
         pub const KIND_KEY: u64 = 1;
         pub const KIND_TOUCH: u64 = 2;
         pub const KIND_BUTTON: u64 = 3;
