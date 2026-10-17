@@ -400,7 +400,7 @@ const AUDIO: [Clock; 5] = [
     },
 ];
 
-/// UART B (bank L bit 7) and C (bank H bit 23): PLLP_OUT0 (408 MHz)
+/// UART B (bank L bit 7), C (bank H bit 23) and D (below): PLLP_OUT0 (408 MHz)
 /// through the 16x clock divider at 1 Mbaud (hekate `clock_uart_use_src_div`).
 const UART_DIV_EN: u32 = 1 << 24;
 const UART_DIV_1M: u32 = 49;
@@ -417,6 +417,16 @@ const UARTC: [Clock; 1] = [Clock {
     bank: &H,
     bit: 23,
     source: 0x1A0,
+    keep: 0,
+    src: UART_DIV_EN | UART_DIV_1M,
+    reset: true,
+}];
+
+/// UART D (bank U bit 1), set up like B and C.
+const UARTD: [Clock; 1] = [Clock {
+    bank: &U,
+    bit: 1,
+    source: 0x1C0,
     keep: 0,
     src: UART_DIV_EN | UART_DIV_1M,
     reset: true,
@@ -461,6 +471,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::AUDIO => (&AUDIO, PART_AUD),
         proto::UARTB => (&UARTB, 0),
         proto::UARTC => (&UARTC, 0),
+        proto::UARTD => (&UARTD, 0),
         _ => return None,
     };
     Some(Device {
@@ -981,7 +992,7 @@ fn enable(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>, d: &Device) -> i6
 /// `UART_BAUD`: the divider of a running UART's source clock.
 fn uart_baud(car: &Mmio, dev: u64, baud: u64) -> i64 {
     let (Some(d), Some(div)) = (
-        table(dev).filter(|_| matches!(dev, proto::UARTB | proto::UARTC)),
+        table(dev).filter(|_| matches!(dev, proto::UARTB | proto::UARTC | proto::UARTD)),
         match baud {
             proto::BAUD_1M => Some(UART_DIV_1M),
             proto::BAUD_3M => Some(UART_DIV_3M),

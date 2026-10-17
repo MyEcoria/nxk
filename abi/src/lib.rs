@@ -1170,12 +1170,15 @@ pub mod proto {
         /// (`UART_BAUD` changes it): clock on, reset released.
         pub const UARTB: u64 = 28;
         pub const UARTC: u64 = 29;
+        /// UART D (the BCM4356's Bluetooth HCI), 1 Mbaud like B and C:
+        /// `bt` sets `BAUD_3M` and divides it in the UART itself.
+        pub const UARTD: u64 = 31;
         /// Audio hub (AHUB, ADMA, I2S1) and the codec's clock: the AUD
         /// partition on, pad power for I2S1 and the audio pads (1.8 V),
         /// PLLA 368.64 MHz and its 36.864 MHz output, the APE, AHUB and
         /// I2S1 clocks, EXTERN1 at 12.288 MHz (the codec's MCLK).
         pub const AUDIO: u64 = 30;
-        /// word 0 = `UARTB` or `UARTC`, word 1 = `BAUD_1M` or `BAUD_3M`:
+        /// word 0 = `UARTB`, `UARTC` or `UARTD`, word 1 = `BAUD_1M` or `BAUD_3M`:
         /// the UART's source clock divider, 16 times the baud rate
         /// (hekate `clock_uart_use_src_div`). Reply: word 0 = state.
         pub const UART_BAUD: u32 = 4;
