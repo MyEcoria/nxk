@@ -5,7 +5,7 @@
 
 `-o`: the UI's own images, built into display: the player avatar
 (64x64), the home screen's round buttons (System, Network, Terminal,
-Logs, System Settings, Power; 76x76, on the dark theme's disc, then on
+Logs, Controllers, System Settings, Power; 76x76, on the dark theme's disc, then on
 the light one's) and the same glyphs for the page headers (40x40, on
 each theme's background). `--games DIR`: one DIR/NAME.bin per game of
 jeux/ (title and color from its game.txt), installed by tools/mksd.py as
@@ -452,10 +452,20 @@ def ic_power(d, cx, cy, s, col):
     d.line((cx, cy - r * 1.2, cx, cy - r * 0.15), fill=col, width=t)
 
 
-# Home order: System, Network, Terminal, Logs, System Settings, Power.
-GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_settings, ic_power]
+def ic_controllers(d, cx, cy, s, col):
+    """A pair of Joy-Cons side by side, each with its stick."""
+    w, h, t, g = s * 0.17, s * 0.44, int(s * 0.045), s * 0.035
+    for x0 in (cx - g - w, cx + g):
+        d.rounded_rectangle((x0, cy - h / 2, x0 + w, cy + h / 2), w * 0.45, outline=col, width=t)
+    r = w * 0.27
+    for x, y in ((cx - g - w / 2, cy - h * 0.2), (cx + g + w / 2, cy + h * 0.1)):
+        d.ellipse((x - r, y - r, x + r, y + r), fill=col)
+
+
+# Home order: System, Network, Terminal, Logs, Controllers, System Settings, Power.
+GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_controllers, ic_settings, ic_power]
 # Glyph colors; None: the theme's grey.
-COLORS = [(240, 86, 62), (70, 136, 241), (58, 190, 192), (44, 182, 67), None, None]
+COLORS = [(240, 86, 62), (70, 136, 241), (58, 190, 192), (44, 182, 67), (247, 174, 36), None, None]
 THEMES = {
     # (page background, dock surface, grey glyph)
     "dark": ((28, 28, 28), (46, 46, 46), (196, 196, 196)),

@@ -14,6 +14,7 @@ extern crate alloc;
 mod art;
 mod backlight;
 mod config;
+mod controllers;
 mod font;
 mod games;
 mod home;
@@ -171,7 +172,8 @@ impl Messages {
 
 /// An event as `input` reports it: kind, then for a touch the code (down,
 /// move, up), finger, raw x, y; for a button its code and 1 or 0.
-type Event = (u64, u64, u64, u64, u64);
+/// kind, code, value, x, y, source (`input::READ`).
+type Event = (u64, u64, u64, u64, u64, u64);
 
 enum Job {
     Act(Action),
@@ -589,7 +591,7 @@ fn main() -> i32 {
             match INPUT.call(&m) {
                 Ok(r) => {
                     q.lock()
-                        .push_back((r.mr[0], r.mr[1], r.mr[2], r.mr[3], r.mr[4]));
+                        .push_back((r.mr[0], r.mr[1], r.mr[2], r.mr[3], r.mr[4], r.mr[5]));
                     let _ = sys::notify_signal(notif, EV_TOUCH);
                 }
                 Err(_) => time::sleep_ms(1000),
@@ -805,6 +807,15 @@ fn main() -> i32 {
             if ui.deadline().is_some_and(|d| now >= d) {
                 dirty = true;
             }
+            // A held stick repeats its direction, as a pressed key.
+            if let Some(b) = ui.stick_repeat(now) {
+                if !owned {
+                    touches
+                        .lock()
+                        .push_back((input::KIND_BUTTON, b, 1, 0, 0, input::SRC_NONE));
+                    let _ = sys::notify_signal(notif, EV_TOUCH);
+                }
+            }
             if dirty {
                 ui.draw(&mut scr, &data, &msgs, &term, time::now_ns());
                 scr.present();
@@ -815,6 +826,9 @@ fn main() -> i32 {
                 wake = wake.min((blink + 1) * BLINK_NS);
             }
             if let Some(d) = ui.deadline() {
+                wake = wake.min(d);
+            }
+            if let Some(d) = ui.stick_due() {
                 wake = wake.min(d);
             }
             if ui.page == ui::LIBRARY {
@@ -859,7 +873,7 @@ fn main() -> i32 {
                 let now = time::now_ns();
                 let mut batch: Vec<Event> = touches.lock().drain(..).collect();
                 if sleeping {
-                    let wake_ev = batch.iter().any(|&(kind, code, id, _, _)| {
+                    let wake_ev = batch.iter().any(|&(kind, code, id, _, _, _)| {
                         (kind == input::KIND_TOUCH && code == input::TOUCH_DOWN)
                             || (kind == input::KIND_BUTTON && id == 1)
                     });
@@ -928,7 +942,7 @@ fn main() -> i32 {
                 }
                 if let Some(g) = game.as_mut() {
                     for e in batch {
-                        let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]);
+                        let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4, e.5]);
                         match g.waiter.take() {
                             Some((tok, _)) => {
                                 let _ = ipc::reply_to(tok, &m);
@@ -943,9 +957,22 @@ fn main() -> i32 {
                     }
                     continue;
                 }
-                for (kind, code, id, x, y) in batch {
-                    // The sticks are for games.
-                    if kind == input::KIND_STICK {
+                for (kind, code, id, x, y, src) in batch {
+                    // Each controller's state, for the Test tab.
+                    if ui.track(kind, code, id, x, y, src) {
+                        dirty = true;
+                    }
+                    // The left stick moves like the D-pad (games get it raw).
+                    let (kind, code, id) = if kind == input::KIND_STICK {
+                        match ui.stick_nav(code, x, y, now) {
+                            Some(b) if !owned => (input::KIND_BUTTON, b, 1),
+                            _ => continue,
+                        }
+                    } else {
+                        (kind, code, id)
+                    };
+                    // Testing, the buttons only light up (HOME leaves).
+                    if kind == input::KIND_BUTTON && ui.testing() && code != input::BTN_HOME {
                         continue;
                     }
                     let action = if kind == input::KIND_BUTTON {
@@ -1211,7 +1238,7 @@ fn main() -> i32 {
             proto::EVENT => match game.as_mut() {
                 None => Msg::error(-ENODEV),
                 Some(g) => match g.events.pop_front() {
-                    Some(e) => Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4]),
+                    Some(e) => Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4, e.5]),
                     None => {
                         let t = rx.msg.mr[0];
                         let deadline = if t == 0 { 0 } else { time::now_ns() + t };

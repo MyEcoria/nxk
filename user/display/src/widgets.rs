@@ -190,6 +190,12 @@ pub fn button_glyph(s: &mut Screen, cx: usize, cy: usize, b: &str, c: u32, bg: u
             s.line(x - 5, y, x + 5, y, 3, bg);
             s.line(x, y - 5, x, y + 5, 3, bg);
         }
+        // A house, as on the HOME button.
+        "HOME" => {
+            s.line(x - 6, y, x, y - 6, 2, bg);
+            s.line(x, y - 6, x + 6, y, 2, bg);
+            s.fill(cx - 4, cy, 9, 5, bg);
+        }
         _ => {
             s.label_c(cx + 1, cy, b, Face::CapB, bg);
         }

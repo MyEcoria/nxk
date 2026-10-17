@@ -10,8 +10,8 @@ pub const UI: &[u8] = include_bytes!("../../../build/uiart.bin");
 pub const AVATAR: usize = 0;
 pub const AVATAR_SMALL: usize = 1;
 const BUTTON: usize = 2;
-const HEAD: usize = 20;
-const KINDS: usize = 6;
+const HEAD: usize = 23;
+const KINDS: usize = 7;
 /// In a game's `cover.bin`: its square icon.
 pub const ICON: usize = 0;
 

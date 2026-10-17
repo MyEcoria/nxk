@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{bt, cpufreq, eth, fan, fs, gpu, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{bt, cpufreq, eth, fan, fs, gpu, joycon, net, power, usbcon as usb, wifi};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::seqpage::SeqPage;
@@ -34,6 +34,7 @@ static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
 static BT: Service = Service::optional("bt");
+static JOYCON: Service = Service::optional("joycon");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -79,6 +80,8 @@ impl<T> Seen<T> {
 /// A paired Bluetooth controller (`bt::LIST`).
 pub struct BtPad {
     pub addr: u64,
+    /// `bt::KIND_*`.
+    pub kind: u8,
     pub connected: bool,
     /// 0..4, or `bt::BATTERY_UNKNOWN`.
     pub battery: u8,
@@ -113,6 +116,7 @@ impl Bt {
             };
             pads.push(BtPad {
                 addr: rec[..6].iter().rev().fold(0, |w, &b| w << 8 | b as u64),
+                kind: rec[6],
                 connected: rec[7] != 0,
                 battery: rec[8],
                 name: String::from_utf8_lossy(name).into_owned(),
@@ -363,6 +367,8 @@ pub struct Data {
     pub battery: Seen<Battery>,
     /// Asked every refresh: pairing and connections change quickly.
     pub bt: Seen<Bt>,
+    /// The rails' Joy-Cons: (state `joycon::ST_*`, battery) left, right.
+    pub rails: Seen<[(u64, u64); 2]>,
     /// Asked every refresh; busy while it measures its speed (1 s).
     pub fan: Seen<Fan>,
     pub cpu: Seen<Cpu>,
@@ -407,6 +413,7 @@ impl Data {
             supply: Seen::Unknown,
             battery: Seen::Unknown,
             bt: Seen::Unknown,
+            rails: Seen::Unknown,
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
@@ -471,6 +478,9 @@ impl Data {
             .poll(&POWER, power::SUPPLY, n, force, |m| m.mr[0]);
         self.battery_refresh(n, force);
         self.bt_refresh();
+        self.rails.poll(&JOYCON, joycon::STATUS, n, true, |m| {
+            [(m.mr[0], m.mr[2]), (m.mr[1], m.mr[3])]
+        });
         self.fan.poll(&FAN, fan::STATUS, n, true, Fan::from_reply);
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);

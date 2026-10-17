@@ -15,15 +15,16 @@ use crate::screen::Screen;
 use crate::stats::{Data, Seen};
 use crate::status::usb_short;
 use crate::theme::{pal, BLACK, WHITE};
-use crate::ui::{Action, Id, Ui, LOGS, NETWORK, SETTINGS, SYSTEM, TERMINAL, W};
+use crate::ui::{Action, Id, Ui, CONTROLLERS, LOGS, NETWORK, SETTINGS, SYSTEM, TERMINAL, W};
 use crate::widgets::{fit, icon, Icon};
 
 /// The round buttons under the game row, in `art::button` / `art::head` order.
-pub const BUTTONS: [&str; 6] = [
+pub const BUTTONS: [&str; 7] = [
     "System",
     "Network",
     "Terminal",
     "Logs",
+    "Controllers",
     "System Settings",
     "Power",
 ];
@@ -63,7 +64,8 @@ impl Ui {
             1 => self.go(NETWORK),
             2 => self.go(TERMINAL),
             3 => self.go(LOGS),
-            4 => self.go(SETTINGS),
+            4 => self.go(CONTROLLERS),
+            5 => self.go(SETTINGS),
             _ => self.open_power(),
         }
         None

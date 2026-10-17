@@ -45,6 +45,7 @@ pub const NETWORK: usize = 2;
 pub const TERMINAL: usize = 3;
 pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
+pub const CONTROLLERS: usize = 6;
 
 const TOAST_NS: u64 = 4_000_000_000;
 const FAN_STEP: u64 = 10;
@@ -84,6 +85,8 @@ pub enum Id {
     PowerOff,
     // System.
     SysTab(usize),
+    /// A tab of the Controllers page.
+    CtlTab(usize),
     // Network.
     Scan,
     Retry,
@@ -226,6 +229,12 @@ pub struct Ui {
     pub has_backlight: bool,
     pub(crate) cat: usize,
     pub(crate) sys_tab: usize,
+    /// Controllers page: its tab, each controller's live state, the left
+    /// stick's direction held and when it repeats.
+    pub(crate) ctl_tab: usize,
+    pub(crate) pads: Vec<crate::controllers::PadView>,
+    pub(crate) nav: Option<u64>,
+    pub(crate) nav_at: u64,
     drag: Option<(Id, usize, usize)>,
     /// Wall clock of the frame being drawn.
     pub(crate) wall: u64,
@@ -269,6 +278,10 @@ impl Ui {
             has_backlight: false,
             cat: 0,
             sys_tab: 0,
+            ctl_tab: 0,
+            pads: Vec::new(),
+            nav: None,
+            nav_at: 0,
             drag: None,
             wall: 0,
         }
@@ -499,7 +512,7 @@ impl Ui {
         }
     }
 
-    fn overlay(&self) -> bool {
+    pub(crate) fn overlay(&self) -> bool {
         self.modal.is_some() || self.sheet.is_some() || self.quick
     }
 
@@ -591,6 +604,7 @@ impl Ui {
             }
             BTN_L | BTN_ZL if !open => match self.page {
                 SYSTEM => self.sys_tab ^= 1,
+                CONTROLLERS => self.ctl_tab ^= 1,
                 SETTINGS => {
                     let n = crate::settings::CATS.len();
                     self.cat = (self.cat + n - 1) % n;
@@ -603,11 +617,12 @@ impl Ui {
             },
             BTN_R | BTN_ZR if !open => match self.page {
                 SYSTEM => self.sys_tab ^= 1,
+                CONTROLLERS => self.ctl_tab ^= 1,
                 SETTINGS => {
                     self.cat = (self.cat + 1) % crate::settings::CATS.len();
                 }
                 LIBRARY => {
-                    self.home = self.games.len() + 4;
+                    self.home = self.games.len() + 5;
                 }
                 _ => {}
             },
@@ -697,6 +712,7 @@ impl Ui {
                 return Some(Action::Save);
             }
             Id::SysTab(i) => self.sys_tab = i,
+            Id::CtlTab(i) => self.ctl_tab = i,
             Id::FanOpen => self.sheet = Some(Sheet::Fan),
             Id::CpuOpen => self.sheet = Some(Sheet::Cpu),
             Id::GpuOpen => self.sheet = Some(Sheet::Gpu),
@@ -844,6 +860,7 @@ impl Ui {
             SETTINGS => self.settings(s, d),
             NETWORK => self.network(s, d),
             SYSTEM => self.system(s, d),
+            CONTROLLERS => self.controllers(s, d),
             TERMINAL => self.terminal(s, d, term, now),
             _ => self.logs(s, msgs),
         }
@@ -965,7 +982,8 @@ impl Ui {
                 NETWORK => 1,
                 TERMINAL => 2,
                 LOGS => 3,
-                _ => 4,
+                CONTROLLERS => 4,
+                _ => 5,
             };
             if let Some(img) = art::get(art::UI, art::head(k)) {
                 s.image(&img, 58, cy - 20, 40, 40, 6);
