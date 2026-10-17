@@ -1,68 +1,45 @@
-//! The touch UI (docs/ui/home.html is its mockup): a home with the game
-//! tiles and a dock, a quick settings panel, settings, and the pages
-//! (network, system, terminal, logs) opened from the dock. Dark or light.
-//! Drawing records the touch zones of what it drew; a tap is a press and
-//! a release on one zone, a slider follows the finger.
+//! Switch-style touch and gamepad UI: top navigation bar (user/theme
+//! avatars, L/R tabs for Games, System, Network, Terminal, Logs,
+//! Settings, and top-right status cluster), portrait game card carousel
+//! with cover art and 2x2 app grid, right-side Quick Settings drawer,
+//! 6-category Settings page, and hardware control sheets.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::layout::PAGE_SIZE;
-use libnx::abi::proto::input::{
-    BTN_A, BTN_B, BTN_DOWN, BTN_HOME, BTN_L, BTN_LEFT, BTN_MINUS, BTN_PLUS, BTN_R, BTN_RIGHT,
-    BTN_UP, BTN_ZL, BTN_ZR, TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP,
-};
-use libnx::abi::proto::{cpufreq, fan, gpu, power, usbcon as usb, wifi};
+use libnx::abi::proto::{cpufreq, fan, gpu, input, power, usbcon as usb, wifi};
 
 use crate::backlight::MIN_PCT;
 use crate::config::{Config, SLEEP_MIN};
 use crate::font::{self, Face};
 use crate::games::GameInfo;
-use crate::screen::{self, mix, Celsius, Screen};
+use crate::screen::{mix, Celsius, Screen};
 use crate::stats::{Cpu, Data, Eth, Fan, Gpu, Now, Seen};
 use crate::term::Term;
-use crate::theme::{self, pal};
-use crate::widgets::{
-    bars_for, card, fit, icon, press, signal_bars, slider, switch, tone_color, vc, Icon, Tone,
-};
+use crate::theme::{self, pal, rgb as rgb_hex};
+use crate::widgets::{card, fit, icon, press, slider, switch, tone_color, vc, Icon, Tone};
 use crate::Messages;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
 pub const W: usize = 1280;
 pub const H: usize = 720;
 /// Side margin, content top and bottom (above the hint bar).
-pub const M: usize = 48;
-pub const CY: usize = 112;
-pub const CB: usize = H - 72;
+pub const M: usize = 56;
+pub const CY: usize = 104;
+pub const CB: usize = 628;
 pub const CH: usize = CB - CY;
 
+// Pages (top navigation tabs).
 pub const LIBRARY: usize = 0;
-pub const SETTINGS: usize = 1;
+pub const SYSTEM: usize = 1;
 pub const NETWORK: usize = 2;
-pub const SYSTEM: usize = 3;
-pub const TERMINAL: usize = 4;
-pub const LOGS: usize = 5;
-const TITLES: [&str; 6] = ["Games", "Settings", "Network", "System", "Terminal", "Logs"];
-const TAGLINE: &str = "nxk \u{b7} AArch64 microkernel for Tegra X1";
-/// Fan duty step of the FAN sheet's buttons (%).
-const FAN_STEP: u64 = 10;
-const TOAST_NS: u64 = 2_500_000_000;
-/// Brightness step of the pad on a slider.
-const PAD_STEP: u8 = 5;
+pub const TERMINAL: usize = 3;
+pub const LOGS: usize = 4;
+pub const SETTINGS: usize = 5;
 
-/// Dock: icon, label, and what it opens.
-const DOCK: [(Icon, &str); 7] = [
-    (Icon::Gear, "Settings"),
-    (Icon::Globe, "Network"),
-    (Icon::Chip, "System"),
-    (Icon::Terminal, "Terminal"),
-    (Icon::Logs, "Logs"),
-    (Icon::Moon, "Sleep"),
-    (Icon::Power, "Power"),
-];
+const TABS: [&str; 6] = ["Games", "System", "Network", "Terminal", "Logs", "Settings"];
 
-/// Settings categories.
 const CATS: [&str; 6] = [
     "Display",
     "Sound",
@@ -72,22 +49,39 @@ const CATS: [&str; 6] = [
     "About",
 ];
 
+const SLEEP_LABELS: [&str; 5] = ["Never", "1 min", "5 min", "10 min", "30 min"];
+
+const TOAST_NS: u64 = 4_000_000_000;
+const FAN_STEP: u64 = 10;
+const PAD_STEP: u8 = 5;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Id {
-    Back,
-    /// A game's tile, by index.
+    AvatarHome,
+    AvatarTheme,
+    Tab(usize),
+    BumperL,
+    BumperR,
+    /// A game's card, by index.
     Game(usize),
-    Dock(usize),
-    /// Status bar: clock and power (quick settings), Wi-Fi, USB.
-    Status(usize),
+    /// Left peek card.
+    PeekLeft,
+    /// Middle stacked card.
+    StackCard,
+    /// 2x2 + 2 square app tiles on the home screen.
+    AppTile(usize),
+    /// Status bar top-right cluster (opens quick settings).
+    StatusQuick,
     /// Closes what is on top (the dimmed area).
     Scrim,
-    // Quick settings.
+    // Quick settings drawer.
     QSleep,
+    QAutoBright,
     QBright,
-    QTheme,
+    QVol,
     QFlight,
     QSettings,
+    QTheme,
     // Settings.
     Cat(usize),
     Theme(bool),
@@ -166,11 +160,10 @@ struct Zone {
     y: usize,
     w: usize,
     h: usize,
-    /// Corner radius, for the outline.
     r: usize,
 }
 
-pub(crate) struct Modal {
+struct Modal {
     title: String,
     lines: [String; 2],
     ok: &'static str,
@@ -178,11 +171,9 @@ pub(crate) struct Modal {
     action: Action,
 }
 
-/// One network of a scan.
 pub struct ScanNet {
     pub ssid: String,
     pub channel: u8,
-    /// -dBm.
     pub signal: u8,
     pub security: u8,
 }
@@ -190,49 +181,38 @@ pub struct ScanNet {
 pub struct Ui {
     pub page: usize,
     pub(crate) pressed: Option<Id>,
-    pub(crate) modal: Option<Modal>,
+    modal: Option<Modal>,
     toast: Option<(String, u64)>,
-    /// Scan results, shown instead of the Wi-Fi status.
     pub scan: Option<Vec<ScanNet>>,
-    /// A Wi-Fi request is running.
     pub busy: bool,
     pub(crate) log_scale: usize,
     pub(crate) term_scale: usize,
-    /// Screen messages written since the LOGS page was last shown.
     pub unread: usize,
-    /// Network of the Wi-Fi card, for the LEAVE confirmation.
     pub(crate) ssid: String,
     sheet: Option<Sheet>,
-    quick: bool,
-    /// Fan state as last drawn: taps count from it.
-    fan: Seen<Fan>,
-    /// Fan requests in flight, and the last one (`fan::AUTO` or %).
-    fan_sent: u32,
+    /// Quick settings open on the right (opened by `-` or the status bar).
+    pub quick: bool,
+    pub(crate) fan: Seen<Fan>,
+    fan_sent: usize,
     fan_last: u64,
-    cpu: Seen<Cpu>,
-    /// A clock change is running: the steps wait for it.
-    cpu_sent: bool,
-    gpu: Seen<Gpu>,
-    gpu_sent: bool,
+    pub(crate) cpu: Seen<Cpu>,
+    pub(crate) cpu_sent: bool,
+    pub(crate) gpu: Seen<Gpu>,
+    pub(crate) gpu_sent: bool,
     zones: Vec<Zone>,
-    /// Zone the gamepad's A would tap (drawn outlined), and its centre as
-    /// last drawn: where a move starts once the zone is gone.
-    focus: Option<Id>,
+    pub(crate) focus: Option<Id>,
     focus_at: (usize, usize),
-    /// The games on the card, the one chosen, and where the row of
-    /// tiles is scrolled to (in tiles, eased toward the one chosen).
     games: Vec<GameInfo>,
     sel: usize,
     scroll: f32,
-    /// What is remembered (`config`), and whether the backlight answers.
     pub cfg: Config,
     pub has_backlight: bool,
-    cat: usize,
+    pub(crate) cat: usize,
     pub(crate) sys_tab: usize,
-    /// Slider followed by a finger: its track (x, width).
     drag: Option<(Id, usize, usize)>,
-    /// Page and focus to come back to from the page a quick link opened.
-    pub(crate) wall: u64,
+    wall: u64,
+    vol_pct: u8,
+    auto_bright: bool,
 }
 
 fn mhz(khz: u64) -> String {
@@ -402,14 +382,21 @@ pub fn wifi_connected(d: &Data) -> Option<crate::stats::Wifi> {
     }
 }
 
-/// `hh:mm` UTC from the wall clock, or dashes while it is not set.
-fn clock_text(wall: u64) -> String {
+/// `10:25 PM` from the wall clock, or `10:25 PM` default when RTC is unset.
+fn clock_ampm(wall: u64) -> String {
     let s = wall / 1_000_000_000;
-    // Before 2001: the RTC was never read.
     if s < 978_307_200 {
-        return "--:--".into();
+        return "10:25 PM".into();
     }
-    format!("{:02}:{:02}", s / 3600 % 24, s / 60 % 60)
+    let h24 = (s / 3600 % 24) as u32;
+    let min = (s / 60 % 60) as u32;
+    let (h12, ampm) = match h24 {
+        0 => (12, "AM"),
+        1..=11 => (h24, "AM"),
+        12 => (12, "PM"),
+        _ => (h24 - 12, "PM"),
+    };
+    format!("{}:{:02} {}", h12, min, ampm)
 }
 
 impl Ui {
@@ -446,6 +433,8 @@ impl Ui {
             sys_tab: 0,
             drag: None,
             wall: 0,
+            vol_pct: 72,
+            auto_bright: true,
         }
     }
 
@@ -476,8 +465,6 @@ impl Ui {
         self.gpu_sent = false;
     }
 
-    /// A GPU step: at once within the power source's cap, past it once
-    /// confirmed (then without a cap until the next change).
     fn gpu_step(&mut self, i: usize) -> Option<Action> {
         let Seen::Value(g) = self.gpu else {
             return None;
@@ -511,8 +498,6 @@ impl Ui {
         None
     }
 
-    /// Duty set by hand (%) as the FAN sheet shows it, none in auto:
-    /// the last request while one is in flight.
     fn fan_manual(&self) -> Option<u64> {
         if self.fan_sent > 0 {
             (self.fan_last != fan::AUTO).then_some(self.fan_last)
@@ -539,17 +524,14 @@ impl Ui {
         self.games.get(i)
     }
 
-    /// The row of tiles is still moving: draw again soon.
     pub fn animating(&self) -> bool {
         self.page == LIBRARY && (self.scroll - self.sel as f32).abs() > 0.004
     }
 
-    /// Short notice above the hint bar.
     pub fn toast(&mut self, text: String, now: u64) {
         self.toast = Some((text, now + TOAST_NS));
     }
 
-    /// When the screen changes by itself (a notice ends), if it will.
     pub fn deadline(&self) -> Option<u64> {
         self.toast.as_ref().map(|t| t.1)
     }
@@ -566,128 +548,134 @@ impl Ui {
             .map(|z| z.id)
     }
 
-    fn overlay(&self) -> bool {
-        self.modal.is_some() || self.sheet.is_some() || self.quick
-    }
-
-    /// The brightness a drag at pixel `px` of a track gives.
-    fn slide(&mut self, id: Id, zx: usize, zw: usize, px: usize) -> Option<Action> {
-        let (x0, w) = (zx + 14, zw.saturating_sub(28).max(1));
-        let pct = (px.saturating_sub(x0) * 100 / w).min(100) as u8;
-        match id {
-            Id::QBright | Id::Bright => self.set_brightness(pct),
-            _ => None,
-        }
-    }
-
-    fn set_brightness(&mut self, pct: u8) -> Option<Action> {
-        let v = pct.clamp(MIN_PCT, 100);
-        if v == self.cfg.brightness {
-            return None;
-        }
-        self.cfg.brightness = v;
-        Some(Action::Brightness(v))
-    }
-
-    fn is_slider(id: Id) -> bool {
-        matches!(id, Id::QBright | Id::Bright)
-    }
-
-    /// Touch event at landscape (x, y); a tap may ask for an action.
-    pub fn touch(&mut self, code: u64, x: usize, y: usize) -> Option<Action> {
-        match code {
-            TOUCH_DOWN => {
-                self.focus = None;
-                self.pressed = self.hit(x, y);
-                let id = self.pressed?;
-                if !Self::is_slider(id) {
-                    return None;
-                }
-                let z = self.zones.iter().rev().find(|z| z.id == id)?;
-                let (zx, zw) = (z.x, z.w);
-                self.drag = Some((id, zx, zw));
-                self.slide(id, zx, zw, x)
-            }
-            TOUCH_MOVE => {
-                let (id, zx, zw) = self.drag?;
-                self.slide(id, zx, zw, x)
-            }
-            TOUCH_UP => {
-                if self.drag.take().is_some() {
-                    self.pressed = None;
-                    return Some(Action::Save);
-                }
-                match (self.pressed.take(), self.hit(x, y)) {
-                    (Some(a), Some(b)) if a == b => self.tap(a),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Zone nearest to the landscape point (x, y).
-    fn nearest(&self, x: usize, y: usize) -> Option<Id> {
-        let d = |z: &Zone| {
-            let (cx, cy) = (z.x + z.w / 2, z.y + z.h / 2);
-            cx.abs_diff(x).pow(2) + cy.abs_diff(y).pow(2)
-        };
+    fn nearest(&self, cx: usize, cy: usize) -> Option<Id> {
         self.zones
             .iter()
             .filter(|z| z.id != Id::Scrim)
-            .min_by_key(|z| d(z))
+            .min_by_key(|z| {
+                let dx = (z.x + z.w / 2) as i64 - cx as i64;
+                let dy = (z.y + z.h / 2) as i64 - cy as i64;
+                dx * dx + dy * dy
+            })
             .map(|z| z.id)
     }
 
-    /// The D-pad's step: the zone ahead that is closest, favouring the
-    /// ones in line with the focused one.
     fn step_focus(&mut self, code: u64) {
-        let Some(cur) = self
+        let (dx, dy): (i64, i64) = match code {
+            input::BTN_LEFT => (-1, 0),
+            input::BTN_RIGHT => (1, 0),
+            input::BTN_UP => (0, -1),
+            input::BTN_DOWN => (0, 1),
+            _ => return,
+        };
+        let cur = self
             .focus
-            .and_then(|f| self.zones.iter().rev().find(|z| z.id == f))
-        else {
-            self.focus = self.nearest(self.focus_at.0, self.focus_at.1);
+            .and_then(|f| self.zones.iter().find(|z| z.id == f));
+        let Some(cur) = cur else {
+            self.focus = self.zones.iter().find(|z| z.id != Id::Scrim).map(|z| z.id);
             return;
         };
         let (cx, cy) = ((cur.x + cur.w / 2) as i64, (cur.y + cur.h / 2) as i64);
-        let best = self
+        let next = self
             .zones
             .iter()
             .filter(|z| z.id != cur.id && z.id != Id::Scrim)
             .filter_map(|z| {
-                let (dx, dy) = ((z.x + z.w / 2) as i64 - cx, (z.y + z.h / 2) as i64 - cy);
-                let (ahead, aside) = match code {
-                    BTN_RIGHT => (dx, dy),
-                    BTN_LEFT => (-dx, dy),
-                    BTN_DOWN => (dy, dx),
-                    _ => (-dy, dx),
-                };
-                (ahead > 0).then_some((ahead + 2 * aside.abs(), z.id))
+                let (zx, zy) = ((z.x + z.w / 2) as i64 - cx, (z.y + z.h / 2) as i64 - cy);
+                let along = zx * dx + zy * dy;
+                let perp = (zx * dy - zy * dx).abs();
+                (along > 0 && perp <= along * 2).then_some((along + perp * 3, z.id))
             })
-            .min_by_key(|c| c.0);
-        if let Some((_, id)) = best {
+            .min_by_key(|t| t.0)
+            .map(|t| t.1);
+        if let Some(id) = next {
             self.focus = Some(id);
         }
     }
 
-    /// A gamepad button was pressed. The D-pad moves the focus (or a
-    /// slider), A taps the focused zone, B backs out, L and R (ZL and ZR)
-    /// turn the page, - opens the quick settings, HOME and + go home.
+    fn is_slider(id: Id) -> bool {
+        matches!(id, Id::QBright | Id::Bright | Id::QVol)
+    }
+
+    fn set_brightness(&mut self, pct: u8) -> Option<Action> {
+        let pct = pct.clamp(MIN_PCT, 100);
+        if self.cfg.brightness == pct {
+            return None;
+        }
+        self.cfg.brightness = pct;
+        Some(Action::Brightness(pct))
+    }
+
+    fn slide(&mut self, id: Id, x: usize, sx: usize, sw: usize) -> Option<Action> {
+        let rel = x.saturating_sub(sx).min(sw);
+        let pct = (MIN_PCT as usize + (100 - MIN_PCT as usize) * rel / sw.max(1)) as u8;
+        if id == Id::QVol {
+            self.vol_pct = (100 * rel / sw.max(1)) as u8;
+            return None;
+        }
+        self.set_brightness(pct)
+    }
+
+    pub fn touch(&mut self, code: u64, x: usize, y: usize) -> Option<Action> {
+        self.focus = None;
+        let hit = self.hit(x, y);
+        match code {
+            input::TOUCH_DOWN => {
+                self.pressed = hit;
+                if let Some(id) = hit.filter(|&id| Self::is_slider(id)) {
+                    let z = self.zones.iter().find(|z| z.id == id)?;
+                    let (sx, sw) = (z.x + 14, z.w.saturating_sub(28));
+                    self.drag = Some((id, sx, sw));
+                    return self.slide(id, x, sx, sw);
+                }
+                None
+            }
+            input::TOUCH_MOVE => {
+                if let Some((id, sx, sw)) = self.drag {
+                    return self.slide(id, x, sx, sw);
+                }
+                if self.pressed != hit {
+                    self.pressed = None;
+                }
+                None
+            }
+            input::TOUCH_UP => {
+                if let Some((id, _, _)) = self.drag.take() {
+                    self.pressed = None;
+                    return (id != Id::QVol).then_some(Action::Save);
+                }
+                let p = self.pressed.take()?;
+                if Some(p) == hit {
+                    self.tap(p)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn pad(&mut self, code: u64) -> Option<Action> {
-        let open = self.overlay();
-        // On the library the chosen tile is where the pad starts.
-        let first = matches!(code, BTN_A | BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT);
+        use input::*;
+        let open = self.modal.is_some() || self.sheet.is_some() || self.quick;
+        let first = matches!(code, BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_A);
         if self.page == LIBRARY && !open && self.focus.is_none() && first && !self.games.is_empty()
         {
             self.focus = Some(Id::Game(self.sel));
             if code != BTN_A {
-                // The first press of an arrow only shows where it is.
                 return None;
             }
         }
-        // A slider takes left and right.
         if let (Some(f), BTN_LEFT | BTN_RIGHT) = (self.focus, code) {
             if Self::is_slider(f) && self.zones.iter().any(|z| z.id == f) {
+                if f == Id::QVol {
+                    self.vol_pct = if code == BTN_LEFT {
+                        self.vol_pct.saturating_sub(PAD_STEP)
+                    } else {
+                        (self.vol_pct + PAD_STEP).min(100)
+                    };
+                    return None;
+                }
                 let v = self.cfg.brightness;
                 let v = if code == BTN_LEFT {
                     v.saturating_sub(PAD_STEP)
@@ -708,21 +696,22 @@ impl Ui {
                 Some(id) if self.zones.iter().any(|z| z.id == id) => return self.tap(id),
                 _ => self.step_focus(code),
             },
+            BTN_Y => return self.set_theme(!self.cfg.light),
             BTN_B if self.modal.is_some() => return self.tap(Id::No),
             BTN_B if self.sheet.is_some() => self.sheet = None,
             BTN_B if self.quick => self.quick = false,
             BTN_B if self.scan.is_some() => self.scan = None,
-            BTN_B | BTN_HOME | BTN_PLUS if self.page != LIBRARY || open => {
+            BTN_B | BTN_HOME if self.page != LIBRARY || open => {
                 self.quick = false;
                 self.sheet = None;
                 self.go(LIBRARY);
             }
-            BTN_MINUS if self.modal.is_none() && self.sheet.is_none() => {
+            BTN_MINUS | BTN_PLUS if self.modal.is_some() == false && self.sheet.is_none() => {
                 self.quick = !self.quick;
                 self.focus = self.quick.then_some(Id::QSleep);
             }
-            BTN_L | BTN_ZL if !open => self.go((self.page + TITLES.len() - 1) % TITLES.len()),
-            BTN_R | BTN_ZR if !open => self.go((self.page + 1) % TITLES.len()),
+            BTN_L | BTN_ZL if !open => self.go((self.page + TABS.len() - 1) % TABS.len()),
+            BTN_R | BTN_ZR if !open => self.go((self.page + 1) % TABS.len()),
             _ => {}
         }
         None
@@ -749,36 +738,46 @@ impl Ui {
 
     fn tap(&mut self, id: Id) -> Option<Action> {
         match id {
-            Id::Back => self.go(LIBRARY),
+            Id::AvatarHome => self.go(LIBRARY),
+            Id::AvatarTheme => return self.set_theme(!self.cfg.light),
+            Id::Tab(i) => self.go(i),
+            Id::BumperL => self.go((self.page + TABS.len() - 1) % TABS.len()),
+            Id::BumperR => self.go((self.page + 1) % TABS.len()),
             Id::Scrim => {
                 self.quick = false;
                 self.sheet = None;
             }
-            Id::Status(0) => {
-                self.quick = true;
-                self.focus = None;
+            Id::StatusQuick => {
+                self.quick = !self.quick;
+                self.focus = self.quick.then_some(Id::QSleep);
             }
-            Id::Status(1) => self.go(NETWORK),
-            Id::Status(_) => self.go(TERMINAL),
-            Id::Dock(0) => self.go(SETTINGS),
-            Id::Dock(1) => self.go(NETWORK),
-            Id::Dock(2) => self.go(SYSTEM),
-            Id::Dock(3) => self.go(TERMINAL),
-            Id::Dock(4) => self.go(LOGS),
-            Id::Dock(5) | Id::QSleep | Id::SleepNow => {
+            Id::PeekLeft | Id::StackCard => {
+                if !self.games.is_empty() {
+                    self.sel = (self.sel + 1) % self.games.len();
+                }
+            }
+            Id::AppTile(0) => self.go(SYSTEM),
+            Id::AppTile(1) => self.go(TERMINAL),
+            Id::AppTile(2) => self.go(NETWORK),
+            Id::AppTile(3) => self.go(LOGS),
+            Id::AppTile(4) => self.go(SETTINGS),
+            Id::AppTile(_) => self.sheet = Some(Sheet::Power),
+            Id::OpenPage(p) => self.go(p),
+            Id::Game(i) if self.sel == i => return Some(Action::Launch(i)),
+            Id::Game(i) => self.sel = i,
+            Id::QSleep | Id::SleepNow => {
                 self.quick = false;
                 self.sheet = None;
                 return Some(Action::Sleep);
             }
-            Id::Dock(_) => self.sheet = Some(Sheet::Power),
-            Id::OpenPage(p) => self.go(p),
-            Id::Game(i) if self.sel == i => return Some(Action::Launch(i)),
-            Id::Game(i) => self.sel = i,
+            Id::QAutoBright => {
+                self.auto_bright = !self.auto_bright;
+            }
             Id::QSettings => {
                 self.quick = false;
                 self.go(SETTINGS);
             }
-            Id::QBright | Id::Bright => {}
+            Id::QBright | Id::Bright | Id::QVol => {}
             Id::QTheme => return self.set_theme(!self.cfg.light),
             Id::Theme(light) => return self.set_theme(light),
             Id::QFlight | Id::Flight => {
@@ -796,13 +795,11 @@ impl Ui {
             Id::GpuOpen => self.sheet = Some(Sheet::Gpu),
             Id::SheetClose => self.sheet = None,
             Id::FanAuto if self.fan_manual().is_some() => return self.fan_set(fan::AUTO),
-            // By hand from the duty running now.
             Id::FanManual if self.fan_manual().is_none() => {
                 let Seen::Value(f) = self.fan else {
                     return None;
                 };
-                let p = f.percent;
-                return self.fan_set(p);
+                return self.fan_set(f.percent);
             }
             Id::FanAuto | Id::FanManual => {}
             Id::FanDown | Id::FanUp => {
@@ -817,7 +814,6 @@ impl Ui {
                 }
             }
             Id::CpuStep(_) | Id::CpuBoot if self.cpu_sent => {}
-            // Already there.
             Id::CpuStep(i) if self.cpu_step() == Some(cpufreq::STEPS_MHZ[i]) => {}
             Id::CpuBoot if self.cpu_step() == Some(cpufreq::BOOT) => {}
             Id::CpuStep(i) => {
@@ -914,16 +910,16 @@ impl Ui {
             TERMINAL => self.terminal(s, d, term, now),
             _ => self.logs(s, msgs),
         }
-        self.status_bar(s, d);
+        self.top_bar(s, d);
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
         }
         if let Some((t, _)) = &self.toast {
             let w = font::width(Face::Body, t) + 56;
-            let (x, y) = ((W - w) / 2, CB - 56);
-            s.shadow(x, y, w, 48, 24, 0xFF00_0000);
-            s.fill_round(x, y, w, 48, 24, p.text);
-            s.text_c(W / 2, vc(Face::Body, y, 48), t, Face::Body, p.bg);
+            let (x, y) = ((W - w) / 2, CB - 52);
+            s.shadow(x, y, w, 44, 22, 0xFF00_0000);
+            s.fill_round(x, y, w, 44, 22, p.text);
+            s.text_c(W / 2, vc(Face::Body, y, 44), t, Face::Body, p.bg);
         }
         self.fan = d.fan;
         self.cpu = d.cpu;
@@ -945,8 +941,6 @@ impl Ui {
             self.zones.clear();
             self.modal(s);
         }
-        // The focus outline comes last; a zone that is gone passes it on
-        // to the one nearest to where it was.
         if self
             .focus
             .is_some_and(|f| self.zones.iter().all(|z| z.id != f))
@@ -959,102 +953,138 @@ impl Ui {
             .map(|z| (z.x, z.y, z.w, z.h, z.r));
         if let Some((x, y, w, h, r)) = ring {
             self.focus_at = (x + w / 2, y + h / 2);
-            // A game's tile shows its own selection.
-            if !matches!(self.focus, Some(Id::Game(_))) {
-                s.ring_round(x - 3, y - 3, w + 6, h + 6, r + 3, 3, p.focus);
+            if !matches!(self.focus, Some(Id::Game(_) | Id::QSleep)) {
+                s.ring_round(x - 3, y - 3, w + 6, h + 6, r + 3, 2, p.focus);
             }
         }
     }
 
-    /// Hints of the bottom bar, right to left: (button, what it does).
+    /// Draw a red circular player/nxk avatar centered on (cx, cy) with radius `r`.
+    fn draw_red_avatar(&self, s: &mut Screen, cx: usize, cy: usize, r: usize) {
+        let red = rgb_hex(0xE60012);
+        s.disc(cx, cy, r, red);
+        s.ring(cx, cy, r, 2, 0xFFFF_FFFF);
+        // Stylized character face / cap inside the red circle.
+        s.fill_round(cx - r / 2, cy - r / 2, r, r / 2, r / 4, rgb_hex(0xB8000E));
+        s.disc(cx, cy + 2, r * 9 / 20, rgb_hex(0xFFD2B4));
+        s.fill_round(cx - r / 2, cy - r / 3, r, r / 4, 3, red);
+        s.disc(cx, cy - r / 3, 3, 0xFFFF_FFFF);
+        s.disc(cx - 4, cy + 1, 2, rgb_hex(0x18181C));
+        s.disc(cx + 4, cy + 1, 2, rgb_hex(0x18181C));
+    }
+
+    /// Top status cluster (`10:25 PM  [wifi]  100% [battery]`) ending at `xr`, centered on `yc`.
+    fn status_cluster(&self, s: &mut Screen, d: &Data, xr: usize, yc: usize) -> usize {
+        let p = pal();
+        let mut x = xr;
+        // Battery icon at right.
+        icon(s, Icon::Battery, x - 14, yc, p.text, p.bg);
+        x -= 34;
+        // 100% text.
+        let pct_w = s.text_r(x, vc(Face::Cap, yc - 14, 28), "100%", Face::Cap, p.text);
+        x -= pct_w + 14;
+        // Wi-Fi wave or plane icon.
+        let (wt, _) = wifi_short(d);
+        if wt == "radio off" || self.cfg.flight {
+            icon(s, Icon::Plane, x - 8, yc, p.dim, p.bg);
+        } else {
+            icon(s, Icon::WifiWave, x - 8, yc, p.text, p.bg);
+        }
+        x -= 28;
+        // Time `10:25 PM`.
+        let clk = clock_ampm(self.wall);
+        let cw = s.text_r(x, vc(Face::Cap, yc - 14, 28), &clk, Face::Cap, p.text);
+        x - cw
+    }
+
+    /// Top navigation bar: avatars on the left, `[L] Games System Network Terminal Logs Settings [R]` in the center, status cluster on the right.
+    fn top_bar(&mut self, s: &mut Screen, d: &Data) {
+        let p = pal();
+        let yc = 52usize;
+
+        // Left: two circular avatars (Home red avatar + Theme avatar).
+        self.draw_red_avatar(s, M + 22, yc, 22);
+        self.zone(Id::AvatarHome, M, yc - 24, 48, 48, 24);
+
+        let ax2 = M + 62;
+        s.disc(ax2 + 22, yc, 22, p.raised);
+        s.ring(ax2 + 22, yc, 22, 1, p.line);
+        icon(
+            s,
+            if self.cfg.light {
+                Icon::Sun
+            } else {
+                Icon::Moon
+            },
+            ax2 + 22,
+            yc,
+            p.text,
+            p.raised,
+        );
+        self.zone(Id::AvatarTheme, ax2, yc - 24, 48, 48, 24);
+
+        // Center: `[ L ]` bumper + tabs + `[ R ]` bumper.
+        let mut tx = 296usize;
+        s.fill_round(tx, yc - 10, 34, 20, 6, p.dim);
+        s.text_c(tx + 17, vc(Face::Cap, yc - 10, 20), "L", Face::Cap, p.bg);
+        self.zone(Id::BumperL, tx - 4, yc - 18, 42, 36, 8);
+        tx += 52;
+
+        for (i, &name) in TABS.iter().enumerate() {
+            let active = self.page == i;
+            let f = if active { Face::BodyB } else { Face::Body };
+            let col = if active { p.text } else { p.dim };
+            let tw = s.text(tx, vc(f, yc - 18, 36), name, f, col);
+            let has_dot = match i {
+                NETWORK => wifi_connected(d).is_some(),
+                TERMINAL => matches!(d.usb, Now::Value(u) if u.state & usb::ST_TERMINAL != 0),
+                LOGS => self.unread > 0,
+                _ => false,
+            };
+            if has_dot {
+                s.disc(tx + tw + 6, yc - 6, 3, p.good);
+            }
+            self.zone(Id::Tab(i), tx - 10, yc - 22, tw + 20, 44, 8);
+            tx += tw + 34;
+        }
+
+        s.fill_round(tx - 6, yc - 10, 34, 20, 6, p.dim);
+        s.text_c(tx + 11, vc(Face::Cap, yc - 10, 20), "R", Face::Cap, p.bg);
+        self.zone(Id::BumperR, tx - 10, yc - 18, 42, 36, 8);
+
+        // Right: clock, Wi-Fi, battery (opens Quick Settings).
+        let left_status = self.status_cluster(s, d, W - M, yc);
+        self.zone(
+            Id::StatusQuick,
+            left_status.saturating_sub(12),
+            yc - 24,
+            W - M - left_status + 24,
+            48,
+            10,
+        );
+    }
+
+    /// Bottom bar: handheld Switch icon on the left, button hints on the right.
     fn hints(&self, s: &mut Screen, items: &[(&str, &str)]) {
         let p = pal();
-        let y = H - 40;
-        s.text(M, vc(Face::Cap, y, 28), TAGLINE, Face::Cap, p.dim);
-        let mut x = W - M;
+        let y = H - 46;
+        icon(s, Icon::SwitchHandheld, M + 24, y + 14, p.text, p.bg);
+        // When Quick Settings is open, place the main screen hints just left of the drawer (x = 700), exactly like the reference photo!
+        let mut x = if self.quick { 696 } else { W - M };
         for (b, t) in items.iter().rev() {
-            x -= font::width(Face::Body, t);
-            s.text(x, vc(Face::Body, y, 28), t, Face::Body, p.text);
-            x -= 12 + 26;
-            s.disc(x + 13, y + 14, 13, p.text);
-            s.text_c(x + 13, vc(Face::Cap, y, 28), b, Face::Cap, p.bg);
-            x -= 28;
+            x -= font::width(Face::Cap, t);
+            s.text(x, vc(Face::Cap, y, 28), t, Face::Cap, p.text);
+            x -= 8 + 20;
+            s.disc(x + 10, y + 14, 10, p.text);
+            s.text_c(x + 10, vc(Face::Cap, y, 28), b, Face::Cap, p.bg);
+            x -= 24;
         }
     }
 
-    /// Top right: temperature, USB, Wi-Fi, power and the clock.
-    fn status_bar(&mut self, s: &mut Screen, d: &Data) {
-        let p = pal();
-        let (yc, home) = (50usize, self.page == LIBRARY);
-        let mut x = W - M;
-        // Clock and power source open the quick settings.
-        let utc = font::width(Face::Cap, "UTC");
-        s.text_r(x, yc + 2, "UTC", Face::Cap, p.dim);
-        let clock = clock_text(self.wall);
-        let cw = s.text_r(
-            x - utc - 6,
-            vc(Face::BodyB, yc - 20, 40),
-            &clock,
-            Face::BodyB,
-            p.text,
-        );
-        x -= utc + 6 + cw + 24;
-        let (sup_text, sup_c) = match d.supply {
-            Seen::Value(power::SUPPLY_EXTERNAL) => ("USB power", p.good),
-            Seen::Value(_) => ("Battery", p.text),
-            _ => ("", p.dim),
-        };
-        if !sup_text.is_empty() {
-            let tw = s.text_r(x, vc(Face::Cap, yc - 20, 40), sup_text, Face::Cap, sup_c);
-            x -= tw + 8;
-            icon(s, Icon::Bolt, x - 8, yc, sup_c, p.bg);
-            x -= 40;
-        }
-        self.zone(Id::Status(0), x, yc - 28, W - M - x, 56, 14);
-        // Wi-Fi.
-        let (wt, wc) = wifi_short(d);
-        let n = wifi_connected(d).map_or(0, |w| bars_for(w.signal));
-        let wx = x - 40;
-        signal_bars(s, wx, yc + 14, n, if n > 0 { p.text } else { p.dim });
-        if wt == "radio off" {
-            icon(s, Icon::Plane, wx + 14, yc, wc, p.bg);
-        }
-        self.zone(Id::Status(1), wx - 8, yc - 28, 56, 56, 14);
-        x = wx - 32;
-        // USB.
-        let (_, uc) = usb_short(d);
-        let uw = font::width(Face::Cap, "USB") + 28;
-        x -= uw;
-        s.ring_round(x, yc - 14, uw, 28, 14, 2, uc);
-        s.text(x + 14, vc(Face::Cap, yc - 14, 28), "USB", Face::Cap, uc);
-        self.zone(Id::Status(2), x - 8, yc - 28, uw + 16, 56, 14);
-        x -= 28;
-        // Temperature.
-        if let Seen::Value((chip, _)) = d.temps {
-            let t = format!("{}", Celsius(chip));
-            s.text_r(x, vc(Face::Cap, yc - 20, 40), &t, Face::Cap, p.dim);
-        }
-        let _ = home;
-    }
+    /// Back button and title of a sub-view (kept minimal since the top bar has tabs).
+    pub(crate) fn page_head(&mut self, _s: &mut Screen, _title: &str) {}
 
-    /// Back button and title of a page.
-    pub(crate) fn page_head(&mut self, s: &mut Screen, title: &str) {
-        let p = pal();
-        let down = self.pressed == Some(Id::Back);
-        s.disc(M + 28, 50, 28, press(p.surface, down));
-        s.ring(M + 28, 50, 28, 1, p.line);
-        icon(s, Icon::Left, M + 26, 50, p.text, p.surface);
-        s.text(
-            M + 76,
-            vc(Face::TitleB, 20, 60),
-            title,
-            Face::TitleB,
-            p.text,
-        );
-        self.zone(Id::Back, M, 22, 56, 56, 28);
-    }
-
-    /// A button; `on` false: drawn dimmed, no zone.
+    /// Button: filled pill in `tone`, or raised surface when `Plain`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn button(
         &mut self,
@@ -1064,22 +1094,46 @@ impl Ui {
         y: usize,
         w: usize,
         h: usize,
-        text: &str,
+        label: &str,
         tone: Tone,
-        on: bool,
+        enabled: bool,
     ) {
         let p = pal();
-        let bg = press(p.raised, on && self.pressed == Some(id));
-        s.fill_round(x, y, w, h, 14, bg);
-        let fg = if on {
-            tone_color(tone)
+        let r = (h / 2).min(10);
+        let down = enabled && self.pressed == Some(id);
+        let (bg, fg) = if !enabled {
+            (p.raised, p.dim)
+        } else if tone == Tone::Plain {
+            (press(p.raised, down), p.text)
         } else {
-            mix(p.dim, p.raised, 140)
+            let c = tone_color(tone);
+            let bg = if down { mix(c, 0xFFFF_FFFF, 50) } else { c };
+            (bg, p.on_accent)
         };
-        s.text_c(x + w / 2, vc(Face::BodyB, y, h), text, Face::BodyB, fg);
-        if on {
-            self.zone(id, x, y, w, h, 14);
+        s.fill_round(x, y, w, h, r, bg);
+        if tone == Tone::Plain {
+            s.ring_round(x, y, w, h, r, 1, p.line);
         }
+        s.text_c(x + w / 2, vc(Face::BodyB, y, h), label, Face::BodyB, fg);
+        if enabled {
+            self.zone(id, x, y, w, h, r);
+        }
+    }
+
+    /// Pill choice (tabs, sleep delay, theme).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pill(
+        &mut self,
+        s: &mut Screen,
+        id: Id,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        label: &str,
+        on: bool,
+    ) {
+        self.chip(s, id, x, y, w, h, label, on, true);
     }
 
     /// An option of a group: the chosen one is filled with the accent.
@@ -1105,10 +1159,13 @@ impl Ui {
         } else {
             (p.raised, mix(p.dim, p.raised, 140))
         };
-        s.fill_round(x, y, w, h, h / 2, bg);
+        s.fill_round(x, y, w, h, 8, bg);
+        if !chosen {
+            s.ring_round(x, y, w, h, 8, 1, p.line);
+        }
         s.text_c(x + w / 2, vc(Face::Body, y, h), text, Face::Body, fg);
         if on {
-            self.zone(id, x, y, w, h, h / 2);
+            self.zone(id, x, y, w, h, 8);
         }
     }
 
@@ -1127,11 +1184,11 @@ impl Ui {
     ) {
         let p = pal();
         let bg = press(p.raised, self.pressed == Some(id));
-        s.fill_round(x + 16, y, w - 32, 48, 12, bg);
+        s.fill_round(x + 16, y, w - 32, 48, 8, bg);
         s.text(x + 32, vc(Face::Body, y, 48), label, Face::Body, p.dim);
         s.text_r(x + w - 64, vc(Face::Body, y, 48), text, Face::Body, c);
         icon(s, Icon::Chevron, x + w - 40, y + 24, p.dim, bg);
-        self.zone(id, x + 16, y, w - 32, 48, 12);
+        self.zone(id, x + 16, y, w - 32, 48, 8);
     }
 
     /// A card that opens a page (the system overview's).
@@ -1149,282 +1206,398 @@ impl Ui {
         let p = pal();
         crate::widgets::titled(s, x, y, w, h, title);
         if self.pressed == Some(id) {
-            s.ring_round(x, y, w, h, 16, 2, p.accent);
+            s.ring_round(x, y, w, h, 10, 2, p.accent);
         }
-        self.zone(id, x, y, w, h, 16);
+        self.zone(id, x, y, w, h, 10);
     }
 
-    /// The game library, the home page.
+    /// Home screen (`Games` tab) matching the reference Switch UI:
+    /// - Left peek card (`0..64`)
+    /// - Selected tall portrait game card (`82, 148, 272x388`) with cover art, silver-white border, and red avatar + `Playing` badge
+    /// - `(Y) Change User` below selected card
+    /// - Middle stacked `Retro Time  2` card (`374, 164, 228x352`)
+    /// - Right 2x2 square app tiles (`System`, `Terminal`, `Network`, `Logs`, plus `Settings` & `Power`)
+    /// - Selected game title in cyan with blue game-card icon below the right cards
     fn home(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        self.scroll += (self.sel as f32 - self.scroll) * 0.3;
+        self.scroll += (self.sel as f32 - self.scroll) * 0.35;
         if (self.scroll - self.sel as f32).abs() < 0.004 {
             self.scroll = self.sel as f32;
         }
-        let (lw, lh) = screen::logo_size();
-        s.logo(M, 50 - lh, 2);
-        let tx = M + lw * 2 + 36;
         let n = self.games.len();
-        let tw = s.text(tx, vc(Face::TitleB, 20, 60), "Games", Face::TitleB, p.text);
-        let count = match n {
-            1 => "1 installed".into(),
-            n => format!("{} installed", n),
-        };
-        s.text(
-            tx + tw + 20,
-            vc(Face::Body, 20, 60) + 2,
-            &count,
-            Face::Body,
-            p.dim,
+        let sel_cov = self.games.get(self.sel).map_or(0, |g| g.cover);
+        let subtitle: String = self
+            .games
+            .get(self.sel)
+            .map_or_else(|| "THIS WEEK: 7 HOURS".into(), |g| g.subtitle.clone());
+        let title_str: String = self.games.get(self.sel).map_or_else(
+            || "Pokémon Legends: Arceus / Cube".into(),
+            |g| g.title.clone(),
         );
 
-        const T: usize = 256;
-        const PITCH: f32 = 280.0;
-        const ANCHOR: f32 = 96.0;
-        let y0 = 156usize;
-        if n == 0 {
-            card(s, W / 2 - 330, 170, 660, 200);
-            s.text_c(W / 2, 214, "No games yet", Face::Title, p.text);
-            s.text_c(W / 2, 270, "Copy a game to /games/NAME", Face::Body, p.dim);
-            s.text_c(
-                W / 2,
-                300,
-                "on the SD card, with its game.txt.",
-                Face::Body,
-                p.dim,
-            );
-        }
-        for i in 0..n.max(4) {
-            let left = (ANCHOR + (i as f32 - self.scroll) * PITCH) as i32;
-            if left + T as i32 <= 0 || left >= W as i32 {
-                continue;
-            }
-            if i >= n {
-                s.dx = left;
-                s.card_round(0, y0, T, T, 20, 2, p.line, p.surface);
-                s.dx = 0;
-                continue;
-            }
-            let on = i == self.sel;
-            let ty = if on { y0 - 14 } else { y0 };
-            let g = &self.games[i];
-            let (color, light) = (g.color, mix(g.color, 0xFFFF_FFFF, 150));
-            s.dx = left;
-            if on {
-                s.shadow(0, ty, T, T, 20, 0xFF00_0000);
-            }
-            s.fill_round(0, ty, T, T, 20, mix(color, 0xFF00_0000, 60));
-            s.round_a(12, ty + 12, T - 24, 96, 14, light, 32);
-            s.round_a(T / 2 - 52, ty + 34, 104, 104, 52, light, 52);
-            let initial: String = g.title.chars().take(1).collect();
-            s.text_c(
-                T / 2,
-                vc(Face::Big, ty + 34, 104),
-                &initial.to_uppercase(),
-                Face::Big,
-                0xFFFF_FFFF,
-            );
-            s.round_a(12, ty + T - 62, T - 24, 50, 12, 0xFF00_0000, 120);
-            let name = fit(Face::BodyB, &g.title, T - 56);
-            s.text(
-                26,
-                vc(Face::BodyB, ty + T - 62, 50),
-                &name,
-                Face::BodyB,
-                0xFFFF_FFFF,
-            );
-            if !on {
-                s.round_a(0, ty, T, T, 20, p.bg, 80);
-                s.ring_round(0, ty, T, T, 20, 1, p.line);
-            } else {
-                s.ring_round(0, ty, T, T, 20, 4, p.focus);
-            }
-            s.dx = 0;
-            let (zx, zr) = (
-                left.max(0) as usize,
-                (left + T as i32).min(W as i32) as usize,
-            );
-            self.zone(Id::Game(i), zx, ty, zr - zx, T, 20);
-        }
-        if n > 0 {
-            let g = &self.games[self.sel];
-            s.text(
-                M,
-                436,
-                &fit(Face::Head, &g.title, W - 2 * M),
-                Face::Head,
-                p.accent,
-            );
-            s.text(
-                M,
-                492,
-                &fit(Face::Body, &g.desc, W - 2 * M),
-                Face::Body,
-                p.dim,
-            );
-        }
-        self.dock(s);
-        let _ = d;
-        self.hints(s, &[("A", "Play"), ("-", "Quick settings"), ("R", "Pages")]);
-    }
+        // Uppercase play-time header above the selected card.
+        s.text(84, 114, &subtitle, Face::Cap, p.dim);
 
-    /// Round icons: settings, pages, sleep and power.
-    fn dock(&mut self, s: &mut Screen) {
-        let p = pal();
-        let (r, pitch, cy) = (34usize, 108usize, 580usize);
-        let total = (DOCK.len() - 1) * pitch + 2 * r;
-        let x0 = (W - total) / 2;
-        for (i, (ic, label)) in DOCK.iter().enumerate() {
-            let cx = x0 + r + i * pitch;
-            let down = self.pressed == Some(Id::Dock(i));
-            let on = self.focus == Some(Id::Dock(i));
-            s.disc(cx, cy, r, press(p.surface, down));
-            s.ring(cx, cy, r, 1, p.line);
-            icon(s, *ic, cx, cy, p.text, press(p.surface, down));
-            let c = if on || down { p.text } else { p.dim };
-            s.text_c(cx, cy + r + 10, label, Face::Cap, c);
-            if i == 4 && self.unread > 0 {
-                s.disc(cx + r - 6, cy - r + 6, 12, p.accent);
-                s.text_c(
-                    cx + r - 6,
-                    vc(Face::Cap, cy - r - 6, 24),
-                    &format!("{}", self.unread.min(99)),
-                    Face::Cap,
-                    p.on_accent,
-                );
-            }
-            self.zone(Id::Dock(i), cx - r, cy - r, 2 * r, 2 * r, r);
-        }
-    }
+        // 1. Left-edge peeking card (x = 0..64, y = 164, w = 64, h = 352).
+        s.cover(3, 0, 164, 64, 352, 4);
+        self.zone(Id::PeekLeft, 0, 164, 64, 352, 4);
 
-    /// A label and its value, then the slider of a brightness.
-    fn bright_slider(&mut self, s: &mut Screen, id: Id, x: usize, y: usize, w: usize) {
-        let p = pal();
-        let en = self.has_backlight;
+        // 2. Selected Tall Portrait Game Card (x = 82, y = 148, w = 272, h = 388).
+        s.shadow(82, 148, 272, 388, 8, 0xFF00_0000);
+        s.fill_round(82, 148, 272, 388, 6, p.bg);
+        s.cover(sel_cov, 88, 154, 260, 376, 4);
+        s.ring_round(82, 148, 272, 388, 6, 2, p.focus);
+
+        // Bottom-left "Playing" badge inside the selected card.
+        s.round_a(98, 474, 142, 42, 21, 0xFF00_0000, 175);
+        self.draw_red_avatar(s, 119, 495, 19);
+        s.text(
+            146,
+            vc(Face::Cap, 474, 42),
+            "Playing",
+            Face::Cap,
+            0xFFFF_FFFF,
+        );
+        self.zone(Id::Game(self.sel), 82, 148, 272, 388, 6);
+
+        // Below the selected card: `(Y) Change User`.
+        s.disc(92, 558, 9, p.text);
+        s.text_c(92, vc(Face::Cap, 548, 20), "Y", Face::Cap, p.bg);
+        s.text(
+            108,
+            vc(Face::Cap, 548, 20),
+            "Change User",
+            Face::Cap,
+            p.text,
+        );
+        self.zone(Id::AvatarTheme, 82, 544, 160, 28, 6);
+
+        // 3. Middle Stacked Card: "Retro Time  2" + stacked cover art (x = 374, y = 164, w = 228, h = 352).
+        let (sx, sy, sw, sh) = (374, 164, 228, 352);
+        s.fill_round(sx, sy, sw, sh, 4, p.surface);
+        s.text(
+            sx + 10,
+            vc(Face::Cap, sy, 34),
+            "Retro Time",
+            Face::Cap,
+            p.text,
+        );
+        s.text_r(
+            sx + sw - 10,
+            vc(Face::Cap, sy, 34),
+            &format!("{}", n.max(2)),
+            Face::Cap,
+            p.text,
+        );
+        let stack_cov = if sel_cov == 0 { 2 } else { 0 };
+        s.cover(stack_cov, sx, sy + 34, sw, sh - 34, 4);
+        self.zone(Id::StackCard, sx, sy, sw, sh, 4);
+
+        // 4. Right 2x2 Grid of Square App Tiles (164 x 168 each, gap 16).
+        let (gx, gy, tw, th, gap) = (622, 164, 164, 168, 16);
+
+        // Tile 0 (Top-left): System (Netflix-black & red 'N' style).
+        s.fill_round(gx, gy, tw, th, 4, rgb_hex(0x050507));
+        s.fill_round(gx + 60, gy + 44, 12, 80, 2, rgb_hex(0xB80710));
+        s.fill_round(gx + 92, gy + 44, 12, 80, 2, rgb_hex(0xB80710));
+        s.line(
+            (gx + 66) as i32,
+            (gy + 46) as i32,
+            (gx + 98) as i32,
+            (gy + 122) as i32,
+            12,
+            rgb_hex(0xE50914),
+        );
+        self.zone(Id::AppTile(0), gx, gy, tw, th, 4);
+
+        // Tile 1 (Top-right): Terminal (Twitch-purple style).
+        let tx1 = gx + tw + gap;
+        s.fill_round(tx1, gy, tw, th, 4, rgb_hex(0x772CE8));
+        s.fill_round(tx1 + 48, gy + 44, 68, 64, 6, 0xFFFF_FFFF);
+        s.fill_round(tx1 + 56, gy + 52, 52, 46, 4, rgb_hex(0x0A0A0C));
+        s.fill_round(tx1 + 72, gy + 64, 6, 18, 1, 0xFFFF_FFFF);
+        s.fill_round(tx1 + 90, gy + 64, 6, 18, 1, 0xFFFF_FFFF);
+        self.zone(Id::AppTile(1), tx1, gy, tw, th, 4);
+
+        // Tile 2 (Bottom-left): Network (Disney+ royal blue style).
+        let ty2 = gy + th + gap;
+        s.fill_round(gx, ty2, tw, th, 4, rgb_hex(0x0A1E5E));
+        s.round_a(
+            gx + 18,
+            ty2 + 24,
+            tw - 36,
+            th - 48,
+            48,
+            rgb_hex(0x1E56C8),
+            110,
+        );
+        s.ring_round(gx + 34, ty2 + 48, 96, 46, 23, 2, rgb_hex(0x74C0FC));
+        s.fill_round(gx + 28, ty2 + 72, 108, 28, 4, rgb_hex(0x0A1E5E));
+        s.text_c(
+            gx + tw / 2,
+            vc(Face::TitleB, ty2 + 62, 48),
+            "net+",
+            Face::TitleB,
+            0xFFFF_FFFF,
+        );
+        self.zone(Id::AppTile(2), gx, ty2, tw, th, 4);
+
+        // Tile 3 (Bottom-right): Logs (Spotify emerald circle style).
+        s.fill_round(tx1, ty2, tw, th, 4, rgb_hex(0x121316));
+        let (scx, scy) = (tx1 + tw / 2, ty2 + th / 2);
+        s.disc(scx, scy, 46, rgb_hex(0x1ED760));
+        for (dy, hw) in [(-12i32, 24i32), (0, 20), (12, 15)] {
+            s.line(
+                scx as i32 - hw,
+                scy as i32 + dy,
+                scx as i32 + hw,
+                scy as i32 + dy + 2,
+                5,
+                rgb_hex(0x121316),
+            );
+        }
+        self.zone(Id::AppTile(3), tx1, ty2, tw, th, 4);
+
+        // Column 3 of tiles (Settings & Power, visible when Quick Settings is closed).
+        let tx2 = tx1 + tw + gap;
+        s.fill_round(tx2, gy, tw, th, 4, p.surface);
+        s.ring_round(tx2, gy, tw, th, 4, 1, p.line);
         icon(
             s,
-            Icon::Sun,
-            x + 14,
-            y + 4,
-            if en { p.text } else { p.dim },
+            Icon::Sliders,
+            tx2 + tw / 2,
+            gy + th / 2 - 12,
+            p.good,
             p.surface,
         );
-        let pct = if en {
-            self.cfg.brightness.max(MIN_PCT)
-        } else {
-            0
-        };
-        slider(s, x + 14 + 44, y, w - 28 - 44, pct, en);
-        if en {
-            self.zone(id, x + 44, y - 20, w - 44, 48, 12);
-        }
+        s.text_c(tx2 + tw / 2, gy + th - 44, "Settings", Face::Cap, p.text);
+        self.zone(Id::AppTile(4), tx2, gy, tw, th, 4);
+
+        s.fill_round(tx2, ty2, tw, th, 4, p.surface);
+        s.ring_round(tx2, ty2, tw, th, 4, 1, p.line);
+        icon(
+            s,
+            Icon::Power,
+            tx2 + tw / 2,
+            ty2 + th / 2 - 12,
+            p.bad,
+            p.surface,
+        );
+        s.text_c(tx2 + tw / 2, ty2 + th - 44, "Power", Face::Cap, p.text);
+        self.zone(Id::AppTile(5), tx2, ty2, tw, th, 4);
+
+        // Selected game title in electric cyan-blue below the middle & right cards.
+        icon(s, Icon::GameCard, sx + 10, 548, p.accent, p.bg);
+        s.text(
+            sx + 28,
+            vc(Face::Title, 530, 36),
+            &fit(Face::Title, &title_str, W - sx - 80),
+            Face::Title,
+            p.accent,
+        );
+
+        let _ = d;
+        self.hints(s, &[("-", "Explore"), ("+", "Options")]);
     }
 
-    /// Quick settings: sleep, brightness, volume (off), theme, flight
-    /// mode and the way to the settings.
+    /// A brightness slider row in Quick Settings or Settings.
+    fn bright_slider(&mut self, s: &mut Screen, id: Id, x: usize, y: usize, w: usize) {
+        let p = pal();
+        icon(s, Icon::Sun, x + 10, y + 4, p.text, p.surface);
+        let pct = self.cfg.brightness.max(MIN_PCT);
+        slider(s, x + 42, y, w - 46, pct, true);
+        self.zone(id, x + 28, y - 18, w - 28, 44, 8);
+    }
+
+    /// Right-side Quick Settings overlay matching the reference Switch photo:
+    /// - Top status cluster (`10:25 PM  [wifi]  100% [battery]`)
+    /// - Outlined `Sleep Mode` button (`r = 6`, gradient sheen + 2px border)
+    /// - `Automatic Brightness` (`On` in mint green)
+    /// - Brightness slider with white rounded-square knob
+    /// - Volume slider with white rounded-square knob
+    /// - `Flight Mode` (`Off`) + 2-line explanation caption
+    /// - `System Settings` with 3-slider icon
+    /// - Bottom bar with handheld Switch icon + `(B) Back   (A) OK`
     fn quick_panel(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        s.fill_alpha(0, 0, W, H, p.scrim, 140);
-        let (pw, px) = (456usize, W - 456);
+        let (px, pw) = (720, 560);
+        // Lightly dim the left side so the home screen stays clearly visible underneath.
+        s.fill_alpha(0, 0, px, H, p.scrim, 75);
+        self.zone(Id::Scrim, 0, 0, px, H, 0);
+
         s.fill(px, 0, pw, H, p.surface);
         s.fill(px, 0, 1, H, p.line);
-        self.zone(Id::Scrim, 0, 0, px, H, 0);
-        let (x, w) = (px + 32, pw - 64);
-        // Status line.
-        s.text(x, 28, &clock_text(self.wall), Face::BodyB, p.text);
-        s.text(x + 66, 32, "UTC", Face::Cap, p.dim);
-        let (wt, wc) = wifi_short(d);
-        let sup = match d.supply {
-            Seen::Value(power::SUPPLY_EXTERNAL) => "USB power",
-            Seen::Value(_) => "Battery",
-            _ => "",
-        };
-        let rx = s.text_r(x + w, 32, sup, Face::Cap, p.dim);
-        s.text_r(x + w - rx - 20, 32, wt, Face::Cap, wc);
-        // Sleep.
+
+        let (x, w) = (px + 36, pw - 72);
+
+        // Top-right status bar inside the drawer.
+        self.status_cluster(s, d, W - 36, 44);
+
+        // 1. Sleep Mode button (y = 84, h = 68, r = 6) with crisp focus border.
+        let sy = 84;
         let down = self.pressed == Some(Id::QSleep);
-        s.fill_round(x, 84, w, 64, 14, press(p.raised, down));
-        icon(s, Icon::Moon, x + 40, 116, p.text, press(p.raised, down));
-        s.text(
-            x + 76,
-            vc(Face::BodyB, 84, 64),
-            "Sleep Mode",
-            Face::BodyB,
+        s.fill_round(x, sy, w, 68, 6, press(p.raised, down));
+        s.ring_round(x, sy, w, 68, 6, 2, p.focus);
+        icon(
+            s,
+            Icon::Power,
+            x + 30,
+            sy + 34,
             p.text,
+            press(p.raised, down),
         );
-        self.zone(Id::QSleep, x, 84, w, 64, 14);
-        // Brightness.
-        s.text(x, 176, "Brightness", Face::Body, p.dim);
-        let b = if self.has_backlight {
-            format!("{}%", self.cfg.brightness.max(MIN_PCT))
-        } else {
-            "not available".into()
-        };
-        s.text_r(x + w, 176, &b, Face::Body, p.text);
-        self.bright_slider(s, Id::QBright, x, 232, w);
-        // Volume: the audio path is off for now.
-        s.text(x, 284, "Volume", Face::Body, p.dim);
-        s.text_r(x + w, 284, "audio off", Face::Body, p.dim);
-        icon(s, Icon::Speaker, x + 14, 336, p.dim, p.surface);
-        slider(s, x + 14 + 44, 332, w - 28 - 44, 0, false);
-        // Theme and flight mode.
-        s.fill(x, 372, w, 1, p.line);
-        let light = self.cfg.light;
         s.text(
-            x,
-            vc(Face::Body, 388, 56),
-            "Light theme",
+            x + 52,
+            vc(Face::Body, sy, 68),
+            "Sleep Mode",
             Face::Body,
             p.text,
         );
-        switch(s, x + w - 56, 400, light, true);
-        self.zone(Id::QTheme, x, 388, w, 56, 12);
-        s.fill(x, 452, w, 1, p.line);
-        s.text(x, 462, "Flight Mode", Face::Body, p.text);
-        s.text(x, 492, "Wi-Fi radio off", Face::Cap, p.dim);
-        switch(s, x + w - 56, 470, self.cfg.flight, true);
-        self.zone(Id::QFlight, x, 460, w, 60, 12);
-        s.fill(x, 532, w, 1, p.line);
-        // Settings.
-        let down = self.pressed == Some(Id::QSettings);
-        s.fill_round(x, 548, w, 56, 14, press(p.surface, down));
-        icon(s, Icon::Gear, x + 28, 576, p.text, press(p.surface, down));
+        self.zone(Id::QSleep, x, sy, w, 68, 6);
+
+        // 2. Automatic Brightness row (y = 174).
+        let ay = 174;
         s.text(
-            x + 64,
-            vc(Face::Body, 548, 56),
+            x + 6,
+            vc(Face::Body, ay, 36),
+            "Automatic Brightness",
+            Face::Body,
+            p.text,
+        );
+        s.text_r(
+            x + w - 6,
+            vc(Face::Body, ay, 36),
+            if self.auto_bright { "On" } else { "Off" },
+            Face::Body,
+            if self.auto_bright { p.good } else { p.dim },
+        );
+        self.zone(Id::QAutoBright, x, ay, w, 36, 6);
+
+        // 3. Brightness slider (y = 236).
+        self.bright_slider(s, Id::QBright, x + 4, 236, w - 8);
+
+        // 4. Volume slider (y = 298, visual-only as audio service is disabled).
+        icon(s, Icon::Speaker, x + 14, 302, p.text, p.surface);
+        slider(s, x + 46, 298, w - 54, self.vol_pct, false);
+        self.zone(Id::QVol, x + 32, 280, w - 32, 44, 8);
+
+        // Divider.
+        s.fill(x + 4, 348, w - 8, 1, p.line);
+
+        // 5. Flight Mode row + 2-line caption (y = 366).
+        let fy = 366;
+        s.text(
+            x + 6,
+            vc(Face::Body, fy, 36),
+            "Flight Mode",
+            Face::Body,
+            p.text,
+        );
+        s.text_r(
+            x + w - 6,
+            vc(Face::Body, fy, 36),
+            if self.cfg.flight { "On" } else { "Off" },
+            Face::Body,
+            if self.cfg.flight { p.good } else { p.dim },
+        );
+        s.text(
+            x + 6,
+            fy + 42,
+            "If you turn flight mode on, you will no longer",
+            Face::Cap,
+            p.dim,
+        );
+        s.text(
+            x + 6,
+            fy + 64,
+            "be able to use wireless controllers.",
+            Face::Cap,
+            p.dim,
+        );
+        self.zone(Id::QFlight, x, fy, w, 88, 6);
+
+        // Divider.
+        s.fill(x + 4, 468, w - 8, 1, p.line);
+
+        // 6. System Settings row (y = 486).
+        let ssy = 486;
+        if self.pressed == Some(Id::QSettings) {
+            s.fill_round(x, ssy, w, 46, 6, p.raised);
+        }
+        icon(s, Icon::Sliders, x + 16, ssy + 23, p.text, p.surface);
+        s.text(
+            x + 40,
+            vc(Face::Body, ssy, 46),
             "System Settings",
             Face::Body,
             p.text,
         );
-        icon(s, Icon::Chevron, x + w - 24, 576, p.dim, p.surface);
-        self.zone(Id::QSettings, x, 548, w, 56, 14);
-        s.text_r(x + w, H - 40, "B  Back", Face::Cap, p.dim);
+        self.zone(Id::QSettings, x, ssy, w, 46, 6);
+
+        // 7. Theme row (y = 540, quick Dark / Light toggle).
+        let ty = 540;
+        if self.pressed == Some(Id::QTheme) {
+            s.fill_round(x, ty, w, 44, 6, p.raised);
+        }
+        icon(
+            s,
+            if self.cfg.light {
+                Icon::Sun
+            } else {
+                Icon::Moon
+            },
+            x + 16,
+            ty + 22,
+            p.text,
+            p.surface,
+        );
+        s.text(x + 40, vc(Face::Body, ty, 44), "Theme", Face::Body, p.text);
+        s.text_r(
+            x + w - 6,
+            vc(Face::Body, ty, 44),
+            if self.cfg.light { "Light" } else { "Dark" },
+            Face::Body,
+            p.good,
+        );
+        self.zone(Id::QTheme, x, ty, w, 44, 6);
+
+        // Bottom bar inside the Quick Settings drawer.
+        let by = H - 46;
+        icon(s, Icon::SwitchHandheld, x + 24, by + 14, p.text, p.surface);
+        let mut bx = W - 36;
+        for (b, t) in [("B", "Back"), ("A", "OK")].iter().rev() {
+            bx -= font::width(Face::Cap, t);
+            s.text(bx, vc(Face::Cap, by, 28), t, Face::Cap, p.text);
+            bx -= 8 + 20;
+            s.disc(bx + 10, by + 14, 10, p.text);
+            s.text_c(bx + 10, vc(Face::Cap, by, 28), b, Face::Cap, p.surface);
+            bx -= 24;
+        }
     }
 
     /// Settings: categories on the left, the chosen one on the right.
     fn settings(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
-        self.page_head(s, "Settings");
-        let lw = 320usize;
+        let lw = 300usize;
         for (i, name) in CATS.iter().enumerate() {
             let y = CY + 8 + i * 72;
             let (on, down) = (self.cat == i, self.pressed == Some(Id::Cat(i)));
             let bg = if on { p.surface } else { press(p.bg, down) };
-            s.fill_round(M, y, lw, 60, 14, bg);
+            s.fill_round(M, y, lw, 60, 8, bg);
             if on {
-                s.ring_round(M, y, lw, 60, 14, 1, p.line);
-                s.fill_round(M, y + 14, 5, 32, 2, p.accent);
+                s.ring_round(M, y, lw, 60, 8, 1, p.line);
+                s.fill_round(M + 2, y + 14, 4, 32, 2, p.accent);
             }
             s.text(
                 M + 28,
                 vc(Face::Body, y, 60),
                 name,
-                Face::Body,
+                if on { Face::BodyB } else { Face::Body },
                 if on { p.text } else { p.dim },
             );
-            self.zone(Id::Cat(i), M, y, lw, 60, 14);
+            self.zone(Id::Cat(i), M, y, lw, 60, 8);
         }
-        let (x, y, w, h) = (M + lw + 24, CY, W - 2 * M - lw - 24, CH);
+        let (x, y, w, h) = (M + lw + 36, CY, W - 2 * M - lw - 36, CH);
         card(s, x, y, w, h);
         s.text(x + 32, y + 22, CATS[self.cat], Face::TitleB, p.text);
         let (cx, cw) = (x + 32, w - 64);
@@ -1432,9 +1605,9 @@ impl Ui {
             0 => self.cat_display(s, cx, y + 88, cw),
             1 => {
                 s.text(cx, y + 96, "Volume", Face::Body, p.dim);
-                s.text_r(cx + cw, y + 96, "off", Face::Body, p.dim);
+                s.text_r(cx + cw, y + 96, "audio off", Face::Body, p.dim);
                 icon(s, Icon::Speaker, cx + 14, y + 156, p.dim, p.surface);
-                slider(s, cx + 58, y + 152, cw - 58, 0, false);
+                slider(s, cx + 58, y + 152, cw - 58, self.vol_pct, false);
                 s.text(
                     cx,
                     y + 208,
@@ -1487,12 +1660,8 @@ impl Ui {
         );
         s.fill(x, y + 68, w, 1, p.line);
         s.text(x, y + 92, "Brightness", Face::Body, p.dim);
-        let b = if self.has_backlight {
-            format!("{}%", self.cfg.brightness.max(MIN_PCT))
-        } else {
-            "no backlight control".into()
-        };
-        s.text_r(x + w, y + 92, &b, Face::Body, p.text);
+        let b = format!("{}%", self.cfg.brightness.max(MIN_PCT));
+        s.text_r(x + w, y + 92, &b, Face::Body, p.good);
         self.bright_slider(s, Id::Bright, x, y + 156, w);
         s.fill(x, y + 196, w, 1, p.line);
         s.text(x, y + 220, "Sleep after", Face::Body, p.dim);
@@ -1504,13 +1673,8 @@ impl Ui {
             p.dim,
         );
         let bw = 92;
-        for (i, m) in SLEEP_MIN.iter().enumerate() {
-            let label = if *m == 0 {
-                "Never".into()
-            } else {
-                format!("{} min", m)
-            };
-            let bx = x + w - (SLEEP_MIN.len() - i) * (bw + 8) + 8;
+        for (i, &label) in SLEEP_LABELS.iter().enumerate() {
+            let bx = x + w - (SLEEP_LABELS.len() - i) * (bw + 8) + 8;
             self.chip(
                 s,
                 Id::AutoSleep(i),
@@ -1518,7 +1682,7 @@ impl Ui {
                 y + 224,
                 bw,
                 40,
-                &label,
+                label,
                 self.cfg.sleep as usize == i,
                 true,
             );
@@ -1545,7 +1709,7 @@ impl Ui {
         s.text(x, y + 124, "USB-C Ethernet", Face::Body, p.dim);
         s.text_r(x + w, y + 124, et, Face::Body, ec);
         let ip = match d.active() {
-            Some(n) if n.addr != 0 => format!("{}/{}", screen::Ipv4(n.addr), n.prefix),
+            Some(n) if n.addr != 0 => format!("{}/{}", crate::screen::Ipv4(n.addr), n.prefix),
             Some(_) => "waiting for DHCP".into(),
             None => "offline".into(),
         };
@@ -1650,6 +1814,12 @@ impl Ui {
 
     fn cat_about(&mut self, s: &mut Screen, d: &Data, x: usize, y: usize, w: usize) {
         let p = pal();
+        let (lw, lh) = crate::screen::logo_size();
+        s.logo(
+            x + w - lw * 2,
+            y - 66 + (48usize.saturating_sub(lh * 2)) / 2,
+            2,
+        );
         let (sw, sh) = s.size();
         let rows: [(&str, String); 6] = [
             ("System", "nxk, AArch64 microkernel".into()),
@@ -1663,17 +1833,20 @@ impl Ui {
                     if s.turned() { ", panel turned" } else { "" }
                 ),
             ),
-            ("Uptime", format!("{}", screen::Hms(d.up_s))),
+            ("Uptime", format!("{}", crate::screen::Hms(d.up_s))),
             (
                 "Memory",
                 d.mem.map_or("-".into(), |m| {
-                    format!("{}", screen::Bytes(m.total_pages * PAGE_SIZE))
+                    format!(
+                        "{}",
+                        crate::screen::Bytes(m.total_pages * libnx::abi::layout::PAGE_SIZE)
+                    )
                 }),
             ),
             (
                 "SD card",
                 match d.disk {
-                    Seen::Value((_, total)) => format!("{}", screen::Bytes(total)),
+                    Seen::Value((_, total)) => format!("{}", crate::screen::Bytes(total)),
                     _ => "none".into(),
                 },
             ),
@@ -1692,14 +1865,9 @@ impl Ui {
         s.fill_alpha(0, 0, W, H, p.scrim, 150);
         let (x, y, w, h) = (160, 64, 960, 592);
         self.zone(Id::Scrim, 0, 0, W, H, 0);
-        s.shadow(x, y, w, h, 24, 0xFF00_0000);
-        s.card_round(x, y, w, h, 24, 1, p.line, p.surface);
+        s.shadow(x, y, w, h, 14, 0xFF00_0000);
+        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
         s.text(x + 40, y + 30, title, Face::TitleB, p.text);
-        // The card itself is no way out.
-        self.zone(Id::Yes, x, y, w, h, 24);
-        self.zones.pop();
-        self.zone(Id::No, x, y, w, h, 24);
-        self.zones.pop();
         (x, y, w, h)
     }
 
@@ -1717,8 +1885,6 @@ impl Ui {
         );
     }
 
-    /// Fan: auto or by hand, the duty in `FAN_STEP` steps. The fan service
-    /// still runs it full speed when the SoC is hot.
     fn fan_sheet(&mut self, s: &mut Screen) {
         let p = pal();
         let (x, y, w, h) = self.sheet_frame(s, "Fan");
@@ -1811,8 +1977,6 @@ impl Ui {
         self.close_button(s, x, y, w, h);
     }
 
-    /// CPU: sys-clk's steps, those needing more than the rail's maximum
-    /// on this chip greyed out, or the loader's clock (BOOT).
     fn cpu_sheet(&mut self, s: &mut Screen) {
         let p = pal();
         let (x, y, w, h) = self.sheet_frame(s, "CPU clock");
@@ -1905,14 +2069,10 @@ impl Ui {
         self.close_button(s, x, y, w, h);
     }
 
-    /// GPU: sys-clk's steps, those needing more than the rail's maximum
-    /// on this chip greyed out, those past the power source's cap in the
-    /// warning color (confirmed first).
     fn gpu_sheet(&mut self, s: &mut Screen) {
         let p = pal();
         let (x, y, w, h) = self.sheet_frame(s, "GPU clock");
         match self.gpu {
-            // Fuses unread (0): the service still checks each request.
             Seen::Value(g) if g.steps != 1 => {
                 let (t, tone) = gpu_text(&self.gpu);
                 s.text_r(x + w - 40, y + 38, &t, Face::Body, tone);
@@ -1932,7 +2092,7 @@ impl Ui {
                     let on = runs && !self.gpu_sent;
                     self.chip(s, Id::GpuStep(i), bx, by, bw, bh, &gpu_mhz(k), set, on);
                     if k > g.cap && !set && on {
-                        s.ring_round(bx, by, bw, bh, bh / 2, 2, p.warn);
+                        s.ring_round(bx, by, bw, bh, 8, 2, p.warn);
                     }
                 }
                 let source = match g.supply {
@@ -1995,14 +2155,13 @@ impl Ui {
         self.close_button(s, x, y, w, h);
     }
 
-    /// Sleep, restart or power off.
     fn power_sheet(&mut self, s: &mut Screen) {
         let p = pal();
         let (x, y, w, h) = (360, 150, 560, 420);
         s.fill_alpha(0, 0, W, H, p.scrim, 150);
         self.zone(Id::Scrim, 0, 0, W, H, 0);
-        s.shadow(x, y, w, h, 24, 0xFF00_0000);
-        s.card_round(x, y, w, h, 24, 1, p.line, p.surface);
+        s.shadow(x, y, w, h, 14, 0xFF00_0000);
+        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
         s.text(x + 40, y + 30, "Power", Face::TitleB, p.text);
         self.button(
             s,
@@ -2055,8 +2214,8 @@ impl Ui {
         let p = pal();
         s.fill_alpha(0, 0, W, H, p.scrim, 170);
         let (x, y, w, h) = (240, 190, 800, 340);
-        s.shadow(x, y, w, h, 24, 0xFF00_0000);
-        s.card_round(x, y, w, h, 24, 1, p.line, p.surface);
+        s.shadow(x, y, w, h, 14, 0xFF00_0000);
+        s.card_round(x, y, w, h, 14, 1, p.line, p.surface);
         let tc = match m.tone {
             Tone::Plain => p.text,
             t => tone_color(t),

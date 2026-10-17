@@ -1,3 +1,7 @@
-title=Starlane
-description=Fly the lane, dodge the blocks, grab the gems
-color=F0A04C
+title=Starlane: Hollow
+subtitle=THIS WEEK: 4 HOURS
+studio=nxk Arcade · 60 fps
+version=1.4.0
+description=Fly the neon lane, dodge the blocks, grab the gems
+color=2EE59D
+cover=1

@@ -47,7 +47,7 @@ pub fn fit(f: Face, s: &str, w: usize) -> String {
 /// A card: surface with a hairline, rounded.
 pub fn card(s: &mut Screen, x: usize, y: usize, w: usize, h: usize) {
     let p = pal();
-    s.card_round(x, y, w, h, 16, 1, p.line, p.surface);
+    s.card_round(x, y, w, h, 10, 1, p.line, p.surface);
 }
 
 /// Card with its title, small and dim, at the top left.
@@ -165,31 +165,34 @@ pub fn switch(s: &mut Screen, x: usize, y: usize, on: bool, enabled: bool) {
     s.disc(knob, y + 16, 12, if enabled { 0xFFFF_FFFF } else { p.dim });
 }
 
-/// Slider: `x`, `w` from knob centre to knob centre; the track is 8
-/// thick at `y`. `pct` in 0..=100.
+/// Switch-style slider with a 4 px mint-green track and a 28x28 rounded-square white knob.
 pub fn slider(s: &mut Screen, x: usize, y: usize, w: usize, pct: u8, enabled: bool) {
     let p = pal();
     let (fill, knob) = if enabled {
         (p.good, 0xFFFF_FFFF)
     } else {
-        (p.track, p.dim)
+        (p.good, 0xFFF2_F4F8)
     };
     let kx = x + w * pct.min(100) as usize / 100;
-    s.fill_round(x, y, w, 8, 4, p.track);
-    s.fill_round(x, y, kx - x + 1, 8, 4, fill);
-    if enabled {
-        s.round_a(kx - 14, y - 6, 28, 28, 14, 0xFF00_0000, 50);
+    s.fill_round(x, y + 2, w, 4, 2, p.track);
+    if kx > x {
+        s.fill_round(x, y + 2, kx - x, 4, 2, fill);
     }
-    s.disc(kx, y + 4, 13, knob);
-    if enabled && crate::theme::is_light() {
-        s.ring(kx, y + 4, 13, 1, p.line);
+    let bx = kx.saturating_sub(14);
+    let by = y.saturating_sub(10);
+    s.round_a(bx, by + 2, 28, 28, 6, 0xFF00_0000, 70);
+    s.fill_round(bx, by, 28, 28, 6, knob);
+    if crate::theme::is_light() {
+        s.ring_round(bx, by, 28, 28, 6, 1, p.line);
     }
 }
 
-/// Icon kinds of the dock and the status bar.
+/// Icon kinds of the UI.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum Icon {
     Gear,
+    Sliders,
     Globe,
     Chip,
     Terminal,
@@ -202,93 +205,130 @@ pub enum Icon {
     Chevron,
     Left,
     Plane,
+    WifiWave,
+    Battery,
+    SwitchHandheld,
+    GameCard,
 }
 
-/// An icon of about 32 px centered on (cx, cy).
+/// An icon centered on (cx, cy).
 pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
     let (x, y) = (cx as i32, cy as i32);
     match k {
         Icon::Gear => {
             for a in 0..4 {
                 let (dx, dy) = [(0, 1), (1, 0), (1, 1), (1, -1)][a];
-                s.line(x - 12 * dx, y - 12 * dy, x + 12 * dx, y + 12 * dy, 6, c);
+                s.line(x - 11 * dx, y - 11 * dy, x + 11 * dx, y + 11 * dy, 5, c);
             }
-            s.disc(cx, cy, 10, c);
-            s.disc(cx, cy, 5, bg);
+            s.disc(cx, cy, 9, c);
+            s.disc(cx, cy, 4, bg);
+        }
+        Icon::Sliders => {
+            for (i, kx) in [(-6, -4), (0, 5), (6, -2)] {
+                s.line(x - 10, y + i, x + 10, y + i, 2, c);
+                s.fill_round((x + kx - 2) as usize, (y + i - 3) as usize, 4, 7, 1, c);
+            }
         }
         Icon::Globe => {
-            s.ring(cx, cy, 15, 3, c);
-            s.line(x - 15, y, x + 15, y, 2, c);
-            s.line(x, y - 15, x, y + 15, 2, c);
-            s.ring_round(cx - 7, cy - 15, 14, 30, 7, 2, c);
+            s.ring(cx, cy, 14, 2, c);
+            s.line(x - 14, y, x + 14, y, 2, c);
+            s.line(x, y - 14, x, y + 14, 2, c);
+            s.ring_round(cx - 7, cy - 14, 14, 28, 7, 2, c);
         }
         Icon::Chip => {
-            s.fill_round(cx - 11, cy - 11, 22, 22, 4, c);
-            s.fill_round(cx - 6, cy - 6, 12, 12, 2, bg);
+            s.fill_round(cx - 10, cy - 10, 20, 20, 4, c);
+            s.fill_round(cx - 5, cy - 5, 10, 10, 2, bg);
             for i in [-6, 0, 6] {
-                s.line(x + i, y - 16, x + i, y - 12, 2, c);
-                s.line(x + i, y + 12, x + i, y + 16, 2, c);
-                s.line(x - 16, y + i, x - 12, y + i, 2, c);
-                s.line(x + 12, y + i, x + 16, y + i, 2, c);
+                s.line(x + i, y - 15, x + i, y - 11, 2, c);
+                s.line(x + i, y + 11, x + i, y + 15, 2, c);
+                s.line(x - 15, y + i, x - 11, y + i, 2, c);
+                s.line(x + 11, y + i, x + 15, y + i, 2, c);
             }
         }
         Icon::Terminal => {
-            s.ring_round(cx - 16, cy - 12, 32, 24, 5, 2, c);
-            s.line(x - 9, y - 5, x - 3, y, 3, c);
-            s.line(x - 9, y + 5, x - 3, y, 3, c);
-            s.line(x + 1, y + 5, x + 9, y + 5, 3, c);
+            s.ring_round(cx - 14, cy - 11, 28, 22, 4, 2, c);
+            s.line(x - 8, y - 4, x - 3, y, 2, c);
+            s.line(x - 8, y + 4, x - 3, y, 2, c);
+            s.line(x + 1, y + 4, x + 8, y + 4, 2, c);
         }
         Icon::Logs => {
             for i in 0..4 {
-                let w = if i == 3 { 12 } else { 28 };
-                s.fill_round(cx - 14, cy - 13 + i * 9, w, 4, 2, c);
+                let w = if i == 3 { 12 } else { 24 };
+                s.fill_round(cx - 12, cy - 11 + i * 7, w, 3, 1, c);
             }
         }
         Icon::Moon => {
-            s.disc(cx, cy, 14, c);
-            s.disc(cx + 7, cy - 6, 12, bg);
+            s.disc(cx, cy, 11, c);
+            s.disc(cx + 5, cy - 4, 9, bg);
         }
         Icon::Power => {
-            s.ring(cx, cy + 2, 13, 3, c);
-            s.fill_round(cx - 6, cy - 18, 12, 18, 0, bg);
-            s.line(x, y - 16, x, y + 2, 3, c);
+            s.ring(cx, cy + 1, 10, 2, c);
+            s.fill_round(cx - 5, cy - 13, 10, 12, 0, bg);
+            s.line(x, y - 11, x, y + 1, 2, c);
         }
         Icon::Bolt => {
-            s.line(x + 3, y - 12, x - 5, y + 2, 3, c);
-            s.line(x - 5, y + 2, x + 4, y + 2, 3, c);
-            s.line(x + 4, y + 2, x - 3, y + 14, 3, c);
+            s.line(x + 2, y - 9, x - 4, y + 1, 2, c);
+            s.line(x - 4, y + 1, x + 3, y + 1, 2, c);
+            s.line(x + 3, y + 1, x - 2, y + 10, 2, c);
         }
         Icon::Sun => {
-            s.disc(cx, cy, 6, c);
+            s.disc(cx, cy, 5, c);
             for (dx, dy) in [(0, 1), (1, 0), (1, 1), (1, -1)] {
-                s.line(x - 11 * dx, y - 11 * dy, x - 8 * dx, y - 8 * dy, 2, c);
-                s.line(x + 8 * dx, y + 8 * dy, x + 11 * dx, y + 11 * dy, 2, c);
+                s.line(x - 10 * dx, y - 10 * dy, x - 7 * dx, y - 7 * dy, 2, c);
+                s.line(x + 7 * dx, y + 7 * dy, x + 10 * dx, y + 10 * dy, 2, c);
             }
         }
         Icon::Speaker => {
-            s.fill_round(cx - 12, cy - 5, 8, 10, 2, c);
-            s.line(x - 6, y - 5, x + 2, y - 11, 4, c);
-            s.line(x - 6, y + 5, x + 2, y + 11, 4, c);
-            s.line(x + 2, y - 11, x + 2, y + 11, 4, c);
-            s.ring_round(cx + 4, cy - 8, 12, 16, 6, 2, c);
+            s.fill_round(cx - 9, cy - 4, 5, 8, 1, c);
+            s.line(x - 5, y - 4, x, y - 8, 3, c);
+            s.line(x - 5, y + 4, x, y + 8, 3, c);
+            s.line(x, y - 8, x, y + 8, 3, c);
+            s.line(x + 5, y - 4, x + 7, y, 2, c);
+            s.line(x + 7, y, x + 5, y + 4, 2, c);
         }
         Icon::Chevron => {
-            s.line(x - 3, y - 8, x + 4, y, 3, c);
-            s.line(x - 3, y + 8, x + 4, y, 3, c);
+            s.line(x - 3, y - 7, x + 4, y, 2, c);
+            s.line(x - 3, y + 7, x + 4, y, 2, c);
         }
         Icon::Left => {
-            s.line(x + 3, y - 9, x - 4, y, 4, c);
-            s.line(x + 3, y + 9, x - 4, y, 4, c);
+            s.line(x + 3, y - 8, x - 4, y, 3, c);
+            s.line(x + 3, y + 8, x - 4, y, 3, c);
         }
         Icon::Plane => {
-            s.line(x - 14, y + 2, x + 14, y - 8, 4, c);
-            s.line(x - 3, y - 1, x - 10, y + 12, 4, c);
-            s.line(x - 4, y - 8, x - 12, y - 14, 4, c);
+            s.line(x - 11, y + 2, x + 11, y - 6, 3, c);
+            s.line(x - 2, y - 1, x - 8, y + 10, 3, c);
+            s.line(x - 3, y - 6, x - 10, y - 11, 3, c);
+        }
+        Icon::WifiWave => {
+            // Fan-shaped Wi-Fi icon: 2 top arcs + bottom dot.
+            s.line(x - 8, y - 3, x, y - 8, 2, c);
+            s.line(x, y - 8, x + 8, y - 3, 2, c);
+            s.line(x - 5, y + 1, x, y - 3, 2, c);
+            s.line(x, y - 3, x + 5, y + 1, 2, c);
+            s.disc(cx, cy + 5, 2, c);
+        }
+        Icon::Battery => {
+            // Horizontal battery body + right terminal nub.
+            s.ring_round(cx - 13, cy - 7, 24, 14, 3, 2, c);
+            s.fill_round(cx - 10, cy - 4, 18, 8, 1, c);
+            s.fill_round(cx + 11, cy - 3, 3, 6, 1, c);
+        }
+        Icon::SwitchHandheld => {
+            // Handheld Switch console icon (48 x 22).
+            s.ring_round(cx - 24, cy - 11, 48, 22, 5, 2, c);
+            s.fill_round(cx - 13, cy - 9, 26, 18, 1, c);
+            s.disc(cx - 19, cy - 3, 2, c);
+            s.disc(cx + 19, cy + 2, 2, c);
+        }
+        Icon::GameCard => {
+            // Blue game cartridge icon next to selected title (18 x 22).
+            s.fill_round(cx - 9, cy - 11, 18, 22, 4, c);
+            s.fill_round(cx - 4, cy - 4, 8, 10, 2, bg);
         }
     }
 }
 
-/// Circle button background: `c` or a lighter `c` when pressed.
+/// Surface or raised background: `c` or a lighter `c` when pressed.
 pub fn press(c: u32, pressed: bool) -> u32 {
     if pressed {
         mix(c, pal().accent, 60)

@@ -15,6 +15,8 @@ echo "== userland"
 python3 "$ici/tools/mkfont.py" -o "$ici/build/font.bin"
 # Proportional antialiased UI font atlas.
 python3 "$ici/tools/mkuifont.py" -o "$ici/build/uifont.bin"
+# Paletted RGB565 game cover artwork.
+python3 "$ici/tools/mkcovers.py" -o "$ici/build/covers.bin"
 # Boot screen logo of the display service.
 python3 "$ici/tools/mklogo.py" --raw "$ici/build/logo.bin"
 # cargo reads .cargo/config.toml from cwd: enter it.

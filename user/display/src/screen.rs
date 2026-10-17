@@ -17,6 +17,8 @@ use crate::font::{self, Face};
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
 /// tools/mklogo.py --raw: width, height, 8 R G B A palette entries, indices.
 const LOGO: &[u8] = include_bytes!("../../../build/logo.bin");
+/// tools/mkcovers.py: paletted RGB565 cover art.
+const COVERS: &[u8] = include_bytes!("../../../build/covers.bin");
 
 // The terminal's colors, A B G R: it is dark in both themes.
 pub const FG: u32 = 0xFFD8_D8D8;
@@ -453,6 +455,45 @@ impl Screen {
         for (i, &p) in LOGO[34..34 + w * h].iter().enumerate() {
             if p != 0 {
                 self.fill(x0 + i % w * s, y0 + i / w * s, s, s, palette(p as usize));
+            }
+        }
+    }
+
+    /// Paletted RGB565 cover `idx` from `covers.bin` drawn in `(x0, y0, w, h)` with corner radius `r`.
+    pub fn cover(&mut self, idx: usize, x0: usize, y0: usize, w: usize, h: usize, r: usize) {
+        let count = COVERS[0] as usize;
+        if idx >= count || w == 0 || h == 0 {
+            return;
+        }
+        let rec = 1 + idx * 8;
+        let cw = u16::from_le_bytes([COVERS[rec], COVERS[rec + 1]]) as usize;
+        let ch = u16::from_le_bytes([COVERS[rec + 2], COVERS[rec + 3]]) as usize;
+        let off = u32::from_le_bytes([
+            COVERS[rec + 4],
+            COVERS[rec + 5],
+            COVERS[rec + 6],
+            COVERS[rec + 7],
+        ]) as usize;
+        let pal_slice = &COVERS[off..off + 512];
+        let pix = &COVERS[off + 512..off + 512 + cw * ch];
+        let r = r.min(w / 2).min(h / 2);
+        for py in 0..h {
+            let sy = (py * ch / h).min(ch - 1);
+            let row = &pix[sy * cw..(sy + 1) * cw];
+            for px in 0..w {
+                let cov = rr_cov(px, py, w, h, r);
+                if cov == 0 {
+                    continue;
+                }
+                let sx = (px * cw / w).min(cw - 1);
+                let pi = row[sx] as usize * 2;
+                let p565 = u16::from_le_bytes([pal_slice[pi], pal_slice[pi + 1]]);
+                self.plot(
+                    x0 as i32 + px as i32,
+                    y0 as i32 + py as i32,
+                    expand(p565),
+                    cov,
+                );
             }
         }
     }

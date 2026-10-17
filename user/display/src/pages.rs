@@ -15,7 +15,7 @@ use crate::term::Term;
 use crate::theme::pal;
 use crate::ui::{
     cpu_text, eth_text, fan_text, gpu_text, usb_short, usb_status, wifi_connected, wifi_short, Id,
-    Ui, CH, CY, LOGS, M, NETWORK, TERMINAL, W,
+    Ui, CH, CY, H, LOGS, M, NETWORK, TERMINAL, W,
 };
 use crate::widgets::{
     badge, bar, bars_for, card, fit, kv, load_color, signal_bars, split_bar, titled, vc, Tone,
@@ -56,35 +56,32 @@ fn link_badge(s: &mut Screen, d: &Data, xr: usize, y: usize, name: &str, usable:
 
 impl Ui {
     pub(crate) fn system(&mut self, s: &mut Screen, d: &Data) {
-        self.page_head(s, "System");
-        let tx = M + 260;
-        self.chip(
-            s,
-            Id::SysTab(0),
-            tx,
-            30,
-            148,
-            40,
-            "Overview",
-            self.sys_tab == 0,
-            true,
-        );
-        self.chip(
-            s,
-            Id::SysTab(1),
-            tx + 160,
-            30,
-            148,
-            40,
-            "Details",
-            self.sys_tab == 1,
-            true,
-        );
         if self.sys_tab == 0 {
             self.sys_overview(s, d);
         } else {
             self.sys_detail(s, d);
         }
+        let tx = W / 2 - 144;
+        self.pill(
+            s,
+            Id::SysTab(0),
+            tx,
+            H - 54,
+            136,
+            36,
+            "Overview",
+            self.sys_tab == 0,
+        );
+        self.pill(
+            s,
+            Id::SysTab(1),
+            tx + 148,
+            H - 54,
+            136,
+            36,
+            "Details",
+            self.sys_tab == 1,
+        );
         self.hint_bar(s, &[("B", "Back"), ("A", "OK")]);
     }
 

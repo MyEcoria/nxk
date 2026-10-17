@@ -3,7 +3,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-const fn rgb(c: u32) -> u32 {
+pub const fn rgb(c: u32) -> u32 {
     0xFF00_0000 | (c & 0xFF) << 16 | (c >> 8 & 0xFF) << 8 | c >> 16
 }
 
@@ -30,37 +30,37 @@ pub struct Palette {
 }
 
 pub const DARK: Palette = Palette {
-    bg: rgb(0x17181A),
-    surface: rgb(0x232427),
-    raised: rgb(0x2F3136),
-    line: rgb(0x3C3E44),
-    track: rgb(0x3C3E44),
-    text: rgb(0xF2F2F2),
-    dim: rgb(0x9A9CA3),
-    accent: rgb(0x00BFE8),
-    on_accent: rgb(0x06161B),
-    good: rgb(0x3DDBB0),
+    bg: rgb(0x08090B),
+    surface: rgb(0x141518),
+    raised: rgb(0x222429),
+    line: rgb(0x282A30),
+    track: rgb(0x383B42),
+    text: rgb(0xF5F6F8),
+    dim: rgb(0x8A8E96),
+    accent: rgb(0x20A4F3),
+    on_accent: rgb(0xFFFFFF),
+    good: rgb(0x2EE59D),
     warn: rgb(0xFFB84D),
-    bad: rgb(0xFF5C5C),
-    focus: rgb(0xFFFFFF),
+    bad: rgb(0xFF5252),
+    focus: rgb(0xDCE0E8),
     scrim: rgb(0x000000),
 };
 
 pub const LIGHT: Palette = Palette {
-    bg: rgb(0xEBEBED),
+    bg: rgb(0xF3F4F7),
     surface: rgb(0xFFFFFF),
-    raised: rgb(0xF1F2F4),
-    line: rgb(0xD4D5D9),
-    track: rgb(0xD9DADE),
-    text: rgb(0x2B2C30),
-    dim: rgb(0x71737B),
-    accent: rgb(0x0096C2),
+    raised: rgb(0xE8EAEF),
+    line: rgb(0xD8DCE4),
+    track: rgb(0xCFD4DE),
+    text: rgb(0x14161A),
+    dim: rgb(0x6E737D),
+    accent: rgb(0x0084D6),
     on_accent: rgb(0xFFFFFF),
-    good: rgb(0x0E9C76),
+    good: rgb(0x0FA968),
     warn: rgb(0xC77700),
-    bad: rgb(0xD23232),
-    focus: rgb(0x00A9D6),
-    scrim: rgb(0x20222A),
+    bad: rgb(0xD93030),
+    focus: rgb(0x14161A),
+    scrim: rgb(0x14161A),
 };
 
 static LIGHT_ON: AtomicBool = AtomicBool::new(false);
