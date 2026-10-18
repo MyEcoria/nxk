@@ -483,14 +483,22 @@ impl Sim<'_> {
                 let y = if bits(w, 45, 1) == 1 { -y } else { y };
                 let mut r = f(ra) + y;
                 if bits(w, 50, 1) == 1 {
-                    r = r.clamp(0.0, 1.0);
+                    // A NaN saturates to 0, as the hardware's .SAT does.
+                    #[allow(clippy::manual_clamp)]
+                    {
+                        r = r.max(0.0).min(1.0);
+                    }
                 }
                 setd(self, r.to_bits());
             }
             Op::Fmul => {
                 let mut r = f(ra) * f(self.src_b(w, op));
                 if bits(w, 50, 1) == 1 {
-                    r = r.clamp(0.0, 1.0);
+                    // A NaN saturates to 0, as the hardware's .SAT does.
+                    #[allow(clippy::manual_clamp)]
+                    {
+                        r = r.max(0.0).min(1.0);
+                    }
                 }
                 setd(self, r.to_bits());
             }
