@@ -17,6 +17,7 @@
 pub mod bvh;
 pub mod demo;
 pub mod kernel;
+pub mod shadow;
 pub mod trace;
 
 pub use bvh::{build, BuildError, Bvh, Triangle};
@@ -71,6 +72,8 @@ pub struct Hit {
     pub id: u32,
 }
 
+#[cfg(test)]
+mod shadow_tests;
 #[cfg(test)]
 mod tests;
 

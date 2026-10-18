@@ -108,8 +108,57 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool, counted: bool) {
     let w0 = b.load_n(s.rays, rbase, 0, &[Ty::F32; 4]);
     let w1 = b.load_n(s.rays, rbase, 4, &[Ty::F32; 4]);
     let o = [w0[0], w0[1], w0[2]];
-    let t_min = w0[3];
     let d = [w1[0], w1[1], w1[2]];
+    let w = walk(b, s.nodes, s.tris, o, d, w0[3], w1[3], any, counted);
+    let (best_t, best_u, best_v, best_id, found) = (w.t, w.u, w.v, w.id, w.found);
+    let (n_inner, n_leaf) = (w.inner, w.leaf);
+    if any {
+        b.store(s.hits, id, 0, &[found]);
+    } else {
+        let two = b.u32(HIT_WORDS.trailing_zeros());
+        let hbase = b.shl(id, two);
+        let (tb, ub, vb) = (b.fbits(best_t), b.fbits(best_u), b.fbits(best_v));
+        if counted {
+            b.store(s.hits, hbase, 0, &[tb, n_inner, n_leaf, best_id]);
+        } else {
+            b.store(s.hits, hbase, 0, &[tb, ub, vb, best_id]);
+        }
+    }
+}
+
+/// What a walk found: the nearest hit (`t`, barycentrics, triangle `id`,
+/// `MISS` for none), whether anything at all (any-hit walks stop at the
+/// first), and the nodes it visited.
+pub struct Walk {
+    pub t: Reg,
+    pub u: Reg,
+    pub v: Reg,
+    pub id: Reg,
+    pub found: Reg,
+    pub inner: Reg,
+    pub leaf: Reg,
+}
+
+/// One ray through the tree in buffers `nodes` and `tris`: from `o` along
+/// `d` (not necessarily unit), distances between `t_min` and `t_max`.
+#[allow(clippy::too_many_arguments)]
+pub fn walk(
+    b: &mut Builder,
+    nodes: u8,
+    tris: u8,
+    o: [Reg; 3],
+    d: [Reg; 3],
+    t_min: Reg,
+    t_max: Reg,
+    any: bool,
+    counted: bool,
+) -> Walk {
+    let s = Slots {
+        rays: 0,
+        hits: 0,
+        nodes,
+        tris,
+    };
     // Slab distances as one FMA each: t = plane * inv + off, with off =
     // -origin * inv. A direction too small to invert is nudged so that
     // inv stays finite (infinities would make NaNs of the products).
@@ -136,7 +185,7 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool, counted: bool) {
         far_at[a] = b.sel(neg, min_at, max_at);
     }
     let guard = b.f32(1.000_000_5);
-    let best_t = b.copy(w1[3]);
+    let best_t = b.copy(t_max);
     let (best_u, best_v) = (b.f32(0.0), b.f32(0.0));
     let best_id = b.u32(MISS);
     let found = b.u32(0);
@@ -314,16 +363,13 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool, counted: bool) {
         }
     });
 
-    if any {
-        b.store(s.hits, id, 0, &[found]);
-    } else {
-        let two = b.u32(HIT_WORDS.trailing_zeros());
-        let hbase = b.shl(id, two);
-        let (tb, ub, vb) = (b.fbits(best_t), b.fbits(best_u), b.fbits(best_v));
-        if counted {
-            b.store(s.hits, hbase, 0, &[tb, n_inner, n_leaf, best_id]);
-        } else {
-            b.store(s.hits, hbase, 0, &[tb, ub, vb, best_id]);
-        }
+    Walk {
+        t: best_t,
+        u: best_u,
+        v: best_v,
+        id: best_id,
+        found,
+        inner: n_inner,
+        leaf: n_leaf,
     }
 }
