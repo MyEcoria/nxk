@@ -14,6 +14,7 @@
 extern crate alloc;
 
 mod acr;
+mod arena;
 mod client;
 mod engine;
 mod falcon;
@@ -22,6 +23,7 @@ mod fw;
 mod gfx;
 mod gr;
 mod hw;
+mod irtest;
 mod kernels;
 mod mmu;
 mod pll;
@@ -694,11 +696,35 @@ fn attach_shared(
     Ok(id)
 }
 
+/// `SHADER_ATTACH`: the client's shm with the IR is taken (and closed on
+/// any failure).
+fn attach_shader(g: &mut Gpu, m: &Msg) -> Msg {
+    let h = ipc::received_handle(0);
+    let d = match g.dev(0) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = sys::handle_close(h);
+            return Msg::error(e);
+        }
+    };
+    match d
+        .client
+        .attach_shader(&mut d.gfx, &mut d.compute, h, m.mr[0])
+    {
+        Ok((id, gprs, stage)) => Msg::from_words(0, &[id, gprs as u64, stage as u64]),
+        Err(e) => Msg::error(e),
+    }
+}
+
 fn render(g: &mut Gpu, m: &Msg) -> core::result::Result<u64, i64> {
     let d = g.dev(proto::IF_ON)?;
-    let p = d
-        .client
-        .build(&mut d.gfx, m.mr[0] as u32, m.mr[1] as u32, m.mr[2] as u32)?;
+    let p = d.client.build(
+        &mut d.gfx,
+        &d.compute,
+        m.mr[0] as u32,
+        m.mr[1] as u32,
+        m.mr[2] as u32,
+    )?;
     g.run(p, BATCH_TIMEOUT_US)
 }
 
@@ -1244,6 +1270,22 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     Ok((pass, all, ns))
 }
 
+/// The shader compiler on the GPU: random compute programs, and a draw.
+fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
+    let (mut pass, mut ns) = (0, 0);
+    let (ok, t) = irtest::compute(g)?;
+    ns += t;
+    if ok {
+        pass |= proto::T3_IR_COMPUTE;
+    }
+    let (ok, t) = irtest::draw(g)?;
+    ns += t;
+    if ok {
+        pass |= proto::T3_IR_DRAW;
+    }
+    Ok((pass, proto::T3_IR_COMPUTE | proto::T3_IR_DRAW, ns))
+}
+
 /// `n` words of `m` against `want`; the first wrong one reported.
 fn check(name: &str, m: &Dma, n: u32, want: impl Fn(usize) -> u32) -> bool {
     let bad: Vec<usize> = (0..n as usize)
@@ -1422,15 +1464,41 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
                 None => Err(-EINVAL),
             })
         }
+        proto::SHADER_ATTACH if m.handles() == 1 => attach_shader(g, m),
+        proto::PIPELINE_ATTACH if m.handles() == 1 => {
+            let h = ipc::received_handle(0);
+            match g.dev(0) {
+                Ok(d) => reply(d.client.attach_pipeline(h, m.mr[0])),
+                Err(e) => {
+                    let _ = sys::handle_close(h);
+                    Msg::error(e)
+                }
+            }
+        }
+        proto::SHADER_DETACH => reply(match g.dev.as_mut() {
+            Some(d) => d
+                .client
+                .detach_shader(&mut d.gfx, &mut d.compute, m.mr[0])
+                .map(|_| 0),
+            None => Err(-EINVAL),
+        }),
+        proto::PIPELINE_DETACH => reply(match g.dev.as_mut() {
+            Some(d) => d.client.detach_pipeline(m.mr[0]).map(|_| 0),
+            None => Err(-EINVAL),
+        }),
         proto::RENDER => reply(render(g, m)),
         proto::RESET => {
             let regs = g.regs;
             if let Some(d) = g.dev.as_mut() {
-                d.client.clear(&mut d.vm, &d.gfx);
+                d.client.clear(&mut d.vm, &mut d.gfx, &mut d.compute);
                 let _ = mmu::invalidate(&regs, &d.vm);
             }
             Msg::new(0, 0, 0)
         }
+        proto::TEST_IR => match test_ir(g) {
+            Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
+            Err(e) => Msg::error(e),
+        },
         proto::TEST3D => match test3d(g) {
             Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
             Err(e) => Msg::error(e),

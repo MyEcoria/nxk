@@ -13,16 +13,30 @@ use libnx::abi::proto::gpu as proto;
 use libnx::mem::SharedMemory;
 use libnx::sys;
 
-use crate::gfx::{Color, Depth, Gfx, Pipe, Target, Tiled, LIT_UBO_WORDS, MAX_TEXTURES};
+use nxk_shader::lower::{self, Compiled};
+use nxk_shader::{wire, Stage};
+
+use crate::engine::Compute;
+use crate::gfx::{
+    attr_word, Color, Custom, Depth, Gfx, Layout, Pipe, Target, Tiled, ATTR_INACTIVE,
+    LIT_UBO_WORDS, MAX_TEXTURES,
+};
 use crate::mmu::{self, Vm, PAGE};
 use crate::push::Push;
+use crate::qmd::{Launch3, Qmd};
 
 const MAX_BUFFERS: usize = 64;
 const MAX_TARGETS: usize = 16;
 /// Pushbuffer words a stream may fill (the pushbuffer holds 64 Ki).
 const MAX_WORDS: usize = 48_000;
 /// Largest uniform block of a draw, in words.
-const MAX_UNIFORM_WORDS: usize = 256;
+const MAX_UNIFORM_WORDS: usize = 1024;
+const MAX_SHADERS: usize = 64;
+const MAX_PIPELINES: usize = 64;
+/// Words of one shader's wire form (4096 instructions of up to 8 words).
+const MAX_SHADER_WORDS: u64 = 40_000;
+/// Registers a compute group may use together (one SM's file).
+const GROUP_REGISTERS: u32 = 65_536;
 
 type Res<T> = core::result::Result<T, i64>;
 
@@ -65,11 +79,42 @@ struct Tex {
     _held: Held,
 }
 
+/// A compiled shader of the client, in a program region.
+struct Shader {
+    stage: Stage,
+    /// Graphics: the header's offset; compute: the program's.
+    at: u32,
+    /// What to give back to the region.
+    block: u32,
+    len: u32,
+    gprs: u32,
+    block_dim: [u32; 3],
+    uniform_words: u32,
+    /// Pipelines built on it.
+    users: u32,
+}
+
+struct Pipeline {
+    custom: Custom,
+    vs: u32,
+    fs: u32,
+    uniform_words: u32,
+}
+
 #[derive(Default)]
 pub struct Client {
     bufs: Vec<Option<Buf>>,
     tgts: Vec<Option<Tgt>>,
     texs: Vec<Option<Tex>>,
+    shaders: Vec<Option<Shader>>,
+    pipelines: Vec<Option<Pipeline>>,
+}
+
+/// The pipeline draws go through.
+#[derive(Clone, Copy)]
+enum Cur {
+    Builtin(Pipe),
+    Custom(u32),
 }
 
 /// Physical pages of `len` bytes of a client's shm (DMA right).
@@ -233,8 +278,203 @@ impl Client {
         Ok(())
     }
 
+    /// Compile the shader whose wire words are in the client's shm `h`
+    /// (taken, closed on error too).
+    pub fn attach_shader(
+        &mut self,
+        gfx: &mut Gfx,
+        compute: &mut Compute,
+        h: u32,
+        words: u64,
+    ) -> Res<(u64, u32, u32)> {
+        if words == 0 || words > MAX_SHADER_WORDS {
+            let _ = sys::handle_close(h);
+            return Err(-EINVAL);
+        }
+        let m = match SharedMemory::map(h, words as usize * 4, prot::READ) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = sys::handle_close(h);
+                return Err(e);
+            }
+        };
+        // A copy: the client could change it while it is checked.
+        let w: Vec<u32> =
+            unsafe { core::slice::from_raw_parts(m.as_ptr() as *const u32, words as usize) }
+                .to_vec();
+        drop(m);
+        let prog = wire::decode(&w).map_err(|e| {
+            libnx::drv::report("gpu", &alloc::format!("shader: {e}"));
+            -EINVAL
+        })?;
+        let c: Compiled = lower::compile(&prog).map_err(|e| {
+            libnx::drv::report("gpu", &alloc::format!("shader: {e:?}"));
+            -EINVAL
+        })?;
+        if c.stage == Stage::Compute && c.info.textures != 0 {
+            libnx::drv::report(
+                "gpu",
+                "shader: textures in compute shaders are not supported yet",
+            );
+            return Err(-EINVAL);
+        }
+        let gprs = c.gprs.next_multiple_of(8).max(8);
+        let block_dim = prog.local_size.map(|v| v as u32);
+        let (at, block, len) = match c.stage {
+            Stage::Compute => {
+                if gprs * block_dim.iter().product::<u32>() > GROUP_REGISTERS {
+                    return Err(-EINVAL);
+                }
+                let (at, len) = compute.install(&c.code).ok_or(-ENOSPC)?;
+                (at, at, len)
+            }
+            _ => gfx.install(&c.header, &c.code).ok_or(-ENOSPC)?,
+        };
+        let i = match slot(&mut self.shaders, MAX_SHADERS) {
+            Ok(i) => i,
+            Err(e) => {
+                match c.stage {
+                    Stage::Compute => compute.uninstall(block, len),
+                    _ => gfx.uninstall(block, len),
+                }
+                return Err(e);
+            }
+        };
+        self.shaders[i] = Some(Shader {
+            stage: c.stage,
+            at,
+            block,
+            len,
+            gprs,
+            block_dim,
+            uniform_words: c.info.uniform_words as u32,
+            users: 0,
+        });
+        Ok((i as u64, gprs, c.stage as u32))
+    }
+
+    pub fn detach_shader(&mut self, gfx: &mut Gfx, compute: &mut Compute, id: u64) -> Res<()> {
+        let sh = self
+            .shaders
+            .get_mut(id as usize)
+            .ok_or(-EINVAL)?
+            .as_ref()
+            .ok_or(-EINVAL)?;
+        if sh.users > 0 {
+            return Err(-libnx::abi::err::EBUSY);
+        }
+        let sh = self.shaders[id as usize].take().unwrap();
+        match sh.stage {
+            Stage::Compute => compute.uninstall(sh.block, sh.len),
+            _ => gfx.uninstall(sh.block, sh.len),
+        }
+        Ok(())
+    }
+
+    /// A pipeline from the description in the client's shm `h` (taken).
+    pub fn attach_pipeline(&mut self, h: u32, words: u64) -> Res<u64> {
+        if words < proto::PD_ATTRS as u64 || words > 64 {
+            let _ = sys::handle_close(h);
+            return Err(-EINVAL);
+        }
+        let m = match SharedMemory::map(h, words as usize * 4, prot::READ) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = sys::handle_close(h);
+                return Err(e);
+            }
+        };
+        let w: Vec<u32> =
+            unsafe { core::slice::from_raw_parts(m.as_ptr() as *const u32, words as usize) }
+                .to_vec();
+        drop(m);
+        let n = w[proto::PD_COUNT] as usize;
+        if n > proto::MAX_ATTRIBUTES || w.len() < proto::PD_ATTRS + n {
+            return Err(-EINVAL);
+        }
+        let stride = w[proto::PD_STRIDE];
+        if stride == 0 || stride > 1024 || !stride.is_multiple_of(4) {
+            return Err(-EINVAL);
+        }
+        let mut attrs = Vec::new();
+        for k in 0..n {
+            let a = w[proto::PD_ATTRS + k];
+            let (offset, format) = (a & 0xFFFF, a >> 16);
+            let word = attr_word(offset, format).ok_or(-EINVAL)?;
+            // The attribute lies inside the vertex.
+            let size = match format {
+                proto::AF_F32X1 | proto::AF_U8X4_UNORM => 4,
+                proto::AF_F32X2 => 8,
+                proto::AF_F32X3 => 12,
+                _ => 16,
+            };
+            if offset + size > stride {
+                return Err(-EINVAL);
+            }
+            attrs.push(word);
+        }
+        attrs.resize(proto::MAX_ATTRIBUTES, ATTR_INACTIVE);
+        let (vs, fs) = (w[proto::PD_VERTEX], w[proto::PD_FRAGMENT]);
+        let get = |id: u32, stage: Stage| -> Res<&Shader> {
+            match self.shaders.get(id as usize).and_then(|s| s.as_ref()) {
+                Some(s) if s.stage == stage => Ok(s),
+                _ => Err(-EINVAL),
+            }
+        };
+        let (v, f) = (get(vs, Stage::Vertex)?, get(fs, Stage::Fragment)?);
+        let blend = w[proto::PD_BLEND];
+        if blend > proto::BLEND_PREMUL || w[proto::PD_DEPTH] > proto::DEPTH_ALWAYS {
+            return Err(-EINVAL);
+        }
+        let custom = Custom {
+            vs: v.at,
+            vs_gprs: v.gprs,
+            fs: f.at,
+            fs_gprs: f.gprs,
+            stride,
+            attrs,
+            flags: w[proto::PD_FLAGS],
+            blend,
+            depth: w[proto::PD_DEPTH],
+        };
+        let uniform_words = v.uniform_words.max(f.uniform_words);
+        let i = slot(&mut self.pipelines, MAX_PIPELINES)?;
+        for id in [vs, fs] {
+            if let Some(Some(s)) = self.shaders.get_mut(id as usize) {
+                s.users += 1;
+            }
+        }
+        self.pipelines[i] = Some(Pipeline {
+            custom,
+            vs,
+            fs,
+            uniform_words,
+        });
+        Ok(i as u64)
+    }
+
+    pub fn detach_pipeline(&mut self, id: u64) -> Res<()> {
+        let p = self
+            .pipelines
+            .get_mut(id as usize)
+            .and_then(|p| p.take())
+            .ok_or(-EINVAL)?;
+        for sid in [p.vs, p.fs] {
+            if let Some(Some(s)) = self.shaders.get_mut(sid as usize) {
+                s.users = s.users.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
     /// Everything went: handles and GPU mappings.
-    pub fn clear(&mut self, vm: &mut Vm, gfx: &Gfx) {
+    pub fn clear(&mut self, vm: &mut Vm, gfx: &mut Gfx, compute: &mut Compute) {
+        for id in 0..self.pipelines.len() as u64 {
+            let _ = self.detach_pipeline(id);
+        }
+        for id in 0..self.shaders.len() as u64 {
+            let _ = self.detach_shader(gfx, compute, id);
+        }
         for id in 0..self.texs.len() as u64 {
             let _ = self.detach_texture(vm, gfx, id);
         }
@@ -332,20 +572,118 @@ impl Client {
         }
     }
 
+    /// Constant buffers 2 and 3 of the shaders: a descriptor (address
+    /// low, high, length in words) per bound buffer, a handle per bound
+    /// texture. Unbound slots are empty: a shader reads zeros there.
+    fn tables(&self, b: &Binds) -> Res<(Vec<u32>, Vec<u32>)> {
+        let mut desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+        for (k, id) in b.bufs.iter().enumerate() {
+            if let Some(id) = id {
+                let buf = self.buf(*id)?;
+                desc[4 * k] = buf.va as u32;
+                desc[4 * k + 1] = (buf.va >> 32) as u32;
+                desc[4 * k + 2] = (buf.len / 4) as u32;
+            }
+        }
+        let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+        for (k, id) in b.texs.iter().enumerate() {
+            if let Some(id) = id {
+                handles[k] = Gfx::texture_handle(*id as usize);
+            }
+        }
+        Ok((desc, handles))
+    }
+
+    /// Uniforms and bindings for the next custom draw, if changed.
+    fn flush_custom(&self, gfx: &mut Gfx, p: &mut Push, pl: &Pipeline, st: &mut Draw) -> Res<()> {
+        if core::mem::take(&mut st.dirty) {
+            let mut w = st.uniforms.clone();
+            w.resize(w.len().max(pl.uniform_words as usize).max(1), 0);
+            if !gfx.uniforms(p, &w) {
+                return Err(-ENOSPC);
+            }
+        }
+        if core::mem::take(&mut st.binds.dirty) {
+            let (desc, handles) = self.tables(&st.binds)?;
+            if !gfx.cbuf(p, 2, &desc) || !gfx.cbuf(p, 3, &handles) {
+                return Err(-ENOSPC);
+            }
+        }
+        Ok(())
+    }
+
+    fn pipeline(&self, id: u32) -> Res<&Pipeline> {
+        self.pipelines
+            .get(id as usize)
+            .and_then(|p| p.as_ref())
+            .ok_or(-EINVAL)
+    }
+
+    /// Launch compute shader `sid` over `groups` with the uniforms and
+    /// bindings of the stream so far.
+    fn dispatch(
+        &self,
+        gfx: &mut Gfx,
+        compute: &Compute,
+        p: &mut Push,
+        sid: u32,
+        groups: [u32; 3],
+        st: &Draw,
+    ) -> Res<()> {
+        let sh = match self.shaders.get(sid as usize).and_then(|s| s.as_ref()) {
+            Some(s) if s.stage == Stage::Compute => s,
+            _ => return Err(-EINVAL),
+        };
+        if groups.iter().any(|&g| g == 0 || g > 65_535) {
+            return Err(-EINVAL);
+        }
+        let (desc, handles) = self.tables(&st.binds)?;
+        let mut u = st.uniforms.clone();
+        u.resize(u.len().max(sh.uniform_words as usize).max(1), 0);
+        let stage = |gfx: &mut Gfx, w: &[u32]| gfx.stage(w).ok_or(-ENOSPC);
+        // Constant buffer 0 is unused; 1: uniforms; 2 and 3: bindings.
+        let cbs = [
+            stage(gfx, &[0; 64])?,
+            stage(gfx, &u)?,
+            stage(gfx, &desc)?,
+            stage(gfx, &handles)?,
+        ];
+        let (at, qva) = gfx.alloc_ubo(crate::qmd::SIZE).ok_or(-ENOSPC)?;
+        let q = Qmd::new3(&Launch3 {
+            program: sh.at,
+            regs: sh.gprs,
+            grid: groups,
+            block: sh.block_dim,
+            cbs: &cbs,
+        });
+        gfx.ubo_write(at, &q.bytes());
+        // Earlier draws are done first, later ones see the results.
+        gfx.barrier(p);
+        compute.launch(p, qva);
+        gfx.barrier(p);
+        Ok(())
+    }
+
     /// The batch for the stream `first..first + count` of buffer `id`,
     /// or why it is refused; nothing has run.
-    pub fn build(&self, gfx: &mut Gfx, id: u32, first: u32, count: u32) -> Res<Push> {
+    pub fn build(
+        &self,
+        gfx: &mut Gfx,
+        compute: &Compute,
+        id: u32,
+        first: u32,
+        count: u32,
+    ) -> Res<Push> {
         let w = self.words(id, first, count)?;
         let mut p = Push::default();
         gfx.begin(&mut p);
         let mut at = 0;
         let mut target: Option<Target> = None;
-        let mut pipe: Option<Pipe> = None;
+        let mut cur: Option<Cur> = None;
         // Uniforms are written before a draw, once they or the texture
         // changed.
-        let mut uniforms: Vec<u32> = Vec::new();
         let mut texture: Option<u32> = None;
-        let mut dirty = false;
+        let mut st = Draw::default();
         while at < w.len() {
             let (op, n) = (w[at] & 0xFFFF, (w[at] >> 16) as usize);
             let a = w.get(at + 1..at + 1 + n).ok_or(-EINVAL)?;
@@ -367,14 +705,22 @@ impl Client {
                         proto::PIPE_TEXTURED => Pipe::Textured,
                         _ => return Err(-EINVAL),
                     };
-                    dirty |= pipe != Some(k);
-                    pipe = Some(k);
+                    st.dirty |= !matches!(cur, Some(Cur::Builtin(c)) if c == k);
+                    cur = Some(Cur::Builtin(k));
                     gfx.pipeline(&mut p, t, k, flags & proto::PF_CULL_BACK != 0);
                 }
+                (proto::CMD_USE_PIPELINE, &[pid]) => {
+                    let t = target.as_ref().ok_or(-EINVAL)?;
+                    let pl = self.pipeline(pid)?;
+                    gfx.pipeline_custom(&mut p, t, &pl.custom);
+                    st.dirty = true;
+                    st.binds.dirty = true;
+                    cur = Some(Cur::Custom(pid));
+                }
                 (proto::CMD_UNIFORMS, u) if !u.is_empty() && u.len() <= MAX_UNIFORM_WORDS => {
-                    uniforms.clear();
-                    uniforms.extend_from_slice(u);
-                    dirty = true;
+                    st.uniforms.clear();
+                    st.uniforms.extend_from_slice(u);
+                    st.dirty = true;
                 }
                 (proto::CMD_TEXTURE, &[id]) => {
                     let live = self.texs.get(id as usize).is_some_and(|t| t.is_some());
@@ -382,31 +728,109 @@ impl Client {
                         return Err(-EINVAL);
                     }
                     texture = Some(id);
-                    dirty = true;
+                    st.dirty = true;
                 }
+                (proto::CMD_BIND_BUFFER, &[slot, id]) => {
+                    let slot = slot as usize;
+                    if slot >= proto::SHADER_BUFFERS {
+                        return Err(-EINVAL);
+                    }
+                    st.binds.bufs[slot] = if id == proto::NO_TARGET {
+                        None
+                    } else {
+                        self.buf(id)?;
+                        Some(id)
+                    };
+                    st.binds.dirty = true;
+                }
+                (proto::CMD_BIND_TEXTURE, &[slot, id]) => {
+                    let slot = slot as usize;
+                    if slot >= proto::SHADER_TEXTURES {
+                        return Err(-EINVAL);
+                    }
+                    st.binds.texs[slot] = if id == proto::NO_TARGET {
+                        None
+                    } else {
+                        let live = self.texs.get(id as usize).is_some_and(|t| t.is_some());
+                        if !live {
+                            return Err(-EINVAL);
+                        }
+                        Some(id)
+                    };
+                    st.binds.dirty = true;
+                }
+                (proto::CMD_DISPATCH, &[sid, x, y, z]) => {
+                    self.dispatch(gfx, compute, &mut p, sid, [x, y, z], &st)?;
+                }
+                (proto::CMD_BARRIER, &[]) => gfx.barrier(&mut p),
                 (proto::CMD_DRAW, &[vb, off, vertices, f, c]) => {
-                    let k = pipe.ok_or(-EINVAL)?;
+                    let cu = cur.ok_or(-EINVAL)?;
                     if c == 0 || c % 3 != 0 || f as u64 + c as u64 > vertices as u64 {
                         return Err(-EINVAL);
                     }
-                    Self::flush(gfx, &mut p, k, &uniforms, texture, &mut dirty)?;
-                    let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
-                    gfx.draw(&mut p, k, va, vertices, f, c);
+                    match cu {
+                        Cur::Builtin(k) => {
+                            Self::flush(gfx, &mut p, k, &st.uniforms, texture, &mut st.dirty)?;
+                            let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
+                            gfx.draw(&mut p, k, va, vertices, f, c);
+                        }
+                        Cur::Custom(pid) => {
+                            let pl = self.pipeline(pid)?;
+                            self.flush_custom(gfx, &mut p, pl, &mut st)?;
+                            let lay = Layout {
+                                stride: pl.custom.stride,
+                                attrs: &pl.custom.attrs,
+                            };
+                            let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
+                            gfx.draw_layout(&mut p, &lay, va, vertices, f, c);
+                        }
+                    }
                 }
                 (proto::CMD_DRAW_INDEXED, &[vb, off, vertices, ib, ioff, indices, f, c]) => {
-                    let k = pipe.ok_or(-EINVAL)?;
+                    let cu = cur.ok_or(-EINVAL)?;
                     if c == 0 || c % 3 != 0 || f as u64 + c as u64 > indices as u64 || vertices == 0
                     {
                         return Err(-EINVAL);
                     }
-                    Self::flush(gfx, &mut p, k, &uniforms, texture, &mut dirty)?;
-                    let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
                     let iva = self.span(ib, ioff, indices as u64 * 2)?;
-                    gfx.draw_indexed(&mut p, k, va, vertices, iva, indices, f, c);
+                    match cu {
+                        Cur::Builtin(k) => {
+                            Self::flush(gfx, &mut p, k, &st.uniforms, texture, &mut st.dirty)?;
+                            let va = self.span(vb, off, vertices as u64 * k.stride() as u64)?;
+                            gfx.draw_indexed(&mut p, k, va, vertices, iva, indices, f, c);
+                        }
+                        Cur::Custom(pid) => {
+                            let pl = self.pipeline(pid)?;
+                            self.flush_custom(gfx, &mut p, pl, &mut st)?;
+                            let lay = Layout {
+                                stride: pl.custom.stride,
+                                attrs: &pl.custom.attrs,
+                            };
+                            let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
+                            gfx.draw_indexed_layout(&mut p, &lay, va, vertices, iva, indices, f, c);
+                        }
+                    }
                 }
                 _ => return Err(-EINVAL),
             }
         }
         Ok(p)
     }
+}
+
+/// What a stream has bound for the shaders.
+#[derive(Default)]
+struct Binds {
+    bufs: [Option<u32>; proto::SHADER_BUFFERS],
+    texs: [Option<u32>; proto::SHADER_TEXTURES],
+    dirty: bool,
+}
+
+/// The uniforms and bindings of a stream, and whether they changed since
+/// the last draw.
+#[derive(Default)]
+struct Draw {
+    uniforms: Vec<u32>,
+    dirty: bool,
+    binds: Binds,
 }

@@ -18,6 +18,16 @@ pub struct Launch {
     pub cb0_size: u32,
 }
 
+/// A launch of a client's compute shader: grid and block in three
+/// dimensions, constant buffers 0, 1, ... (address, bytes).
+pub struct Launch3<'a> {
+    pub program: u32,
+    pub regs: u32,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub cbs: &'a [(u64, u32)],
+}
+
 impl Qmd {
     /// Field at bits `lo..=hi` of the descriptor (`MW(hi:lo)`).
     fn set(&mut self, hi: u32, lo: u32, v: u64) {
@@ -29,6 +39,16 @@ impl Qmd {
     }
 
     pub fn new(l: &Launch) -> Self {
+        Self::new3(&Launch3 {
+            program: l.program,
+            regs: l.regs,
+            grid: [l.grid, 1, 1],
+            block: [l.block, 1, 1],
+            cbs: &[(l.cb0, l.cb0_size)],
+        })
+    }
+
+    pub fn new3(l: &Launch3) -> Self {
         let mut q = Self([0; 64]);
         // All six INVALIDATE_*_CACHE bits: nothing stale from an earlier launch.
         q.set(255, 250, 0x3F);
@@ -36,19 +56,24 @@ impl Qmd {
         q.set(366, 366, 1); // RELEASE_MEMBAR_TYPE: FE_SYSMEMBAR
         q.set(369, 368, 1); // CWD_MEMBAR_TYPE: L1_SYSMEMBAR
         q.set(378, 378, 1); // API_VISIBLE_CALL_LIMIT: NO_CHECK
-        q.set(415, 384, l.grid as u64);
-        q.set(431, 416, 1);
-        q.set(447, 432, 1);
+        q.set(415, 384, l.grid[0] as u64);
+        q.set(431, 416, l.grid[1] as u64);
+        q.set(447, 432, l.grid[2] as u64);
         q.set(579, 576, 7); // QMD_VERSION
         q.set(583, 580, 1); // QMD_MAJOR_VERSION
-        q.set(607, 592, l.block as u64);
-        q.set(623, 608, 1);
-        q.set(639, 624, 1);
-        q.set(640, 640, 1); // CONSTANT_BUFFER_VALID(0)
+        q.set(607, 592, l.block[0] as u64);
+        q.set(623, 608, l.block[1] as u64);
+        q.set(639, 624, l.block[2] as u64);
         q.set(671, 669, 1); // L1_CONFIGURATION: 16 KiB shared
-        q.set(959, 928, l.cb0 & 0xFFFF_FFFF);
-        q.set(967, 960, l.cb0 >> 32);
-        q.set(991, 975, l.cb0_size as u64);
+                            // Eight constant buffers of 64 bits each from bit 928: address
+                            // low, high (8 bits), size; valid flags from bit 640.
+        for (i, &(va, size)) in l.cbs.iter().enumerate().take(8) {
+            let o = 64 * i as u32;
+            q.set(640 + i as u32, 640 + i as u32, 1); // CONSTANT_BUFFER_VALID
+            q.set(959 + o, 928 + o, va & 0xFFFF_FFFF);
+            q.set(967 + o, 960 + o, va >> 32);
+            q.set(991 + o, 975 + o, size as u64);
+        }
         q.set(1503, 1496, l.regs as u64);
         q.set(1535, 1528, 0x30); // SASS_VERSION
         q
@@ -95,5 +120,32 @@ mod tests {
             1 << 14 | 1 << 16 | 1 << 26
         );
         assert_eq!(q.bytes()[32..36], 0x300u32.to_le_bytes());
+    }
+
+    #[test]
+    fn three_dimensions_and_buffers() {
+        let q = Qmd::new3(&Launch3 {
+            program: 0x400,
+            regs: 24,
+            grid: [3, 4, 5],
+            block: [8, 4, 2],
+            cbs: &[
+                (0x1_0000_0100, 0x40),
+                (0x2_0000_0200, 0x80),
+                (0x3_0000_0300, 0x100),
+            ],
+        });
+        let w = &q.0;
+        assert_eq!((w[12], w[13]), (3, 4 | 5 << 16));
+        assert_eq!(w[18] & 0xFFFF_0000, 8 << 16);
+        assert_eq!(w[19], 4 | 2 << 16);
+        // Constant buffers 0-2 valid.
+        assert_eq!(w[20] & 7, 7);
+        // Buffer 1: address at bit 992, size at 1039.
+        assert_eq!(w[31], 0x2_0000_0200u64 as u32);
+        assert_eq!(w[32] & 0xFF, 2);
+        assert_eq!(w[32] >> 15 & 0x1_FFFF, 0x80);
+        assert_eq!(w[33], 0x3_0000_0300u64 as u32);
+        assert_eq!(w[34] & 0xFF, 3);
     }
 }

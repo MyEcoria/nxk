@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use crate::arena::Arena;
 use crate::hw::{Dma, Result};
 use crate::kernels;
 use crate::mmu::{Vm, PAGE};
@@ -120,12 +121,17 @@ pub enum Kernel {
 /// Kernel code and the per-launch argument page (constant buffer 0,
 /// then the QMD).
 pub struct Compute {
-    _code: Dma,
+    code: Dma,
     code_va: u64,
     offsets: [u32; 5],
     args: Dma,
     args_va: u64,
+    /// Room past the built-in kernels for the client's shaders.
+    arena: Arena,
 }
+
+/// Bytes of program region for the client's compute shaders.
+const USER_HEAP: usize = 0x40000;
 
 const ARGS_QMD: usize = 0x100;
 
@@ -150,7 +156,8 @@ impl Compute {
         }
         // Room for the instruction prefetch past the last one.
         words.extend_from_slice(&[0; 32]);
-        let code = Dma::new(words.len() * 8)?;
+        let builtin = words.len() * 8;
+        let code = Dma::new(builtin + USER_HEAP)?;
         for (i, w) in words.iter().enumerate() {
             code.w64(i * 8, *w);
         }
@@ -158,12 +165,40 @@ impl Compute {
         let args = Dma::new(PAGE as usize)?;
         let args_va = vm.map(&args, false)?;
         Ok(Self {
-            _code: code,
+            code,
             code_va,
             offsets,
             args,
             args_va,
+            arena: Arena::new(builtin as u32, USER_HEAP as u32),
         })
+    }
+
+    /// Install a client's compute shader; its program offset and the
+    /// block to give back.
+    pub fn install(&mut self, code: &[u64]) -> Option<(u32, u32)> {
+        // 256-byte aligned, with room for the prefetch past the end.
+        let len = (code.len() * 8 + 0x100).next_multiple_of(0x100) as u32;
+        let at = self.arena.alloc(len, 0x100)?;
+        for (i, w) in code.iter().enumerate() {
+            self.code.w64(at as usize + i * 8, *w);
+        }
+        Some((at, len))
+    }
+
+    pub fn uninstall(&mut self, at: u32, len: u32) {
+        self.arena.release(at, len);
+    }
+
+    /// Launch the QMD at GPU address `qmd_va` (256-aligned).
+    pub fn launch(&self, p: &mut Push, qmd_va: u64) {
+        p.immd(SUBC_COMPUTE, INVALIDATE_SKED_CACHES, 0);
+        p.inc(SUBC_COMPUTE, SEND_PCAS_A, &[(qmd_va >> 8) as u32]);
+        p.inc(
+            SUBC_COMPUTE,
+            SEND_SIGNALING_PCAS_B,
+            &[PCAS_INVALIDATE_SCHEDULE],
+        );
     }
 
     /// Channel setup: both classes bound, compute's program region and

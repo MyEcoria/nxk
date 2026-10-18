@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use libnx::abi::proto::gpu as proto;
 
+use crate::arena::Arena;
 use crate::engine::Surface;
 use crate::hw::{Dma, Result};
 use crate::mmu::Vm;
@@ -49,6 +50,8 @@ const INVALIDATE_SAMPLER_CACHE: u32 = 0x1330;
 const INVALIDATE_TEXTURE_HEADER_CACHE: u32 = 0x1334;
 const INVALIDATE_TEXTURE_DATA_CACHE: u32 = 0x1338;
 const SET_BLEND: u32 = 0x1360;
+const SET_BLEND_SEPARATE_FOR_ALPHA: u32 = 0x133C;
+const SET_BLEND_COLOR_OP: u32 = 0x1340;
 const SET_WINDOW_ORIGIN: u32 = 0x13AC;
 const SET_ZT_SELECT: u32 = 0x1538;
 const SET_TEX_SAMPLER_POOL_A: u32 = 0x155C;
@@ -124,6 +127,8 @@ const LIT_FS: usize = 0x1030;
 const TEX_VS: usize = 0x2030;
 const TEX_FS: usize = 0x2830;
 const REGION_SIZE: usize = 0x3000;
+/// Room past the built-in shaders for the client's.
+const USER_HEAP: usize = 0x40000;
 /// Constant buffer data of a batch.
 const UBO_SIZE: usize = 0x40000;
 /// Textures a client may have attached; entries in the header and
@@ -195,6 +200,47 @@ impl Pipe {
         }
     }
 }
+
+/// How vertices sit in a vertex buffer: bytes each, and the
+/// `SET_VERTEX_ATTRIBUTE_A` words (`attr_word`).
+pub struct Layout<'a> {
+    pub stride: u32,
+    pub attrs: &'a [u32],
+}
+
+/// A client pipeline: its shaders (program header offsets), their
+/// registers, and the draw state.
+#[derive(Clone)]
+pub struct Custom {
+    pub vs: u32,
+    pub vs_gprs: u32,
+    pub fs: u32,
+    pub fs_gprs: u32,
+    pub stride: u32,
+    /// One word per attribute slot, 16 of them.
+    pub attrs: Vec<u32>,
+    pub flags: u32,
+    pub blend: u32,
+    pub depth: u32,
+}
+
+/// A vertex attribute word: `proto::AF_*` format at a byte offset.
+pub fn attr_word(offset: u32, format: u32) -> Option<u32> {
+    const FLOAT: u32 = 7;
+    const UNORM: u32 = 2;
+    let (width, ty) = match format {
+        proto::AF_F32X1 => (0x12, FLOAT),
+        proto::AF_F32X2 => (4, FLOAT),
+        proto::AF_F32X3 => (2, FLOAT),
+        proto::AF_F32X4 => (1, FLOAT),
+        proto::AF_U8X4_UNORM => (0x0A, UNORM),
+        _ => return None,
+    };
+    (offset < 1 << 14).then_some(width << 21 | ty << 27 | offset << 7)
+}
+
+/// A vertex attribute slot that feeds nothing.
+pub const ATTR_INACTIVE: u32 = 1 << 6;
 
 /// Depth buffer: 32-bit float, block-linear (the engine does not take it
 /// pitch-linear), `bytes` of memory for a `width` x `height` image.
@@ -333,7 +379,10 @@ fn flat_vs() -> Vec<u64> {
 fn flat_fs() -> Vec<u64> {
     let mut a = Asm::new();
     for c in 0..4u8 {
-        a.emit(ipa(c, A_GENERIC0 + 4 * c as u32, IpaMode::Pass, RZ), sets(0));
+        a.emit(
+            ipa(c, A_GENERIC0 + 4 * c as u32, IpaMode::Pass, RZ),
+            sets(0),
+        );
     }
     a.emit(exit(), Sched::stall(5).wait(0x3F));
     a.finish()
@@ -580,8 +629,9 @@ fn tsc(flags: u64) -> [u32; 8] {
 
 /// Shaders in GPU memory, and the constant buffer data of a batch.
 pub struct Gfx {
-    _prog: Dma,
+    prog: Dma,
     prog_va: u64,
+    arena: Arena,
     ubo: Dma,
     ubo_va: u64,
     ubo_pos: usize,
@@ -594,7 +644,7 @@ pub struct Gfx {
 
 impl Gfx {
     pub fn new(vm: &mut Vm) -> Result<Self> {
-        let prog = Dma::new(REGION_SIZE)?;
+        let prog = Dma::new(REGION_SIZE + USER_HEAP)?;
         let lit_in = 0x7 | 0x7 << 4 | 0xF << 8;
         // Output words: normal in generic 0 (3), color in generic 1 (4).
         let lit_out = 0x7 | 0xF << 4;
@@ -625,8 +675,9 @@ impl Gfx {
         let tics_va = vm.map(&tics, false)?;
         let tscs_va = vm.map(&tscs, false)?;
         Ok(Self {
-            _prog: prog,
+            prog,
             prog_va,
+            arena: Arena::new(REGION_SIZE as u32, USER_HEAP as u32),
             ubo,
             ubo_va,
             ubo_pos: 0,
@@ -810,42 +861,165 @@ impl Gfx {
         p.inc(SUBC_3D, OGL_SET_CULL, &[cull_back as u32]);
         p.inc(SUBC_3D, OGL_SET_FRONT_FACE, &[0x901]);
         p.inc(SUBC_3D, OGL_SET_CULL_FACE, &[0x405]);
+        // Back to the state the built-in pipelines draw with.
+        p.inc(SUBC_3D, SET_BLEND, &[0]);
+        p.inc(SUBC_3D, SET_DEPTH_FUNC, &[DEPTH_LESS]);
+        p.inc(SUBC_3D, SET_CT_WRITE, &[0x1111]);
+    }
+
+    /// Install a client's shader in the program region: header and code
+    /// together. The offset of its header and the block to give back.
+    pub fn install(&mut self, header: &[u32; 20], code: &[u64]) -> Option<(u32, u32, u32)> {
+        // Headers at 0x30 modulo 0x80, code 0x50 later; room for the
+        // instruction prefetch past the last instruction.
+        let len = (0x80 + code.len() * 8 + 0x80).next_multiple_of(0x80) as u32;
+        let block = self.arena.alloc(len, 0x80)?;
+        let hdr = block + 0x30;
+        self.prog.words(hdr as usize, header);
+        for (i, w) in code.iter().enumerate() {
+            self.prog.w64(block as usize + 0x80 + i * 8, *w);
+        }
+        Some((hdr, block, len))
+    }
+
+    pub fn uninstall(&mut self, block: u32, len: u32) {
+        self.arena.release(block, len);
+    }
+
+    /// Room for `bytes` (256-aligned) in this batch's constant buffer
+    /// memory: its offset and GPU address. The caller writes through
+    /// `ubo_write`.
+    pub fn alloc_ubo(&mut self, bytes: usize) -> Option<(usize, u64)> {
+        let at = self.ubo_pos.next_multiple_of(256);
+        if at + bytes.next_multiple_of(256) > UBO_SIZE {
+            return None;
+        }
+        self.ubo_pos = at + bytes;
+        Some((at, self.ubo_va + at as u64))
+    }
+
+    pub fn ubo_write(&self, at: usize, bytes: &[u8]) {
+        self.ubo.write(at, bytes);
+    }
+
+    /// Shaders and state of a client pipeline for the draws that follow.
+    pub fn pipeline_custom(&self, p: &mut Push, t: &Target, c: &Custom) {
+        self.target(p, t);
+        for (ty, at, gprs, group) in [
+            (TYPE_VERTEX, c.vs, c.vs_gprs, GROUP_VERTEX),
+            (TYPE_PIXEL, c.fs, c.fs_gprs, GROUP_PIXEL),
+        ] {
+            let m = SET_PIPELINE_SHADER + ty * PIPELINE_STRIDE;
+            p.inc(SUBC_3D, m, &[1 | ty << 4, at]);
+            p.inc(SUBC_3D, m + 0xC, &[gprs, group]);
+        }
+        let cull = c.flags & (proto::PF_CULL_BACK | proto::PF_CULL_FRONT) != 0;
+        p.inc(SUBC_3D, OGL_SET_CULL, &[cull as u32]);
+        p.inc(SUBC_3D, OGL_SET_FRONT_FACE, &[0x901]);
+        let face = if c.flags & proto::PF_CULL_FRONT != 0 {
+            0x404
+        } else {
+            0x405
+        };
+        p.inc(SUBC_3D, OGL_SET_CULL_FACE, &[face]);
+        if t.depth.is_some() {
+            let test = c.flags & proto::PF_NO_DEPTH_TEST == 0;
+            p.inc(SUBC_3D, SET_DEPTH_TEST, &[test as u32]);
+            p.inc(
+                SUBC_3D,
+                SET_DEPTH_WRITE,
+                &[(c.flags & proto::PF_NO_DEPTH_WRITE == 0) as u32],
+            );
+            let func = match c.depth {
+                proto::DEPTH_LEQUAL => 0x203,
+                proto::DEPTH_GREATER => 0x204,
+                proto::DEPTH_GEQUAL => 0x206,
+                proto::DEPTH_EQUAL => 0x202,
+                proto::DEPTH_ALWAYS => 0x207,
+                _ => DEPTH_LESS,
+            };
+            p.inc(SUBC_3D, SET_DEPTH_FUNC, &[func]);
+        }
+        // Blend equations (OGL values of cl9097.h).
+        const ADD: u32 = 0x8006;
+        const ZERO: u32 = 0x4000;
+        const ONE: u32 = 0x4001;
+        const SRC_ALPHA: u32 = 0x4302;
+        const INV_SRC_ALPHA: u32 = 0x4303;
+        // (colour source, colour dest, alpha source, alpha dest)
+        let eq = match c.blend {
+            proto::BLEND_ALPHA => Some([SRC_ALPHA, INV_SRC_ALPHA, ONE, INV_SRC_ALPHA]),
+            proto::BLEND_ADD => Some([SRC_ALPHA, ONE, ZERO, ONE]),
+            proto::BLEND_PREMUL => Some([ONE, INV_SRC_ALPHA, ONE, INV_SRC_ALPHA]),
+            _ => None,
+        };
+        if let Some(e) = eq {
+            p.inc(SUBC_3D, SET_BLEND_SEPARATE_FOR_ALPHA, &[1]);
+            p.inc(
+                SUBC_3D,
+                SET_BLEND_COLOR_OP,
+                &[ADD, e[0], e[1], ADD, e[2], 0, e[3]],
+            );
+        }
+        p.inc(SUBC_3D, SET_BLEND, &[eq.is_some() as u32]);
+        p.inc(SUBC_3D, SET_CT_WRITE, &[0x1111]);
     }
 
     /// `words` as the shaders' constant buffer, for the draws that follow
     /// (copied now: the batch runs after).
     /// False if the batch has used up its constant buffer memory.
     pub fn uniforms(&mut self, p: &mut Push, words: &[u32]) -> bool {
-        let bytes = words.len() * 4;
-        let at = self.ubo_pos.next_multiple_of(256);
-        if at + bytes.next_multiple_of(256) > UBO_SIZE {
-            return false;
+        self.cbuf(p, UBO_SLOT, words)
+    }
+
+    /// `words` as constant buffer `slot` of both shader groups.
+    pub fn cbuf(&mut self, p: &mut Push, slot: u8, words: &[u32]) -> bool {
+        match self.stage(words) {
+            Some((va, bytes)) => {
+                self.bind_cbuf(p, slot, va, bytes);
+                true
+            }
+            None => false,
         }
+    }
+
+    /// `words` copied to this batch's constant buffer memory: GPU
+    /// address and size in bytes (rounded to 256).
+    pub fn stage(&mut self, words: &[u32]) -> Option<(u64, u32)> {
+        let bytes = words.len() * 4;
+        let (at, va) = self.alloc_ubo(bytes)?;
         self.ubo.words(at, words);
-        self.ubo_pos = at + bytes;
-        let va = self.ubo_va + at as u64;
+        Some((va, bytes.next_multiple_of(256) as u32))
+    }
+
+    /// Constant buffer `slot` of both shader groups, from `va`.
+    pub fn bind_cbuf(&self, p: &mut Push, slot: u8, va: u64, bytes: u32) {
         p.inc(
             SUBC_3D,
             SET_CONSTANT_BUFFER_SELECTOR_A,
-            &[
-                bytes.next_multiple_of(256) as u32,
-                (va >> 32) as u32,
-                va as u32,
-            ],
+            &[bytes, (va >> 32) as u32, va as u32],
         );
-        let bind = (UBO_SLOT as u32) << 4 | 1;
+        let bind = (slot as u32) << 4 | 1;
         for g in [GROUP_VERTEX, GROUP_PIXEL] {
             p.inc(SUBC_3D, BIND_GROUP_CONSTANT_BUFFER + g * 0x20, &[bind]);
         }
-        true
     }
 
-    fn stream(&self, p: &mut Push, pipe: Pipe, vb: u64, vertices: u32) {
-        let size = vertices as u64 * pipe.stride() as u64;
+    /// Caches that may hold what an earlier pass wrote (textures) or the
+    /// CPU did (constants), after the engines are idle.
+    pub fn barrier(&self, p: &mut Push) {
+        p.immd(SUBC_3D, crate::push::WFI, crate::push::WFI_SCOPE_ALL);
+        p.inc(SUBC_3D, INVALIDATE_SHADER_CACHES, &[1 | 1 << 4 | 1 << 12]);
+        p.inc(SUBC_3D, INVALIDATE_TEXTURE_HEADER_CACHE, &[0]);
+        p.inc(SUBC_3D, INVALIDATE_TEXTURE_DATA_CACHE, &[0]);
+    }
+
+    fn stream(&self, p: &mut Push, lay: &Layout, vb: u64, vertices: u32) {
+        let size = vertices as u64 * lay.stride as u64;
         p.inc(
             SUBC_3D,
             SET_VERTEX_STREAM_A_FORMAT,
-            &[pipe.stride() | 1 << 12, (vb >> 32) as u32, vb as u32],
+            &[lay.stride | 1 << 12, (vb >> 32) as u32, vb as u32],
         );
         let end = vb + size - 1;
         p.inc(
@@ -853,12 +1027,30 @@ impl Gfx {
             SET_VERTEX_STREAM_LIMIT_A_A,
             &[(end >> 32) as u32, end as u32],
         );
-        p.inc(SUBC_3D, SET_VERTEX_ATTRIBUTE_A, &pipe.attributes());
+        p.inc(SUBC_3D, SET_VERTEX_ATTRIBUTE_A, lay.attrs);
     }
 
     /// `count` vertices from `first`, of the `vertices` at `vb`, as triangles.
     pub fn draw(&self, p: &mut Push, pipe: Pipe, vb: u64, vertices: u32, first: u32, count: u32) {
-        self.stream(p, pipe, vb, vertices);
+        let attrs = pipe.attributes();
+        let lay = Layout {
+            stride: pipe.stride(),
+            attrs: &attrs,
+        };
+        self.draw_layout(p, &lay, vb, vertices, first, count);
+    }
+
+    /// `draw` with any vertex layout.
+    pub fn draw_layout(
+        &self,
+        p: &mut Push,
+        lay: &Layout,
+        vb: u64,
+        vertices: u32,
+        first: u32,
+        count: u32,
+    ) {
+        self.stream(p, lay, vb, vertices);
         p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES]);
         p.inc(SUBC_3D, SET_VERTEX_ARRAY_START, &[first]);
         p.inc(SUBC_3D, DRAW_VERTEX_ARRAY, &[count]);
@@ -878,7 +1070,28 @@ impl Gfx {
         first: u32,
         count: u32,
     ) {
-        self.stream(p, pipe, vb, vertices);
+        let attrs = pipe.attributes();
+        let lay = Layout {
+            stride: pipe.stride(),
+            attrs: &attrs,
+        };
+        self.draw_indexed_layout(p, &lay, vb, vertices, ib, indices, first, count);
+    }
+
+    /// `draw_indexed` with any vertex layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_layout(
+        &self,
+        p: &mut Push,
+        lay: &Layout,
+        vb: u64,
+        vertices: u32,
+        ib: u64,
+        indices: u32,
+        first: u32,
+        count: u32,
+    ) {
+        self.stream(p, lay, vb, vertices);
         let end = ib + indices as u64 * 2 - 1;
         p.inc(
             SUBC_3D,

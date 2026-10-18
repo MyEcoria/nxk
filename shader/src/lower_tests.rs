@@ -11,30 +11,12 @@ use crate::sass::{SR_CTAID_X, SR_TID_X};
 use crate::sassim::Sim;
 use crate::*;
 
+use crate::fuzz::{random_program, Rng};
+
 const BASE: u64 = 0x2_0000_0000;
 
 fn base_of(i: usize) -> u64 {
     BASE + 0x10000 * i as u64
-}
-
-pub struct Rng(pub u64);
-
-impl Rng {
-    pub fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) as u32
-    }
-
-    pub fn below(&mut self, n: usize) -> usize {
-        self.next() as usize % n
-    }
-
-    pub fn float(&mut self) -> f32 {
-        (self.next() % 8001) as f32 / 1000.0 - 4.0
-    }
 }
 
 fn same(a: u32, b: u32) -> bool {
@@ -57,10 +39,12 @@ fn same(a: u32, b: u32) -> bool {
 /// Run `p` (compute) both ways; the buffers after, each.
 type Buffers = Vec<Vec<u32>>;
 
-pub fn both(
+/// Run `p` (compute) as thread `tid` of its group, both ways.
+pub fn both_t(
     p: &Program,
     uniforms: &[u32],
     bufs: &[Vec<u32>],
+    tid: u32,
 ) -> Result<(Buffers, Buffers), String> {
     // Reference.
     let mut ref_bufs: Vec<Vec<u32>> = bufs.to_vec();
@@ -72,7 +56,7 @@ pub fn both(
         buffers: &mut ref_bufs,
         sampler: &mut NoTextures,
     };
-    m.builtins[0] = 5; // local id x
+    m.builtins[0] = tid; // local id x
     m.builtins[3] = 7; // group id x
     run(p, &mut m);
     ref_bufs.truncate(bufs.len());
@@ -95,7 +79,7 @@ pub fn both(
     for (i, b) in bufs.iter().enumerate() {
         s.mem.push((base_of(i), b.clone()));
     }
-    s.sregs.insert(SR_TID_X, 5);
+    s.sregs.insert(SR_TID_X, tid);
     s.sregs.insert(SR_CTAID_X, 7);
     for k in 1..3 {
         s.sregs.insert(SR_TID_X + k, 0);
@@ -108,7 +92,11 @@ pub fn both(
 }
 
 pub fn check(p: &Program, uniforms: &[u32], bufs: &[Vec<u32>]) -> Result<(), String> {
-    let (r, s) = both(p, uniforms, bufs)?;
+    check_t(p, uniforms, bufs, 5)
+}
+
+pub fn check_t(p: &Program, uniforms: &[u32], bufs: &[Vec<u32>], tid: u32) -> Result<(), String> {
+    let (r, s) = both_t(p, uniforms, bufs, tid)?;
     for (bi, (x, y)) in r.iter().zip(&s).enumerate() {
         for (i, (&a, &b)) in x.iter().zip(y).enumerate() {
             if !same(a, b) {
@@ -227,12 +215,12 @@ fn every_unary_and_binary_op() {
             let mut inp = vec![
                 rng.float().to_bits(),
                 rng.float().to_bits(),
-                (rng.next() % 2000).wrapping_sub(1000),
-                rng.next() % 70,
+                (rng.next_u32() % 2000).wrapping_sub(1000),
+                rng.next_u32() % 70,
             ];
             if rng.below(4) == 0 {
-                inp[2] = rng.next();
-                inp[3] = rng.next();
+                inp[2] = rng.next_u32();
+                inp[3] = rng.next_u32();
             }
             if rng.below(5) == 0 {
                 inp[1] = inp[0];
@@ -247,310 +235,6 @@ fn every_unary_and_binary_op() {
     }
 }
 
-// Random programs.
-
-use core::cell::RefCell;
-
-#[derive(Clone, Default)]
-struct Pools {
-    f: Vec<Reg>,
-    u: Vec<Reg>,
-    i: Vec<Reg>,
-    bo: Vec<Reg>,
-}
-
-fn pick(rng: &RefCell<Rng>, v: &[Reg]) -> Reg {
-    let k = rng.borrow_mut().below(v.len());
-    v[k]
-}
-
-fn roll(rng: &RefCell<Rng>, n: usize) -> usize {
-    rng.borrow_mut().below(n)
-}
-
-fn gen_block(
-    b: &mut Builder,
-    rng: &RefCell<Rng>,
-    pools: &mut Pools,
-    depth: usize,
-    in_loop: bool,
-    n: usize,
-) {
-    for _ in 0..n {
-        if b.reg_count() > 165 {
-            return;
-        }
-        match roll(rng, 100) {
-            0..=19 => {
-                let (x, y, z) = (
-                    pick(rng, &pools.f),
-                    pick(rng, &pools.f),
-                    pick(rng, &pools.f),
-                );
-                let r = match roll(rng, 8) {
-                    0 => b.fadd(x, y),
-                    1 => b.fsub(x, y),
-                    2 => b.fmul(x, y),
-                    3 => b.fmin(x, y),
-                    4 => b.fmax(x, y),
-                    5 => b.fma(x, y, z),
-                    6 => {
-                        let a = b.fabs(x);
-                        b.fsqrt(a)
-                    }
-                    _ => b.fsat(x),
-                };
-                pools.f.push(r);
-            }
-            20..=24 => {
-                let x = pick(rng, &pools.f);
-                let r = match roll(rng, 6) {
-                    0 => b.fneg(x),
-                    1 => b.fabs(x),
-                    2 => b.ffloor(x),
-                    3 => b.fsin(x),
-                    4 => b.fex2(x),
-                    _ => {
-                        let a = b.fabs(x);
-                        b.flg2(a)
-                    }
-                };
-                pools.f.push(r);
-            }
-            25..=39 => {
-                let (x, y) = (pick(rng, &pools.u), pick(rng, &pools.u));
-                let r = match roll(rng, 9) {
-                    0 => b.uadd(x, y),
-                    1 => b.usub(x, y),
-                    2 => b.umul(x, y),
-                    3 => b.umin(x, y),
-                    4 => b.umax(x, y),
-                    5 => b.and(x, y),
-                    6 => b.or(x, y),
-                    7 => b.xor(x, y),
-                    _ => b.shl(x, y),
-                };
-                pools.u.push(r);
-            }
-            40..=47 => {
-                let (x, y) = (pick(rng, &pools.i), pick(rng, &pools.i));
-                let r = match roll(rng, 6) {
-                    0 => b.iadd(x, y),
-                    1 => b.isub(x, y),
-                    2 => b.imin(x, y),
-                    3 => b.imax(x, y),
-                    4 => b.ineg(x),
-                    _ => b.iabs(x),
-                };
-                pools.i.push(r);
-            }
-            48..=52 => {
-                // Conversions between the kinds.
-                match roll(rng, 4) {
-                    0 => {
-                        let x = pick(rng, &pools.f);
-                        let r = b.f2i(x);
-                        pools.i.push(r);
-                    }
-                    1 => {
-                        let x = pick(rng, &pools.i);
-                        let r = b.i2f(x);
-                        pools.f.push(r);
-                    }
-                    2 => {
-                        let x = pick(rng, &pools.u);
-                        let r = b.ibits(x);
-                        pools.i.push(r);
-                    }
-                    _ => {
-                        let x = pick(rng, &pools.i);
-                        let r = b.ubits(x);
-                        pools.u.push(r);
-                    }
-                }
-            }
-            53..=62 => {
-                let r = match roll(rng, 3) {
-                    0 => {
-                        let (x, y) = (pick(rng, &pools.f), pick(rng, &pools.f));
-                        b.cmp(cmp_of(roll(rng, 6)), x, y)
-                    }
-                    1 => {
-                        let (x, y) = (pick(rng, &pools.i), pick(rng, &pools.i));
-                        b.cmp(cmp_of(roll(rng, 6)), x, y)
-                    }
-                    _ => {
-                        let (x, y) = (pick(rng, &pools.u), pick(rng, &pools.u));
-                        b.cmp(cmp_of(roll(rng, 6)), x, y)
-                    }
-                };
-                pools.bo.push(r);
-            }
-            63..=66 => {
-                let (x, y) = (pick(rng, &pools.bo), pick(rng, &pools.bo));
-                let r = match roll(rng, 4) {
-                    0 => b.band(x, y),
-                    1 => b.bor(x, y),
-                    2 => b.bxor(x, y),
-                    _ => b.bnot(x),
-                };
-                pools.bo.push(r);
-            }
-            67..=71 => {
-                let p = pick(rng, &pools.bo);
-                match roll(rng, 4) {
-                    0 => {
-                        let (x, y) = (pick(rng, &pools.f), pick(rng, &pools.f));
-                        pools.f.push(b.sel(p, x, y));
-                    }
-                    1 => {
-                        let (x, y) = (pick(rng, &pools.u), pick(rng, &pools.u));
-                        pools.u.push(b.sel(p, x, y));
-                    }
-                    2 => {
-                        let (x, y) = (pick(rng, &pools.i), pick(rng, &pools.i));
-                        pools.i.push(b.sel(p, x, y));
-                    }
-                    _ => {
-                        let (x, y) = (pick(rng, &pools.bo), pick(rng, &pools.bo));
-                        pools.bo.push(b.sel(p, x, y));
-                    }
-                }
-            }
-            72..=79 => {
-                // Carry a value out of a block: assign an older register.
-                match roll(rng, 3) {
-                    0 => {
-                        let (d, s) = (pick(rng, &pools.f), pick(rng, &pools.f));
-                        b.mov(d, s);
-                    }
-                    1 => {
-                        let (d, s) = (pick(rng, &pools.u), pick(rng, &pools.u));
-                        b.mov(d, s);
-                    }
-                    _ => {
-                        let (d, s) = (pick(rng, &pools.bo), pick(rng, &pools.bo));
-                        b.mov(d, s);
-                    }
-                }
-            }
-            80..=86 if depth < 3 => {
-                let cond = pick(rng, &pools.bo);
-                let k = 1 + roll(rng, 4);
-                let k2 = roll(rng, 4);
-                let (p1, p2) = (pools.clone(), pools.clone());
-                b.if_else(
-                    cond,
-                    |b| {
-                        let mut p = p1;
-                        gen_block(b, rng, &mut p, depth + 1, in_loop, k);
-                    },
-                    |b| {
-                        let mut p = p2;
-                        gen_block(b, rng, &mut p, depth + 1, in_loop, k2);
-                    },
-                );
-            }
-            87..=91 if depth < 3 => {
-                let max = 1 + roll(rng, 5) as u32;
-                let k = 2 + roll(rng, 5);
-                let p1 = pools.clone();
-                b.loop_(max, |b| {
-                    let mut p = p1;
-                    gen_block(b, rng, &mut p, depth + 1, true, k);
-                });
-            }
-            92..=93 if in_loop => {
-                let c = pick(rng, &pools.bo);
-                if roll(rng, 2) == 0 {
-                    b.break_if(c);
-                } else {
-                    b.continue_if(c);
-                }
-            }
-            94..=96 => {
-                let u = pick(rng, &pools.u);
-                let m = b.u32(15);
-                let idx = b.and(u, m);
-                let w = [1usize, 2, 4][roll(rng, 3)];
-                let t = [Ty::F32, Ty::U32, Ty::I32];
-                let types: Vec<Ty> = (0..w).map(|_| t[roll(rng, 3)]).collect();
-                let off = roll(rng, 4) as u16;
-                let regs = b.load_n(0, idx, off, &types);
-                for (r, ty) in regs.iter().zip(&types) {
-                    match ty {
-                        Ty::F32 => pools.f.push(*r),
-                        Ty::U32 => pools.u.push(*r),
-                        _ => pools.i.push(*r),
-                    }
-                }
-            }
-            97..=98 => {
-                let u = pick(rng, &pools.u);
-                let m = b.u32(31);
-                let idx = b.and(u, m);
-                let w = [1usize, 2, 4][roll(rng, 3)];
-                let srcs: Vec<Reg> = (0..w).map(|_| pick(rng, &pools.u)).collect();
-                b.store(1, idx, 0, &srcs);
-            }
-            _ => {
-                let u = pick(rng, &pools.u);
-                let m = b.u32(3);
-                let idx = b.and(u, m);
-                let v = pick(rng, &pools.u);
-                let old = b.atomic_add(2, idx, v);
-                pools.u.push(old);
-            }
-        }
-    }
-}
-
-fn cmp_of(k: usize) -> CmpOp {
-    [
-        CmpOp::Eq,
-        CmpOp::Ne,
-        CmpOp::Lt,
-        CmpOp::Le,
-        CmpOp::Gt,
-        CmpOp::Ge,
-    ][k]
-}
-
-pub fn random_program(seed: u64) -> Program {
-    let rng = RefCell::new(Rng(seed));
-    let mut b = Builder::new(Stage::Compute);
-    let mut pools = Pools::default();
-    let z = b.u32(0);
-    for k in 0..4u16 {
-        pools.f.push(b.load(0, z, k, Ty::F32));
-        pools.u.push(b.load(0, z, 4 + k, Ty::U32));
-        pools.i.push(b.load(0, z, 8 + k, Ty::I32));
-    }
-    for k in 0..3 {
-        let c = b.cmp(cmp_of(k), pools.f[k], pools.f[k + 1]);
-        pools.bo.push(c);
-    }
-    gen_block(&mut b, &rng, &mut pools, 0, false, 12 + roll(&rng, 20));
-    // Show what the registers hold.
-    for (k, r) in pools.u.iter().rev().take(6).enumerate() {
-        let i = b.u32(32 + k as u32);
-        b.store(1, i, 0, &[*r]);
-    }
-    for (k, r) in pools.f.iter().rev().take(6).enumerate() {
-        let i = b.u32(40 + k as u32);
-        let bits = b.fbits(*r);
-        b.store(1, i, 0, &[bits]);
-    }
-    for (k, r) in pools.bo.iter().rev().take(4).enumerate() {
-        let i = b.u32(48 + k as u32);
-        let one = b.u32(1);
-        let zero = b.u32(0);
-        let w = b.sel(*r, one, zero);
-        b.store(1, i, 0, &[w]);
-    }
-    b.finish()
-}
-
 #[test]
 fn random_programs_match_the_reference() {
     let seeds: u64 = std::env::var("SHADER_FUZZ")
@@ -558,14 +242,14 @@ fn random_programs_match_the_reference() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(400);
     for seed in 1..=seeds {
-        let p = random_program(seed);
+        let p = random_program(seed, false);
         validate(&p).unwrap_or_else(|e| panic!("seed {seed}: invalid program: {e}"));
         let mut rng = Rng(seed * 7919);
         for _ in 0..3 {
             let mut b0: Vec<u32> = (0..4).map(|_| rng.float().to_bits()).collect();
-            b0.extend((0..4).map(|_| rng.next() % 40));
-            b0.extend((0..4).map(|_| (rng.next() % 200).wrapping_sub(100)));
-            b0.extend((0..8).map(|_| rng.next()));
+            b0.extend((0..4).map(|_| rng.next_u32() % 40));
+            b0.extend((0..4).map(|_| (rng.next_u32() % 200).wrapping_sub(100)));
+            b0.extend((0..8).map(|_| rng.next_u32()));
             let b1 = vec![0xAAAA_AAAA; 56];
             let b2 = vec![5, 6, 7, 8];
             if let Err(e) = check(&p, &[], &[b0.clone(), b1, b2]) {
@@ -579,7 +263,7 @@ fn random_programs_match_the_reference() {
 fn fuzzer_covers_control_flow() {
     let (mut ifs, mut loops, mut brks, mut insts, mut preds, mut ssy) = (0, 0, 0, 0, 0, 0);
     for seed in 1..=200 {
-        let p = random_program(seed);
+        let p = random_program(seed, false);
         walk(&p.body, &mut |i| {
             insts += 1;
             match i {
@@ -779,4 +463,26 @@ fn builtins_and_dynamic_uniforms() {
     let p = b.finish();
     let r = check(&p, &[10, 20, 30, 40, 50, 60], &[vec![0; 4]]);
     assert!(r.is_ok(), "{}", r.unwrap_err());
+}
+
+#[test]
+fn threaded_programs_match_per_thread() {
+    for seed in 1..=150u64 {
+        let p = random_program(seed, true);
+        validate(&p).unwrap();
+        let mut rng = Rng(seed * 31);
+        let mut b0: Vec<u32> = (0..4).map(|_| rng.float().to_bits()).collect();
+        b0.extend((0..4).map(|_| rng.next_u32() % 40));
+        b0.extend((0..4).map(|_| (rng.next_u32() % 200).wrapping_sub(100)));
+        b0.extend((0..8).map(|_| rng.next_u32()));
+        for tid in [0, 1, 7, 31, 63] {
+            let r = check_t(
+                &p,
+                &[],
+                &[b0.clone(), vec![0xAAAA_AAAA; 64 * 64], vec![0; 4]],
+                tid,
+            );
+            assert!(r.is_ok(), "seed {seed} thread {tid}: {}", r.unwrap_err());
+        }
+    }
 }

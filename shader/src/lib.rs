@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod builder;
 pub mod emit;
 pub mod fmath;
+pub mod fuzz;
 pub mod interp;
 pub mod ir;
 pub mod lower;
