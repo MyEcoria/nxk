@@ -125,12 +125,14 @@ the IR (closest hit and any hit, the stack in the thread's local memory)
 answer buffers of rays; `Graphics::rt_scene` uploads a scene and
 `Frame::trace` records a query. A game shoots a few rays per pixel at
 reduced resolution (shadows, ambient occlusion) next to its raster passes.
-On the Erista (768 MHz) 65,536 random rays through 4,000 triangles take
-46 ms (closest hit) and 29 ms (any hit), about 1.4 and 2.3 million rays per
-second; rays that travel together are much cheaper: a camera's 256 x 256
-rays 4.8 ms (13.7 Mrays/s), the shadow rays toward the sun from what it
-sees 2.4 ms (27 Mrays/s), because the lanes of a warp read the same
-nodes. Shooting in screen order is what makes it fast.
+On the Erista (768 MHz), per 65,536 rays: random rays through 4,000
+triangles 42 ms (closest hit) and 27 ms (any hit), about 1.5 and 2.4
+million rays per second; in a valley of 41,000 triangles (a height field
+and 1,000 trees, the size of Lumen's) a camera's 256 x 256 rays take 9.8 ms
+(6.7 Mrays/s) and the sun's shadow rays from what it sees 4.9 ms (13.5
+Mrays/s). Rays that go the same way in a warp cost about 2.3 times less
+than the same rays in random order (10.8 ms for the shadows shuffled), so a
+game shoots them in screen order, at reduced resolution.
 
 `jeux/lumen` is the game built on all of this: a valley from dawn to
 night to run through, third person (left stick, right stick for the

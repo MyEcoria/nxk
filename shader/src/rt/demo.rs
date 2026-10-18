@@ -94,3 +94,75 @@ pub fn shadow_rays(bvh: &super::Bvh, camera: &[Ray], sun: [f32; 3]) -> Vec<Ray> 
         })
         .collect()
 }
+
+/// A valley: a `n` x `n` cell height field (2 triangles a cell, 1 unit
+/// apart, centred) with `trees` cones of 6 triangles on it, as
+/// triangles with ids in order. About what a small game level is.
+pub fn valley(n: usize, trees: usize, seed: u64) -> Vec<Triangle> {
+    let h = |x: f32, z: f32| {
+        4.0 * crate::fmath::sin(x * 0.07) * crate::fmath::cos(z * 0.05)
+            + 2.0 * crate::fmath::sin(x * 0.19 + z * 0.13)
+    };
+    let half = n as f32 / 2.0;
+    let mut v: Vec<[[f32; 3]; 3]> = Vec::new();
+    let p = |i: usize, j: usize| {
+        let (x, z) = (i as f32 - half, j as f32 - half);
+        [x, h(x, z), z]
+    };
+    for i in 0..n {
+        for j in 0..n {
+            v.push([p(i, j), p(i + 1, j), p(i, j + 1)]);
+            v.push([p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)]);
+        }
+    }
+    let mut r = Rng(seed);
+    for _ in 0..trees {
+        let (x, z) = (
+            unit(&mut r) * n as f32 - half,
+            unit(&mut r) * n as f32 - half,
+        );
+        let base = h(x, z);
+        let top = [x, base + 3.0 + unit(&mut r) * 2.0, z];
+        let ring: Vec<[f32; 3]> = (0..6)
+            .map(|k| {
+                let a = k as f32 * (core::f32::consts::TAU / 6.0);
+                [
+                    x + 0.8 * crate::fmath::cos(a),
+                    base,
+                    z + 0.8 * crate::fmath::sin(a),
+                ]
+            })
+            .collect();
+        for k in 0..6 {
+            v.push([ring[k], ring[(k + 1) % 6], top]);
+        }
+    }
+    v.into_iter()
+        .enumerate()
+        .map(|(i, v)| Triangle { v, id: i as u32 })
+        .collect()
+}
+
+/// A camera at `eye`, `pitch` radians down (looking along +z): `w` x `h`
+/// rays, row by row.
+pub fn camera_rays_from(w: usize, h: usize, eye: [f32; 3], pitch: f32) -> Vec<Ray> {
+    let half = 0.577_350_3f32;
+    let (sp, cp) = (crate::fmath::sin(pitch), crate::fmath::cos(pitch));
+    let mut v = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let u = ((x as f32 + 0.5) / w as f32 * 2.0 - 1.0) * half;
+            let t = (1.0 - (y as f32 + 0.5) / h as f32 * 2.0) * half;
+            // (u, t, 1) tilted down by `pitch` about the x axis.
+            let d = [u, t * cp - sp, t * sp + cp];
+            let l = crate::fmath::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            v.push(Ray {
+                origin: eye,
+                t_min: 1e-4,
+                dir: [d[0] / l, d[1] / l, d[2] / l],
+                t_max: 1e9,
+            });
+        }
+    }
+    v
+}

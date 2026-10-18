@@ -1004,17 +1004,50 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
             return Ok((false, 0));
         }
     };
-    let camera = demo::camera_rays(256, 256);
     let sun = [0.3, 0.8, 0.5];
     let l = fmath::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
-    let shadow = demo::shadow_rays(&bvh, &camera, [sun[0] / l, sun[1] / l, sun[2] / l]);
+    let sun = [sun[0] / l, sun[1] / l, sun[2] / l];
     let (mut ok, mut ns) = (true, 0);
-    for (set, rs) in [
-        ("random", demo::rays(65_536, 2)),
-        ("camera", camera),
-        ("shadow", shadow),
-    ] {
+    // The same rays in a fixed random order tell coherence from ease.
+    let shuffled = |v: &[rt::Ray]| {
+        let mut v = v.to_vec();
+        let mut r = Rng(7);
+        for i in (1..v.len()).rev() {
+            v.swap(i, r.next_u32() as usize % (i + 1));
+        }
+        v
+    };
+    let camera = demo::camera_rays(256, 256);
+    let shadow = demo::shadow_rays(&bvh, &camera, sun);
+    let mut sets = alloc::vec![
+        ("soup random", demo::rays(65_536, 2)),
+        ("soup shuffled camera", shuffled(&camera)),
+        ("soup shuffled shadow", shuffled(&shadow)),
+        ("soup camera", camera),
+        ("soup shadow", shadow),
+    ];
+    for (set, rs) in sets.drain(..) {
         let (o, t) = rays_set(g, set, &rs, &bvh, &compiled)?;
+        ok &= o;
+        ns += t;
+    }
+    // A height field of the size of Lumen's valley (about 41,000 triangles).
+    let valley = demo::valley(128, 1000, 5);
+    let vbvh = match rt::build(&valley) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("[gpu] IR rays: the valley does not build: {:?}", err);
+            return Ok((false, ns));
+        }
+    };
+    let vcam = demo::camera_rays_from(256, 256, [0.0, 14.0, -62.0], 0.25);
+    let vshadow = demo::shadow_rays(&vbvh, &vcam, sun);
+    for (set, rs) in [
+        ("valley camera", vcam.clone()),
+        ("valley shadow", vshadow.clone()),
+        ("valley shuffled shadow", shuffled(&vshadow)),
+    ] {
+        let (o, t) = rays_set(g, set, &rs, &vbvh, &compiled)?;
         ok &= o;
         ns += t;
     }

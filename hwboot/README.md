@@ -1044,17 +1044,21 @@ within 5 s.
     until a reboot. Separately: such a game is not owned by `display`;
     after HOME the library is back and the GPU is switched off, but the
     process is still alive (`ps`). A reload in that state has not been tried.
-41. 18/10/2026, Erista, **coherent rays**: `gpu test` now also traces a camera's
+41. 18/10/2026, Erista, **coherent rays**: `gpu test` also traces a camera's
     256 x 256 rays (row by row) and the shadow rays toward the sun from their
-    hits, against the CPU walk (0 of 65,536 differ each): closest hit 4.8 ms
-    (13.7 Mrays/s), shadows 2.4 ms (27 Mrays/s), against 46 ms for random
-    rays (1.4 Mrays/s): divergence, not instructions, is what costs. Two
-    levers that did not pay: the LDG's `.ci` read-only mode (bits 46-47 = 2,
-    envytools' gm107 table) makes a 16 KB chase 3x faster but the rays 4%,
-    and page tables read through L2 changed nothing; the default mode
-    behaves as `.cg` (L2 only). A game launched from the library (A) is
-    killed by HOME (`ps` shows no process afterwards), so `--reload gpu`
-    is safe after that.
+    hits, against the CPU walk (0 of 65,536 differ each). Soup of 4,000
+    triangles: closest hit 4.8 ms for the camera's (13.7 Mrays/s), 2.4 ms for
+    the shadows (27 Mrays/s), 42 ms for random rays (1.6 Mrays/s). Most of
+    that is the rays being easy (21% and 5% hit): the same rays in a fixed
+    random order take 11 ms and 5.7 ms, so warp coherence is worth about
+    2.3x. Valley of 41,000 triangles (height field, 1,000 trees; every
+    camera ray hits): camera 9.8 ms (6.7 Mrays/s), shadows 4.9 ms (13.5
+    Mrays/s), shadows shuffled 10.8 ms (6.0 Mrays/s). Two levers that did
+    not pay: the LDG's `.ci` read-only mode (bits 46-47 = 2, envytools'
+    gm107 table) makes a 16 KB chase 3x faster but the rays 4%, and page
+    tables read through L2 changed nothing; the default mode behaves as
+    `.cg` (L2 only). A game launched from the library (A) is killed by HOME
+    (`ps` shows no process afterwards), so `--reload gpu` is safe after that.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
