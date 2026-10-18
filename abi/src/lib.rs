@@ -1539,7 +1539,8 @@ pub mod proto {
         pub const CMD_CLEAR: u32 = 2;
         /// `[pipeline (PIPE_*), flags (PF_*)]`.
         pub const CMD_PIPELINE: u32 = 3;
-        /// Words for the shaders' constant buffer 1 (`PIPE_LIT`: 33).
+        /// Words for the shaders' constant buffer 1 (`PIPE_LIT`: 33; a shader of
+        /// the IR reads up to 1024).
         pub const CMD_UNIFORMS: u32 = 4;
         /// `[vertex buffer, byte offset, vertices, first, count]`.
         pub const CMD_DRAW: u32 = 5;
@@ -1562,12 +1563,93 @@ pub mod proto {
         /// Cull back faces (counter-clockwise front).
         pub const PF_CULL_BACK: u32 = 1;
         pub const LIT_UBO_WORDS: usize = 33;
+        /// The shader compiler's self-test, apart from `TEST` (a program
+        /// the GPU cannot run resets it): as `TEST3D`'s reply, with the
+        /// `T3_IR_*` bits.
+        pub const TEST_IR: u32 = 25;
         /// `TEST` bits of the 3D engine (and `TEST3D`'s alone).
         pub const T3_CLEAR: u64 = 32;
         pub const T3_TRIANGLE: u64 = 64;
         pub const T3_DEPTH: u64 = 128;
         pub const T3_LIT: u64 = 256;
         pub const T3_TEXTURE: u64 = 512;
+        /// Compute programs of the IR (random ones, 64 threads each) give
+        /// the reference machine's results; a vertex and a fragment shader
+        /// of the IR with a uniform, a texture and a bound state draw the
+        /// expected pixel.
+        pub const T3_IR_COMPUTE: u64 = 1024;
+        pub const T3_IR_DRAW: u64 = 2048;
+        /// Compile a shader written in `nxk-shader`'s IR: handle 0 = shm
+        /// (readable, `MAP` right) holding its wire words; word 0 = number
+        /// of words. Reply: word 0 = shader ID, word 1 = registers per
+        /// thread, word 2 = stage (0 vertex, 1 fragment, 2 compute).
+        /// EINVAL: it does not decode, validate or compile (the reason is
+        /// logged); ENOSPC: no room for its code.
+        pub const SHADER_ATTACH: u32 = 21;
+        /// word 0 = shader ID.
+        pub const SHADER_DETACH: u32 = 22;
+        /// A graphics pipeline: handle 0 = shm (readable) with the `PD_*`
+        /// words; word 0 = number of words. Reply: word 0 = pipeline ID.
+        pub const PIPELINE_ATTACH: u32 = 23;
+        /// word 0 = pipeline ID.
+        pub const PIPELINE_DETACH: u32 = 24;
+        /// Words of a pipeline description: vertex shader ID, fragment
+        /// shader ID, bytes per vertex, `PF_*` flags, `BLEND_*`, `DEPTH_*`,
+        /// the number of attributes, then that many words
+        /// (`offset | format << 16`); attribute n feeds the vertex
+        /// shader's input n.
+        pub const PD_VERTEX: usize = 0;
+        pub const PD_FRAGMENT: usize = 1;
+        pub const PD_STRIDE: usize = 2;
+        pub const PD_FLAGS: usize = 3;
+        pub const PD_BLEND: usize = 4;
+        pub const PD_DEPTH: usize = 5;
+        pub const PD_COUNT: usize = 6;
+        pub const PD_ATTRS: usize = 7;
+        pub const MAX_ATTRIBUTES: usize = 16;
+        /// Vertex attribute formats.
+        pub const AF_F32X1: u32 = 1;
+        pub const AF_F32X2: u32 = 2;
+        pub const AF_F32X3: u32 = 3;
+        pub const AF_F32X4: u32 = 4;
+        /// Four bytes, 0..255 read as 0..1.
+        pub const AF_U8X4_UNORM: u32 = 5;
+        /// More `PF_*` flags (with `PF_CULL_BACK`): no depth writes, no
+        /// depth test, cull front faces.
+        pub const PF_NO_DEPTH_WRITE: u32 = 2;
+        pub const PF_NO_DEPTH_TEST: u32 = 4;
+        pub const PF_CULL_FRONT: u32 = 8;
+        /// Blending of color target 0: none; source alpha over; source
+        /// alpha added; premultiplied (source added, destination faded by
+        /// the source alpha).
+        pub const BLEND_NONE: u32 = 0;
+        pub const BLEND_ALPHA: u32 = 1;
+        pub const BLEND_ADD: u32 = 2;
+        pub const BLEND_PREMUL: u32 = 3;
+        /// Depth comparisons: a fragment passes when it is less, ...
+        pub const DEPTH_LESS: u32 = 0;
+        pub const DEPTH_LEQUAL: u32 = 1;
+        pub const DEPTH_GREATER: u32 = 2;
+        pub const DEPTH_GEQUAL: u32 = 3;
+        pub const DEPTH_EQUAL: u32 = 4;
+        pub const DEPTH_ALWAYS: u32 = 5;
+        /// `[pipeline ID]`: the shaders and state of a pipeline made with
+        /// `PIPELINE_ATTACH` for the draws that follow (a target first).
+        pub const CMD_USE_PIPELINE: u32 = 8;
+        /// `[slot, buffer ID]`: buffer `slot` (0-7) of the shaders'
+        /// `Buf*` instructions (bounds: the buffer's length in words).
+        pub const CMD_BIND_BUFFER: u32 = 9;
+        /// `[slot, texture ID]`: texture `slot` (0-15) of the shaders'
+        /// `Tex` instructions.
+        pub const CMD_BIND_TEXTURE: u32 = 10;
+        /// `[compute shader ID, groups x, y, z]`: after the draws before
+        /// it are done; the uniforms and bindings as set.
+        pub const CMD_DISPATCH: u32 = 11;
+        /// Nothing before this is still running when the commands after
+        /// it start (a pass that reads what the last wrote).
+        pub const CMD_BARRIER: u32 = 12;
+        pub const SHADER_BUFFERS: usize = 8;
+        pub const SHADER_TEXTURES: usize = 16;
     }
     /// Block device (SD card, eMMC).
     pub mod blk {
