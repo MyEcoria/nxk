@@ -1,7 +1,7 @@
 //! The game's shaders, written in the IR: one lit vertex and fragment pair
 //! for everything solid (a sun, a hemisphere light, distance fog, gamma).
 
-use nxgfx::ir::rt::shadow::lit_factor as shadow_factor;
+use nxgfx::ir::rt::shadow::lit_factor_ex as shadow_factor;
 use nxgfx::ir::{Builder, CmpOp, OutKind, Program, Reg, Stage, Ty};
 
 /// Uniform words: the model-view-projection rows, the model rows (3x4,
@@ -80,12 +80,48 @@ pub fn vertex() -> Program {
     b.finish()
 }
 
+/// The sun's share at this pixel from the mask (buffer slot 0), and
+/// whether the filter had texels to work with. `n`: the unit normal, `w`:
+/// the world position, `cam`: the camera, `dist`: the distance to it.
+fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: Reg) -> (Reg, Reg) {
+    let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
+    let low = [
+        b.uniform(U_SHADOW_W, Ty::F32),
+        b.uniform(U_SHADOW_H, Ty::F32),
+    ];
+    let rw = b.frcp(clip[2]);
+    let (nx, ny) = (b.fmul(clip[0], rw), b.fmul(clip[1], rw));
+    let half = b.f32(0.5);
+    let (hw, hh) = (b.fmul(low[0], half), b.fmul(low[1], half));
+    let mhh = b.fneg(hh);
+    let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
+    let px = b.fma(nx, hw, ox);
+    let py = b.fma(ny, mhh, oy);
+    // Neighbouring texels of a surface seen at a grazing angle are far
+    // apart in depth: the tolerance grows as the view turns flat.
+    let to_cam = [
+        b.fsub(cam[0], w[0]),
+        b.fsub(cam[1], w[1]),
+        b.fsub(cam[2], w[2]),
+    ];
+    let facing = dot3(b, n, to_cam);
+    let facing = b.fabs(facing);
+    let floor = b.f32(0.08);
+    let across = b.fmul(dist, floor);
+    let facing = b.fmax(facing, across);
+    let base = b.f32(0.15);
+    let rel = b.f32(0.04);
+    let scaled = b.fmul(dist, rel);
+    let rf = b.frcp(facing);
+    let grazing = b.fmul(scaled, dist);
+    let tol = b.fma(grazing, rf, base);
+    shadow_factor(b, 0, px, py, dist, tol, low)
+}
+
 pub fn fragment() -> Program {
     let mut b = Builder::new(Stage::Fragment);
     let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
-    let col = [b.input(1, 0), b.input(1, 1), b.input(1, 2), b.input(1, 3)];
     let w = [b.input(2, 0), b.input(2, 1), b.input(2, 2)];
-    let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
     // Normalize the interpolated normal.
     let len2 = dot3(&mut b, n, n);
     let tiny = b.f32(1e-8);
@@ -93,23 +129,7 @@ pub fn fragment() -> Program {
     let len = b.fsqrt(len2);
     let rl = b.frcp(len);
     let n = [b.fmul(n[0], rl), b.fmul(n[1], rl), b.fmul(n[2], rl)];
-    let sun = uni3(&mut b, U_SUN_DIR);
-    let sun_c = uni3(&mut b, U_SUN_COL);
-    let sky = uni3(&mut b, U_SKY);
-    let ground = uni3(&mut b, U_GROUND);
-    let fog = uni3(&mut b, U_FOG);
     let cam = uni3(&mut b, U_CAMERA);
-    let tint = [
-        b.uniform(U_TINT, Ty::F32),
-        b.uniform(U_TINT + 1, Ty::F32),
-        b.uniform(U_TINT + 2, Ty::F32),
-        b.uniform(U_TINT + 3, Ty::F32),
-    ];
-    let emissive = b.uniform(U_EMISSIVE, Ty::F32);
-    let ndl = dot3(&mut b, n, sun);
-    let ndl = b.fsat(ndl);
-    let half = b.f32(0.5);
-    let h = b.fma(n[1], half, half);
     // Fog: 1 - 2^(-density * distance / ln 2).
     let d = [
         b.fsub(w[0], cam[0]),
@@ -128,43 +148,32 @@ pub fn fragment() -> Program {
     let f = b.fsat(f);
     let zero = b.f32(0.0);
     // The sun's share from the ray-traced mask, filtered at this pixel.
+    // Done first, so that what the lighting needs is not held meanwhile:
+    // fewer registers, more fragments in flight.
     let shadow = b.copy(one);
     let on = b.uniform(U_SHADOW_ON, Ty::F32);
     let enabled = b.cmp(CmpOp::Gt, on, zero);
     b.if_(enabled, |b| {
-        let low = [
-            b.uniform(U_SHADOW_W, Ty::F32),
-            b.uniform(U_SHADOW_H, Ty::F32),
-        ];
-        let rw = b.frcp(clip[2]);
-        let (nx, ny) = (b.fmul(clip[0], rw), b.fmul(clip[1], rw));
-        let half = b.f32(0.5);
-        let (hw, hh) = (b.fmul(low[0], half), b.fmul(low[1], half));
-        let mhh = b.fneg(hh);
-        let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
-        let px = b.fma(nx, hw, ox);
-        let py = b.fma(ny, mhh, oy);
-        // Neighbouring texels of a surface seen at a grazing angle are far
-        // apart in depth: the tolerance grows as the view turns flat.
-        let to_cam = [
-            b.fsub(cam[0], w[0]),
-            b.fsub(cam[1], w[1]),
-            b.fsub(cam[2], w[2]),
-        ];
-        let facing = dot3(b, n, to_cam);
-        let facing = b.fabs(facing);
-        let floor = b.f32(0.08);
-        let across = b.fmul(dist, floor);
-        let facing = b.fmax(facing, across);
-        let base = b.f32(0.15);
-        let rel = b.f32(0.04);
-        let scaled = b.fmul(dist, rel);
-        let rf = b.frcp(facing);
-        let grazing = b.fmul(scaled, dist);
-        let tol = b.fma(grazing, rf, base);
-        let f = shadow_factor(b, 0, px, py, dist, tol, low);
+        let (f, _) = mask_factor(b, n, w, cam, dist);
         b.mov(shadow, f);
     });
+    let col = [b.input(1, 0), b.input(1, 1), b.input(1, 2), b.input(1, 3)];
+    let sun = uni3(&mut b, U_SUN_DIR);
+    let sun_c = uni3(&mut b, U_SUN_COL);
+    let sky = uni3(&mut b, U_SKY);
+    let ground = uni3(&mut b, U_GROUND);
+    let fog = uni3(&mut b, U_FOG);
+    let tint = [
+        b.uniform(U_TINT, Ty::F32),
+        b.uniform(U_TINT + 1, Ty::F32),
+        b.uniform(U_TINT + 2, Ty::F32),
+        b.uniform(U_TINT + 3, Ty::F32),
+    ];
+    let emissive = b.uniform(U_EMISSIVE, Ty::F32);
+    let ndl = dot3(&mut b, n, sun);
+    let ndl = b.fsat(ndl);
+    let half = b.f32(0.5);
+    let h = b.fma(n[1], half, half);
     let sun_term = b.fmul(ndl, shadow);
     for i in 0..3 {
         let albedo = b.fmul(col[i], tint[i]);
@@ -223,5 +232,37 @@ pub fn position_fragment() -> Program {
     let facing = b.cmp(CmpOp::Gt, ndl, floor);
     let out = b.sel(facing, dist, zero);
     b.output(OutKind::Color(0), 3, out);
+    b.finish()
+}
+
+/// The Lab's view of the mask: the factor as grey, red where the filter
+/// had no texel to blend and took the nearest in depth.
+pub fn mask_view_fragment() -> Program {
+    let mut b = Builder::new(Stage::Fragment);
+    let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
+    let w = [b.input(2, 0), b.input(2, 1), b.input(2, 2)];
+    let len2 = dot3(&mut b, n, n);
+    let tiny = b.f32(1e-8);
+    let len2 = b.fmax(len2, tiny);
+    let len = b.fsqrt(len2);
+    let rl = b.frcp(len);
+    let n = [b.fmul(n[0], rl), b.fmul(n[1], rl), b.fmul(n[2], rl)];
+    let cam = uni3(&mut b, U_CAMERA);
+    let d = [
+        b.fsub(w[0], cam[0]),
+        b.fsub(w[1], cam[1]),
+        b.fsub(w[2], cam[2]),
+    ];
+    let d2 = dot3(&mut b, d, d);
+    let dist = b.fsqrt(d2);
+    let (f, strong) = mask_factor(&mut b, n, w, cam, dist);
+    let (one, zero, half) = (b.f32(1.0), b.f32(0.0), b.f32(0.5));
+    let red = b.sel(strong, f, one);
+    let blue = b.sel(strong, f, half);
+    let _ = zero;
+    b.output(OutKind::Color(0), 0, red);
+    b.output(OutKind::Color(0), 1, f);
+    b.output(OutKind::Color(0), 2, blue);
+    b.output(OutKind::Color(0), 3, one);
     b.finish()
 }
