@@ -83,7 +83,13 @@ pub fn vertex() -> Program {
 /// The sun's share at this pixel from the mask (buffer slot 0), and
 /// whether the filter had texels to work with. `n`: the unit normal, `w`:
 /// the world position, `cam`: the camera, `dist`: the distance to it.
-fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: Reg) -> (Reg, Reg) {
+fn mask_factor(
+    b: &mut Builder,
+    n: [Reg; 3],
+    w: [Reg; 3],
+    cam: [Reg; 3],
+    dist: Reg,
+) -> (Reg, Reg, Reg) {
     let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
     let low = [
         b.uniform(U_SHADOW_W, Ty::F32),
@@ -154,7 +160,7 @@ pub fn fragment() -> Program {
     let on = b.uniform(U_SHADOW_ON, Ty::F32);
     let enabled = b.cmp(CmpOp::Gt, on, zero);
     b.if_(enabled, |b| {
-        let (f, _) = mask_factor(b, n, w, cam, dist);
+        let (f, _, _) = mask_factor(b, n, w, cam, dist);
         b.mov(shadow, f);
     });
     let col = [b.input(1, 0), b.input(1, 1), b.input(1, 2), b.input(1, 3)];
@@ -235,8 +241,9 @@ pub fn position_fragment() -> Program {
     b.finish()
 }
 
-/// The Lab's view of the mask: the factor as grey, red where the filter
-/// had no texel to blend and took the nearest in depth.
+/// The Lab's view of the mask: the factor as grey; yellow or pink where
+/// the filter rejected every texel on depth and took the nearest; blue
+/// where no texel had a distance at all.
 pub fn mask_view_fragment() -> Program {
     let mut b = Builder::new(Stage::Fragment);
     let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
@@ -255,13 +262,16 @@ pub fn mask_view_fragment() -> Program {
     ];
     let d2 = dot3(&mut b, d, d);
     let dist = b.fsqrt(d2);
-    let (f, strong) = mask_factor(&mut b, n, w, cam, dist);
-    let (one, zero, half) = (b.f32(1.0), b.f32(0.0), b.f32(0.5));
-    let red = b.sel(strong, f, one);
-    let blue = b.sel(strong, f, half);
-    let _ = zero;
+    let (f, strong, any) = mask_factor(&mut b, n, w, cam, dist);
+    let (one, zero, mid, hi) = (b.f32(1.0), b.f32(0.0), b.f32(0.6), b.f32(0.4));
+    let red_weak = b.sel(any, one, zero);
+    let green_weak = b.sel(any, f, mid);
+    let blue_weak = b.sel(any, hi, one);
+    let red = b.sel(strong, f, red_weak);
+    let green = b.sel(strong, f, green_weak);
+    let blue = b.sel(strong, f, blue_weak);
     b.output(OutKind::Color(0), 0, red);
-    b.output(OutKind::Color(0), 1, f);
+    b.output(OutKind::Color(0), 1, green);
     b.output(OutKind::Color(0), 2, blue);
     b.output(OutKind::Color(0), 3, one);
     b.finish()

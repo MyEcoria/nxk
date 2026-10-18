@@ -33,7 +33,8 @@ use shadow::Shadows;
 
 struct Pipes {
     lit: Pipeline,
-    mask_view: Pipeline,
+    /// The Lab's view of the shadow mask: a debug aid, optional.
+    mask_view: Option<Pipeline>,
     alpha: Pipeline,
     add: Pipeline,
 }
@@ -81,12 +82,17 @@ fn load(g: &Graphics, terrain: &MeshData, scenery: &world::Scenery) -> nxgfx::Re
         d.depth_write = blend == Blend::None;
         d
     };
-    let mask_fs = g.shader(&mask_view_fragment())?;
-    let mut view = PipelineDesc::new(&vs, &mask_fs, meshes::STRIDE, &attrs);
-    view.cull = Cull::Back;
+    let mask_view = g.shader(&mask_view_fragment()).and_then(|fs| {
+        let mut view = PipelineDesc::new(&vs, &fs, meshes::STRIDE, &attrs);
+        view.cull = Cull::Back;
+        g.pipeline_from(&view)
+    });
+    if let Err(e) = &mask_view {
+        eprintln!("lumen: mask view: errno {}", -e);
+    }
     let pipes = Pipes {
         lit: g.pipeline_from(&desc(Cull::Back, Blend::None))?,
-        mask_view: g.pipeline_from(&view)?,
+        mask_view: mask_view.ok(),
         alpha: g.pipeline_from(&desc(Cull::None, Blend::Alpha))?,
         add: g.pipeline_from(&desc(Cull::None, Blend::Additive))?,
     };
@@ -239,7 +245,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("lumen: assets: errno {}", -e);
-            return;
+            std::process::exit(1);
         }
     };
     let mut audio = Audio::open().ok();
@@ -457,7 +463,7 @@ fn main() {
             let parts: [[[f32; 4]; 3]; 6] =
                 std::array::from_fn(|k| [pose[k].0[0], pose[k].0[1], pose[k].0[2]]);
             if mode != 2 {
-                sh.trace(&mut f, sky.sun_dir, &parts, me.pos, &vp.0, eye);
+                sh.trace(&mut f, sky.sun_dir, &parts, me.pos, &vp.0, eye, mode == 5);
             }
             f.screen();
             if mode == 4 && g_frames % 120 == 60 {
@@ -466,12 +472,11 @@ fn main() {
         }
         f.clear(hor);
         f.canvas(&bg);
-        f.use_pipeline(if rt_on && mode == 4 {
-            &assets.pipes.mask_view
-        } else {
-            &assets.pipes.lit
+        f.use_pipeline(match (&assets.pipes.mask_view, rt_on && mode == 4) {
+            (Some(view), true) => view,
+            _ => &assets.pipes.lit,
         });
-        d.shadow_on = rt_on && (mode == 0 || mode == 4);
+        d.shadow_on = rt_on && matches!(mode, 0 | 4 | 5);
         d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);

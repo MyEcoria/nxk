@@ -1076,6 +1076,21 @@ within 5 s.
     uniforms). The console ran out of battery during the session (a USB-C
     port from a PC does not keep up with 768 MHz and the screen): charge it
     from a charger for long sessions.
+43. 19/10/2026, Erista, **the shadow mask over time**: two masks of two words
+    a texel, history reprojected with the last camera, a sun disc of 1.5
+    degrees jittered per texel and frame, half the texels tracing each
+    frame: 60 fps with the GPU 76% busy (82-88% with every texel tracing),
+    penumbrae on the edges. After the console ran out of battery and was
+    started again, Lumen from the library did nothing: the boot image
+    carries the services of its build, so its `gpu` refused the new kernel
+    (errno 22, the game then left with code 0, no toast): after a reboot,
+    `usbterm --reload gpu` first (or update the image, see "Driver updates
+    over USB-C"). A game started with `run` from the shell is not owned by
+    `display`: HOME gives the screen back and the game keeps running, and
+    two games drew over each other; the Lab now leaves after a second of
+    refused frames, and the shell has `jobs` and `kill` (not in the boot
+    image until it is updated). `lumen lab MODE` starts with the Lab open
+    at a shadow mode (the shell sees its panic messages).
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

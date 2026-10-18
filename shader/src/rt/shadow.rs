@@ -365,8 +365,9 @@ pub fn lit_factor(
     lit_factor_ex(b, buf, px, py, dist, tol, low).0
 }
 
-/// `lit_factor`, and whether the texels agreed well enough to be
-/// filtered (false: the nearest in depth decided).
+/// `lit_factor`, whether the texels agreed well enough to be filtered
+/// (false: the nearest in depth decided), and whether any texel had a
+/// distance at all.
 pub fn lit_factor_ex(
     b: &mut Builder,
     buf: u8,
@@ -375,7 +376,7 @@ pub fn lit_factor_ex(
     dist: Reg,
     tol: Reg,
     low: [Reg; 2],
-) -> (Reg, Reg) {
+) -> (Reg, Reg, Reg) {
     let (zero, one) = (b.f32(0.0), b.f32(1.0));
     let (x0, y0) = (b.ffloor(px), b.ffloor(py));
     let (fx, fy) = (b.fsub(px, x0), b.fsub(py, y0));
@@ -433,5 +434,6 @@ pub fn lit_factor_ex(
     let denom = b.fmax(sum_w, tiny);
     let rcp = b.frcp(denom);
     let mean = b.fmul(sum_l, rcp);
-    (b.sel(strong, mean, best_l), strong)
+    let any = b.cmp(CmpOp::Lt, best_e, huge);
+    (b.sel(strong, mean, best_l), strong, any)
 }

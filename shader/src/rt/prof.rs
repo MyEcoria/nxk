@@ -436,5 +436,10 @@ fn shadow_kernel_size() {
     let p = shadow::kernel(shadow::Slots::default());
     let w = crate::wire::encode(&p);
     let c = compile(&p).unwrap();
-    std::println!("shadow kernel: {} wire words, {} registers, {} code words", w.len(), c.gprs, c.code.len());
+    std::println!(
+        "shadow kernel: {} wire words, {} registers, {} code words",
+        w.len(),
+        c.gprs,
+        c.code.len()
+    );
 }

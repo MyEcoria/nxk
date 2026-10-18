@@ -111,6 +111,7 @@ impl Shadows {
         at: [f32; 3],
         vp: &[[f32; 4]; 4],
         eye: [f32; 3],
+        forget: bool,
     ) {
         let sphere = [at[0], at[1] + 0.95, at[2], 1.35];
         let mut un = vec![0u32; u::WORDS];
@@ -138,7 +139,7 @@ impl Shadows {
         // frame and when the sun jumped (a change of the time of day).
         let (pvp, pcam, psun, psphere) = self.prev.unwrap_or((*vp, eye, sun, sphere));
         let cos = sun[0] * psun[0] + sun[1] * psun[1] + sun[2] * psun[2];
-        let reset = self.prev.is_none() || cos < 0.999_95;
+        let reset = self.prev.is_none() || forget || cos < 0.999_95;
         for (r, row) in pvp.iter().enumerate() {
             set(u::PREV_VP + 4 * r as u16, row);
         }
