@@ -976,12 +976,11 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
 
 /// Closest-hit and any-hit traversal of a wide BVH on the GPU: 65536
 /// rays through 4000 triangles against the CPU walk of the same tree,
-/// with the rate it manages.
+/// with the rate it manages: random rays, then a camera's and the
+/// shadow rays from what it sees (neighbours in a warp are neighbours on
+/// the screen).
 pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
-    use nxk_shader::rt::{self, demo, kernel, trace};
-    const RAYS: usize = 65_536;
-    let e = |(e, _): (i64, &str)| -e;
-    let regs = g.regs;
+    use nxk_shader::rt::{self, demo, kernel};
     let tris = demo::soup(4000, 3.0, 1);
     let bvh = match rt::build(&tris) {
         Ok(b) => b,
@@ -990,10 +989,8 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
             return Ok((false, 0));
         }
     };
-    let rs = demo::rays(RAYS, 2);
-    let ray_words: Vec<u32> = rs.iter().flat_map(|r| r.words()).collect();
     let slots = kernel::Slots::default();
-    let (closest, any) = match (
+    let compiled = match (
         lower::compile(&kernel::closest_hit(slots)),
         lower::compile(&kernel::any_hit(slots)),
     ) {
@@ -1007,11 +1004,43 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
             return Ok((false, 0));
         }
     };
+    let camera = demo::camera_rays(256, 256);
+    let sun = [0.3, 0.8, 0.5];
+    let l = fmath::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+    let shadow = demo::shadow_rays(&bvh, &camera, [sun[0] / l, sun[1] / l, sun[2] / l]);
+    let (mut ok, mut ns) = (true, 0);
+    for (set, rs) in [
+        ("random", demo::rays(65_536, 2)),
+        ("camera", camera),
+        ("shadow", shadow),
+    ] {
+        let (o, t) = rays_set(g, set, &rs, &bvh, &compiled)?;
+        ok &= o;
+        ns += t;
+    }
+    if let Err(e) = crate::probe::run(g) {
+        println!("[gpu] probe: errno {}", -e);
+    }
+    Ok((ok, ns))
+}
+
+fn rays_set(
+    g: &mut Gpu,
+    set: &str,
+    rs: &[nxk_shader::rt::Ray],
+    bvh: &nxk_shader::rt::Bvh,
+    kernels: &(lower::Compiled, lower::Compiled),
+) -> Res<(bool, u64)> {
+    use nxk_shader::rt::{self, kernel, trace};
+    let n_rays = rs.len();
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+    let ray_words: Vec<u32> = rs.iter().flat_map(|r| r.words()).collect();
 
     let d = g.dev(0)?;
     let mk = |words: usize| Dma::new(words.max(1) * 4);
     let rays_m = mk(ray_words.len()).map_err(e)?;
-    let hits_m = mk(RAYS * rt::HIT_WORDS).map_err(e)?;
+    let hits_m = mk(n_rays * rt::HIT_WORDS).map_err(e)?;
     let nodes_m = mk(bvh.nodes.len()).map_err(e)?;
     let tris_m = mk(bvh.tris.len()).map_err(e)?;
     rays_m.words(0, &ray_words);
@@ -1020,7 +1049,7 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
     let mems = [&rays_m, &hits_m, &nodes_m, &tris_m];
     let lens = [
         ray_words.len(),
-        RAYS * rt::HIT_WORDS,
+        n_rays * rt::HIT_WORDS,
         bvh.nodes.len(),
         bvh.tris.len(),
     ];
@@ -1037,12 +1066,15 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
     }
     let handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
     let (mut ok, mut ns_total) = (true, 0u64);
-    for (name, c, words) in [("closest", &closest, rt::HIT_WORDS), ("any", &any, 1)] {
+    for (name, c, words) in [
+        ("closest", &kernels.0, rt::HIT_WORDS),
+        ("any", &kernels.1, 1),
+    ] {
         let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
         let Some((at, len)) = d.compute.install(&c.code) else {
             return Err(-libnx::abi::err::ENOSPC);
         };
-        for i in 0..RAYS * words {
+        for i in 0..n_rays * words {
             hits_m.w32(i * 4, GARBAGE);
         }
         let mut p = Push::default();
@@ -1050,7 +1082,7 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         let stage = |gfx: &mut gfx::Gfx, w: &[u32]| gfx.stage(w).ok_or(-libnx::abi::err::ENOSPC);
         let cbs = [
             stage(&mut d.gfx, &[0; 64])?,
-            stage(&mut d.gfx, &[RAYS as u32])?,
+            stage(&mut d.gfx, &[n_rays as u32])?,
             stage(&mut d.gfx, &desc)?,
             stage(&mut d.gfx, &handles)?,
         ];
@@ -1061,7 +1093,7 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         let q = Qmd::new3(&Launch3 {
             program: at,
             regs: c.gprs.next_multiple_of(8).max(8),
-            grid: [(RAYS as u32).div_ceil(kernel::GROUP), 1, 1],
+            grid: [(n_rays as u32).div_ceil(kernel::GROUP), 1, 1],
             block: [kernel::GROUP, 1, 1],
             cbs: &cbs,
             local_bytes: c.local_bytes,
@@ -1086,12 +1118,12 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         let mut hits = 0usize;
         for (i, r) in rs.iter().enumerate() {
             if name == "any" {
-                let want = trace::occluded(&bvh, r);
+                let want = trace::occluded(bvh, r);
                 let got = hits_m.r32(i * 4) != 0;
                 hits += got as usize;
                 wrong += (want != got) as usize;
             } else {
-                let want = trace::trace(&bvh, r);
+                let want = trace::trace(bvh, r);
                 let w: [u32; 4] = core::array::from_fn(|k| hits_m.r32((i * 4 + k) * 4));
                 let got = (w[3] != rt::MISS).then(|| (f32::from_bits(w[0]), w[3]));
                 hits += got.is_some() as usize;
@@ -1108,16 +1140,17 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         }
         // Rays grazing an edge may fall either way (the hardware's
         // reciprocal is approximate): a few in a thousand.
-        let pass = wrong * 500 <= RAYS;
+        let pass = wrong * 500 <= n_rays;
         println!(
-            "[gpu] IR rays ({}): {} of {} rays differ from the CPU, {} hit; {} us, {}.{:02} Mrays/s ({} registers)",
+            "[gpu] IR rays {} ({}): {} of {} rays differ from the CPU, {} hit; {} us, {}.{:02} Mrays/s ({} registers)",
+            set,
             name,
             wrong,
-            RAYS,
+            n_rays,
             hits,
             t / 1000,
-            RAYS as u64 * 100 / (t / 1000).max(1) / 100,
-            RAYS as u64 * 100 / (t / 1000).max(1) % 100,
+            n_rays as u64 * 100 / (t / 1000).max(1) / 100,
+            n_rays as u64 * 100 / (t / 1000).max(1) % 100,
             c.gprs
         );
         ok &= pass;
@@ -1127,8 +1160,5 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         let _ = d.vm.unmap(vas[k], m.len() as u64);
     }
     let _ = mmu::invalidate(&regs, &d.vm);
-    if let Err(e) = crate::probe::run(g) {
-        println!("[gpu] probe: errno {}", -e);
-    }
     Ok((ok, ns_total))
 }
