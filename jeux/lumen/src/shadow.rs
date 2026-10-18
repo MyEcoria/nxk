@@ -50,7 +50,9 @@ impl Shadows {
         stride: u32,
         attrs: &[(u32, Attr)],
     ) -> nxgfx::Result<Self> {
-        let (w, h) = (WIDTH / SCALE, HEIGHT / SCALE);
+        // The panel's picture is a quarter turn: the images are 720 wide
+        // and 1280 high (see `Graphics::panel`).
+        let (w, h) = (HEIGHT / SCALE, WIDTH / SCALE);
         let target = g.render_target(
             w,
             h,

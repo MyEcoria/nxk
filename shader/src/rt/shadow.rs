@@ -18,6 +18,8 @@ use crate::{Builder, Builtin, CmpOp, Program, Reg, Stage, Ty};
 
 /// Threads of a group: x, y.
 pub const GROUP: [u32; 2] = [8, 4];
+/// Hits nearer than this to the start of a shadow ray do not count.
+pub const T_MIN: f32 = 0.05;
 /// Oriented boxes of the moving figure that cast shadows.
 pub const BOXES: usize = 6;
 /// Words of a box: three axes (the world directions of its local x, y,
@@ -139,7 +141,9 @@ pub fn kernel(s: Slots) -> Program {
         b.if_(needed, |b| {
             let o = [p[0], p[1], p[2]];
             let d = uni3(b, u::SUN);
-            let t_min = b.f32(0.001);
+            // Hits closer than this are the surface's own (flat triangles against
+            // a smooth normal).
+            let t_min = b.f32(T_MIN);
             let t_max = b.uniform(u::T_MAX, Ty::F32);
             let wk = walk(b, s.nodes, s.tris, o, d, t_min, t_max, true, false);
             let blocked = b.copy(wk.found);
@@ -183,9 +187,19 @@ pub fn kernel(s: Slots) -> Program {
 /// The lit fragment shader's share of the sun: 1 when the pixel is lit, 0
 /// in shadow, between where the mask's four nearest texels disagree.
 /// `px`, `py`: the pixel in texel coordinates of the mask, texel centres
-/// at whole numbers; `dist`: its distance from the camera; `low`: the
-/// mask's size (F32); `buf`: the slot holding the mask.
-pub fn lit_factor(b: &mut Builder, buf: u8, px: Reg, py: Reg, dist: Reg, low: [Reg; 2]) -> Reg {
+/// at whole numbers; `dist`: its distance from the camera; `tol`: how far
+/// from `dist` a texel's distance may be and still count (more on a
+/// surface seen at a grazing angle, where neighbours differ much); `low`:
+/// the mask's size (F32); `buf`: the slot holding the mask.
+pub fn lit_factor(
+    b: &mut Builder,
+    buf: u8,
+    px: Reg,
+    py: Reg,
+    dist: Reg,
+    tol: Reg,
+    low: [Reg; 2],
+) -> Reg {
     let (zero, one) = (b.f32(0.0), b.f32(1.0));
     let (x0, y0) = (b.ffloor(px), b.ffloor(py));
     let (fx, fy) = (b.fsub(px, x0), b.fsub(py, y0));
@@ -201,10 +215,6 @@ pub fn lit_factor(b: &mut Builder, buf: u8, px: Reg, py: Reg, dist: Reg, low: [R
     let xs = [clamp(b, x0, xmax), clamp(b, x1, xmax)];
     let ys = [clamp(b, y0, ymax), clamp(b, y1, ymax)];
     let wu = b.f2u(low[0]);
-    // Distances closer than this to the pixel's own count.
-    let k = b.f32(0.04);
-    let slack = b.f32(0.15);
-    let tol = b.fma(dist, k, slack);
     let inv_tol = b.frcp(tol);
     let huge = b.f32(1e9);
     let (mut sum_w, mut sum_l) = (zero, zero);

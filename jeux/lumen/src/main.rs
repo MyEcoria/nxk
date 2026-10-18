@@ -395,8 +395,10 @@ fn main() {
         let mut d = Draws::new(&sky, eye, mask);
         // Ray-traced shadows by day, and by moonlight too while it is bright
         // enough to show them.
-        let rt_on =
-            assets.shadows.is_some() && sky.sun_col.iter().cloned().fold(0.0, f32::max) > 0.03;
+        let mode = lab_mode.as_ref().map_or(0, |l| l.shadow_mode);
+        let rt_on = assets.shadows.is_some()
+            && mode < 3
+            && sky.sun_col.iter().cloned().fold(0.0, f32::max) > 0.03;
         // The Lab's resources, made before the frame borrows the screen.
         if let Some(lab) = lab_mode.as_mut() {
             match lab.room {
@@ -437,13 +439,15 @@ fn main() {
             d.tris = tris;
             let parts: [[[f32; 4]; 3]; 6] =
                 std::array::from_fn(|k| [pose[k].0[0], pose[k].0[1], pose[k].0[2]]);
-            sh.trace(&mut f, sky.sun_dir, &parts, me.pos);
+            if mode < 2 {
+                sh.trace(&mut f, sky.sun_dir, &parts, me.pos);
+            }
             f.screen();
         }
         f.clear(hor);
         f.canvas(&bg);
         f.use_pipeline(&assets.pipes.lit);
-        d.shadow_on = rt_on;
+        d.shadow_on = rt_on && mode == 0;
         d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);

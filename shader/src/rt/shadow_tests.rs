@@ -121,12 +121,15 @@ fn expected(sc: &Scene) -> Vec<f32> {
             let o = [p[0], p[1], p[2]];
             let ray = Ray {
                 origin: o,
-                t_min: 0.001,
+                t_min: shadow::T_MIN,
                 dir: sc.sun,
                 t_max: 80.0,
             };
             let blocked = trace::occluded(&sc.bvh, &ray)
-                || sc.boxes.iter().any(|b| hits_box(b, o, sc.sun, 0.001, 80.0));
+                || sc
+                    .boxes
+                    .iter()
+                    .any(|b| hits_box(b, o, sc.sun, shadow::T_MIN, 80.0));
             if blocked {
                 -p[3]
             } else {
@@ -251,7 +254,9 @@ fn factor(mask: &[f32], w: u32, h: u32, px: f32, py: f32, dist: f32) -> f32 {
         b.uniform(2, Ty::F32),
     );
     let low = [b.uniform(3, Ty::F32), b.uniform(4, Ty::F32)];
-    let f = shadow::lit_factor(&mut b, 0, px_r, py_r, d_r, low);
+    let (k, slack) = (b.f32(0.04), b.f32(0.15));
+    let tol = b.fma(d_r, k, slack);
+    let f = shadow::lit_factor(&mut b, 0, px_r, py_r, d_r, tol, low);
     b.output(OutKind::Color(0), 0, f);
     let p = b.finish();
     let mut bufs = vec![Vec::new(); MAX_BUFFERS];
@@ -297,4 +302,56 @@ fn the_mask_is_filtered_by_distance() {
     // No usable texel: lit; only far ones: the nearest in depth.
     assert!(near(factor(&vec![0.0; 12], 4, 3, 1.5, 1.5, 10.0), 1.0));
     assert!(near(factor(&vec![-40.0; 12], 4, 3, 1.5, 1.5, 10.0), 0.0));
+}
+
+/// `lit_factor` compiled, on the simulator, against the reference machine.
+#[test]
+fn the_compiled_mask_filter_matches_the_reference() {
+    let mut b = Builder::new(Stage::Compute);
+    b.local_size(64, 1, 1);
+    let (px, py, d) = (
+        b.uniform(0, Ty::F32),
+        b.uniform(1, Ty::F32),
+        b.uniform(2, Ty::F32),
+    );
+    let low = [b.uniform(3, Ty::F32), b.uniform(4, Ty::F32)];
+    let (k, slack) = (b.f32(0.04), b.f32(0.15));
+    let tol = b.fma(d, k, slack);
+    let f = shadow::lit_factor(&mut b, 0, px, py, d, tol, low);
+    let zero = b.u32(0);
+    let bits = b.fbits(f);
+    b.store(1, zero, 0, &[bits]);
+    let p = b.finish();
+    // A mask of 8 x 6 with a shadow edge and a depth edge in it.
+    let mut mask = vec![10.0f32; 48];
+    for y in 0..6 {
+        for x in 3..8 {
+            mask[y * 8 + x] = -10.0;
+        }
+    }
+    mask[9] = -40.0;
+    mask[20] = 0.0;
+    let bufs = vec![
+        mask.iter().map(|v| v.to_bits()).collect::<Vec<u32>>(),
+        vec![0u32; 4],
+    ];
+    let mut worst = 0.0f32;
+    for (px, py, dist) in [
+        (2.5f32, 2.0f32, 10.0f32),
+        (1.2, 1.7, 10.0),
+        (3.0, 3.5, 10.0),
+        (6.4, 4.4, 10.0),
+        (0.2, 0.3, 10.0),
+        (1.5, 1.5, 11.0),
+        (4.5, 2.5, 30.0),
+        (-0.5, 5.5, 10.0),
+        (7.9, 5.9, 10.0),
+    ] {
+        let uniforms = [px, py, dist, 8.0, 6.0].map(f32::to_bits);
+        let (r, s) = crate::lower_tests::both_t(&p, &uniforms, &bufs, 0).unwrap();
+        let (a, c) = (f32::from_bits(r[1][0]), f32::from_bits(s[1][0]));
+        std::println!("({px}, {py}, {dist}): reference {a}, compiled {c}");
+        worst = worst.max((a - c).abs());
+    }
+    assert!(worst < 1e-3, "the compiled filter differs by {worst}");
 }

@@ -144,7 +144,25 @@ pub fn fragment() -> Program {
         let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
         let px = b.fma(nx, hw, ox);
         let py = b.fma(ny, mhh, oy);
-        let f = shadow_factor(b, 0, px, py, dist, low);
+        // Neighbouring texels of a surface seen at a grazing angle are far
+        // apart in depth: the tolerance grows as the view turns flat.
+        let to_cam = [
+            b.fsub(cam[0], w[0]),
+            b.fsub(cam[1], w[1]),
+            b.fsub(cam[2], w[2]),
+        ];
+        let facing = dot3(b, n, to_cam);
+        let facing = b.fabs(facing);
+        let floor = b.f32(0.08);
+        let across = b.fmul(dist, floor);
+        let facing = b.fmax(facing, across);
+        let base = b.f32(0.15);
+        let rel = b.f32(0.04);
+        let scaled = b.fmul(dist, rel);
+        let rf = b.frcp(facing);
+        let grazing = b.fmul(scaled, dist);
+        let tol = b.fma(grazing, rf, base);
+        let f = shadow_factor(b, 0, px, py, dist, tol, low);
         b.mov(shadow, f);
     });
     let sun_term = b.fmul(ndl, shadow);

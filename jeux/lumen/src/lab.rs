@@ -33,6 +33,10 @@ pub struct Lab {
     pub draws: u32,
     pub tris: u32,
     pub rays: Option<RayRoom>,
+    /// What the sun's shadows cost, step by step (Overview, Up / Down):
+    /// 0 all of it, 1 without the mask in the lit shader, 2 positions
+    /// only, 3 none.
+    pub shadow_mode: u8,
     pub particle_buf: Option<(Buffer, Buffer)>,
     /// Set when a frame was refused for being too big.
     pub refused: u32,
@@ -66,6 +70,7 @@ impl Lab {
             draws: 0,
             tris: 0,
             rays: None,
+            shadow_mode: 0,
             particle_buf: None,
             refused: 0,
         }
@@ -78,11 +83,13 @@ impl Lab {
             Button::Up => match self.room {
                 1 => self.cubes = (self.cubes + 50).min(MAX_CUBES),
                 2 => self.particles = (self.particles + 100).min(MAX_PARTICLES),
+                0 => self.shadow_mode = (self.shadow_mode + 1) % 4,
                 _ => {}
             },
             Button::Down => match self.room {
                 1 => self.cubes = self.cubes.saturating_sub(50).max(50),
                 2 => self.particles = self.particles.saturating_sub(100).max(100),
+                0 => self.shadow_mode = (self.shadow_mode + 3) % 4,
                 _ => {}
             },
             _ => {}
@@ -140,7 +147,15 @@ impl Lab {
                 ),
                 None => "BUILDING...".into(),
             },
-            _ => "LEFT/RIGHT: ROOM".into(),
+            _ => format!(
+                "SHADOWS: {} (UP/DOWN)",
+                [
+                    "RAY TRACED",
+                    "NO MASK IN LIT SHADER",
+                    "POSITIONS ONLY",
+                    "OFF"
+                ][self.shadow_mode as usize]
+            ),
         };
         c.text(28.0, 110.0, 2.0, &extra, rgb(160, 255, 180));
         if self.refused > 0 {
