@@ -31,7 +31,29 @@ const THREADS: u32 = 64;
 const OUT_WORDS: usize = 64 * 64;
 const GARBAGE: u32 = 0xAAAA_AAAA;
 
-fn same(a: u32, b: u32) -> bool {
+/// Programs with a transcendental function: the multi-function unit is
+/// approximate (a couple of ulps, more near a zero or a pole), and the
+/// random chains after it amplify that.
+fn uses_mufu(p: &Program) -> bool {
+    let mut found = false;
+    nxk_shader::walk(&p.body, &mut |i| {
+        if let nxk_shader::Inst::Un { op, .. } = i {
+            found |= matches!(
+                op,
+                nxk_shader::UnOp::FSin
+                    | nxk_shader::UnOp::FCos
+                    | nxk_shader::UnOp::FEx2
+                    | nxk_shader::UnOp::FLg2
+                    | nxk_shader::UnOp::FRcp
+                    | nxk_shader::UnOp::FRsq
+                    | nxk_shader::UnOp::FSqrt
+            );
+        }
+    });
+    found
+}
+
+fn same(a: u32, b: u32, tol: f32) -> bool {
     if a == b {
         return true;
     }
@@ -45,7 +67,7 @@ fn same(a: u32, b: u32) -> bool {
     if x.is_infinite() || y.is_infinite() {
         return false;
     }
-    fmath::abs(x - y) <= 2e-2 * fmath::abs(x).max(fmath::abs(y)).max(1e-3)
+    fmath::abs(x - y) <= tol * fmath::abs(x).max(fmath::abs(y)).max(1e-3)
 }
 
 /// The random programs of the IR on the GPU and the CPU.
@@ -85,22 +107,36 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
         }
         atom.words(0, &[0; 4]);
 
-        // Reference, thread by thread.
-        let mut bufs: Vec<Vec<u32>> = alloc::vec![Vec::new(); MAX_BUFFERS];
-        bufs[0] = b0;
-        bufs[1] = alloc::vec![GARBAGE; OUT_WORDS];
-        bufs[2] = alloc::vec![0; 4];
-        for tid in 0..THREADS {
-            let mut m = Machine {
-                inputs: [[0; 4]; MAX_ATTRS],
-                builtins: [0; 11],
-                uniforms: &[],
-                buffers: &mut bufs,
-                sampler: &mut NoTextures,
-            };
-            m.builtins[nxk_shader::Builtin::LocalIdX as usize] = tid;
-            interp::run(&prog, &mut m);
-        }
+        // Reference, thread by thread: with exact transcendentals, and
+        // with the error of the hardware's approximate unit added. An
+        // output the noise moves is not a test of the compiler.
+        let reference = |err: f32| {
+            use core::sync::atomic::Ordering;
+            interp::MUFU_ERROR_BITS.store(err.to_bits(), Ordering::Relaxed);
+            let mut bufs: Vec<Vec<u32>> = alloc::vec![Vec::new(); MAX_BUFFERS];
+            bufs[0] = b0.clone();
+            bufs[1] = alloc::vec![GARBAGE; OUT_WORDS];
+            bufs[2] = alloc::vec![0; 4];
+            for tid in 0..THREADS {
+                let mut m = Machine {
+                    inputs: [[0; 4]; MAX_ATTRS],
+                    builtins: [0; 11],
+                    uniforms: &[],
+                    buffers: &mut bufs,
+                    sampler: &mut NoTextures,
+                };
+                m.builtins[nxk_shader::Builtin::LocalIdX as usize] = tid;
+                interp::run(&prog, &mut m);
+            }
+            interp::MUFU_ERROR_BITS.store(0, Ordering::Relaxed);
+            bufs.swap_remove(1)
+        };
+        let want = reference(0.0);
+        let noisy = if uses_mufu(&prog) {
+            reference(4e-6)
+        } else {
+            want.clone()
+        };
 
         // The GPU.
         let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
@@ -142,12 +178,45 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
         d.compute.launch(&mut p, qva);
         d.gfx.barrier(&mut p);
         let t = g.run(p, BATCH_TIMEOUT_US);
+        let first: Vec<u32> = (0..OUT_WORDS).map(|i| out.r32(i * 4)).collect();
+        // The same launch again: the results must not change from run to
+        // run.
+        let mut repeat = 0;
+        if t.is_ok() {
+            for i in 0..OUT_WORDS {
+                out.w32(i * 4, GARBAGE);
+            }
+            let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+            let mut p2 = Push::default();
+            d.gfx.barrier(&mut p2);
+            d.compute.launch(&mut p2, qva);
+            d.gfx.barrier(&mut p2);
+            if g.run(p2, BATCH_TIMEOUT_US).is_ok() {
+                repeat = (0..OUT_WORDS)
+                    .filter(|&i| out.r32(i * 4) != first[i])
+                    .count();
+            }
+        }
         let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
         d.compute.uninstall(at, len);
         ns += t?;
+        if repeat != 0 {
+            println!(
+                "[gpu] IR seed {}: {} words differ between two runs of the same launch",
+                seed, repeat
+            );
+        }
 
+        let tol = if uses_mufu(&prog) { 2e-3 } else { 1e-4 };
         let wrong: Vec<usize> = (0..OUT_WORDS)
-            .filter(|&i| !same(out.r32(i * 4), bufs[1][i]))
+            .filter(|&i| {
+                let got = out.r32(i * 4);
+                // Right if it matches either reference, or the noise
+                // alone moves the word more than the tolerance.
+                !(same(got, want[i], tol)
+                    || same(got, noisy[i], tol)
+                    || !same(want[i], noisy[i], 10.0 * tol))
+            })
             .collect();
         if let Some(&i) = wrong.first() {
             println!(
@@ -159,7 +228,7 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
                 i / 64,
                 i % 64,
                 out.r32(i * 4),
-                bufs[1][i],
+                want[i],
                 c.gprs
             );
             ok = false;
@@ -657,8 +726,9 @@ pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
 /// R32F, RGBA16F or RGBA32F image (values past 1.0 included) with a
 /// gradient, a barrier, and a second pass reads it back through a
 /// texture of the same memory into an RGBA8 image, scaled down.
-pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
+fn targets_one(g: &mut Gpu, tf1: u64, name1: &'static str) -> Res<(bool, u64)> {
     const N: u32 = 16;
+    const PITCH: u32 = 256;
     let e = |(e, _): (i64, &str)| -e;
     let regs = g.regs;
 
@@ -708,13 +778,15 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
     };
 
     let d = g.dev(0)?;
-    let img = Dma::new((N * N * 4) as usize).map_err(e)?;
+    // A pitch-linear target wants a pitch of 256 bytes or more (a 64-byte
+    // one, 16 pixels, stopped the front end at the first draw).
+    let img = Dma::new((N * PITCH) as usize).map_err(e)?;
     let vb = Dma::new(4096).map_err(e)?;
     let s = crate::engine::Surface {
         va: d.vm.map(&img, false).map_err(e)?,
         width: N,
         height: N,
-        pitch: N * 4,
+        pitch: PITCH,
         format: proto::FMT_A8B8G8R8 as u32,
     };
     let vbv = d.vm.map(&vb, false).map_err(e)?;
@@ -751,18 +823,15 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
         attrs: &p1.attrs,
         inst_stride: 0,
     };
-    let px = |x: u32, y: u32| img.r32(((y * N + x) * 4) as usize);
+    let px = |x: u32, y: u32| img.r32((y * PITCH + x * 4) as usize);
     let near = |a: u32, b: u32| {
         (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 3)
     };
     let word = |r: u32, g: u32, b: u32, a: u32| a << 24 | b << 16 | g << 8 | r;
     let mut ok = true;
     let mut ns = 0;
-    for (tf, name) in [
-        (proto::TF_R32F, "R32F"),
-        (proto::TF_RGBA16F, "RGBA16F"),
-        (proto::TF_RGBA32F, "RGBA32F"),
-    ] {
+    for (tf, name) in [(tf1, name1)] {
+        println!("[gpu] IR targets ({}): starting", name);
         let bpp = proto::tf_bytes(tf);
         let bl = proto::tex_block_log2(N);
         let fmt = gfx::color_format(tf).ok_or(-libnx::abi::err::EINVAL)?;
@@ -801,7 +870,7 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
             color: gfx::Color::Linear(s),
             depth: None,
         };
-        img.words(0, &alloc::vec![0xDEAD_BEEF; (N * N) as usize]);
+        img.words(0, &alloc::vec![0xDEAD_BEEF; (N * PITCH / 4) as usize]);
         let mut p = Push::default();
         d.gfx.begin(&mut p);
         let desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
@@ -815,11 +884,35 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
             return Err(-libnx::abi::err::ENOSPC);
         }
         d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
-        // What `CMD_TARGET` does between passes.
-        d.gfx.barrier(&mut p);
+        // Two batches while a hang is hunted: the first pass alone.
+        match g.run(p, BATCH_TIMEOUT_US) {
+            Ok(t) => ns += t,
+            Err(_) => {
+                println!("[gpu] IR targets ({}): the first pass hung", name);
+                ok = false;
+                continue;
+            }
+        }
+        println!("[gpu] IR targets ({}): first pass done", name);
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        let mut p = Push::default();
+        d.gfx.begin(&mut p);
         d.gfx.pipeline_custom(&mut p, &second, &p2);
+        let staged = d.gfx.uniforms(&mut p, &[0])
+            && d.gfx.cbuf(&mut p, 2, &desc)
+            && d.gfx.cbuf(&mut p, 3, &handles);
+        if !staged {
+            return Err(-libnx::abi::err::ENOSPC);
+        }
         d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
-        ns += g.run(p, BATCH_TIMEOUT_US)?;
+        match g.run(p, BATCH_TIMEOUT_US) {
+            Ok(t) => ns += t,
+            Err(_) => {
+                println!("[gpu] IR targets ({}): the second pass hung", name);
+                ok = false;
+                continue;
+            }
+        }
         let mut bad = 0;
         for (x, y) in [(0u32, 0u32), (3, 2), (8, 9), (15, 15), (5, 12)] {
             let (u, v) = ((x as f32 + 0.5) / N as f32, (y as f32 + 0.5) / N as f32);
@@ -861,5 +954,21 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
         let _ = d.vm.unmap(va, len as u64);
     }
     let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((ok, ns))
+}
+
+/// Render to a float target, then sample it, for each float format; a hang
+/// in one leaves the others to run.
+pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
+    let (mut ok, mut ns) = (true, 0);
+    for (tf, name) in [
+        (proto::TF_RGBA16F, "RGBA16F"),
+        (proto::TF_RGBA32F, "RGBA32F"),
+        (proto::TF_R32F, "R32F"),
+    ] {
+        let (o, t) = targets_one(g, tf, name)?;
+        ok &= o;
+        ns += t;
+    }
     Ok((ok, ns))
 }

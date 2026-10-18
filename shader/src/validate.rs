@@ -33,6 +33,8 @@ pub struct Info {
     /// Writes a buffer (store or atomic).
     pub stores: bool,
     pub loops: bool,
+    /// Bit n: `Builtin` number n is read.
+    pub builtins: u32,
 }
 
 type R<T> = Result<T, Error>;
@@ -272,6 +274,7 @@ impl Ctx<'_> {
                 if !ok {
                     return err("builtin not available in this stage");
                 }
+                self.info.builtins |= 1 << *which as u32;
                 self.def(*dst, t, defs)?;
             }
             Inst::Uniform { dst, word } => {

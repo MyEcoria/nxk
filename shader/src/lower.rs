@@ -153,6 +153,13 @@ fn vertex_header(info: &Info) -> [u32; SPH_WORDS] {
     setf(&mut h, 10, 1); // vertex shader
     common_flags(&mut h, info);
     setf(&mut h, 140, 0xFF); // no store-request range
+                             // System values read: instance and vertex number (IMAP system values C).
+    if info.builtins >> Builtin::InstanceId as u32 & 1 != 0 {
+        setf(&mut h, 336 + 14, 1);
+    }
+    if info.builtins >> Builtin::VertexId as u32 & 1 != 0 {
+        setf(&mut h, 336 + 15, 1);
+    }
     for &(attr, comp, _) in &info.inputs {
         let bit = 192 + 4 * attr as usize + comp as usize;
         h[bit / 32] |= 1 << (bit % 32);
@@ -174,9 +181,10 @@ fn fragment_header(info: &Info, reads_w: bool) -> [u32; SPH_WORDS] {
     setf(&mut h, 10, 5); // pixel shader
     setf(&mut h, 14, 1); // MRT enable
     common_flags(&mut h, info);
-    if reads_w {
-        setf(&mut h, 191, 1);
-    }
+    // Position.w is always declared, as the built-in shaders do: a pixel
+    // shader with no input at all hung an Erista's shader unit.
+    let _ = reads_w;
+    setf(&mut h, 191, 1);
     for &(attr, comp, i) in &info.inputs {
         let word = 4 * attr as usize + comp as usize;
         let code = match i {

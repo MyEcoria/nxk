@@ -84,6 +84,20 @@ pub fn run(p: &Program, m: &mut Machine<'_>) -> Outputs {
     r.out
 }
 
+/// Relative error a test adds to every transcendental result, to see how
+/// far the approximate hardware unit can move a program's outputs.
+pub static MUFU_ERROR_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The range reduction of the sine and cosine is off in proportion to the
+/// argument, not to the result.
+fn approx_arg(x: f32) -> f32 {
+    approx(x)
+}
+
+fn approx(v: f32) -> f32 {
+    v * (1.0 + f32::from_bits(MUFU_ERROR_BITS.load(core::sync::atomic::Ordering::Relaxed)))
+}
+
 fn f(x: u32) -> f32 {
     f32::from_bits(x)
 }
@@ -309,13 +323,13 @@ impl Run<'_, '_> {
         match op {
             UnOp::FNeg => a ^ 0x8000_0000,
             UnOp::FAbs => a & 0x7FFF_FFFF,
-            UnOp::FRcp => fl(fmath::rcp(x)),
-            UnOp::FRsq => fl(fmath::rsq(x)),
-            UnOp::FSqrt => fl(fmath::sqrt(x)),
-            UnOp::FSin => fl(fmath::sin(x)),
-            UnOp::FCos => fl(fmath::cos(x)),
-            UnOp::FEx2 => fl(fmath::ex2(x)),
-            UnOp::FLg2 => fl(fmath::lg2(x)),
+            UnOp::FRcp => fl(approx(fmath::rcp(x))),
+            UnOp::FRsq => fl(approx(fmath::rsq(x))),
+            UnOp::FSqrt => fl(approx(fmath::sqrt(x))),
+            UnOp::FSin => fl(fmath::sin(approx_arg(x))),
+            UnOp::FCos => fl(fmath::cos(approx_arg(x))),
+            UnOp::FEx2 => fl(approx(fmath::ex2(x))),
+            UnOp::FLg2 => fl(approx(fmath::lg2(x))),
             UnOp::FFloor => fl(fmath::floor(x)),
             // NaN gives 0 (clamp would keep it), as the hardware's .SAT.
             #[allow(clippy::manual_clamp)]

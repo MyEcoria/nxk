@@ -57,7 +57,7 @@ fn gen_block(
     n: usize,
 ) {
     for _ in 0..n {
-        if b.reg_count() > 165 {
+        if b.reg_count() > 140 {
             return;
         }
         match roll(rng, 100) {
@@ -88,7 +88,14 @@ fn gen_block(
                     0 => b.fneg(x),
                     1 => b.fabs(x),
                     2 => b.ffloor(x),
-                    3 => b.fsin(x),
+                    3 => {
+                        // The hardware's range reduction is only good
+                        // near zero: keep the argument within a few turns.
+                        let (lo, hi) = (b.f32(-6.0), b.f32(6.0));
+                        let x = b.fmax(x, lo);
+                        let x = b.fmin(x, hi);
+                        b.fsin(x)
+                    }
                     4 => b.fex2(x),
                     _ => {
                         let a = b.fabs(x);

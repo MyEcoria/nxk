@@ -511,3 +511,51 @@ fn dump_constant_pair() {
         }
     }
 }
+
+/// How much a 1e-6 relative error in every transcendental result moves
+/// the outputs of a random program: the hardware's MUFU is that far off.
+#[test]
+fn mufu_error_sensitivity_of_seed_10() {
+    use core::sync::atomic::Ordering;
+    let p = random_program(10, true);
+    let mut rng = Rng(10 * 31);
+    let mut b0: Vec<u32> = (0..4).map(|_| rng.float().to_bits()).collect();
+    b0.extend((0..4).map(|_| rng.next_u32() % 40));
+    b0.extend((0..4).map(|_| (rng.next_u32() % 200).wrapping_sub(100)));
+    b0.extend((0..4).map(|_| rng.next_u32()));
+    let run_with = |err: f32| {
+        crate::interp::MUFU_ERROR_BITS.store(err.to_bits(), Ordering::Relaxed);
+        let mut bufs = vec![Vec::new(); MAX_BUFFERS];
+        bufs[0] = b0.clone();
+        bufs[1] = vec![0xAAAA_AAAA; 64 * 64];
+        bufs[2] = vec![0; 4];
+        for tid in 0..64 {
+            let mut m = Machine {
+                inputs: [[0; 4]; MAX_ATTRS],
+                builtins: [0; 11],
+                uniforms: &[],
+                buffers: &mut bufs,
+                sampler: &mut NoTextures,
+            };
+            m.builtins[Builtin::LocalIdX as usize] = tid;
+            run(&p, &mut m);
+        }
+        bufs.swap_remove(1)
+    };
+    let exact = run_with(0.0);
+    let off = run_with(2e-6);
+    crate::interp::MUFU_ERROR_BITS.store(0, Ordering::Relaxed);
+    let worst = exact
+        .iter()
+        .zip(&off)
+        .map(|(&a, &b)| {
+            let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+            if x == y || (x.is_nan() && y.is_nan()) {
+                0.0
+            } else {
+                (x - y).abs() / x.abs().max(y.abs()).max(1e-3)
+            }
+        })
+        .fold(0.0f32, f32::max);
+    std::println!("worst relative move of an output for a 2e-6 error: {worst}");
+}
