@@ -257,8 +257,10 @@ pub fn attr_word(offset: u32, format: u32) -> Option<u32> {
     (offset < 1 << 14).then_some(width << 21 | ty << 27 | offset << 7)
 }
 
-/// A vertex attribute slot that feeds nothing.
-pub const ATTR_INACTIVE: u32 = 1 << 6;
+/// A vertex attribute slot that feeds nothing: inactive, but with a valid
+/// format (R32_G32_B32_A32 float, as NVK writes it), or the front end
+/// refuses the value (data error at SET_VERTEX_ATTRIBUTE_A).
+pub const ATTR_INACTIVE: u32 = 1 << 6 | 1 << 21 | 7 << 27;
 
 /// Depth buffer: 32-bit float, block-linear (the engine does not take it
 /// pitch-linear), `bytes` of memory for a `width` x `height` image.

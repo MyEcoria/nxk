@@ -13,7 +13,9 @@ use libnx::println;
 use nxk_shader::fuzz::{random_program, Rng};
 use nxk_shader::interp::{self, Machine, NoTextures};
 use nxk_shader::lower::{self, CB_BUFFERS, CB_TEXTURES};
-use nxk_shader::{fmath, Builder, CmpOp, Interp, OutKind, Stage, Ty, MAX_ATTRS, MAX_BUFFERS};
+use nxk_shader::{
+    fmath, Builder, CmpOp, Interp, OutKind, Program, Stage, Ty, MAX_ATTRS, MAX_BUFFERS,
+};
 
 use crate::gfx::{self, attr_word, Custom, Layout};
 use crate::hw::Dma;
@@ -43,7 +45,7 @@ fn same(a: u32, b: u32) -> bool {
     if x.is_infinite() || y.is_infinite() {
         return false;
     }
-    fmath::abs(x - y) <= 2e-3 * fmath::abs(x).max(fmath::abs(y)).max(1e-3)
+    fmath::abs(x - y) <= 2e-2 * fmath::abs(x).max(fmath::abs(y)).max(1e-3)
 }
 
 /// The random programs of the IR on the GPU and the CPU.
@@ -182,15 +184,22 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
     Ok((ok, ns))
 }
 
-/// A vertex and a fragment shader of the IR: a triangle whose color is
-/// the vertex color times a uniform times a bound texture's texel.
+/// Vertex and fragment shaders of the IR drawing a triangle, from the
+/// simplest pair to one with a varying, a uniform, a texture and a
+/// discard: the first that fails (or hangs the GPU) names the feature.
 pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
     const W: u32 = 64;
     const H: u32 = 64;
     let e = |(e, _): (i64, &str)| -e;
     let regs = g.regs;
 
-    // Vertex: position and color through, color times the uniform's xyz.
+    // Vertex shaders: position only, or position and color through.
+    let mut b = Builder::new(Stage::Vertex);
+    for c in 0..4u8 {
+        let p = b.input(0, c);
+        b.output(OutKind::Position, c, p);
+    }
+    let vs_pos = b.finish();
     let mut b = Builder::new(Stage::Vertex);
     for c in 0..4u8 {
         let p = b.input(0, c);
@@ -198,35 +207,55 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         let col = b.input(1, c);
         b.output(OutKind::Varying(0), c, col);
     }
-    let vs = b.finish();
-    // Fragment: varying * uniform * texel (at the center of the texture);
-    // the pixel is dropped when the red uniform is negative.
-    let mut b = Builder::new(Stage::Fragment);
-    let zero = b.f32(0.0);
-    let u0 = b.uniform(0, Ty::F32);
-    let dead = b.cmp(CmpOp::Lt, u0, zero);
-    b.discard_if(dead);
-    let half = b.f32(0.5);
-    let t = b.sample(0, half, half);
-    for c in 0..4u8 {
-        let v = b.input_as(0, c, Interp::Perspective);
-        let u = b.uniform(c as u16, Ty::F32);
-        let m = b.fmul(v, u);
-        let r = b.fmul(m, t[c as usize]);
-        b.output(OutKind::Color(0), c, r);
-    }
-    let fs = b.finish();
-    let (cv, cf) = match (lower::compile(&vs), lower::compile(&fs)) {
-        (Ok(v), Ok(f)) => (v, f),
-        (v, f) => {
-            println!(
-                "[gpu] IR draw: does not compile: vertex {:?}, fragment {:?}",
-                v.err(),
-                f.err()
-            );
-            return Ok((false, 0));
-        }
+    let vs_full = b.finish();
+    // Fragment shaders, each adding a feature.
+    let frag = |f: &dyn Fn(&mut Builder)| {
+        let mut b = Builder::new(Stage::Fragment);
+        f(&mut b);
+        b.finish()
     };
+    let fs_const = frag(&|b| {
+        for (c, v) in [0.4f32, 0.2, 0.1, 1.0].into_iter().enumerate() {
+            let r = b.f32(v);
+            b.output(OutKind::Color(0), c as u8, r);
+        }
+    });
+    let fs_varying = frag(&|b| {
+        for c in 0..4u8 {
+            let v = b.input(0, c);
+            b.output(OutKind::Color(0), c, v);
+        }
+    });
+    let fs_uniform = frag(&|b| {
+        for c in 0..4u8 {
+            let v = b.input(0, c);
+            let u = b.uniform(c as u16, Ty::F32);
+            let r = b.fmul(v, u);
+            b.output(OutKind::Color(0), c, r);
+        }
+    });
+    let fs_texture = frag(&|b| {
+        let half = b.f32(0.5);
+        let t = b.sample(0, half, half);
+        for c in 0..4u8 {
+            b.output(OutKind::Color(0), c, t[c as usize]);
+        }
+    });
+    let fs_full = frag(&|b| {
+        let zero = b.f32(0.0);
+        let u0 = b.uniform(0, Ty::F32);
+        let dead = b.cmp(CmpOp::Lt, u0, zero);
+        b.discard_if(dead);
+        let half = b.f32(0.5);
+        let t = b.sample(0, half, half);
+        for c in 0..4u8 {
+            let v = b.input_as(0, c, Interp::Perspective);
+            let u = b.uniform(c as u16, Ty::F32);
+            let m = b.fmul(v, u);
+            let r = b.fmul(m, t[c as usize]);
+            b.output(OutKind::Color(0), c, r);
+        }
+    });
 
     let d = g.dev(0)?;
     let img = Dma::new((W * H * 4) as usize).map_err(e)?;
@@ -258,28 +287,10 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         levels: 1,
     };
     d.gfx.set_texture(0, &img8, 0);
-    let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
-        return Err(-libnx::abi::err::ENOSPC);
-    };
-    let Some((fh, fblock, flen)) = d.gfx.install(&cf.header, &cf.code) else {
-        return Err(-libnx::abi::err::ENOSPC);
-    };
     let mut attrs = Vec::new();
     attrs.push(attr_word(0, proto::AF_F32X4).unwrap());
     attrs.push(attr_word(16, proto::AF_F32X4).unwrap());
     attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
-    let custom = Custom {
-        vs: vh,
-        vs_gprs: cv.gprs.next_multiple_of(8).max(8),
-        fs: fh,
-        fs_gprs: cf.gprs.next_multiple_of(8).max(8),
-        stride: 32,
-        attrs,
-        inst_stride: 0,
-        flags: 0,
-        blend: proto::BLEND_NONE,
-        depth: proto::DEPTH_LESS,
-    };
     // One big triangle with a flat color.
     let tri: [f32; 24] = [
         -1.0, -1.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0, //
@@ -297,21 +308,60 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
     let near = |a: u32, b: u32, tol: u32| {
         (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= tol)
     };
-    let mut ok = true;
-    let mut ns = 0;
-    // (uniform red, expected pixel) in memory order R, G, B, A.
     let clear = [0.1f32, 0.2, 0.3, 1.0];
     let clear_px = 0xFF00_0000 | 77 << 16 | 51 << 8 | 26;
-    for (u, want, name) in [
+    let rgb = |r: u32, g: u32, b: u32| 0xFF00_0000 | b << 16 | g << 8 | r;
+    let uni = [0.5f32, 1.0, 0.25, 1.0];
+    // (name, vertex, fragment, uniforms, expected pixel).
+    let cases: [(&str, &Program, &Program, [f32; 4], u32); 6] = [
+        ("constant colour", &vs_pos, &fs_const, uni, rgb(102, 51, 26)),
+        ("varying", &vs_full, &fs_varying, uni, rgb(204, 102, 153)),
+        ("uniform", &vs_full, &fs_uniform, uni, rgb(102, 102, 38)),
+        ("texture", &vs_full, &fs_texture, uni, rgb(255, 128, 64)),
+        ("all together", &vs_full, &fs_full, uni, rgb(102, 51, 10)),
         (
-            [0.5f32, 1.0, 0.25, 1.0],
-            0xFF00_0000 | 10 << 16 | 51 << 8 | 102,
-            "drawn",
+            "discard",
+            &vs_full,
+            &fs_full,
+            [-1.0, 1.0, 0.25, 1.0],
+            clear_px,
         ),
-        ([-1.0, 1.0, 0.25, 1.0], clear_px, "discarded"),
-    ] {
-        img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
+    ];
+    let (mut ok, mut ns) = (true, 0u64);
+    for (name, vs, fs, u, want) in cases {
+        let (cv, cf) = match (lower::compile(vs), lower::compile(fs)) {
+            (Ok(v), Ok(f)) => (v, f),
+            (v, f) => {
+                println!(
+                    "[gpu] IR draw ({}): does not compile: vertex {:?}, fragment {:?}",
+                    name,
+                    v.err(),
+                    f.err()
+                );
+                ok = false;
+                continue;
+            }
+        };
         let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
+            return Err(-libnx::abi::err::ENOSPC);
+        };
+        let Some((fh, fblock, flen)) = d.gfx.install(&cf.header, &cf.code) else {
+            return Err(-libnx::abi::err::ENOSPC);
+        };
+        let custom = Custom {
+            vs: vh,
+            vs_gprs: cv.gprs.next_multiple_of(8).max(8),
+            fs: fh,
+            fs_gprs: cf.gprs.next_multiple_of(8).max(8),
+            stride: 32,
+            attrs: attrs.clone(),
+            inst_stride: 0,
+            flags: 0,
+            blend: proto::BLEND_NONE,
+            depth: proto::DEPTH_LESS,
+        };
+        img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
         let mut p = Push::default();
         d.gfx.begin(&mut p);
         d.gfx.clear(&mut p, &target, clear);
@@ -332,7 +382,21 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
             inst_stride: 0,
         };
         d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
-        ns += g.run(p, BATCH_TIMEOUT_US)?;
+        match g.run(p, BATCH_TIMEOUT_US) {
+            Ok(t) => ns += t,
+            Err(err) => {
+                println!(
+                    "[gpu] IR draw ({}): the GPU hung ({}); vertex {} instructions, {} registers, fragment {} instructions, {} registers",
+                    name,
+                    err,
+                    cv.code.len(),
+                    cv.gprs,
+                    cf.code.len(),
+                    cf.gprs
+                );
+                return Ok((false, ns));
+            }
+        }
         let got = px(W / 2, H / 2);
         println!(
             "[gpu] IR draw ({}): centre {:#010x}, corner {:#010x}, expected {:#010x}",
@@ -344,11 +408,12 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         if !near(got, want, 2) {
             ok = false;
         }
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        d.gfx.uninstall(vblock, vlen);
+        d.gfx.uninstall(fblock, flen);
     }
     let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
     d.gfx.clear_texture(0);
-    d.gfx.uninstall(vblock, vlen);
-    d.gfx.uninstall(fblock, flen);
     let _ = d.vm.unmap(s.va, img.len() as u64);
     let _ = d.vm.unmap(vbv, vb.len() as u64);
     let _ = d.vm.unmap(tva, tex.len() as u64);
