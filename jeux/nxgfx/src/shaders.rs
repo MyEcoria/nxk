@@ -50,7 +50,9 @@ impl Buffer {
     pub fn read_words(&self, first: usize, out: &mut [u32]) {
         assert!((first + out.len()) * 4 <= self.mem.len());
         for (i, o) in out.iter_mut().enumerate() {
-            *o = unsafe { core::ptr::read_volatile((self.mem.as_ptr() as *const u32).add(first + i)) };
+            *o = unsafe {
+                core::ptr::read_volatile((self.mem.as_ptr() as *const u32).add(first + i))
+            };
         }
     }
 }

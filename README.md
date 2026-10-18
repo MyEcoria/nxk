@@ -86,8 +86,10 @@ vertex layout, culling, depth state and blending; a `Frame` then does
 `use_pipeline`, `bind_buffer`, `bind_texture`, `uniforms`, `draw_buffers`
 and `dispatch`, with `barrier` between passes that read each other's
 output. `gpu irtest` checks the compiler on the console itself: random
-programs of the IR run by 64 threads against the CPU reference, and a
-vertex and fragment pair drawing a pixel. The emulator runs no shaders:
+programs of the IR run by 64 threads against the CPU reference, a
+vertex and fragment pair drawing a pixel, four instances of a triangle,
+and a gradient rendered to an R32F, an RGBA16F and an RGBA32F target
+then sampled back through a texture of the same memory. The emulator runs no shaders:
 on a PC, `cd shader && cargo test` runs the same programs through a
 simulator of the generated code that also checks the GPU's latency and
 scoreboard rules.

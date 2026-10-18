@@ -327,7 +327,8 @@ fn halve(src: &[u8], w: u32, h: u32) -> Vec<u8> {
             let (x0, y0) = ((2 * x).min(w - 1), (2 * y).min(h - 1));
             let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
             for c in 0..4 {
-                let t = |px: u32, py: u32| src[(py as usize * w as usize + px as usize) * 4 + c] as u32;
+                let t =
+                    |px: u32, py: u32| src[(py as usize * w as usize + px as usize) * 4 + c] as u32;
                 let sum = t(x0, y0) + t(x1, y0) + t(x0, y1) + t(x1, y1);
                 out[(y as usize * nw as usize + x as usize) * 4 + c] = ((sum + 2) / 4) as u8;
             }
@@ -548,12 +549,19 @@ impl Graphics {
             return Err(-nxk_abi::err::EINVAL);
         }
         let bl = gpu::tex_block_log2(height);
-        let levels = if mips { gpu::max_levels(width, height) } else { 1 };
+        let levels = if mips {
+            gpu::max_levels(width, height)
+        } else {
+            1
+        };
         let bytes = gpu::mip_bytes(width, height, 4, bl, levels);
         let mut tiled = alloc::vec![0u8; bytes];
         let mut cur = rgba.to_vec();
         for level in 0..levels {
-            let (w, h) = (gpu::level_extent(width, level), gpu::level_extent(height, level));
+            let (w, h) = (
+                gpu::level_extent(width, level),
+                gpu::level_extent(height, level),
+            );
             let base = gpu::level_offset(width, height, 4, bl, level);
             let lbl = gpu::level_block_log2(bl, h);
             for y in 0..h {
@@ -776,7 +784,10 @@ impl Frame<'_> {
 
     /// Draw on the screen's image again (the one `frame` began with).
     pub fn screen(&mut self) {
-        let (c, z) = (self.gfx.images[self.back].id as u32, self.gfx.depth.id as u32);
+        let (c, z) = (
+            self.gfx.images[self.back].id as u32,
+            self.gfx.depth.id as u32,
+        );
         self.push(gpu::CMD_TARGET, &[c, z]);
     }
 
@@ -891,7 +902,16 @@ impl Frame<'_> {
     pub fn draw_buffers(&mut self, vb: &Buffer, vertices: u32, ib: &Buffer, indices: u32) {
         self.push(
             gpu::CMD_DRAW_INDEXED,
-            &[vb.id as u32, 0, vertices, ib.id as u32, 0, indices, 0, indices],
+            &[
+                vb.id as u32,
+                0,
+                vertices,
+                ib.id as u32,
+                0,
+                indices,
+                0,
+                indices,
+            ],
         );
     }
 
@@ -925,7 +945,17 @@ impl Frame<'_> {
         self.push(
             gpu::CMD_DRAW_INDEXED_INSTANCED,
             &[
-                vb.id as u32, 0, vertices, ib.id as u32, 0, indices, 0, indices, d, 0, instances,
+                vb.id as u32,
+                0,
+                vertices,
+                ib.id as u32,
+                0,
+                indices,
+                0,
+                indices,
+                d,
+                0,
+                instances,
             ],
         );
     }

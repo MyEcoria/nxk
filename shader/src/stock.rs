@@ -66,7 +66,10 @@ mod tests {
         let id = b.builtin(Builtin::InstanceId);
         let idf = b.u2f(id);
         let blue = b.fmul(idf, quarter);
-        for (c, r) in [b.input(1, 2), b.input(1, 3), blue, one].into_iter().enumerate() {
+        for (c, r) in [b.input(1, 2), b.input(1, 3), blue, one]
+            .into_iter()
+            .enumerate()
+        {
             b.output(OutKind::Varying(0), c as u8, r);
         }
         let p = b.finish();
@@ -79,7 +82,12 @@ mod tests {
             sampler: &mut NoTextures,
         };
         m.builtins[Builtin::InstanceId as usize] = 3;
-        m.inputs[1] = [(-0.5f32).to_bits(), 0.5f32.to_bits(), 1.0f32.to_bits(), 0.0f32.to_bits()];
+        m.inputs[1] = [
+            (-0.5f32).to_bits(),
+            0.5f32.to_bits(),
+            1.0f32.to_bits(),
+            0.0f32.to_bits(),
+        ];
         let o = run(&p, &mut m);
         assert_eq!(o.position, [-0.5, 0.5, 0.5, 1.0]);
         assert_eq!(o.varyings[0], [1.0, 0.0, 0.75, 1.0]);

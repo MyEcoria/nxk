@@ -1608,6 +1608,10 @@ pub mod proto {
         /// Four instances of a triangle, moved and colored from the
         /// instance stream and `InstanceId`, land on the expected pixels.
         pub const T3_IR_INSTANCE: u64 = 4096;
+        /// A pass draws a gradient (values past 1.0 too) on an R32F, an
+        /// RGBA16F and an RGBA32F target; after a barrier a second pass
+        /// samples the same memory as a texture, into an RGBA8 image.
+        pub const T3_IR_TARGET: u64 = 8192;
         /// Compile a shader written in `nxk-shader`'s IR: handle 0 = shm
         /// (readable, `MAP` right) holding its wire words; word 0 = number
         /// of words. Reply: word 0 = shader ID, word 1 = registers per

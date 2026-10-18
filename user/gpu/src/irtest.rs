@@ -376,7 +376,10 @@ pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
     let id = b.builtin(nxk_shader::Builtin::InstanceId);
     let idf = b.u2f(id);
     let blue = b.fmul(idf, quarter);
-    for (c, r) in [b.input(1, 2), b.input(1, 3), blue, one].into_iter().enumerate() {
+    for (c, r) in [b.input(1, 2), b.input(1, 3), blue, one]
+        .into_iter()
+        .enumerate()
+    {
         b.output(OutKind::Varying(0), c as u8, r);
     }
     let vs = b.finish();
@@ -409,7 +412,10 @@ pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
         pitch: W * 4,
         format: proto::FMT_A8B8G8R8 as u32,
     };
-    let (vbv, ibv) = (d.vm.map(&vb, false).map_err(e)?, d.vm.map(&ib, false).map_err(e)?);
+    let (vbv, ibv) = (
+        d.vm.map(&vb, false).map_err(e)?,
+        d.vm.map(&ib, false).map_err(e)?,
+    );
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
         return Err(-libnx::abi::err::ENOSPC);
@@ -505,6 +511,217 @@ pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
     d.gfx.uninstall(vblock, vlen);
     d.gfx.uninstall(fblock, flen);
     for (va, len) in [(s.va, img.len()), (vbv, vb.len()), (ibv, ib.len())] {
+        let _ = d.vm.unmap(va, len as u64);
+    }
+    let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((ok, ns))
+}
+
+/// Render to a float target, then sample it: a pass fills a block-linear
+/// R32F, RGBA16F or RGBA32F image (values past 1.0 included) with a
+/// gradient, a barrier, and a second pass reads it back through a
+/// texture of the same memory into an RGBA8 image, scaled down.
+pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
+    const N: u32 = 16;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+
+    // First pass: (4u, 4v, 2, 0.5) from the fullscreen triangle's uv.
+    let vs = nxk_shader::stock::fullscreen_vertex();
+    let mut b = Builder::new(Stage::Fragment);
+    let four = b.f32(4.0);
+    let (u, v) = (
+        b.input_as(0, 0, Interp::Perspective),
+        b.input_as(0, 1, Interp::Perspective),
+    );
+    let (r, gr) = (b.fmul(u, four), b.fmul(v, four));
+    let (two, half) = (b.f32(2.0), b.f32(0.5));
+    for (c, x) in [r, gr, two, half].into_iter().enumerate() {
+        b.output(OutKind::Color(0), c as u8, x);
+    }
+    let fs1 = b.finish();
+    // Second pass: the texel at the pixel's uv, divided by 4 (alpha as is).
+    let mut b = Builder::new(Stage::Fragment);
+    let quarter = b.f32(0.25);
+    let (u, v) = (
+        b.input_as(0, 0, Interp::Perspective),
+        b.input_as(0, 1, Interp::Perspective),
+    );
+    let t = b.sample(0, u, v);
+    for c in 0..3u8 {
+        let x = b.fmul(t[c as usize], quarter);
+        b.output(OutKind::Color(0), c, x);
+    }
+    b.output(OutKind::Color(0), 3, t[3]);
+    let fs2 = b.finish();
+    let (cv, c1, c2) = match (
+        lower::compile(&vs),
+        lower::compile(&fs1),
+        lower::compile(&fs2),
+    ) {
+        (Ok(v), Ok(a), Ok(b)) => (v, a, b),
+        (v, a, b) => {
+            println!(
+                "[gpu] IR targets: does not compile: vertex {:?}, fragments {:?} {:?}",
+                v.err(),
+                a.err(),
+                b.err()
+            );
+            return Ok((false, 0));
+        }
+    };
+
+    let d = g.dev(0)?;
+    let img = Dma::new((N * N * 4) as usize).map_err(e)?;
+    let vb = Dma::new(4096).map_err(e)?;
+    let s = crate::engine::Surface {
+        va: d.vm.map(&img, false).map_err(e)?,
+        width: N,
+        height: N,
+        pitch: N * 4,
+        format: proto::FMT_A8B8G8R8 as u32,
+    };
+    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    for (i, x) in [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0].iter().enumerate() {
+        vb.w32(i * 4, x.to_bits());
+    }
+    let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((f1, f1block, f1len)) = d.gfx.install(&c1.header, &c1.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((f2, f2block, f2len)) = d.gfx.install(&c2.header, &c2.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let mut attrs = Vec::new();
+    attrs.push(attr_word(0, proto::AF_F32X2).unwrap());
+    attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
+    let pipe = |fs: u32, gprs: u32| Custom {
+        vs: vh,
+        vs_gprs: cv.gprs.next_multiple_of(8).max(8),
+        fs,
+        fs_gprs: gprs.next_multiple_of(8).max(8),
+        stride: 8,
+        attrs: attrs.clone(),
+        inst_stride: 0,
+        flags: proto::PF_NO_DEPTH_TEST | proto::PF_NO_DEPTH_WRITE,
+        blend: proto::BLEND_NONE,
+        depth: proto::DEPTH_LESS,
+    };
+    let (p1, p2) = (pipe(f1, c1.gprs), pipe(f2, c2.gprs));
+    let lay = Layout {
+        stride: 8,
+        attrs: &p1.attrs,
+        inst_stride: 0,
+    };
+    let px = |x: u32, y: u32| img.r32(((y * N + x) * 4) as usize);
+    let near = |a: u32, b: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 3)
+    };
+    let word = |r: u32, g: u32, b: u32, a: u32| a << 24 | b << 16 | g << 8 | r;
+    let mut ok = true;
+    let mut ns = 0;
+    for (tf, name) in [
+        (proto::TF_R32F, "R32F"),
+        (proto::TF_RGBA16F, "RGBA16F"),
+        (proto::TF_RGBA32F, "RGBA32F"),
+    ] {
+        let bpp = proto::tf_bytes(tf);
+        let bl = proto::tex_block_log2(N);
+        let fmt = gfx::color_format(tf).ok_or(-libnx::abi::err::EINVAL)?;
+        let mem =
+            Dma::new(proto::tiled_bytes_bpp(N, N, bpp, bl).next_multiple_of(4096)).map_err(e)?;
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        // The same memory twice, as the client's two attaches make it.
+        let kind = mmu::KIND_GENERIC_16BX2;
+        let (tva, xva) = (
+            d.vm.map_kind(&mem, false, kind, 1 << 17).map_err(e)?,
+            d.vm.map_kind(&mem, false, kind, 1 << 17).map_err(e)?,
+        );
+        mmu::invalidate(&regs, &d.vm).map_err(e)?;
+        let tiled = gfx::Tiled {
+            va: tva,
+            width: N,
+            height: N,
+            format: fmt,
+            bpp,
+            block_log2: bl,
+        };
+        let image = gfx::TexImage {
+            va: xva,
+            width: N,
+            height: N,
+            format: tf,
+            block_log2: bl,
+            levels: 1,
+        };
+        d.gfx.set_texture(0, &image, proto::TEX_CLAMP);
+        let first = gfx::Target {
+            color: gfx::Color::Tiled(tiled),
+            depth: None,
+        };
+        let second = gfx::Target {
+            color: gfx::Color::Linear(s),
+            depth: None,
+        };
+        img.words(0, &alloc::vec![0xDEAD_BEEF; (N * N) as usize]);
+        let mut p = Push::default();
+        d.gfx.begin(&mut p);
+        let desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+        let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+        handles[0] = gfx::Gfx::texture_handle(0);
+        d.gfx.pipeline_custom(&mut p, &first, &p1);
+        let staged = d.gfx.uniforms(&mut p, &[0])
+            && d.gfx.cbuf(&mut p, 2, &desc)
+            && d.gfx.cbuf(&mut p, 3, &handles);
+        if !staged {
+            return Err(-libnx::abi::err::ENOSPC);
+        }
+        d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
+        // What `CMD_TARGET` does between passes.
+        d.gfx.barrier(&mut p);
+        d.gfx.pipeline_custom(&mut p, &second, &p2);
+        d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
+        ns += g.run(p, BATCH_TIMEOUT_US)?;
+        let mut bad = 0;
+        for (x, y) in [(0u32, 0u32), (3, 2), (8, 9), (15, 15), (5, 12)] {
+            let (u, v) = ((x as f32 + 0.5) / N as f32, (y as f32 + 0.5) / N as f32);
+            let (r8, g8) = ((u * 255.0 + 0.5) as u32, (v * 255.0 + 0.5) as u32);
+            // R32F reads as (r, 0, 0, 1).
+            let want = if tf == proto::TF_R32F {
+                word(r8, 0, 0, 255)
+            } else {
+                word(r8, g8, 128, 128)
+            };
+            let got = px(x, y);
+            if !near(got, want) {
+                println!(
+                    "[gpu] IR targets {}: pixel ({}, {}) {:#010x}, expected {:#010x}",
+                    name, x, y, got, want
+                );
+                bad += 1;
+            }
+        }
+        if bad == 0 {
+            println!(
+                "[gpu] IR targets {}: rendered, sampled back, as expected",
+                name
+            );
+        } else {
+            ok = false;
+        }
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        d.gfx.clear_texture(0);
+        for va in [tva, xva] {
+            let _ = d.vm.unmap(va, mem.len() as u64);
+        }
+    }
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    for (at, len) in [(vblock, vlen), (f1block, f1len), (f2block, f2len)] {
+        d.gfx.uninstall(at, len);
+    }
+    for (va, len) in [(s.va, img.len()), (vbv, vb.len())] {
         let _ = d.vm.unmap(va, len as u64);
     }
     let _ = mmu::invalidate(&regs, &d.vm);

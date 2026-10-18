@@ -27,19 +27,34 @@ fn nil_level(width: u32, height: u32, bpp: u32, y_log2: u32, level: u32) -> (usi
 #[test]
 fn sizes_match_nil() {
     for bpp in [4, 8, 16] {
-        for (w, h) in [(1, 1), (8, 8), (64, 64), (100, 37), (256, 1), (1280, 720), (1024, 1024)] {
+        for (w, h) in [
+            (1, 1),
+            (8, 8),
+            (64, 64),
+            (100, 37),
+            (256, 1),
+            (1280, 720),
+            (1024, 1024),
+        ] {
             for block in 0..=4 {
                 let block = level_block_log2(block, h);
                 let mut at = 0;
                 for level in 0..max_levels(w, h) {
                     let (size, y) = nil_level(w, h, bpp, block, level);
-                    assert_eq!(level_bytes(w, h, bpp, block, level), size, "{w}x{h} {bpp} L{level}");
+                    assert_eq!(
+                        level_bytes(w, h, bpp, block, level),
+                        size,
+                        "{w}x{h} {bpp} L{level}"
+                    );
                     assert_eq!(level_block_log2(block, (h >> level).max(1)), y);
                     assert_eq!(level_offset(w, h, bpp, block, level), at);
                     at += size;
                 }
                 assert_eq!(mip_bytes(w, h, bpp, block, max_levels(w, h)), at);
-                assert_eq!(mip_bytes(w, h, bpp, block, 1), tiled_bytes_bpp(w, h, bpp, block));
+                assert_eq!(
+                    mip_bytes(w, h, bpp, block, 1),
+                    tiled_bytes_bpp(w, h, bpp, block)
+                );
             }
         }
     }
@@ -92,7 +107,10 @@ fn four_byte_swizzle_is_unchanged() {
     let pts: Vec<(u32, u32)> = (0..40).flat_map(|y| (0..40).map(move |x| (x, y))).collect();
     for block in 0..=4 {
         for &(x, y) in &pts {
-            assert_eq!(tiled_offset(40, x, y, 4, block), tiled_offset_4(40, x, y, block));
+            assert_eq!(
+                tiled_offset(40, x, y, 4, block),
+                tiled_offset_4(40, x, y, block)
+            );
         }
     }
 }
@@ -106,14 +124,25 @@ fn formats() {
 /// inside its own level, nothing overlaps.
 #[test]
 fn a_mip_chain_packs_its_levels() {
-    for (w, h, bpp) in [(256u32, 256u32, 4u32), (100, 37, 4), (64, 8, 8), (33, 65, 16)] {
-        let bl = (0..=4).rev().find(|&b| level_block_log2(b, h) == b).unwrap();
+    for (w, h, bpp) in [
+        (256u32, 256u32, 4u32),
+        (100, 37, 4),
+        (64, 8, 8),
+        (33, 65, 16),
+    ] {
+        let bl = (0..=4)
+            .rev()
+            .find(|&b| level_block_log2(b, h) == b)
+            .unwrap();
         let levels = max_levels(w, h);
         let mut seen = HashSet::new();
         for level in 0..levels {
             let (lw, lh) = (level_extent(w, level), level_extent(h, level));
             let lbl = level_block_log2(bl, lh);
-            let (base, size) = (level_offset(w, h, bpp, bl, level), level_bytes(w, h, bpp, bl, level));
+            let (base, size) = (
+                level_offset(w, h, bpp, bl, level),
+                level_bytes(w, h, bpp, bl, level),
+            );
             for y in 0..lh {
                 for x in 0..lw {
                     let o = tiled_offset(lw, x, y, bpp, lbl);

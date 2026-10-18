@@ -683,8 +683,9 @@ fn attach_shared(
     };
     let id = if texture {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
-        d.client
-            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1], m.mr[2], m.mr[3], m.mr[4])
+        d.client.attach_texture(
+            &mut d.vm, &d.gfx, h, w, ht, m.mr[1], m.mr[2], m.mr[3], m.mr[4],
+        )
     } else if target {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
@@ -1298,9 +1299,14 @@ fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     if ok {
         pass |= proto::T3_IR_INSTANCE;
     }
+    let (ok, t) = irtest::targets(g)?;
+    ns += t;
+    if ok {
+        pass |= proto::T3_IR_TARGET;
+    }
     Ok((
         pass,
-        proto::T3_IR_COMPUTE | proto::T3_IR_DRAW | proto::T3_IR_INSTANCE,
+        proto::T3_IR_COMPUTE | proto::T3_IR_DRAW | proto::T3_IR_INSTANCE | proto::T3_IR_TARGET,
         ns,
     ))
 }
