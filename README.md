@@ -144,8 +144,12 @@ compute kernel (`nxk_shader::rt::shadow`) shoots one any-hit ray per texel
 toward the sun over the valley's BVH (built once at load) and over the six
 boxes of the moving figure, and the lit shader filters the mask per pixel
 with a joint bilateral upsample (distance weights that follow the slope).
-At 1280 x 720 it holds 60 fps; the GPU is busy 52% without the shadows and
-about 82% with them (pre-pass 1 ms, rays 2.4 ms, mask lookup 0.8 ms). The
+The mask accumulates over frames (history reprojected with the last
+camera, a sun disc of 1.5 degrees jittered per texel and frame, half the
+texels tracing each frame), which gives the edges penumbrae. At 1280 x 720
+it holds 60 fps; the GPU is busy 52% without the shadows and about 76% with
+them (pre-pass 1 ms, rays about 1.2 ms with half the texels, mask lookup
+0.8 ms). The
 render targets of a game that draws upright on the panel are 720 wide and
 1280 high (`Graphics::panel` turns the picture a quarter), so a mask for
 the screen is too. L + R + Minus opens its hidden **Lab**: frame-time
@@ -154,7 +158,8 @@ blending from a buffer rewritten each frame), a ray room that traces a
 96 x 54 grid of camera rays and their shadow rays into the valley's 41,000
 triangles and shows them as a heat map, and, on the Overview, Up / Down
 steps through the shadows' cost (all, no mask in the lit shader, positions
-only, none) and shows the mask itself.
+only, none), shows the mask itself (distance error, filter weight, factor)
+and traces with the history forgotten every frame.
 
 ### Users and save data
 

@@ -1091,6 +1091,16 @@ within 5 s.
     refused frames, and the shell has `jobs` and `kill` (not in the boot
     image until it is updated). `lumen lab MODE` starts with the Lab open
     at a shadow mode (the shell sees its panic messages).
+    The mask's rows were read mirrored (window y is `ndc.y * h / 2 + h / 2`
+    on this viewport, the panel's matrix having turned y down): fine at the
+    middle of the screen, wrong toward the sides, which showed as big ellipses
+    where the filter rejected every texel and as shadows pointing the wrong
+    way; a probe in the mask view (the position texel at the computed place
+    against the fragment's world position) found it. The boot image on the
+    card was updated with `--put` to temporary names and `mv` (backups
+    `bl33.prev`, `bl31.prev`), then the console was restarted: AutoRCM, so
+    `hwboot/inject.sh` for hekate and a tap on More Configs, nxk. The battery
+    fell from 31% to 15% in an hour on the PC's USB: use a charger.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
