@@ -205,13 +205,29 @@ Key details agents must respect:
 ## 7. Technical choices (mandatory)
 
 - For every technical choice (design, hardware sequence, boot path,
-  protocol, data structure, crate, trade-off between approaches), propose
-  **several solutions** (at least two) to the user before implementing:
-  for each, what it involves, pros/cons (hardware safety, complexity,
-  performance, maintenance) and which one you recommend. Wait for the
-  user's pick before writing the code.
+  protocol, data structure, crate, trade-off between approaches), work out
+  **several solutions** (at least two): for each, what it involves,
+  pros/cons (hardware safety, complexity, performance, maintenance).
+  **Do not ask the user to pick: consult the advisor** (the `advisor`
+  tool) with the options, take its answer into account, decide, and
+  implement. Report the options and the decision afterwards (commit
+  message, docs or the final answer), so the user can overrule it.
+- Call the advisor for every question you would otherwise put to the
+  user, at every major choice, after each measurement that changes the
+  picture, when stuck, and at the end of a step to ask for new avenues.
+  Not once per task: often. Bring its new ideas to the next step.
+- **Always choose what is best for the result** (frames per second,
+  latency, memory, quality, robustness), even when it costs much more to
+  write: more code, a harder design, a longer compiler or driver change.
+  Never pick the cheaper option for being cheaper; the cheap one is only
+  right when it is also the best (or equal) on the result. Measure on the
+  console to decide when the answer is not obvious.
+- Ask the user only for what cannot be decided from the code, the
+  measurements and the advisor: something outside the repository, a risk
+  to their hardware or data, a destructive or outward-facing action, or a
+  reboot of their console.
 - Mechanical changes with a single sensible option (typo, rename,
-  following an existing pattern) need no proposal; say so when skipping.
+  following an existing pattern) need no advisor call; say so when skipping.
 
 ## 8. Commits (mandatory)
 
