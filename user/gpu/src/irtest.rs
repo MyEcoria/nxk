@@ -974,6 +974,292 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
     Ok((ok, ns))
 }
 
+/// The data path of ray-traced shadows in one batch: a pass draws a
+/// gradient into an RGBA32F target; after a barrier a compute kernel samples
+/// the target (TEX at an explicit lod in a compute shader) into a buffer;
+/// after a barrier a draw loads that buffer in its fragment shader and
+/// writes the pixels.
+pub fn path(g: &mut Gpu) -> Res<(bool, u64)> {
+    const N: u32 = 16;
+    const PITCH: u32 = 256;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+    let tf = proto::TF_RGBA32F;
+
+    let vs = nxk_shader::stock::fullscreen_vertex();
+    // Pass 1: (4u, 4v, 2, 0.5).
+    let mut b = Builder::new(Stage::Fragment);
+    let four = b.f32(4.0);
+    let (u, v) = (
+        b.input_as(0, 0, Interp::Perspective),
+        b.input_as(0, 1, Interp::Perspective),
+    );
+    let (r, gr) = (b.fmul(u, four), b.fmul(v, four));
+    let (two, half) = (b.f32(2.0), b.f32(0.5));
+    for (c, x) in [r, gr, two, half].into_iter().enumerate() {
+        b.output(OutKind::Color(0), c as u8, x);
+    }
+    let fs1 = b.finish();
+    // Compute: thread i samples the texel (i % 16, i / 16) of texture 0 at
+    // lod 0 and stores its four floats at words 4i.
+    let mut b = Builder::new(Stage::Compute);
+    b.local_size(64, 1, 1);
+    let tid = b.builtin(nxk_shader::Builtin::LocalIdX);
+    let gid = b.builtin(nxk_shader::Builtin::GroupIdX);
+    let six = b.u32(6);
+    let g64 = b.shl(gid, six);
+    let id = b.uadd(g64, tid);
+    let (mask, four_u) = (b.u32(15), b.u32(4));
+    let x = b.and(id, mask);
+    let y = b.shr(id, four_u);
+    let (xf, yf) = (b.u2f(x), b.u2f(y));
+    let (step, centre) = (b.f32(1.0 / N as f32), b.f32(0.5 / N as f32));
+    let u = b.fma(xf, step, centre);
+    let v = b.fma(yf, step, centre);
+    let lod = b.f32(0.0);
+    let t = b.sample_lod(0, u, v, lod);
+    let bits = [b.fbits(t[0]), b.fbits(t[1]), b.fbits(t[2]), b.fbits(t[3])];
+    let two_u = b.u32(2);
+    let at = b.shl(id, two_u);
+    b.store(0, at, 0, &bits);
+    let kernel = b.finish();
+    // Pass 3: the buffer's four floats at the pixel's index, times 1/4
+    // (alpha as is).
+    let mut b = Builder::new(Stage::Fragment);
+    let (u, v) = (
+        b.input_as(0, 0, Interp::Perspective),
+        b.input_as(0, 1, Interp::Perspective),
+    );
+    let n = b.f32(N as f32);
+    let (un, vn) = (b.fmul(u, n), b.fmul(v, n));
+    let (ix, iy) = (b.f2u(un), b.f2u(vn));
+    let (four_u, two_u) = (b.u32(4), b.u32(2));
+    let row = b.shl(iy, four_u);
+    let idx = b.uadd(row, ix);
+    let at = b.shl(idx, two_u);
+    let t = b.load_n(0, at, 0, &[Ty::F32; 4]);
+    let quarter = b.f32(0.25);
+    for c in 0..3u8 {
+        let x = b.fmul(t[c as usize], quarter);
+        b.output(OutKind::Color(0), c, x);
+    }
+    b.output(OutKind::Color(0), 3, t[3]);
+    let fs3 = b.finish();
+    let (cv, c1, ck, c3) = match (
+        lower::compile(&vs),
+        lower::compile(&fs1),
+        lower::compile(&kernel),
+        lower::compile(&fs3),
+    ) {
+        (Ok(v), Ok(a), Ok(k), Ok(c)) => (v, a, k, c),
+        (v, a, k, c) => {
+            println!(
+                "[gpu] IR path: does not compile: {:?} {:?} {:?} {:?}",
+                v.err(),
+                a.err(),
+                k.err(),
+                c.err()
+            );
+            return Ok((false, 0));
+        }
+    };
+
+    let d = g.dev(0)?;
+    let img = Dma::new((N * PITCH) as usize).map_err(e)?;
+    let vb = Dma::new(4096).map_err(e)?;
+    let outb = Dma::new((N * N * 16) as usize).map_err(e)?;
+    let s = crate::engine::Surface {
+        va: d.vm.map(&img, false).map_err(e)?,
+        width: N,
+        height: N,
+        pitch: PITCH,
+        format: proto::FMT_A8B8G8R8 as u32,
+    };
+    let vbv = d.vm.map_cached(&vb).map_err(e)?;
+    let outv = d.vm.map_cached(&outb).map_err(e)?;
+    for (i, x) in [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0].iter().enumerate() {
+        vb.w32(i * 4, x.to_bits());
+    }
+    outb.words(0, &alloc::vec![0xAAAA_AAAA; (N * N * 4) as usize]);
+    let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((f1, f1block, f1len)) = d.gfx.install(&c1.header, &c1.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((f3, f3block, f3len)) = d.gfx.install(&c3.header, &c3.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((kat, klen)) = d.compute.install(&ck.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let mut attrs = Vec::new();
+    attrs.push(attr_word(0, proto::AF_F32X2).unwrap());
+    attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
+    let pipe = |fs: u32, gprs: u32| Custom {
+        vs: vh,
+        vs_gprs: cv.gprs.next_multiple_of(8).max(8),
+        fs,
+        fs_gprs: gprs.next_multiple_of(8).max(8),
+        stride: 8,
+        attrs: attrs.clone(),
+        inst_stride: 0,
+        flags: proto::PF_NO_DEPTH_TEST | proto::PF_NO_DEPTH_WRITE,
+        blend: proto::BLEND_NONE,
+        depth: proto::DEPTH_LESS,
+    };
+    let (p1, p3) = (pipe(f1, c1.gprs), pipe(f3, c3.gprs));
+    let lay = Layout {
+        stride: 8,
+        attrs: &p1.attrs,
+        inst_stride: 0,
+    };
+
+    let bpp = proto::tf_bytes(tf);
+    let bl = proto::tex_block_log2(N);
+    let fmt = gfx::color_format(tf).ok_or(-libnx::abi::err::EINVAL)?;
+    let mem = Dma::new(proto::tiled_bytes_bpp(N, N, bpp, bl).next_multiple_of(4096)).map_err(e)?;
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    let kind = mmu::KIND_GENERIC_16BX2;
+    let (tva, xva) = (
+        d.vm.map_kind(&mem, false, kind, 1 << 17).map_err(e)?,
+        d.vm.map_kind(&mem, false, kind, 1 << 17).map_err(e)?,
+    );
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let first = gfx::Target {
+        color: gfx::Color::Tiled(gfx::Tiled {
+            va: tva,
+            width: N,
+            height: N,
+            format: fmt,
+            bpp,
+            block_log2: bl,
+        }),
+        depth: None,
+    };
+    let third = gfx::Target {
+        color: gfx::Color::Linear(s),
+        depth: None,
+    };
+    d.gfx.set_texture(
+        0,
+        &gfx::TexImage {
+            va: xva,
+            width: N,
+            height: N,
+            format: tf,
+            block_log2: bl,
+            levels: 1,
+        },
+        proto::TEX_CLAMP,
+    );
+    img.words(0, &alloc::vec![0xDEAD_BEEF; (N * PITCH / 4) as usize]);
+
+    // Buffer slot 0 is the kernel's answers, then the fragment shader's
+    // input.
+    let mut desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+    desc[0] = outv as u32;
+    desc[1] = (outv >> 32) as u32;
+    desc[2] = N * N * 4;
+    let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+    handles[0] = gfx::Gfx::texture_handle(0);
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    let nospc = || -libnx::abi::err::ENOSPC;
+    d.gfx.pipeline_custom(&mut p, &first, &p1);
+    let staged = d.gfx.uniforms(&mut p, &[0])
+        && d.gfx.cbuf(&mut p, 2, &desc)
+        && d.gfx.cbuf(&mut p, 3, &handles);
+    if !staged {
+        return Err(nospc());
+    }
+    d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
+    d.gfx.barrier(&mut p);
+    let cbs = [
+        d.gfx.stage(&[0; 64]).ok_or_else(nospc)?,
+        d.gfx.stage(&[N * N]).ok_or_else(nospc)?,
+        d.gfx.stage(&desc).ok_or_else(nospc)?,
+        d.gfx.stage(&handles).ok_or_else(nospc)?,
+    ];
+    let (qat, qva) = d.gfx.alloc_ubo(crate::qmd::SIZE).ok_or_else(nospc)?;
+    let q = Qmd::new3(&Launch3 {
+        program: kat,
+        regs: ck.gprs.next_multiple_of(8).max(8),
+        grid: [(N * N).div_ceil(64), 1, 1],
+        block: [64, 1, 1],
+        cbs: &cbs,
+        local_bytes: ck.local_bytes,
+    });
+    d.gfx.ubo_write(qat, &q.bytes());
+    d.compute.launch(&mut p, qva);
+    d.gfx.barrier(&mut p);
+    d.gfx.pipeline_custom(&mut p, &third, &p3);
+    let staged = d.gfx.uniforms(&mut p, &[0])
+        && d.gfx.cbuf(&mut p, 2, &desc)
+        && d.gfx.cbuf(&mut p, 3, &handles);
+    if !staged {
+        return Err(nospc());
+    }
+    d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
+    let t = g.run(p, BATCH_TIMEOUT_US);
+    let ns = match t {
+        Ok(t) => t,
+        Err(_) => {
+            println!("[gpu] IR path: the batch hung");
+            return Ok((false, 0));
+        }
+    };
+
+    let near = |a: u32, b: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 3)
+    };
+    let word = |r: u32, g: u32, b: u32, a: u32| a << 24 | b << 16 | g << 8 | r;
+    let mut bad = 0;
+    // The kernel's own words first.
+    for (x, y) in [(0u32, 0u32), (3, 2), (15, 15)] {
+        let i = (y * N + x) as usize;
+        let t: [f32; 4] = core::array::from_fn(|k| f32::from_bits(outb.r32((i * 4 + k) * 4)));
+        let (u, v) = ((x as f32 + 0.5) / N as f32, (y as f32 + 0.5) / N as f32);
+        let want = [4.0 * u, 4.0 * v, 2.0, 0.5];
+        if (0..4).any(|k| fmath::abs(t[k] - want[k]) > 0.02) {
+            println!(
+                "[gpu] IR path: kernel texel ({}, {}) {:?}, expected {:?}",
+                x, y, t, want
+            );
+            bad += 1;
+        }
+    }
+    for (x, y) in [(0u32, 0u32), (3, 2), (8, 9), (15, 15), (5, 12)] {
+        let (u, v) = ((x as f32 + 0.5) / N as f32, (y as f32 + 0.5) / N as f32);
+        let want = word((u * 255.0 + 0.5) as u32, (v * 255.0 + 0.5) as u32, 128, 128);
+        let got = img.r32((y * PITCH + x * 4) as usize);
+        if !near(got, want) {
+            println!(
+                "[gpu] IR path: pixel ({}, {}) {:#010x}, expected {:#010x}",
+                x, y, got, want
+            );
+            bad += 1;
+        }
+    }
+    if bad == 0 {
+        println!("[gpu] IR path: target, compute sample, fragment load, as expected");
+    }
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    d.gfx.clear_texture(0);
+    d.compute.uninstall(kat, klen);
+    for (at, len) in [(vblock, vlen), (f1block, f1len), (f3block, f3len)] {
+        d.gfx.uninstall(at, len);
+    }
+    for va in [tva, xva] {
+        let _ = d.vm.unmap(va, mem.len() as u64);
+    }
+    for (va, len) in [(s.va, img.len()), (vbv, vb.len()), (outv, outb.len())] {
+        let _ = d.vm.unmap(va, len as u64);
+    }
+    let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((bad == 0, ns))
+}
+
 /// Closest-hit and any-hit traversal of a wide BVH on the GPU: 65536
 /// rays through 4000 triangles against the CPU walk of the same tree,
 /// with the rate it manages: random rays, then a camera's and the

@@ -1608,6 +1608,10 @@ pub mod proto {
         /// Closest-hit and any-hit traversal kernels on a wide BVH of 4000
         /// triangles, 65536 rays, against the CPU walk of the same tree.
         pub const T3_IR_RAYS: u64 = 1 << 14;
+        /// The path ray-traced shadows take in one batch: a float target,
+        /// a compute kernel sampling it into a buffer, a fragment shader
+        /// loading that buffer.
+        pub const T3_IR_PATH: u64 = 1 << 15;
         /// Four instances of a triangle, moved and colored from the
         /// instance stream and `InstanceId`, land on the expected pixels.
         pub const T3_IR_INSTANCE: u64 = 4096;

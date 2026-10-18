@@ -1080,6 +1080,7 @@ fn gpu_cmd(argv: &[&str]) {
                 (gpu::T3_IR_COMPUTE, "IR compute vs reference"),
                 (gpu::T3_IR_DRAW, "IR vertex+fragment draw"),
                 (gpu::T3_IR_RAYS, "IR ray traversal vs CPU"),
+                (gpu::T3_IR_PATH, "IR target, compute, fragment"),
                 (gpu::T3_IR_INSTANCE, "IR instanced draw"),
                 (gpu::T3_IR_TARGET, "IR float target -> texture"),
             ] {
