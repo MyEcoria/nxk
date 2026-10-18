@@ -153,7 +153,8 @@ impl Lab {
                     "RAY TRACED",
                     "NO MASK IN LIT SHADER",
                     "POSITIONS ONLY",
-                    "OFF"
+                    "OFF",
+                    "MASK VIEW"
                 ][self.shadow_mode as usize]
             ),
         };

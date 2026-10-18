@@ -180,4 +180,27 @@ impl Shadows {
         f.barrier();
         self.cur = before;
     }
+
+    /// What the last mask holds, as text for the log (a test aid): texels
+    /// with a distance, and a column of (distance, share) pairs.
+    pub fn describe(&self) -> String {
+        let m = &self.masks[1 - self.cur];
+        let (w, h) = (self.w as usize, self.h as usize);
+        let mut all = vec![0u32; w * h * 2];
+        m.read_words(0, &mut all);
+        let used = (0..w * h)
+            .filter(|&i| f32::from_bits(all[2 * i]) > 0.0)
+            .count();
+        let mut col = String::new();
+        let x = w / 2;
+        for y in (0..h).step_by(16) {
+            let i = y * w + x;
+            col.push_str(&format!(
+                " {:.1}/{:.2}",
+                f32::from_bits(all[2 * i]),
+                f32::from_bits(all[2 * i + 1])
+            ));
+        }
+        format!("mask: {} of {} texels have a distance;{}", used, w * h, col)
+    }
 }

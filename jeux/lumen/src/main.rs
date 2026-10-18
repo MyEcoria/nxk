@@ -252,13 +252,25 @@ fn main() {
     let mut tod = 0.27f32;
     let mut time_rate = 1.0 / 300.0;
     let mut inp = Input::default();
+    // `lumen lab [MODE [ROOM]]` starts with the Lab open (a test aid: the
+    // shell can read what the game prints).
+    let mut g_frames = 0u32;
+    let mut refused_run = 0u32;
     let mut lab_mode: Option<Lab> = None;
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("lab") {
+        let mut lab = Lab::new();
+        lab.shadow_mode = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
+        lab.room = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(0);
+        lab_mode = Some(lab);
+    }
     let mut last = g.seconds();
     let started = last;
     let (mut fps_n, mut fps_t) = (0u32, last);
     let mut bg = Canvas::background();
     let mut hud = Canvas::new();
     loop {
+        g_frames = g_frames.wrapping_add(1);
         let now = g.seconds();
         if now - fps_t >= 5.0 {
             println!("lumen: {:.1} fps", fps_n as f32 / (now - fps_t));
@@ -448,6 +460,9 @@ fn main() {
                 sh.trace(&mut f, sky.sun_dir, &parts, me.pos, &vp.0, eye);
             }
             f.screen();
+            if mode == 4 && g_frames % 120 == 60 {
+                println!("lumen: {}", sh.describe());
+            }
         }
         f.clear(hor);
         f.canvas(&bg);
@@ -565,15 +580,18 @@ fn main() {
         }
         f.canvas(&hud);
         if f.present().is_err() {
+            refused_run += 1;
             match lab_mode.as_mut() {
-                // A load too big for a frame: the Lab backs off.
-                Some(lab) => {
+                // A load too big for a frame: the Lab backs off. Refused for
+                // a second on end, the screen is no longer ours (HOME).
+                Some(lab) if refused_run < 60 => {
                     lab.refused += 1;
                     lab.cubes = (lab.cubes / 2).max(50);
                 }
-                None => break,
+                _ => break,
             }
         } else {
+            refused_run = 0;
             fps_n += 1;
             if let Some(lab) = lab_mode.as_mut().filter(|l| l.room == 3) {
                 if let Some(r) = lab.rays.as_mut() {
