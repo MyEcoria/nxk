@@ -13,6 +13,7 @@ Standard library only.
     nxdbg.py button A                     # A B X Y L R ZL ZR PLUS MINUS
                                           # UP DOWN LEFT RIGHT LSTICK RSTICK
                                           # HOME CAPTURE VOL_UP VOL_DOWN POWER POWER_LONG, [hold ms]
+    nxdbg.py bdown L bdown R button MINUS bup R bup L    # a chord: hold, press, release
     nxdbg.py tap 640 360 wait 0.5 shot after.png    # chained, in order
     nxdbg.py --emu /tmp/usb.sock shot out.png       # tegra_qemu's USB port
 """
@@ -181,7 +182,7 @@ def shot(ch, path, panel):
 
 
 ARITY = {"ping": 0, "shot": 1, "tap": 2, "down": 2, "move": 2, "up": 2,
-         "swipe": 4, "button": 1, "wait": 1}
+         "swipe": 4, "button": 1, "bdown": 1, "bup": 1, "wait": 1}
 OPTIONAL = {"tap": 1, "swipe": 1, "button": 1}
 
 
@@ -234,6 +235,11 @@ def run(ch, cmds, panel):
             ch.button(name, 1)
             time.sleep((int(a[1]) if len(a) > 1 else 60) / 1000)
             ch.button(name, 0)
+        elif verb in ("bdown", "bup"):
+            name = a[0].upper()
+            if name not in BUTTONS:
+                sys.exit(f"nxdbg: button is one of {' '.join(BUTTONS)}")
+            ch.button(name, 1 if verb == "bdown" else 0)
         elif verb == "wait":
             time.sleep(float(a[0]))
 
@@ -245,7 +251,7 @@ def main():
     ap.add_argument("--panel", action="store_true", help="shot: panel orientation (portrait)")
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("commands", nargs="+", help="ping | shot F | tap X Y [MS] | swipe X1 Y1 X2 Y2 [MS] | "
-                    "button NAME [MS] | down/move/up X Y | wait S")
+                    "button NAME [MS] | bdown/bup NAME | down/move/up X Y | wait S")
     a = ap.parse_args()
     if a.emu:
         link = usbterm.EmuHost(a.emu, timeout=a.timeout)
