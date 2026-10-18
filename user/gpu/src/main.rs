@@ -684,11 +684,11 @@ fn attach_shared(
     let id = if texture {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
-            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1])
+            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1], m.mr[2], m.mr[3])
     } else if target {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
-            .attach_target(&mut d.vm, h, w, ht, m.mr[1], m.mr[2] as u32)
+            .attach_target(&mut d.vm, h, w, ht, m.mr[1], m.mr[2] as u32, m.mr[3])
     } else {
         d.client.attach_buffer(&mut d.vm, h, m.mr[0])
     }?;
@@ -933,6 +933,7 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         width: W,
         height: H,
         format: proto::FMT_A8B8G8R8 as u32,
+        bpp: 4,
         block_log2: 4,
     };
     let timg = Dma::new(tiled.bytes()).map_err(e)?;
@@ -1154,6 +1155,7 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         width: 16,
         height: 16,
         format: proto::FMT_A8B8G8R8 as u32,
+        bpp: 4,
         block_log2: proto::tex_block_log2(16),
     };
     let tex = Dma::new(tt.bytes().next_multiple_of(4096)).map_err(e)?;
@@ -1173,8 +1175,15 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     // Nearest in the last slot, linear and clamped in the one before.
     let (near_id, lin_id) = (gfx::MAX_TEXTURES - 1, gfx::MAX_TEXTURES - 2);
-    d.gfx.set_texture(near_id, texv, 16, 16, proto::TEX_NEAREST);
-    d.gfx.set_texture(lin_id, texv, 16, 16, proto::TEX_CLAMP);
+    let texdesc = gfx::TexImage {
+        va: texv,
+        width: 16,
+        height: 16,
+        format: proto::TF_RGBA8,
+        block_log2: tt.block_log2,
+    };
+    d.gfx.set_texture(near_id, &texdesc, proto::TEX_NEAREST);
+    d.gfx.set_texture(lin_id, &texdesc, proto::TEX_CLAMP);
     let vertex = |x: f32, y: f32, u: f32, v: f32| -> [u8; 36] {
         let mut b = [0u8; 36];
         for (i, f) in [x, y, 0.0, 0.0, 0.0, 1.0, u, v].iter().enumerate() {

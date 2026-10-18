@@ -25,6 +25,8 @@ pub use validate::{validate, Info};
 #[cfg(test)]
 extern crate std;
 #[cfg(test)]
+mod layout_tests;
+#[cfg(test)]
 mod lower_tests;
 #[cfg(test)]
 mod sassim;

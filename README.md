@@ -92,6 +92,15 @@ on a PC, `cd shader && cargo test` runs the same programs through a
 simulator of the generated code that also checks the GPU's latency and
 scoreboard rules.
 
+`Graphics::render_target` makes an image of a game's own to draw on and
+then sample (`RenderTarget::texture`): RGBA8, R32F (shadow maps), RGBA16F
+(HDR) or RGBA32F, with a depth buffer if asked. The service attaches the
+same memory as a target and as a texture (`TARGET_ATTACH`,
+`TEXTURE_ATTACH` with the same format and block height); `Frame::target`
+switches to it and back (`Frame::screen`), waits for the pass before and
+drops the texture caches, so the next pass samples what was drawn. Not
+yet run on the console's GPU (the emulator draws nothing).
+
 ### Users and save data
 
 The console has users. On the first start `display` runs a setup (name

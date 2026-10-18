@@ -205,12 +205,82 @@ pub struct Sampling {
     pub clamp: bool,
 }
 
-/// An RGBA8 image the GPU samples (`Graphics::texture`).
+impl Sampling {
+    fn flags(self) -> u64 {
+        let mut f = 0;
+        if self.nearest {
+            f |= gpu::TEX_NEAREST;
+        }
+        if self.clamp {
+            f |= gpu::TEX_CLAMP;
+        }
+        f
+    }
+}
+
+/// What a texel or a pixel of a render target holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexFormat {
+    /// Four bytes (R, G, B, A), 0..255 read as 0..1.
+    Rgba8,
+    /// One 32-bit float (a sampler reads (r, 0, 0, 1)): shadow maps.
+    R32f,
+    /// Four 16-bit floats: HDR color.
+    Rgba16f,
+    /// Four 32-bit floats.
+    Rgba32f,
+}
+
+impl TexFormat {
+    fn code(self) -> u64 {
+        match self {
+            TexFormat::Rgba8 => gpu::TF_RGBA8,
+            TexFormat::R32f => gpu::TF_R32F,
+            TexFormat::Rgba16f => gpu::TF_RGBA16F,
+            TexFormat::Rgba32f => gpu::TF_RGBA32F,
+        }
+    }
+
+    /// Bytes per pixel.
+    pub fn bytes(self) -> u32 {
+        gpu::tf_bytes(self.code())
+    }
+}
+
+/// An image the GPU samples (`Graphics::texture`, `RenderTarget::texture`).
 pub struct Texture {
-    _mem: Shm,
+    _mem: Option<Shm>,
     id: u64,
     pub width: u32,
     pub height: u32,
+    pub format: TexFormat,
+}
+
+/// An image to draw on, which the GPU can sample afterwards (a shadow
+/// map, an HDR buffer for post-processing), with its own depth buffer if
+/// asked. `Frame::target` draws on it; the passes that follow can sample
+/// `texture()`.
+pub struct RenderTarget {
+    _mem: Shm,
+    _depth_mem: Option<Shm>,
+    color: u64,
+    depth: u32,
+    texture: Texture,
+}
+
+impl RenderTarget {
+    /// The image as a texture, for `Frame::bind_texture` / `Frame::texture`.
+    pub fn texture(&self) -> &Texture {
+        &self.texture
+    }
+
+    pub fn width(&self) -> u32 {
+        self.texture.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.texture.height
+    }
 }
 
 /// Parameters of `Pipe::Lit`: the shaders compute `mvp * position`,
@@ -245,20 +315,6 @@ impl LitUniforms {
         w[32] = self.diffuse.to_bits();
         w
     }
-}
-
-/// Byte offset of pixel (`x`, `y`) of a block-linear image of
-/// `width`-pixel rows of four bytes, blocks `1 << block_log2` GOBs high:
-/// GOBs of 64 x 8 bytes, swizzled inside (x bits 3-0, y bit 0, x bit 4,
-/// y bits 2-1, x bit 5).
-fn tiled_offset(width: u32, x: u32, y: u32, block_log2: u32) -> usize {
-    let (bx, gob_x) = ((x as usize * 4) % 64, (x as usize * 4) / 64);
-    let (gob_row, row) = (y as usize / 8, y as usize % 8);
-    let gobs_x = (width as usize * 4).div_ceil(64);
-    let block = (gob_row >> block_log2) * gobs_x + gob_x;
-    let in_block = gob_row & ((1 << block_log2) - 1);
-    let inner = (bx / 32) * 256 + (row / 2) * 64 + ((bx % 32) / 16) * 32 + (row % 2) * 16 + bx % 16;
-    block * (512 << block_log2) + in_block * 512 + inner
 }
 
 /// Vertices and indices in GPU-visible memory.
@@ -446,30 +502,80 @@ impl Graphics {
         let mut tiled = alloc::vec![0u8; bytes];
         for y in 0..height {
             for x in 0..width {
-                let at = tiled_offset(width, x, y, bl);
+                let at = gpu::tiled_offset(width, x, y, 4, bl);
                 let from = (y as usize * width as usize + x as usize) * 4;
                 tiled[at..at + 4].copy_from_slice(&rgba[from..from + 4]);
             }
         }
         let mem = Shm::new(bytes, shm::UNCACHED)?;
         mem.write(0, &tiled);
-        let mut flags = 0;
-        if sampling.nearest {
-            flags |= gpu::TEX_NEAREST;
-        }
-        if sampling.clamp {
-            flags |= gpu::TEX_CLAMP;
-        }
         let m = Msg::from_words(
             gpu::TEXTURE_ATTACH,
-            &[width as u64 | (height as u64) << 32, flags],
+            &[width as u64 | (height as u64) << 32, sampling.flags()],
         );
         let id = word(&self.gpu.call_with(m, mem.handle())?, 0);
         Ok(Texture {
-            _mem: mem,
+            _mem: Some(mem),
             id,
             width,
             height,
+            format: TexFormat::Rgba8,
+        })
+    }
+
+    /// An image to draw on and then sample, `width` x `height` pixels of
+    /// `format`, with a depth buffer if `depth`. Its texture is sampled
+    /// as `sampling` says (clamped is what a shadow map or a post-process
+    /// buffer wants).
+    pub fn render_target(
+        &self,
+        width: u32,
+        height: u32,
+        format: TexFormat,
+        depth: bool,
+        sampling: Sampling,
+    ) -> Result<RenderTarget> {
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err(-nxk_abi::err::EINVAL);
+        }
+        let bl = gpu::tex_block_log2(height);
+        let bytes = gpu::tiled_bytes_bpp(width, height, format.bytes(), bl);
+        let mem = Shm::new(bytes, shm::UNCACHED)?;
+        let size = width as u64 | (height as u64) << 32;
+        let m = Msg::from_words(
+            gpu::TARGET_ATTACH,
+            &[size, gpu::TARGET_COLOR, bl as u64, format.code()],
+        );
+        let color = word(&self.gpu.call_with(m, mem.handle())?, 0);
+        // The same memory as a texture: same format and block height.
+        let m = Msg::from_words(
+            gpu::TEXTURE_ATTACH,
+            &[size, sampling.flags(), format.code(), bl as u64 + 1],
+        );
+        let id = word(&self.gpu.call_with(m, mem.handle())?, 0);
+        let (depth_mem, depth_id) = if depth {
+            let dmem = Shm::new(
+                gpu::tiled_bytes(width, height, gpu::DEPTH_BLOCK_LOG2),
+                shm::UNCACHED,
+            )?;
+            let m = Msg::from_words(gpu::TARGET_ATTACH, &[size, gpu::TARGET_DEPTH, 0]);
+            let d = word(&self.gpu.call_with(m, dmem.handle())?, 0);
+            (Some(dmem), d as u32)
+        } else {
+            (None, gpu::NO_TARGET)
+        };
+        Ok(RenderTarget {
+            _mem: mem,
+            _depth_mem: depth_mem,
+            color,
+            depth: depth_id,
+            texture: Texture {
+                _mem: None,
+                id,
+                width,
+                height,
+                format,
+            },
         })
     }
 
@@ -593,6 +699,19 @@ impl Frame<'_> {
     fn push(&mut self, op: u32, args: &[u32]) {
         self.gfx.words.push(op | (args.len() as u32) << 16);
         self.gfx.words.extend_from_slice(args);
+    }
+
+    /// Draw on `t` (and its depth buffer) from here on, after the passes
+    /// before are done: they may have drawn what the next ones sample.
+    /// Choose the pipeline again: a draw needs one set for this target.
+    pub fn target(&mut self, t: &RenderTarget) {
+        self.push(gpu::CMD_TARGET, &[t.color as u32, t.depth]);
+    }
+
+    /// Draw on the screen's image again (the one `frame` began with).
+    pub fn screen(&mut self) {
+        let (c, z) = (self.gfx.images[self.back].id as u32, self.gfx.depth.id as u32);
+        self.push(gpu::CMD_TARGET, &[c, z]);
     }
 
     /// Color and depth to `rgba` and 1.0.

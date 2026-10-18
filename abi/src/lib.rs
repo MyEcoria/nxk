@@ -3,6 +3,8 @@
 
 #![no_std]
 
+mod gpu_layout;
+
 /// Syscall numbers; blocking calls take a timeout in ns.
 /// (`timeout::INFINITE` = 0: no limit; `timeout::POLL` fails fast).
 pub mod sys {
@@ -1485,9 +1487,16 @@ pub mod proto {
         pub const BUFFER_DETACH: u32 = 14;
         /// A block-linear color image or a depth buffer to draw on:
         /// handle 0 = shm with the `DMA` right; words: width | height <<
-        /// 32, kind (`TARGET_*`), block height (log2 of GOBs; the
-        /// scanout images have `display::SCANOUT`'s). Reply: word 0 =
-        /// target ID (its own numbering).
+        /// 32, kind (`TARGET_*`), block height (log2 of GOBs, no taller
+        /// than the image needs; the scanout images have
+        /// `display::SCANOUT`'s), format (`TF_*`, 0: RGBA8; colors only).
+        /// The shm is `tiled_bytes_bpp(width, height, tf_bytes(format),
+        /// block height)` long. The same shm can be attached as a
+        /// texture too (`TEXTURE_ATTACH`, same format and block height)
+        /// to sample what was drawn: a pass that draws it and one that
+        /// samples it are separated by a change of target, which waits
+        /// for the first to finish. Reply: word 0 = target ID (its own
+        /// numbering).
         pub const TARGET_ATTACH: u32 = 15;
         pub const TARGET_DETACH: u32 = 16;
         pub const TARGET_COLOR: u64 = 0;
@@ -1498,20 +1507,30 @@ pub mod proto {
         pub const RENDER: u32 = 17;
         /// Drop every buffer and target a client attached (it is gone).
         pub const RESET: u32 = 18;
+        pub use super::super::gpu_layout::{
+            level_block_log2, level_bytes, level_extent, level_offset, max_levels, mip_bytes,
+            tf_bytes, tiled_bytes_bpp, tiled_offset,
+        };
+        /// Formats of render targets and textures. RGBA8: four bytes, 0..255
+        /// read as 0..1; the others hold floats.
+        pub const TF_RGBA8: u64 = 0;
+        pub const TF_R32F: u64 = 1;
+        pub const TF_RGBA16F: u64 = 2;
+        pub const TF_RGBA32F: u64 = 3;
         /// Bytes of a block-linear image `width` x `height` of four-byte
         /// pixels, GOBs `1 << block_log2` high per block; the depth
         /// buffer is the same with 16 (`DEPTH_BLOCK_LOG2`).
         pub const fn tiled_bytes(width: u32, height: u32, block_log2: u32) -> usize {
-            let gobs_x = (width as usize * 4).div_ceil(64);
-            let rows = 8usize << block_log2;
-            gobs_x * (height as usize).div_ceil(rows) * (512usize << block_log2)
+            tiled_bytes_bpp(width, height, 4, block_log2)
         }
         pub const DEPTH_BLOCK_LOG2: u32 = 4;
         /// A texture to sample: handle 0 = shm with the `DMA` right
-        /// holding an RGBA8 image (bytes in R, G, B, A order) in
-        /// block-linear layout, `tiled_bytes(width, height,
-        /// tex_block_log2(height))` long; words: width | height << 32,
-        /// flags (`TEX_*`). Reply: word 0 = texture ID (its own
+        /// holding a block-linear image, `tiled_bytes_bpp(width, height,
+        /// tf_bytes(format), block height)` long; words: width | height
+        /// << 32, flags (`TEX_*`), format (`TF_*`, 0: RGBA8, bytes in R,
+        /// G, B, A order), block height (0: `tex_block_log2` of the
+        /// height; n: log2 of GOBs + 1, no taller than the image needs,
+        /// a render target's). Reply: word 0 = texture ID (its own
         /// numbering). The image is sampled normalized, without mipmaps.
         pub const TEXTURE_ATTACH: u32 = 19;
         /// word 0 = texture ID.
@@ -1533,7 +1552,9 @@ pub mod proto {
         }
         /// Commands: a word with the opcode (low 16 bits) and the count
         /// of words that follow (high 16), then those.
-        /// `[color target, depth target or NO_TARGET]`.
+        /// `[color target, depth target or NO_TARGET]`. Switching to another
+        /// target first waits for the draws before it and drops the texture
+        /// caches: what a pass drew can be sampled by the next.
         pub const CMD_TARGET: u32 = 1;
         /// `[r, g, b, a (f32 bits)]`: color to all the target, depth to 1.
         pub const CMD_CLEAR: u32 = 2;

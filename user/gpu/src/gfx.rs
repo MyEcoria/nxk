@@ -268,29 +268,32 @@ pub struct Tiled {
     pub va: u64,
     pub width: u32,
     pub height: u32,
+    /// `SET_COLOR_TARGET_FORMAT` value (`color_format`).
     pub format: u32,
+    /// Bytes per pixel.
+    pub bpp: u32,
     pub block_log2: u32,
 }
 
 impl Tiled {
     pub fn bytes(&self) -> usize {
-        let gobs_x = (self.width as u64 * 4).div_ceil(GOB_WIDTH);
-        let rows = GOB_ROWS << self.block_log2;
-        let blocks_y = (self.height as u64).div_ceil(rows);
-        (gobs_x * blocks_y * (GOB_BYTES << self.block_log2)) as usize
+        proto::tiled_bytes_bpp(self.width, self.height, self.bpp, self.block_log2)
     }
 
-    /// Byte offset of pixel (x, y), four bytes each (the GOB's swizzle:
-    /// x bits 3-0, y bit 0, x bit 4, y bits 2-1, x bit 5).
+    /// Byte offset of pixel (x, y).
     pub fn offset(&self, x: u32, y: u32) -> usize {
-        let (bx, gob_x) = ((x as u64 * 4) % GOB_WIDTH, (x as u64 * 4) / GOB_WIDTH);
-        let (gob_row, row) = ((y as u64) / GOB_ROWS, (y as u64) % GOB_ROWS);
-        let gobs_x = (self.width as u64 * 4).div_ceil(GOB_WIDTH);
-        let block = (gob_row >> self.block_log2) * gobs_x + gob_x;
-        let in_block = gob_row & ((1 << self.block_log2) - 1);
-        let inner =
-            (bx / 32) * 256 + (row / 2) * 64 + ((bx % 32) / 16) * 32 + (row % 2) * 16 + bx % 16;
-        (block * (GOB_BYTES << self.block_log2) + in_block * GOB_BYTES + inner) as usize
+        proto::tiled_offset(self.width, x, y, self.bpp, self.block_log2)
+    }
+}
+
+/// `SET_COLOR_TARGET_FORMAT` value of a `proto::TF_*` format.
+pub fn color_format(tf: u64) -> Option<u32> {
+    match tf {
+        proto::TF_RGBA8 => Some(proto::FMT_A8B8G8R8 as u32),
+        proto::TF_R32F => Some(0xE5),
+        proto::TF_RGBA16F => Some(0xCA),
+        proto::TF_RGBA32F => Some(0xC0),
+        _ => None,
     }
 }
 
@@ -560,33 +563,60 @@ fn bits(w: &mut [u32; 8], lo: usize, hi: usize, v: u32) {
     }
 }
 
+/// An image to sample: block-linear at `va` (512-byte aligned), `format`
+/// a `proto::TF_*`, blocks `1 << block_log2` GOBs high.
+#[derive(Clone, Copy)]
+pub struct TexImage {
+    pub va: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: u64,
+    pub block_log2: u32,
+}
+
 /// Texture header (TIC, `TEXHEAD_BL`, as NIL's `nvb097_fill_image_view_desc`
-/// writes it): RGBA8 unorm, block-linear, 2D, one level, normalized.
-fn tic(va: u64, width: u32, height: u32) -> [u32; 8] {
-    const A8B8G8R8: u32 = 8;
+/// writes it): block-linear, 2D, one level, normalized.
+fn tic(t: &TexImage) -> [u32; 8] {
+    const SIZES_RGBA8: u32 = 8;
+    const SIZES_R32: u32 = 0x0F;
+    const SIZES_RGBA16: u32 = 3;
+    const SIZES_RGBA32: u32 = 1;
     const UNORM: u32 = 2;
+    const FLOAT: u32 = 7;
+    const SOURCE_ZERO: u32 = 0;
     const SOURCE_R: u32 = 2;
+    const SOURCE_ONE_FLOAT: u32 = 7;
     const BLOCKLINEAR: u32 = 3;
     const TWO_D: u32 = 1;
     const BORDER_FROM_SAMPLER: u32 = 7;
-    assert!(va.is_multiple_of(512) && va >> 48 == 0);
+    let (sizes, ty, src) = match t.format {
+        proto::TF_R32F => (
+            SIZES_R32,
+            FLOAT,
+            [SOURCE_R, SOURCE_ZERO, SOURCE_ZERO, SOURCE_ONE_FLOAT],
+        ),
+        proto::TF_RGBA16F => (SIZES_RGBA16, FLOAT, [SOURCE_R, 3, 4, 5]),
+        proto::TF_RGBA32F => (SIZES_RGBA32, FLOAT, [SOURCE_R, 3, 4, 5]),
+        _ => (SIZES_RGBA8, UNORM, [SOURCE_R, 3, 4, 5]),
+    };
+    assert!(t.va.is_multiple_of(512) && t.va >> 48 == 0);
     let mut w = [0u32; 8];
-    bits(&mut w, 0, 6, A8B8G8R8);
+    bits(&mut w, 0, 6, sizes);
     for c in 0..4 {
-        bits(&mut w, 7 + 3 * c, 9 + 3 * c, UNORM);
-        bits(&mut w, 19 + 3 * c, 21 + 3 * c, SOURCE_R + c as u32);
+        bits(&mut w, 7 + 3 * c, 9 + 3 * c, ty);
+        bits(&mut w, 19 + 3 * c, 21 + 3 * c, src[c]);
     }
-    bits(&mut w, 41, 63, (va >> 9) as u32 & 0x7F_FFFF);
-    bits(&mut w, 64, 79, (va >> 32) as u32);
+    bits(&mut w, 41, 63, (t.va >> 9) as u32 & 0x7F_FFFF);
+    bits(&mut w, 64, 79, (t.va >> 32) as u32);
     bits(&mut w, 85, 87, BLOCKLINEAR);
-    // One GOB wide blocks, as tall as the image needs.
-    bits(&mut w, 99, 101, proto::tex_block_log2(height));
+    // One GOB wide blocks.
+    bits(&mut w, 99, 101, t.block_log2);
     // LOD quality as NIL sets it.
     bits(&mut w, 112, 114, 0b111);
-    bits(&mut w, 128, 143, width - 1);
+    bits(&mut w, 128, 143, t.width - 1);
     bits(&mut w, 151, 154, TWO_D);
     bits(&mut w, 157, 159, BORDER_FROM_SAMPLER);
-    bits(&mut w, 160, 175, height - 1);
+    bits(&mut w, 160, 175, t.height - 1);
     bits(&mut w, 191, 191, 1); // normalized coordinates
     bits(&mut w, 215, 216, 2); // aniso spread functions, as NIL
     bits(&mut w, 217, 218, 1);
@@ -689,11 +719,10 @@ impl Gfx {
     }
 
     /// Texture `id`: its header and sampler written to the pools; the
-    /// image (RGBA8, block-linear, `va` on a 512-byte boundary) is the
-    /// caller's. The batch that follows sees them (`begin` invalidates the
-    /// caches).
-    pub fn set_texture(&self, id: usize, va: u64, width: u32, height: u32, flags: u64) {
-        self.tics.words(id * POOL_ENTRY, &tic(va, width, height));
+    /// image is the caller's. The batch that follows sees them (`begin`
+    /// invalidates the caches).
+    pub fn set_texture(&self, id: usize, img: &TexImage, flags: u64) {
+        self.tics.words(id * POOL_ENTRY, &tic(img));
         self.tscs.words(id * POOL_ENTRY, &tsc(flags));
     }
 

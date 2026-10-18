@@ -21,6 +21,7 @@ Then:  cargo +nxk build -Z build-std=std,panic_abort \\
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -260,6 +261,10 @@ def main():
             changed.append(str(rel))
     # Kernel ABI, single source shared with the kernel and libnx.
     abi = (ROOT / "abi" / "src" / "lib.rs").read_text().replace("#![no_std]\n", "")
+    # std takes the ABI as one file: `mod x;` becomes the body of x.rs.
+    for m in re.findall(r"^mod (\w+);$", abi, re.M):
+        body = (ROOT / "abi" / "src" / f"{m}.rs").read_text()
+        abi = abi.replace(f"mod {m};", f"mod {m} {{\n{body}}}", 1)
     if write_if_changed(lib / "std/src/sys/pal/nxk/abi.rs", abi):
         changed.append("std/src/sys/pal/nxk/abi.rs")
 

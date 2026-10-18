@@ -18,8 +18,8 @@ use nxk_shader::{wire, Stage};
 
 use crate::engine::Compute;
 use crate::gfx::{
-    attr_word, Color, Custom, Depth, Gfx, Layout, Pipe, Target, Tiled, ATTR_INACTIVE,
-    LIT_UBO_WORDS, MAX_TEXTURES,
+    attr_word, color_format, Color, Custom, Depth, Gfx, Layout, Pipe, Target, TexImage, Tiled,
+    ATTR_INACTIVE, LIT_UBO_WORDS, MAX_TEXTURES,
 };
 use crate::mmu::{self, Vm, PAGE};
 use crate::push::Push;
@@ -165,6 +165,7 @@ impl Client {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn attach_target(
         &mut self,
         vm: &mut Vm,
@@ -173,24 +174,34 @@ impl Client {
         height: u32,
         kind: u64,
         block_log2: u32,
+        format: u64,
     ) -> Res<u64> {
         let held = Held::Raw(h);
         if width == 0 || height == 0 || width > 16384 || height > 16384 || block_log2 > 5 {
             return Err(-EINVAL);
         }
         let (mk, bl, image) = match kind {
-            proto::TARGET_COLOR => (
-                mmu::KIND_GENERIC_16BX2,
-                block_log2,
-                Image::Color(Tiled {
-                    va: 0,
-                    width,
-                    height,
-                    format: proto::FMT_A8B8G8R8 as u32,
+            proto::TARGET_COLOR => {
+                let code = color_format(format).ok_or(-EINVAL)?;
+                // A block taller than the image needs is not what the
+                // sampler reads it as.
+                if proto::level_block_log2(block_log2, height) != block_log2 {
+                    return Err(-EINVAL);
+                }
+                (
+                    mmu::KIND_GENERIC_16BX2,
                     block_log2,
-                }),
-            ),
-            proto::TARGET_DEPTH => (
+                    Image::Color(Tiled {
+                        va: 0,
+                        width,
+                        height,
+                        format: code,
+                        bpp: proto::tf_bytes(format),
+                        block_log2,
+                    }),
+                )
+            }
+            proto::TARGET_DEPTH if format == proto::TF_RGBA8 => (
                 mmu::KIND_ZF32,
                 proto::DEPTH_BLOCK_LOG2,
                 Image::Depth(Depth {
@@ -201,7 +212,10 @@ impl Client {
             ),
             _ => return Err(-EINVAL),
         };
-        let bytes = proto::tiled_bytes(width, height, bl) as u64;
+        let bytes = match &image {
+            Image::Color(c) => c.bytes(),
+            Image::Depth(_) => proto::tiled_bytes(width, height, bl),
+        } as u64;
         let pg = pages(h, bytes)?;
         let i = slot(&mut self.tgts, MAX_TARGETS)?;
         let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
@@ -233,7 +247,9 @@ impl Client {
     }
 
     /// `h`: the client's shm with the image, which this takes (closed on
-    /// error too). The pool entries go in `gfx`.
+    /// error too). The pool entries go in `gfx`. `block`: 0 for the
+    /// automatic block height, else log2 of GOBs + 1.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach_texture(
         &mut self,
         vm: &mut Vm,
@@ -242,6 +258,8 @@ impl Client {
         width: u32,
         height: u32,
         flags: u64,
+        format: u64,
+        block: u64,
     ) -> Res<u64> {
         let held = Held::Raw(h);
         if width == 0
@@ -249,16 +267,34 @@ impl Client {
             || width > 8192
             || height > 8192
             || flags & !(proto::TEX_NEAREST | proto::TEX_CLAMP) != 0
+            || block > 6
         {
             return Err(-EINVAL);
         }
-        let bytes = proto::tiled_bytes(width, height, proto::tex_block_log2(height)) as u64;
+        let bpp = proto::tf_bytes(format);
+        color_format(format).ok_or(-EINVAL)?;
+        let block_log2 = if block == 0 {
+            proto::tex_block_log2(height)
+        } else {
+            block as u32 - 1
+        };
+        if proto::level_block_log2(block_log2, height) != block_log2 {
+            return Err(-EINVAL);
+        }
+        let bytes = proto::tiled_bytes_bpp(width, height, bpp, block_log2) as u64;
         let pg = pages(h, bytes)?;
         let i = slot(&mut self.texs, MAX_TEXTURES)?;
         let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
         vm.map_at_kind(va, &pg, false, mmu::KIND_GENERIC_16BX2)
             .map_err(|(e, _)| -e)?;
-        gfx.set_texture(i, va, width, height, flags);
+        let img = TexImage {
+            va,
+            width,
+            height,
+            format,
+            block_log2,
+        };
+        gfx.set_texture(i, &img, flags);
         self.texs[i] = Some(Tex {
             va,
             bytes,
@@ -679,6 +715,7 @@ impl Client {
         gfx.begin(&mut p);
         let mut at = 0;
         let mut target: Option<Target> = None;
+        let mut bound: Option<(u32, u32)> = None;
         let mut cur: Option<Cur> = None;
         // Uniforms are written before a draw, once they or the texture
         // changed.
@@ -692,7 +729,16 @@ impl Client {
                 return Err(-ENOSPC);
             }
             match (op, a) {
-                (proto::CMD_TARGET, &[c, z]) => target = Some(self.target(c, z)?),
+                (proto::CMD_TARGET, &[c, z]) => {
+                    target = Some(self.target(c, z)?);
+                    // The pass before may have drawn what this one samples.
+                    if bound.is_some_and(|b| b != (c, z)) {
+                        gfx.barrier(&mut p);
+                    }
+                    bound = Some((c, z));
+                    // Draws wait for a pipeline set on this target.
+                    cur = None;
+                }
                 (proto::CMD_CLEAR, &[r, g, b, al]) => {
                     let t = target.as_ref().ok_or(-EINVAL)?;
                     gfx.clear(&mut p, t, [r, g, b, al].map(f32::from_bits));

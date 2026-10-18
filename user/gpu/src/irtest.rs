@@ -249,7 +249,14 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         d.vm.map_kind(&tex, false, mmu::KIND_GENERIC_16BX2, 1 << 17)
             .map_err(e)?;
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
-    d.gfx.set_texture(0, tva, 8, 8, 0);
+    let img8 = gfx::TexImage {
+        va: tva,
+        width: 8,
+        height: 8,
+        format: proto::TF_RGBA8,
+        block_log2: proto::tex_block_log2(8),
+    };
+    d.gfx.set_texture(0, &img8, 0);
     let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
         return Err(-libnx::abi::err::ENOSPC);
     };
