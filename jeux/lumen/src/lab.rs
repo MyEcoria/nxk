@@ -9,7 +9,9 @@
 //!   the GPU (a BVH walked by a compute shader), each hit sending a
 //!   shadow ray to the sun: the hybrid raytracing, shown as a heat map.
 
-use nxgfx::raytrace::{self, RtKernels, RtScene, Triangle};
+use std::rc::Rc;
+
+use nxgfx::raytrace::{self, RtKernels, RtScene};
 use nxgfx::{rgb, Buffer, Button, Canvas, Frame, Graphics};
 
 use crate::meshes::{normalize, V};
@@ -37,7 +39,7 @@ pub struct Lab {
 }
 
 pub struct RayRoom {
-    scene: RtScene,
+    scene: Rc<RtScene>,
     kernels: RtKernels,
     primary: Buffer,
     hits: Buffer,
@@ -108,19 +110,17 @@ impl Lab {
     pub fn hud(&self, c: &mut Canvas) {
         let (avg, min, max) = self.stats();
         c.text(28.0, 24.0, 3.0, "LAB", rgb(255, 200, 80));
-        let title = format!(
-            "{} {}/{}",
-            ROOMS[self.room],
-            self.room + 1,
-            ROOMS.len()
-        );
+        let title = format!("{} {}/{}", ROOMS[self.room], self.room + 1, ROOMS.len());
         c.text(110.0, 24.0, 3.0, &title, rgb(255, 255, 255));
         let fps = if avg > 0.0 { 1000.0 / avg } else { 0.0 };
         c.text(
             28.0,
             62.0,
             2.0,
-            &format!("{:.1} FPS  {:.1} MS (MIN {:.1} MAX {:.1})", fps, avg, min, max),
+            &format!(
+                "{:.1} FPS  {:.1} MS (MIN {:.1} MAX {:.1})",
+                fps, avg, min, max
+            ),
             rgb(200, 220, 255),
         );
         c.text(
@@ -170,14 +170,24 @@ impl Lab {
     }
 
     /// Vertices of `n` billboards around the player, moving.
-    pub fn particle_vertices(&self, t: f32, around: [f32; 3], right: [f32; 3], up: [f32; 3]) -> Vec<V> {
+    pub fn particle_vertices(
+        &self,
+        t: f32,
+        around: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+    ) -> Vec<V> {
         let mut v = Vec::with_capacity(self.particles as usize * 4);
         for k in 0..self.particles {
             let f = k as f32;
             let a = f * 2.399 + t * (0.2 + (f * 0.37).fract() * 0.5);
             let r = 3.0 + (f * 0.618).fract() * 9.0;
             let y = 0.5 + ((f * 0.131).fract() * 6.0 + t * 0.7 * (1.0 + (f * 0.07).fract())) % 6.0;
-            let c = [around[0] + r * a.cos(), around[1] + y, around[2] + r * a.sin()];
+            let c = [
+                around[0] + r * a.cos(),
+                around[1] + y,
+                around[2] + r * a.sin(),
+            ];
             let s = 0.12 + (f * 0.29).fract() * 0.22;
             let hue = (f * 0.071 + t * 0.05).fract();
             let col = [
@@ -220,19 +230,12 @@ impl Lab {
     }
 
     /// Resources of the ray room: the tree over the valley's triangles.
-    pub fn ensure_rays(&mut self, g: &Graphics, tris: &[Triangle]) {
+    /// `scene`: the game's tree (built once at load, in `build_ms`).
+    pub fn ensure_rays(&mut self, g: &Graphics, scene: &Rc<RtScene>, build_ms: f32) {
         if self.rays.is_some() {
             return;
         }
-        let t0 = g.seconds();
-        let scene = match g.rt_scene(tris) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("lumen: ray scene: {:?}", e);
-                return;
-            }
-        };
-        let build_ms = (g.seconds() - t0) * 1000.0;
+        let scene = scene.clone();
         let (Ok(kernels), Ok(primary), Ok(hits), Ok(shadow), Ok(shadow_hits)) = (
             g.rt_kernels(),
             g.rt_rays(RAYS),
@@ -263,7 +266,15 @@ impl Lab {
 impl RayRoom {
     /// Record both queries for this frame: the camera's rays, and the
     /// shadow rays for last frame's hits.
-    pub fn trace(&mut self, f: &mut Frame, eye: [f32; 3], fwd: [f32; 3], right: [f32; 3], up: [f32; 3], sun: [f32; 3]) {
+    pub fn trace(
+        &mut self,
+        f: &mut Frame,
+        eye: [f32; 3],
+        fwd: [f32; 3],
+        right: [f32; 3],
+        up: [f32; 3],
+        sun: [f32; 3],
+    ) {
         let tan = (1.0f32 / 2.0).tan();
         let aspect = RAY_COLS as f32 / RAY_ROWS as f32;
         for y in 0..RAY_ROWS {
@@ -305,8 +316,22 @@ impl RayRoom {
                 raytrace::write_ray(&self.shadow, i, &sray);
             }
         }
-        f.trace(&self.kernels, &self.scene, &self.shadow, &self.shadow_hits, RAYS as u32, true);
-        f.trace(&self.kernels, &self.scene, &self.primary, &self.hits, RAYS as u32, false);
+        f.trace(
+            &self.kernels,
+            &self.scene,
+            &self.shadow,
+            &self.shadow_hits,
+            RAYS as u32,
+            true,
+        );
+        f.trace(
+            &self.kernels,
+            &self.scene,
+            &self.primary,
+            &self.hits,
+            RAYS as u32,
+            false,
+        );
         self.eye = eye;
     }
 
@@ -353,7 +378,13 @@ impl RayRoom {
                 } else {
                     [0.45, 0.62, 0.9, 1.0]
                 };
-                c.rect(x0 + x as f32 * cw, y0 + y as f32 * ch, cw + 0.5, ch + 0.5, col);
+                c.rect(
+                    x0 + x as f32 * cw,
+                    y0 + y as f32 * ch,
+                    cw + 0.5,
+                    ch + 0.5,
+                    col,
+                );
             }
         }
         c.rect(x0 - 4.0, y0 - 4.0, w + 8.0, h + 8.0, [0.0, 0.0, 0.0, 1.0]);

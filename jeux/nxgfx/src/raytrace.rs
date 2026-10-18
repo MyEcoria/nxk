@@ -76,6 +76,16 @@ pub fn write_ray(rays: &Buffer, i: usize, r: &Ray) {
     rays.write_words(i * RAY_WORDS, &r.words());
 }
 
+impl RtScene {
+    /// Bind the tree and the triangles to the slots the ray kernels read
+    /// them from (`kernel::Slots`).
+    pub fn bind(&self, f: &mut Frame) {
+        let s = kernel::Slots::default();
+        f.bind_buffer(s.nodes as u32, &self.nodes);
+        f.bind_buffer(s.tris as u32, &self.tris);
+    }
+}
+
 impl Frame<'_> {
     /// Trace the first `count` rays of `rays` against `scene`, answers in
     /// `hits` (see `Graphics::rt_hits`). Uses buffer slots 0-3 and the

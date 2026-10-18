@@ -1,7 +1,8 @@
 //! The game's shaders, written in the IR: one lit vertex and fragment pair
 //! for everything solid (a sun, a hemisphere light, distance fog, gamma).
 
-use nxgfx::ir::{Builder, OutKind, Program, Reg, Stage, Ty};
+use nxgfx::ir::rt::shadow::lit_factor as shadow_factor;
+use nxgfx::ir::{Builder, CmpOp, OutKind, Program, Reg, Stage, Ty};
 
 /// Uniform words: the model-view-projection rows, the model rows (3x4,
 /// rotation and translation, no scale), the lights and the tint.
@@ -19,7 +20,12 @@ pub const U_CAMERA: u16 = 44;
 pub const U_TINT: u16 = 47;
 /// Added light, times the albedo.
 pub const U_EMISSIVE: u16 = 51;
-pub const WORDS: usize = 52;
+/// Ray-traced shadows: 1 when the mask (buffer slot 0) applies, then its
+/// size in texels.
+pub const U_SHADOW_ON: u16 = 52;
+pub const U_SHADOW_W: u16 = 53;
+pub const U_SHADOW_H: u16 = 54;
+pub const WORDS: usize = 55;
 
 fn dot3(b: &mut Builder, a: [Reg; 3], c: [Reg; 3]) -> Reg {
     let x = b.fmul(a[0], c[0]);
@@ -42,6 +48,7 @@ pub fn vertex() -> Program {
     let p = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
     let n = [b.input(1, 0), b.input(1, 1), b.input(1, 2)];
     let c = [b.input(2, 0), b.input(2, 1), b.input(2, 2), b.input(2, 3)];
+    let mut clip = [b.f32(0.0); 4];
     for row in 0..4u16 {
         let mut acc = b.uniform(U_MVP + 4 * row + 3, Ty::F32);
         for (j, pj) in p.iter().enumerate() {
@@ -49,7 +56,13 @@ pub fn vertex() -> Program {
             acc = b.fma(m, *pj, acc);
         }
         b.output(OutKind::Position, row as u8, acc);
+        clip[row as usize] = acc;
     }
+    // Clip x, y and w, interpolated like any attribute: the fragment
+    // shader finds its place on the screen from them.
+    b.output(OutKind::Varying(3), 0, clip[0]);
+    b.output(OutKind::Varying(3), 1, clip[1]);
+    b.output(OutKind::Varying(3), 2, clip[3]);
     for row in 0..3u16 {
         let mut acc = b.uniform(U_MODEL + 4 * row + 3, Ty::F32);
         let mut nrm = b.f32(0.0);
@@ -72,6 +85,7 @@ pub fn fragment() -> Program {
     let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
     let col = [b.input(1, 0), b.input(1, 1), b.input(1, 2), b.input(1, 3)];
     let w = [b.input(2, 0), b.input(2, 1), b.input(2, 2)];
+    let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
     // Normalize the interpolated normal.
     let len2 = dot3(&mut b, n, n);
     let tiny = b.f32(1e-8);
@@ -113,11 +127,32 @@ pub fn fragment() -> Program {
     let f = b.fsub(one, t);
     let f = b.fsat(f);
     let zero = b.f32(0.0);
+    // The sun's share from the ray-traced mask, filtered at this pixel.
+    let shadow = b.copy(one);
+    let on = b.uniform(U_SHADOW_ON, Ty::F32);
+    let enabled = b.cmp(CmpOp::Gt, on, zero);
+    b.if_(enabled, |b| {
+        let low = [
+            b.uniform(U_SHADOW_W, Ty::F32),
+            b.uniform(U_SHADOW_H, Ty::F32),
+        ];
+        let rw = b.frcp(clip[2]);
+        let (nx, ny) = (b.fmul(clip[0], rw), b.fmul(clip[1], rw));
+        let half = b.f32(0.5);
+        let (hw, hh) = (b.fmul(low[0], half), b.fmul(low[1], half));
+        let mhh = b.fneg(hh);
+        let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
+        let px = b.fma(nx, hw, ox);
+        let py = b.fma(ny, mhh, oy);
+        let f = shadow_factor(b, 0, px, py, dist, low);
+        b.mov(shadow, f);
+    });
+    let sun_term = b.fmul(ndl, shadow);
     for i in 0..3 {
         let albedo = b.fmul(col[i], tint[i]);
         let span = b.fsub(sky[i], ground[i]);
         let hemi = b.fma(span, h, ground[i]);
-        let light = b.fma(sun_c[i], ndl, hemi);
+        let light = b.fma(sun_c[i], sun_term, hemi);
         let light = b.fadd(light, emissive);
         let lit = b.fmul(albedo, light);
         let to_fog = b.fsub(fog[i], lit);
@@ -129,5 +164,46 @@ pub fn fragment() -> Program {
     }
     let a = b.fmul(col[3], tint[3]);
     b.output(OutKind::Color(0), 3, a);
+    b.finish()
+}
+
+/// The shadow pre-pass: the world position of the surface (pushed off it
+/// along the normal), and in w its distance from the camera, or 0 where
+/// the sun does not reach it anyway (facing away) and no ray is needed.
+pub fn position_fragment() -> Program {
+    let mut b = Builder::new(Stage::Fragment);
+    let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
+    let w = [b.input(2, 0), b.input(2, 1), b.input(2, 2)];
+    let len2 = dot3(&mut b, n, n);
+    let tiny = b.f32(1e-8);
+    let len2 = b.fmax(len2, tiny);
+    let len = b.fsqrt(len2);
+    let rl = b.frcp(len);
+    let n = [b.fmul(n[0], rl), b.fmul(n[1], rl), b.fmul(n[2], rl)];
+    let sun = uni3(&mut b, U_SUN_DIR);
+    let cam = uni3(&mut b, U_CAMERA);
+    let ndl = dot3(&mut b, n, sun);
+    let lit = b.fsat(ndl);
+    // A little more offset where the sun grazes the surface.
+    let one = b.f32(1.0);
+    let graze = b.fsub(one, lit);
+    let (slope, base) = (b.f32(0.06), b.f32(0.04));
+    let bias = b.fma(graze, slope, base);
+    for i in 0..3 {
+        let p = b.fma(n[i], bias, w[i]);
+        b.output(OutKind::Color(0), i as u8, p);
+    }
+    let d = [
+        b.fsub(w[0], cam[0]),
+        b.fsub(w[1], cam[1]),
+        b.fsub(w[2], cam[2]),
+    ];
+    let d2 = dot3(&mut b, d, d);
+    let dist = b.fsqrt(d2);
+    let zero = b.f32(0.0);
+    let floor = b.f32(0.02);
+    let facing = b.cmp(CmpOp::Gt, ndl, floor);
+    let out = b.sel(facing, dist, zero);
+    b.output(OutKind::Color(0), 3, out);
     b.finish()
 }

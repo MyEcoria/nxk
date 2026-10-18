@@ -83,10 +83,7 @@ impl Terrain {
         let mut h = Vec::with_capacity(N * N);
         for j in 0..N {
             for i in 0..N {
-                h.push(raw_height(
-                    i as f32 * CELL - HALF,
-                    j as f32 * CELL - HALF,
-                ));
+                h.push(raw_height(i as f32 * CELL - HALF, j as f32 * CELL - HALF));
             }
         }
         Self { h }
@@ -180,7 +177,10 @@ pub fn scatter(t: &Terrain, seed: u32) -> Scenery {
     let mut tries = 0;
     while placed < 230 && tries < 6000 {
         tries += 1;
-        let (x, z) = (rng.range(-HALF + 6.0, HALF - 6.0), rng.range(-HALF + 6.0, HALF - 6.0));
+        let (x, z) = (
+            rng.range(-HALF + 6.0, HALF - 6.0),
+            rng.range(-HALF + 6.0, HALF - 6.0),
+        );
         let y = t.height(x, z);
         let n = t.normal(x, z);
         if (x * x + z * z).sqrt() < 18.0 || n[1] < 0.84 || !(WATER + 0.9..17.0).contains(&y) {
@@ -194,14 +194,23 @@ pub fn scatter(t: &Terrain, seed: u32) -> Scenery {
             [x + 0.18 * s, y + 1.6 * s, z + 0.18 * s],
             trunk,
         );
-        for (k, (r, h)) in [(1.5, 1.7), (1.15, 1.5), (0.8, 1.3)].into_iter().enumerate() {
+        for (k, (r, h)) in [(1.5, 1.7), (1.15, 1.5), (0.8, 1.3)]
+            .into_iter()
+            .enumerate()
+        {
             let green = [
                 (34.0 * g) as u8,
                 ((96.0 + 18.0 * k as f32) * g) as u8,
                 (44.0 * g) as u8,
                 255,
             ];
-            trees.cone([x, y + (0.9 + 1.0 * k as f32) * s, z], r * s, h * s, 7, green);
+            trees.cone(
+                [x, y + (0.9 + 1.0 * k as f32) * s, z],
+                r * s,
+                h * s,
+                7,
+                green,
+            );
         }
         placed += 1;
     }
@@ -209,7 +218,10 @@ pub fn scatter(t: &Terrain, seed: u32) -> Scenery {
     tries = 0;
     while count < 70 && tries < 4000 {
         tries += 1;
-        let (x, z) = (rng.range(-HALF + 6.0, HALF - 6.0), rng.range(-HALF + 6.0, HALF - 6.0));
+        let (x, z) = (
+            rng.range(-HALF + 6.0, HALF - 6.0),
+            rng.range(-HALF + 6.0, HALF - 6.0),
+        );
         let y = t.height(x, z);
         let n = t.normal(x, z);
         if (x * x + z * z).sqrt() < 12.0 || y < WATER + 0.3 || n[1] > 0.9 {

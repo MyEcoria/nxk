@@ -1,7 +1,7 @@
 //! The hero: a walking figure of boxes, and the controller that moves it
 //! over the ground.
 
-use nxgfx::{Mat4, vec3};
+use nxgfx::{vec3, Mat4};
 
 use crate::meshes::MeshData;
 use crate::world::{Terrain, HALF, WATER};
@@ -96,11 +96,23 @@ pub fn figure() -> Figure {
     head.cuboid([-0.15, 0.0, -0.15], [0.15, 0.3, 0.15], [236, 196, 160, 255]);
     head.cuboid([-0.16, 0.2, -0.16], [0.16, 0.34, 0.16], [70, 46, 30, 255]);
     let mut arm = MeshData::new();
-    arm.cuboid([-0.07, -0.58, -0.07], [0.07, 0.0, 0.07], [236, 196, 160, 255]);
-    arm.cuboid([-0.075, -0.2, -0.075], [0.075, 0.0, 0.075], [220, 90, 60, 255]);
+    arm.cuboid(
+        [-0.07, -0.58, -0.07],
+        [0.07, 0.0, 0.07],
+        [236, 196, 160, 255],
+    );
+    arm.cuboid(
+        [-0.075, -0.2, -0.075],
+        [0.075, 0.0, 0.075],
+        [220, 90, 60, 255],
+    );
     let mut leg = MeshData::new();
     leg.cuboid([-0.1, -0.74, -0.11], [0.1, 0.0, 0.11], [52, 66, 120, 255]);
-    leg.cuboid([-0.105, -0.74, -0.12], [0.105, -0.6, 0.16], [60, 40, 30, 255]);
+    leg.cuboid(
+        [-0.105, -0.74, -0.12],
+        [0.105, -0.6, 0.16],
+        [60, 40, 30, 255],
+    );
     Figure {
         torso,
         head,

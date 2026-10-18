@@ -15,17 +15,21 @@ mod light;
 mod meshes;
 mod player;
 mod shaders;
+mod shadow;
 mod world;
 
-use nxgfx::raytrace::Triangle;
+use std::rc::Rc;
+
+use nxgfx::raytrace::{RtScene, Triangle};
 use nxgfx::{
-    rgb, vec3, Attr, Blend, Button, Canvas, Cull, Event, Frame, Graphics, Mat4, Mesh, Phase,
-    Pipeline, PipelineDesc, Sound, Stick, Audio, HEIGHT, WIDTH,
+    rgb, vec3, Attr, Audio, Blend, Button, Canvas, Cull, Event, Frame, Graphics, Mat4, Mesh, Phase,
+    Pipeline, PipelineDesc, Sound, Stick, HEIGHT, WIDTH,
 };
 
 use lab::Lab;
 use meshes::MeshData;
 use shaders::*;
+use shadow::Shadows;
 
 struct Pipes {
     lit: Pipeline,
@@ -35,6 +39,11 @@ struct Pipes {
 
 struct Assets {
     pipes: Pipes,
+    /// The valley's tree and the ray-traced sun shadows (none when the
+    /// tree does not build: the sun then lights without shadows).
+    scene: Option<Rc<RtScene>>,
+    shadows: Option<Shadows>,
+    bvh_ms: f32,
     terrain: Mesh,
     trees: Mesh,
     rocks: Mesh,
@@ -49,6 +58,15 @@ struct Assets {
 
 fn mesh(g: &Graphics, m: &MeshData) -> nxgfx::Result<Mesh> {
     g.mesh_raw(&m.v, &m.i)
+}
+
+fn world_triangles(terrain: &MeshData, scenery: &world::Scenery) -> Vec<Triangle> {
+    let mut t = terrain.triangles(0);
+    let n = t.len() as u32;
+    t.extend(scenery.trees.triangles(n));
+    let n = t.len() as u32;
+    t.extend(scenery.rocks.triangles(n));
+    t
 }
 
 fn load(g: &Graphics, terrain: &MeshData, scenery: &world::Scenery) -> nxgfx::Result<Assets> {
@@ -67,6 +85,24 @@ fn load(g: &Graphics, terrain: &MeshData, scenery: &world::Scenery) -> nxgfx::Re
         alpha: g.pipeline_from(&desc(Cull::None, Blend::Alpha))?,
         add: g.pipeline_from(&desc(Cull::None, Blend::Additive))?,
     };
+    let t0 = g.seconds();
+    let scene = match g.rt_scene(&world_triangles(terrain, scenery)) {
+        Ok(s) => Some(Rc::new(s)),
+        Err(e) => {
+            eprintln!("lumen: ray scene: {:?}", e);
+            None
+        }
+    };
+    let bvh_ms = (g.seconds() - t0) * 1000.0;
+    let shadows = scene.as_ref().and_then(|sc| {
+        match Shadows::new(g, sc.clone(), &vs, meshes::STRIDE, &attrs) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("lumen: shadows: errno {}", -e);
+                None
+            }
+        }
+    });
     let mut water = MeshData::new();
     let h = world::HALF * 1.2;
     water.quad(
@@ -83,6 +119,9 @@ fn load(g: &Graphics, terrain: &MeshData, scenery: &world::Scenery) -> nxgfx::Re
     let fig = player::figure();
     Ok(Assets {
         pipes,
+        scene,
+        shadows,
+        bvh_ms,
         terrain: mesh(g, terrain)?,
         trees: mesh(g, &scenery.trees)?,
         rocks: mesh(g, &scenery.rocks)?,
@@ -101,10 +140,12 @@ struct Draws {
     u: [f32; WORDS],
     draws: u32,
     tris: u32,
+    /// Whether the draws that follow take the ray-traced shadow mask.
+    shadow_on: bool,
 }
 
 impl Draws {
-    fn new(sky: &light::Sky, cam: [f32; 3]) -> Self {
+    fn new(sky: &light::Sky, cam: [f32; 3], mask: Option<(u32, u32)>) -> Self {
         let mut u = [0.0f32; WORDS];
         let set3 = |u: &mut [f32; WORDS], at: u16, v: [f32; 3]| {
             u[at as usize..at as usize + 3].copy_from_slice(&v);
@@ -116,14 +157,27 @@ impl Draws {
         set3(&mut u, U_FOG, sky.fog);
         set3(&mut u, U_CAMERA, cam);
         u[U_FOG_DENSITY as usize] = 0.0055;
+        if let Some((w, h)) = mask {
+            u[U_SHADOW_W as usize] = w as f32;
+            u[U_SHADOW_H as usize] = h as f32;
+        }
         Self {
             u,
             draws: 0,
             tris: 0,
+            shadow_on: false,
         }
     }
 
-    fn draw(&mut self, f: &mut Frame, m: &Mesh, vp: &Mat4, model: &Mat4, tint: [f32; 4], emissive: f32) {
+    fn draw(
+        &mut self,
+        f: &mut Frame,
+        m: &Mesh,
+        vp: &Mat4,
+        model: &Mat4,
+        tint: [f32; 4],
+        emissive: f32,
+    ) {
         let mvp = *vp * *model;
         for r in 0..4 {
             for c in 0..4 {
@@ -137,6 +191,7 @@ impl Draws {
         }
         self.u[U_TINT as usize..U_TINT as usize + 4].copy_from_slice(&tint);
         self.u[U_EMISSIVE as usize] = emissive;
+        self.u[U_SHADOW_ON as usize] = if self.shadow_on { 1.0 } else { 0.0 };
         f.uniforms_f32(&self.u);
         f.draw(m);
         self.draws += 1;
@@ -145,7 +200,12 @@ impl Draws {
 }
 
 fn gamma(c: [f32; 3]) -> [f32; 4] {
-    [c[0].max(0.0).sqrt(), c[1].max(0.0).sqrt(), c[2].max(0.0).sqrt(), 1.0]
+    [
+        c[0].max(0.0).sqrt(),
+        c[1].max(0.0).sqrt(),
+        c[2].max(0.0).sqrt(),
+        1.0,
+    ]
 }
 
 #[derive(Default)]
@@ -188,7 +248,6 @@ fn main() {
     let mut time_rate = 1.0 / 300.0;
     let mut inp = Input::default();
     let mut lab_mode: Option<Lab> = None;
-    let mut world_tris: Option<Vec<Triangle>> = None;
     let mut last = g.seconds();
     let started = last;
     let (mut fps_n, mut fps_t) = (0u32, last);
@@ -236,8 +295,16 @@ fn main() {
                         }
                     }
                 }
-                Event::Stick { stick: Stick::Left, x, y } => inp.mv = [x, y],
-                Event::Stick { stick: Stick::Right, x, y } => inp.look = [x, y],
+                Event::Stick {
+                    stick: Stick::Left,
+                    x,
+                    y,
+                } => inp.mv = [x, y],
+                Event::Stick {
+                    stick: Stick::Right,
+                    x,
+                    y,
+                } => inp.look = [x, y],
                 Event::Touch { phase, x, y, .. } => match phase {
                     Phase::Down => {
                         if x < WIDTH as i32 / 2 {
@@ -324,52 +391,74 @@ fn main() {
         let hor = gamma(sky.horizon);
         bg.gradient(0.0, 0.0, WIDTH as f32, HEIGHT as f32 * 0.62, top, hor);
         bg.rect(0.0, HEIGHT as f32 * 0.62, WIDTH as f32, HEIGHT as f32, hor);
-        let mut d = Draws::new(&sky, eye);
+        let mask = assets.shadows.as_ref().map(|s| (s.w, s.h));
+        let mut d = Draws::new(&sky, eye, mask);
+        // Ray-traced shadows by day, and by moonlight too while it is bright
+        // enough to show them.
+        let rt_on =
+            assets.shadows.is_some() && sky.sun_col.iter().cloned().fold(0.0, f32::max) > 0.03;
         // The Lab's resources, made before the frame borrows the screen.
         if let Some(lab) = lab_mode.as_mut() {
             match lab.room {
                 2 => lab.ensure_particles(&g),
                 3 if lab.rays.is_none() => {
-                    let tris = world_tris.get_or_insert_with(|| {
-                        let mut t = tmesh.triangles(0);
-                        let n = t.len() as u32;
-                        t.extend(scenery.trees.triangles(n));
-                        let n = t.len() as u32;
-                        t.extend(scenery.rocks.triangles(n));
-                        t
-                    });
-                    lab.ensure_rays(&g, tris);
+                    if let Some(scene) = assets.scene.as_ref() {
+                        lab.ensure_rays(&g, scene, assets.bvh_ms);
+                    }
                 }
                 _ => {}
             }
         }
-        let mut f = g.frame();
-        f.clear(hor);
-        f.canvas(&bg);
-        f.use_pipeline(&assets.pipes.lit);
-        let id = Mat4::IDENTITY;
-        let white = [1.0; 4];
-        d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
-        d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
-        d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);
-        for (k, o) in scenery.orbs.iter().enumerate() {
-            if collected[k] {
-                continue;
-            }
-            let t = now + k as f32;
-            let m = Mat4::translation(vec3(o[0], o[1] + t.sin() * 0.15, o[2])) * Mat4::rotation_y(t * 1.7);
-            d.draw(&mut f, &assets.orb, &vp, &m, [1.0, 0.85, 0.35, 1.0], 1.4);
-        }
         let pose = player::pose(&me);
-        for (m, part) in pose.iter().zip([
+        let figure = [
             &assets.torso,
             &assets.head,
             &assets.arm,
             &assets.arm,
             &assets.leg,
             &assets.leg,
-        ]) {
+        ];
+        let mut f = g.frame();
+        let id = Mat4::IDENTITY;
+        let white = [1.0; 4];
+        if let (true, Some(sh)) = (rt_on, assets.shadows.as_ref()) {
+            // Positions at reduced resolution, then one ray per texel.
+            let (draws, tris) = (d.draws, d.tris);
+            f.target(&sh.target);
+            f.clear([0.0; 4]);
+            f.use_pipeline(&sh.pipeline);
+            d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
+            d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
+            d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);
+            for (m, part) in pose.iter().zip(figure) {
+                d.draw(&mut f, part, &vp, m, white, 0.0);
+            }
+            d.draws = draws;
+            d.tris = tris;
+            let parts: [[[f32; 4]; 3]; 6] =
+                std::array::from_fn(|k| [pose[k].0[0], pose[k].0[1], pose[k].0[2]]);
+            sh.trace(&mut f, sky.sun_dir, &parts, me.pos);
+            f.screen();
+        }
+        f.clear(hor);
+        f.canvas(&bg);
+        f.use_pipeline(&assets.pipes.lit);
+        d.shadow_on = rt_on;
+        d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
+        d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
+        d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);
+        for (m, part) in pose.iter().zip(figure) {
             d.draw(&mut f, part, &vp, m, white, 0.0);
+        }
+        d.shadow_on = false;
+        for (k, o) in scenery.orbs.iter().enumerate() {
+            if collected[k] {
+                continue;
+            }
+            let t = now + k as f32;
+            let m = Mat4::translation(vec3(o[0], o[1] + t.sin() * 0.15, o[2]))
+                * Mat4::rotation_y(t * 1.7);
+            d.draw(&mut f, &assets.orb, &vp, &m, [1.0, 0.85, 0.35, 1.0], 1.4);
         }
 
         // The Lab's extra loads.
@@ -392,7 +481,8 @@ fn main() {
                             me.pos[1] + 6.0 + j as f32 * 1.6,
                             me.pos[2] - 8.0 - l as f32 * 3.0,
                         ];
-                        let m = Mat4::translation(vec3(p[0], p[1], p[2])) * Mat4::rotation_y(now + k as f32 * 0.3);
+                        let m = Mat4::translation(vec3(p[0], p[1], p[2]))
+                            * Mat4::rotation_y(now + k as f32 * 0.3);
                         let hue = k as f32 * 0.37;
                         let c = [
                             0.5 + 0.5 * hue.sin(),
@@ -414,7 +504,8 @@ fn main() {
                         };
                         vb.write_words(0, words);
                         f.use_pipeline(&assets.pipes.add);
-                        d.u[U_TINT as usize..U_TINT as usize + 4].copy_from_slice(&[0.3, 0.3, 0.3, 1.0]);
+                        d.u[U_TINT as usize..U_TINT as usize + 4]
+                            .copy_from_slice(&[0.3, 0.3, 0.3, 1.0]);
                         for r in 0..3 {
                             for c in 0..4 {
                                 d.u[U_MODEL as usize + 4 * r + c] = id.0[r][c];
@@ -483,8 +574,20 @@ fn main() {
 fn hud_text(c: &mut Canvas, got: usize, total: usize, tod: f32, since_start: f32) {
     let hours = tod * 24.0;
     let (h, m) = (hours as u32 % 24, ((hours.fract()) * 60.0) as u32);
-    c.text(24.0, 20.0, 3.0, &format!("LIGHTS {}/{}", got, total), rgb(255, 214, 120));
-    c.text(24.0, 52.0, 2.0, &format!("{:02}:{:02}", h, m), rgb(220, 230, 255));
+    c.text(
+        24.0,
+        20.0,
+        3.0,
+        &format!("LIGHTS {}/{}", got, total),
+        rgb(255, 214, 120),
+    );
+    c.text(
+        24.0,
+        52.0,
+        2.0,
+        &format!("{:02}:{:02}", h, m),
+        rgb(220, 230, 255),
+    );
     if since_start < 8.0 {
         c.text_center(
             WIDTH as f32 / 2.0,
