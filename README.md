@@ -72,6 +72,26 @@ canvas) the GPU service checks and runs. The panel is portrait:
 `Graphics::projection` turns the landscape picture. HOME (or the
 `Event::Button` the SDK passes) ends a game; the library is back.
 
+### Shaders and compute
+
+Beyond the built-in pipelines, a game writes its own GPU programs with
+`nxgfx::ir::Builder` (the IR of the `shader/` crate: typed registers,
+`if`, loops bounded by a trip count, texture samples, range-checked
+buffer loads and stores, atomics), vertex and fragment shaders as well as
+compute shaders. `Graphics::shader` sends one to the `gpu` service, which
+validates it and compiles it to the Tegra X1's instruction set (nothing a
+program does can reach memory it was not given, and no loop runs without
+end); `pipeline_from` joins a vertex and a fragment shader with their
+vertex layout, culling, depth state and blending; a `Frame` then does
+`use_pipeline`, `bind_buffer`, `bind_texture`, `uniforms`, `draw_buffers`
+and `dispatch`, with `barrier` between passes that read each other's
+output. `gpu irtest` checks the compiler on the console itself: random
+programs of the IR run by 64 threads against the CPU reference, and a
+vertex and fragment pair drawing a pixel. The emulator runs no shaders:
+on a PC, `cd shader && cargo test` runs the same programs through a
+simulator of the generated code that also checks the GPU's latency and
+scoreboard rules.
+
 ### Users and save data
 
 The console has users. On the first start `display` runs a setup (name
@@ -192,6 +212,9 @@ from the SD card (`/bin/NAME`, or a path).
 abi/        nxk-abi: syscall numbers, errors, rights, service protocols
             (shared by the kernel, libnx and std: single source of truth)
 kernel/     the microkernel
+shader/     nxk-shader: the shader IR games write GPU programs in, its
+            validator, a CPU reference machine, and the compiler to
+            Maxwell SASS (used by `gpu`; `cargo test` runs it on the PC)
 user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
