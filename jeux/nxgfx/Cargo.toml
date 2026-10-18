@@ -6,3 +6,4 @@ description = "Game SDK for nxk: screen, GPU 3D engine, input, math"
 
 [dependencies]
 nxk-abi = { path = "../../abi" }
+nxk-shader = { path = "../../shader" }

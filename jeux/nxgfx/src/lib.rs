@@ -19,6 +19,7 @@ pub mod audio;
 pub mod canvas;
 pub mod math;
 pub mod os;
+pub mod shaders;
 
 use alloc::vec::Vec;
 
@@ -29,7 +30,11 @@ use nxk_abi::user::Msg;
 pub use audio::{Audio, Sound};
 pub use canvas::{rgb, Canvas, Rgba};
 pub use math::{vec3, Mat4, Vec3};
+pub use nxk_shader as ir;
 pub use os::{now_ns, sleep_ns, Result};
+pub use shaders::{
+    Attr, Blend, Buffer, Cull, DepthFunc, Pipeline, PipelineDesc, Shader,
+};
 
 /// What failed while opening the console's services, and the errno.
 #[derive(Clone, Copy, Debug)]
@@ -399,6 +404,10 @@ impl Graphics {
         Self::panel() * Mat4::perspective(fov_y, WIDTH as f32 / HEIGHT as f32, near, far)
     }
 
+    pub(crate) fn buffer_bytes(&self, data: &[u8]) -> Result<(Shm, u64)> {
+        self.buffer(data)
+    }
+
     fn buffer(&self, data: &[u8]) -> Result<(Shm, u64)> {
         let shm = Shm::new(data.len().max(4), shm::UNCACHED)?;
         shm.write(0, data);
@@ -462,6 +471,11 @@ impl Graphics {
             width,
             height,
         })
+    }
+
+    /// A mesh of vertices of any layout (the pipeline's), 16-bit indices.
+    pub fn mesh_raw<T: Copy>(&self, vertices: &[T], indices: &[u16]) -> Result<Mesh> {
+        self.mesh(vertices, indices)
     }
 
     fn mesh<T: Copy>(&self, vertices: &[T], indices: &[u16]) -> Result<Mesh> {
@@ -644,6 +658,55 @@ impl Frame<'_> {
                 0,
                 m.index_count,
             ],
+        );
+    }
+
+    /// The shaders and state of `p` for the draws that follow.
+    pub fn use_pipeline(&mut self, p: &Pipeline) {
+        self.push(gpu::CMD_USE_PIPELINE, &[p.id as u32]);
+    }
+
+    /// Buffer `slot` (0-7) of the shaders' `load` / `store` instructions.
+    pub fn bind_buffer(&mut self, slot: u32, b: &Buffer) {
+        self.push(gpu::CMD_BIND_BUFFER, &[slot, b.id as u32]);
+    }
+
+    /// Texture `slot` (0-15) of the shaders' `sample` instructions.
+    pub fn bind_texture(&mut self, slot: u32, t: &Texture) {
+        self.push(gpu::CMD_BIND_TEXTURE, &[slot, t.id as u32]);
+    }
+
+    /// The shaders' uniforms (up to 1024 words) from here on.
+    pub fn uniforms(&mut self, words: &[u32]) {
+        self.push(gpu::CMD_UNIFORMS, words);
+    }
+
+    pub fn uniforms_f32(&mut self, v: &[f32]) {
+        let w: Vec<u32> = v.iter().map(|x| x.to_bits()).collect();
+        self.push(gpu::CMD_UNIFORMS, &w);
+    }
+
+    /// Run a compute shader over `groups` groups of its size, after
+    /// everything recorded before it; what follows sees its results.
+    pub fn dispatch(&mut self, s: &Shader, groups: [u32; 3]) {
+        self.push(
+            gpu::CMD_DISPATCH,
+            &[s.id as u32, groups[0], groups[1], groups[2]],
+        );
+    }
+
+    /// Everything before is done when what follows starts (a pass that
+    /// draws something a later one samples).
+    pub fn barrier(&mut self) {
+        self.push(gpu::CMD_BARRIER, &[]);
+    }
+
+    /// Triangles from buffers: `vertices` of the pipeline's stride and
+    /// 16-bit `indices`, `first` to `first + count` of them.
+    pub fn draw_buffers(&mut self, vb: &Buffer, vertices: u32, ib: &Buffer, indices: u32) {
+        self.push(
+            gpu::CMD_DRAW_INDEXED,
+            &[vb.id as u32, 0, vertices, ib.id as u32, 0, indices, 0, indices],
         );
     }
 

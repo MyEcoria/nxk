@@ -14,10 +14,15 @@ name = "nxgfx"
 version = "0.1.0"
 dependencies = [
  "nxk-abi",
+ "nxk-shader",
 ]
 
 [[package]]
 name = "nxk-abi"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-shader"
 version = "0.1.0"
 
 [[package]]
