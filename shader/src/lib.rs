@@ -14,6 +14,7 @@ pub mod interp;
 pub mod ir;
 pub mod lower;
 pub mod regalloc;
+pub mod rt;
 pub mod sass;
 pub mod stock;
 pub mod validate;
@@ -28,7 +29,7 @@ extern crate std;
 #[cfg(test)]
 mod layout_tests;
 #[cfg(test)]
-mod lower_tests;
+pub(crate) mod lower_tests;
 #[cfg(test)]
 mod sassim;
 #[cfg(test)]

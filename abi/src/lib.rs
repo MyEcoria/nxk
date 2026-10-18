@@ -1605,6 +1605,9 @@ pub mod proto {
         /// expected pixel.
         pub const T3_IR_COMPUTE: u64 = 1024;
         pub const T3_IR_DRAW: u64 = 2048;
+        /// Closest-hit and any-hit traversal kernels on a wide BVH of 4000
+        /// triangles, 65536 rays, against the CPU walk of the same tree.
+        pub const T3_IR_RAYS: u64 = 1 << 14;
         /// Four instances of a triangle, moved and colored from the
         /// instance stream and `InstanceId`, land on the expected pixels.
         pub const T3_IR_INSTANCE: u64 = 4096;
