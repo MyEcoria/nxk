@@ -4,6 +4,9 @@
 //! then shows at the next vertical blank; `poll` returns the input the
 //! console routes to the game (touch, gamepad).
 //!
+//! A game keeps its saves in the directory the console gives it as
+//! `NXK_SAVE_DIR` (one per user), never under `/games`.
+//!
 //! The panel is portrait: the landscape picture (1280 x 720, the one the
 //! UI shows) is the image turned a quarter. The projection does the
 //! turn, at no cost, through `Graphics::panel`.

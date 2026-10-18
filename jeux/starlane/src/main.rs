@@ -17,7 +17,13 @@ const FAR: f32 = -112.0;
 /// World size of one repeat of the ground texture; it divides the
 /// scroll's period, so the pattern runs on without a jump.
 const GROUND_CELL: f32 = 2.0;
-const BEST_FILE: &str = "/games/starlane/best.txt";
+
+/// The best score, kept in the directory the console gives the user
+/// playing (`NXK_SAVE_DIR`); a bare run keeps it with the game.
+fn best_file() -> String {
+    let dir = std::env::var("NXK_SAVE_DIR").unwrap_or_else(|_| "/games/starlane".into());
+    format!("{}/best.txt", dir)
+}
 /// Columns blocks and gems come in.
 const COLUMNS: [f32; 5] = [-3.2, -1.6, 0.0, 1.6, 3.2];
 
@@ -188,7 +194,7 @@ impl Game {
                 z: rng.range(-110.0, -20.0),
             })
             .collect();
-        let best = fs::read_to_string(BEST_FILE)
+        let best = fs::read_to_string(best_file())
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
@@ -326,7 +332,7 @@ impl Game {
             self.shake = 0.6;
             if self.score > self.best {
                 self.best = self.score;
-                let _ = fs::write(BEST_FILE, format!("{}\n", self.best));
+                let _ = fs::write(best_file(), format!("{}\n", self.best));
             }
         }
     }
