@@ -84,13 +84,13 @@ impl Lab {
             Button::Up => match self.room {
                 1 => self.cubes = (self.cubes + 50).min(MAX_CUBES),
                 2 => self.particles = (self.particles + 100).min(MAX_PARTICLES),
-                0 => self.shadow_mode = (self.shadow_mode + 1) % 6,
+                0 => self.shadow_mode = (self.shadow_mode + 1) % 8,
                 _ => {}
             },
             Button::Down => match self.room {
                 1 => self.cubes = self.cubes.saturating_sub(50).max(50),
                 2 => self.particles = self.particles.saturating_sub(100).max(100),
-                0 => self.shadow_mode = (self.shadow_mode + 5) % 6,
+                0 => self.shadow_mode = (self.shadow_mode + 7) % 8,
                 _ => {}
             },
             _ => {}
@@ -156,7 +156,9 @@ impl Lab {
                     "POSITIONS ONLY",
                     "OFF",
                     "MASK VIEW",
-                    "NO HISTORY"
+                    "NO HISTORY",
+                    "NO JITTER",
+                    "NO JITTER, NO HISTORY"
                 ][self.shadow_mode as usize]
             ),
         };

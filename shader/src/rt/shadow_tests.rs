@@ -26,6 +26,7 @@ impl Sampler for Positions {
 
 struct Scene {
     bvh: Bvh,
+    tris: Vec<Triangle>,
     boxes: Vec<[f32; 18]>,
     sun: [f32; 3],
 }
@@ -46,24 +47,58 @@ fn view_projection(eye: [f32; 3], pitch: f32) -> [[f32; 4]; 4] {
     ]
 }
 
-fn positions(sc: &Scene, eye: [f32; 3], pitch: f32) -> Vec<[f32; 4]> {
-    camera_rays_from(W, H, eye, pitch)
+/// What `pack_normal` stores, and what the kernel reads back from it.
+fn quantize(n: [f32; 3]) -> ([f32; 3], f32) {
+    let e = |v: f32| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 2047.0 + 0.5) as u32;
+    let (ex, ey) = (e(n[0]), e(n[1]));
+    let sign = (n[2] < 0.0) as u32;
+    let packed = (sign << 22 | ex << 11 | ey) as f32 + 1.0;
+    let (x, y) = (
+        ex as f32 / 2047.0 * 2.0 - 1.0,
+        ey as f32 / 2047.0 * 2.0 - 1.0,
+    );
+    let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+    ([x, y, if sign == 1 { -z } else { z }], packed)
+}
+
+/// The pre-pass's texels: the surface point, the normal packed in w
+/// (0: no ray needed), and the normals as the kernel will read them.
+fn positions(sc: &Scene, eye: [f32; 3], pitch: f32) -> (Vec<[f32; 4]>, Vec<[f32; 3]>) {
+    let mut normals = Vec::new();
+    let pos = camera_rays_from(W, H, eye, pitch)
         .iter()
         .enumerate()
         .map(|(i, r)| match trace::trace(&sc.bvh, r) {
             // Every seventh texel is "no ray needed".
             Some(h) if i % 7 != 3 => {
-                let t = h.t - 0.03;
+                let v = sc.tris[h.id as usize].v;
+                let e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]];
+                let e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]];
+                let mut n = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                let side = n[0] * r.dir[0] + n[1] * r.dir[1] + n[2] * r.dir[2];
+                let f = if side > 0.0 { -1.0 } else { 1.0 } / l;
+                n = [n[0] * f, n[1] * f, n[2] * f];
+                let (nq, packed) = quantize(n);
+                normals.push(nq);
                 [
-                    r.origin[0] + r.dir[0] * t,
-                    r.origin[1] + r.dir[1] * t,
-                    r.origin[2] + r.dir[2] * t,
-                    h.t,
+                    r.origin[0] + r.dir[0] * h.t,
+                    r.origin[1] + r.dir[1] * h.t,
+                    r.origin[2] + r.dir[2] * h.t,
+                    packed,
                 ]
             }
-            _ => [0.0; 4],
+            _ => {
+                normals.push([0.0, 1.0, 0.0]);
+                [0.0; 4]
+            }
         })
-        .collect()
+        .collect();
+    (pos, normals)
 }
 
 fn scene() -> Scene {
@@ -85,12 +120,24 @@ fn scene() -> Scene {
             0.4, 1.4, 0.3,
         ]);
     }
-    Scene { bvh, boxes, sun }
+    Scene {
+        bvh,
+        tris,
+        boxes,
+        sun,
+    }
 }
 
 /// The uniforms of a frame: `prev` the camera of the last one, `frame`
 /// its number, no jitter unless `jitter`.
-fn uniforms(sc: &Scene, prev: ([f32; 3], f32), frame: u32, jitter: f32, reset: bool) -> Vec<u32> {
+fn uniforms(
+    sc: &Scene,
+    cur: [f32; 3],
+    prev: ([f32; 3], f32),
+    frame: u32,
+    jitter: f32,
+    reset: bool,
+) -> Vec<u32> {
     let mut un = vec![0u32; u::WORDS];
     un[u::W as usize] = W as u32;
     un[u::H as usize] = H as u32;
@@ -111,6 +158,7 @@ fn uniforms(sc: &Scene, prev: ([f32; 3], f32), frame: u32, jitter: f32, reset: b
         set(u::PREV_VP + 4 * r as u16, row);
     }
     set(u::PREV_CAM, &prev.0);
+    set(u::CAM, &cur);
     set(u::ALPHA, &[0.15]);
     set(u::JITTER, &[jitter]);
     set(u::RESET, &[if reset { 1.0 } else { 0.0 }]);
@@ -158,13 +206,19 @@ fn hits_box(b: &[f32; 18], o: [f32; 3], d: [f32; 3], t_min: f32, t_max: f32) -> 
 
 /// What each texel should say without jitter: (distance, 1 lit or 0
 /// shadowed); (0, 1) for none.
-fn expected(sc: &Scene, pos: &[[f32; 4]]) -> Vec<(f32, f32)> {
+fn expected(sc: &Scene, cam: [f32; 3], pos: &[[f32; 4]], normals: &[[f32; 3]]) -> Vec<(f32, f32)> {
     pos.iter()
-        .map(|p| {
+        .zip(normals)
+        .map(|(p, n)| {
             if p[3] <= 0.0 {
                 return (0.0, 1.0);
             }
-            let o = [p[0], p[1], p[2]];
+            let dist =
+                ((p[0] - cam[0]).powi(2) + (p[1] - cam[1]).powi(2) + (p[2] - cam[2]).powi(2))
+                    .sqrt();
+            let lit_n = (n[0] * sc.sun[0] + n[1] * sc.sun[1] + n[2] * sc.sun[2]).clamp(0.0, 1.0);
+            let bias = shadow::BIAS + shadow::BIAS_SLOPE * (1.0 - lit_n);
+            let o = [p[0] + n[0] * bias, p[1] + n[1] * bias, p[2] + n[2] * bias];
             let ray = Ray {
                 origin: o,
                 t_min: shadow::T_MIN,
@@ -176,7 +230,7 @@ fn expected(sc: &Scene, pos: &[[f32; 4]]) -> Vec<(f32, f32)> {
                     .boxes
                     .iter()
                     .any(|b| hits_box(b, o, sc.sun, shadow::T_MIN, 80.0));
-            (p[3], if blocked { 0.0 } else { 1.0 })
+            (dist, if blocked { 0.0 } else { 1.0 })
         })
         .collect()
 }
@@ -225,16 +279,28 @@ fn frame(sc: &Scene, pos: &[[f32; 4]], hist: &[u32], un: &[u32]) -> Vec<u32> {
     bufs.swap_remove(0)
 }
 
+/// The distance of each texel's point from `cam`; 0 for none.
+fn dists(pos: &[[f32; 4]], cam: [f32; 3]) -> Vec<f32> {
+    pos.iter()
+        .map(|p| {
+            if p[3] <= 0.0 {
+                return 0.0;
+            }
+            ((p[0] - cam[0]).powi(2) + (p[1] - cam[1]).powi(2) + (p[2] - cam[2]).powi(2)).sqrt()
+        })
+        .collect()
+}
+
 const EYE: [f32; 3] = [0.0, 12.0, -34.0];
 const PITCH: f32 = 0.3;
 
 #[test]
 fn the_shadow_kernel_matches_the_cpu() {
     let sc = scene();
-    let pos = positions(&sc, EYE, PITCH);
-    let want = expected(&sc, &pos);
+    let (pos, normals) = positions(&sc, EYE, PITCH);
+    let want = expected(&sc, EYE, &pos, &normals);
     // A first frame: no history, so every texel traces.
-    let un = uniforms(&sc, (EYE, PITCH), 0, 0.0, false);
+    let un = uniforms(&sc, EYE, (EYE, PITCH), 0, 0.0, false);
     let out = frame(&sc, &pos, &vec![0; 2 * W * H], &un);
     let shadowed = want.iter().filter(|w| w.0 > 0.0 && w.1 == 0.0).count();
     let lit = want.iter().filter(|w| w.0 > 0.0 && w.1 == 1.0).count();
@@ -247,13 +313,13 @@ fn the_shadow_kernel_matches_the_cpu() {
 #[test]
 fn history_is_found_where_the_point_was_and_half_the_texels_keep_it() {
     let sc = scene();
-    let pos = positions(&sc, EYE, PITCH);
+    let (pos, _) = positions(&sc, EYE, PITCH);
     // The last frame said 0.5 everywhere, with the right distances.
-    let hist: Vec<u32> = pos
+    let hist: Vec<u32> = dists(&pos, EYE)
         .iter()
-        .flat_map(|p| [p[3].to_bits(), 0.5f32.to_bits()])
+        .flat_map(|d| [d.to_bits(), 0.5f32.to_bits()])
         .collect();
-    let un = uniforms(&sc, (EYE, PITCH), 1, 0.0, false);
+    let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.0, false);
     let out = frame(&sc, &pos, &hist, &un);
     let needed = pos.iter().filter(|p| p[3] > 0.0).count();
     let kept = (0..W * H)
@@ -267,7 +333,7 @@ fn history_is_found_where_the_point_was_and_half_the_texels_keep_it() {
         "{kept} of {needed}"
     );
     // Forgetting history: all trace, none keeps 0.5.
-    let un = uniforms(&sc, (EYE, PITCH), 1, 0.0, true);
+    let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.0, true);
     let out = frame(&sc, &pos, &hist, &un);
     let kept = (0..W * H)
         .filter(|&i| pos[i][3] > 0.0 && f32::from_bits(out[2 * i + 1]) == 0.5)
@@ -279,15 +345,15 @@ fn history_is_found_where_the_point_was_and_half_the_texels_keep_it() {
 fn a_moving_camera_keeps_the_picture_right() {
     let sc = scene();
     let (eye0, eye1) = (EYE, [0.6, 12.2, -33.4]);
-    let pos0 = positions(&sc, eye0, PITCH);
-    let un0 = uniforms(&sc, (eye0, PITCH), 0, 0.0, false);
+    let (pos0, _) = positions(&sc, eye0, PITCH);
+    let un0 = uniforms(&sc, eye0, (eye0, PITCH), 0, 0.0, false);
     let first = frame(&sc, &pos0, &vec![0; 2 * W * H], &un0);
-    let pos1 = positions(&sc, eye1, PITCH);
-    let want = expected(&sc, &pos1);
+    let (pos1, normals1) = positions(&sc, eye1, PITCH);
+    let want = expected(&sc, eye1, &pos1, &normals1);
     // Two frames on, the camera has moved: the history came through the
     // projection of the last frame's camera and must still give the truth
     // within a few texels at the edges.
-    let un1 = uniforms(&sc, (eye0, PITCH), 1, 0.0, false);
+    let un1 = uniforms(&sc, eye1, (eye0, PITCH), 1, 0.0, false);
     let second = frame(&sc, &pos1, &first, &un1);
     let wrong = differ(&second, &want, 0.3);
     std::println!("moving camera: {wrong} of {} texels off", W * H);
@@ -297,11 +363,11 @@ fn a_moving_camera_keeps_the_picture_right() {
 #[test]
 fn the_jitter_makes_penumbrae() {
     let sc = scene();
-    let pos = positions(&sc, EYE, PITCH);
+    let (pos, _) = positions(&sc, EYE, PITCH);
     let mut hist = vec![0u32; 2 * W * H];
     let mut cams = (EYE, PITCH);
     for f in 0..24 {
-        let un = uniforms(&sc, cams, f, 0.03, false);
+        let un = uniforms(&sc, EYE, cams, f, 0.03, false);
         hist = frame(&sc, &pos, &hist, &un);
         cams = (EYE, PITCH);
     }
@@ -318,13 +384,13 @@ fn the_jitter_makes_penumbrae() {
 #[test]
 fn the_compiled_shadow_kernel_matches_the_reference() {
     let sc = scene();
-    let pos = positions(&sc, EYE, PITCH);
-    let hist: Vec<u32> = pos
+    let (pos, _) = positions(&sc, EYE, PITCH);
+    let hist: Vec<u32> = dists(&pos, EYE)
         .iter()
         .enumerate()
-        .flat_map(|(i, p)| [p[3].to_bits(), ((i % 3) as f32 * 0.5).to_bits()])
+        .flat_map(|(i, d)| [d.to_bits(), ((i % 3) as f32 * 0.5).to_bits()])
         .collect();
-    let un = uniforms(&sc, (EYE, PITCH), 1, 0.02, false);
+    let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.02, false);
     let want = frame(&sc, &pos, &hist, &un);
     let p = shadow::kernel(shadow::Slots::default());
     let c = compile(&p).unwrap();

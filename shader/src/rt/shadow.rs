@@ -27,7 +27,11 @@ use crate::{Builder, Builtin, CmpOp, Program, Reg, Stage, Ty};
 /// Threads of a group: x, y.
 pub const GROUP: [u32; 2] = [8, 4];
 /// Hits nearer than this to the start of a shadow ray do not count.
-pub const T_MIN: f32 = 0.05;
+pub const T_MIN: f32 = 0.10;
+/// A shadow ray starts this far off the surface along its normal, plus
+/// `BIAS_SLOPE` times how much the light grazes it.
+pub const BIAS: f32 = 0.10;
+pub const BIAS_SLOPE: f32 = 0.15;
 /// Oriented boxes of the moving figure that cast shadows.
 pub const BOXES: usize = 6;
 /// Words of a box: three axes (the world directions of its local x, y,
@@ -65,7 +69,9 @@ pub mod u {
     pub const SUN_V: u16 = FRAME + 7;
     /// The figure's sphere in the last frame.
     pub const PREV_SPHERE: u16 = FRAME + 10;
-    pub const WORDS: usize = PREV_SPHERE as usize + 4;
+    /// The camera now.
+    pub const CAM: u16 = PREV_SPHERE + 4;
+    pub const WORDS: usize = CAM as usize + 3;
 }
 
 /// Which buffer slot holds what.
@@ -105,12 +111,14 @@ fn uni3(b: &mut Builder, at: u16) -> [Reg; 3] {
 }
 
 /// Whether the ray from `o` along `d` (distances from `t_min`, up to
-/// `t_max`) goes through box `k`.
-fn hits_box(b: &mut Builder, k: usize, o: [Reg; 3], d: [Reg; 3], t_min: Reg, t_max: Reg) -> Reg {
-    let at = u::BOXES + k as u16 * BOX_WORDS;
-    let axes = [uni3(b, at), uni3(b, at + 3), uni3(b, at + 6)];
-    let origin = uni3(b, at + 9);
-    let (lo, hi) = (uni3(b, at + 12), uni3(b, at + 15));
+/// `t_max`) goes through the box whose words start at `base` (a U32
+/// register, words from `u::BOXES`).
+fn hits_box(b: &mut Builder, base: Reg, o: [Reg; 3], d: [Reg; 3], t_min: Reg, t_max: Reg) -> Reg {
+    let word = |b: &mut Builder, k: u16| b.uniform_idx(u::BOXES + k, base, Ty::F32);
+    let v3 = |b: &mut Builder, at: u16| [word(b, at), word(b, at + 1), word(b, at + 2)];
+    let axes = [v3(b, 0), v3(b, 3), v3(b, 6)];
+    let origin = v3(b, 9);
+    let (lo, hi) = (v3(b, 12), v3(b, 15));
     let rel = [
         b.fsub(o[0], origin[0]),
         b.fsub(o[1], origin[1]),
@@ -152,6 +160,66 @@ fn near_sphere(b: &mut Builder, at: u16, o: [Reg; 3], d: [Reg; 3]) -> Reg {
     b.band(near, ahead)
 }
 
+/// What the pre-pass puts in w: 0 for no ray needed, else the unit normal
+/// as 1 + sign(nz) * 2^22 + x * 2^11 + y with x, y in 0..2047 (every value
+/// an exact float below 2^24).
+pub fn pack_normal(b: &mut Builder, n: [Reg; 3]) -> Reg {
+    let (half, scale, round) = (b.f32(0.5), b.f32(2047.0), b.f32(0.5));
+    let mut e = [b.u32(0); 2];
+    for k in 0..2 {
+        let t = b.fma(n[k], half, half);
+        let t = b.fsat(t);
+        let t = b.fma(t, scale, round);
+        e[k] = b.f2u(t);
+    }
+    let (eleven, twenty_two) = (b.u32(11), b.u32(22));
+    // The sign of nz as 0 or 1 without a select: -nz scaled up and
+    // saturated, rounded.
+    let (big, round) = (b.f32(1.0e6), b.f32(0.5));
+    let mz = b.fneg(n[2]);
+    let sat = b.fmul(mz, big);
+    let sat = b.fsat(sat);
+    let sat = b.fadd(sat, round);
+    let sign = b.f2u(sat);
+    let sg = b.shl(sign, twenty_two);
+    let xs = b.shl(e[0], eleven);
+    let bits = b.or(sg, xs);
+    let bits = b.or(bits, e[1]);
+    let v = b.u2f(bits);
+    let one = b.f32(1.0);
+    b.fadd(v, one)
+}
+
+/// The normal `pack_normal` packed.
+fn unpack_normal(b: &mut Builder, packed: Reg) -> [Reg; 3] {
+    let one = b.f32(1.0);
+    let v = b.fsub(packed, one);
+    let bits = b.f2u(v);
+    let (mask, eleven, twenty_two) = (b.u32(2047), b.u32(11), b.u32(22));
+    let ey = b.and(bits, mask);
+    let ex_s = b.shr(bits, eleven);
+    let ex = b.and(ex_s, mask);
+    let sg = b.shr(bits, twenty_two);
+    let (inv, two, minus) = (b.f32(1.0 / 2047.0), b.f32(2.0), b.f32(-1.0));
+    let mut n = [one; 3];
+    for (k, e) in [ex, ey].into_iter().enumerate() {
+        let f = b.u2f(e);
+        let t = b.fmul(f, inv);
+        n[k] = b.fma(t, two, minus);
+    }
+    let (x2, y2) = (b.fmul(n[0], n[0]), b.fmul(n[1], n[1]));
+    let s2 = b.fadd(x2, y2);
+    let rest = b.fsub(one, s2);
+    let zero = b.f32(0.0);
+    let rest = b.fmax(rest, zero);
+    let z = b.fsqrt(rest);
+    let zero_u = b.u32(0);
+    let flip = b.cmp(CmpOp::Ne, sg, zero_u);
+    let nz = b.fneg(z);
+    n[2] = b.sel(flip, nz, z);
+    n
+}
+
 /// `v` modulo 1.
 fn fract(b: &mut Builder, v: Reg) -> Reg {
     let f = b.ffloor(v);
@@ -184,15 +252,26 @@ pub fn kernel(s: Slots) -> Program {
         let (tu, tv) = (b.fmul(xc, iw), b.fmul(yc, ih));
         let lod = b.f32(0.0);
         let p = b.sample_lod(0, tu, tv, lod);
-        let dist = p[3];
+        let packed = p[3];
         let (zero_f, one_f) = (b.f32(0.0), b.f32(1.0));
         // What this texel says: no distance, all lit, until a ray decides.
         let out_dist = b.copy(zero_f);
         let out_cov = b.copy(one_f);
-        let needed = b.cmp(CmpOp::Gt, dist, zero_f);
+        let needed = b.cmp(CmpOp::Gt, packed, zero_f);
         b.if_(needed, |b| {
-            b.mov(out_dist, dist);
+            // The point on the surface, its distance from the camera, and
+            // the normal (packed in w, see `pack_normal`).
             let o = [p[0], p[1], p[2]];
+            let cam = uni3(b, u::CAM);
+            let to_cam = [
+                b.fsub(o[0], cam[0]),
+                b.fsub(o[1], cam[1]),
+                b.fsub(o[2], cam[2]),
+            ];
+            let d2 = dot(b, to_cam, to_cam);
+            let dist = b.fsqrt(d2);
+            b.mov(out_dist, dist);
+            let n = unpack_normal(b, packed);
 
             // Where this point was on the last frame's mask, and what that
             // texel said (accepted when its distance agrees).
@@ -269,6 +348,10 @@ pub fn kernel(s: Slots) -> Program {
             let invalid = b.bnot(valid);
             let trace = b.bor(mine, invalid);
             let cov = b.copy(hc);
+            // `valid` is needed after the walk: kept as a number meanwhile, so
+            // that no predicate is held across the traversal.
+            let (one_n, zero_n) = (b.u32(1), b.u32(0));
+            let valid_n = b.sel(valid, one_n, zero_n);
             b.if_(trace, |b| {
                 // A direction in the sun's disc: a point of the R2
                 // sequence, shifted per texel, advancing with the frame.
@@ -306,6 +389,19 @@ pub fn kernel(s: Slots) -> Program {
                 // triangles against a smooth normal).
                 let t_min = b.f32(T_MIN);
                 let t_max = b.uniform(u::T_MAX, Ty::F32);
+                // The ray starts off the surface along the normal, more
+                // where the light grazes it.
+                let sun_n = dot(b, n, sun);
+                let lit_n = b.fsat(sun_n);
+                let graze = b.fsub(one_f, lit_n);
+                let (slope, base) = (b.f32(BIAS_SLOPE), b.f32(BIAS));
+                let bias = b.fma(graze, slope, base);
+                let ro = [
+                    b.fma(n[0], bias, o[0]),
+                    b.fma(n[1], bias, o[1]),
+                    b.fma(n[2], bias, o[2]),
+                ];
+                let o = ro;
                 let wk = walk(b, s.nodes, s.tris, o, d, t_min, t_max, true, false);
                 let blocked = b.copy(wk.found);
                 // The figure: a sphere test first, then its boxes.
@@ -313,11 +409,18 @@ pub fn kernel(s: Slots) -> Program {
                 let free = b.cmp(CmpOp::Eq, blocked, zero_u);
                 let test = b.band(close, free);
                 b.if_(test, |b| {
-                    for k in 0..BOXES {
-                        let hit = hits_box(b, k, o, d, t_min, t_max);
+                    let k = b.u32(0);
+                    let (stride, count) = (b.u32(BOX_WORDS as u32), b.u32(BOXES as u32));
+                    b.loop_(BOXES as u32, |b| {
+                        let base = b.umul(k, stride);
+                        let hit = hits_box(b, base, o, d, t_min, t_max);
                         let nb = b.sel(hit, one_u, blocked);
                         b.mov(blocked, nb);
-                    }
+                        let nk = b.uadd(k, one_u);
+                        b.mov(k, nk);
+                        let done = b.cmp(CmpOp::Ge, k, count);
+                        b.break_if(done);
+                    });
                 });
                 let shadowed = b.cmp(CmpOp::Ne, blocked, zero_u);
                 let lit = b.sel(shadowed, zero_f, one_f);
@@ -330,7 +433,8 @@ pub fn kernel(s: Slots) -> Program {
                 let alpha = b.sel(figure, fast, slow);
                 let delta = b.fsub(lit, hc);
                 let blend = b.fma(delta, alpha, hc);
-                let fresh = b.sel(valid, blend, lit);
+                let valid_again = b.cmp(CmpOp::Ne, valid_n, zero_n);
+                let fresh = b.sel(valid_again, blend, lit);
                 b.mov(cov, fresh);
             });
             b.mov(out_cov, cov);

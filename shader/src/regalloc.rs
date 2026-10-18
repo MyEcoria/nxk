@@ -33,13 +33,14 @@ struct Range {
     used: bool,
 }
 
-struct Walk {
+struct Walk<'a> {
+    p: &'a Program,
     pc: u32,
     ranges: Vec<Range>,
     loops: Vec<(u32, u32)>,
 }
 
-impl Walk {
+impl Walk<'_> {
     fn touch(&mut self, r: Reg) {
         let pc = self.pc;
         let x = &mut self.ranges[r.0 as usize];
@@ -62,10 +63,15 @@ impl Walk {
                 Inst::If { cond, then_, else_ } => {
                     self.body(then_);
                     self.body(else_);
-                    // The condition can be a guard for the whole statement.
-                    let end = self.pc;
-                    let x = &mut self.ranges[cond.0 as usize];
-                    x.last = x.last.max(end);
+                    // The condition can be a guard for the whole statement,
+                    // when both sides are short: a branch needs it at the
+                    // jump only, and a predicate held across a long body
+                    // (a traversal) is one the body cannot use.
+                    if short_alu(self.p, then_) && short_alu(self.p, else_) {
+                        let end = self.pc;
+                        let x = &mut self.ranges[cond.0 as usize];
+                        x.last = x.last.max(end);
+                    }
                 }
                 Inst::Loop { body, .. } => {
                     let start = self.pc;
@@ -79,6 +85,30 @@ impl Walk {
             }
         }
     }
+}
+
+/// A body that `lower` may run under a guard predicate instead of
+/// branching: a few instructions of plain arithmetic on numbers.
+pub fn short_alu(p: &Program, b: &[Inst]) -> bool {
+    if b.len() > 6 {
+        return false;
+    }
+    b.iter().all(|i| {
+        let ok = matches!(
+            i,
+            Inst::Const { .. }
+                | Inst::Mov { .. }
+                | Inst::Un { .. }
+                | Inst::Bin { .. }
+                | Inst::Fma { .. }
+                | Inst::Sel { .. }
+        );
+        let mut nums = true;
+        visit_regs(i, &mut |r| {
+            nums &= p.reg_types[r.0 as usize] != Ty::Bool;
+        });
+        ok && nums
+    })
 }
 
 /// Every register an instruction names (not those of nested bodies).
@@ -163,6 +193,7 @@ pub struct TooMany;
 pub fn allocate(p: &Program, base: u8) -> Result<Alloc, TooMany> {
     let n = p.reg_types.len();
     let mut w = Walk {
+        p,
         pc: 0,
         ranges: alloc::vec![
             Range {

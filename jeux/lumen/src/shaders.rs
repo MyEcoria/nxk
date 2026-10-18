@@ -1,7 +1,7 @@
 //! The game's shaders, written in the IR: one lit vertex and fragment pair
 //! for everything solid (a sun, a hemisphere light, distance fog, gamma).
 
-use nxgfx::ir::rt::shadow::{lit_factor_ex as shadow_factor, Filtered};
+use nxgfx::ir::rt::shadow::{lit_factor_ex as shadow_factor, pack_normal as shadow_pack, Filtered};
 use nxgfx::ir::{Builder, CmpOp, OutKind, Program, Reg, Stage, Ty};
 
 /// Uniform words: the model-view-projection rows, the model rows (3x4,
@@ -195,9 +195,9 @@ pub fn fragment() -> Program {
     b.finish()
 }
 
-/// The shadow pre-pass: the world position of the surface (pushed off it
-/// along the normal), and in w its distance from the camera, or 0 where
-/// the sun does not reach it anyway (facing away) and no ray is needed.
+/// The shadow pre-pass: the world position of the surface and, in w, its
+/// unit normal packed (`shadow::pack_normal`), or 0 where the sun does
+/// not reach it anyway (facing away) and no ray is needed.
 pub fn position_fragment() -> Program {
     let mut b = Builder::new(Stage::Fragment);
     let n = [b.input(0, 0), b.input(0, 1), b.input(0, 2)];
@@ -209,29 +209,15 @@ pub fn position_fragment() -> Program {
     let rl = b.frcp(len);
     let n = [b.fmul(n[0], rl), b.fmul(n[1], rl), b.fmul(n[2], rl)];
     let sun = uni3(&mut b, U_SUN_DIR);
-    let cam = uni3(&mut b, U_CAMERA);
     let ndl = dot3(&mut b, n, sun);
-    let lit = b.fsat(ndl);
-    // A little more offset where the sun grazes the surface.
-    let one = b.f32(1.0);
-    let graze = b.fsub(one, lit);
-    let (slope, base) = (b.f32(0.06), b.f32(0.04));
-    let bias = b.fma(graze, slope, base);
-    for i in 0..3 {
-        let p = b.fma(n[i], bias, w[i]);
-        b.output(OutKind::Color(0), i as u8, p);
+    for (i, p) in w.iter().enumerate() {
+        b.output(OutKind::Color(0), i as u8, *p);
     }
-    let d = [
-        b.fsub(w[0], cam[0]),
-        b.fsub(w[1], cam[1]),
-        b.fsub(w[2], cam[2]),
-    ];
-    let d2 = dot3(&mut b, d, d);
-    let dist = b.fsqrt(d2);
+    let packed = shadow_pack(&mut b, n);
     let zero = b.f32(0.0);
     let floor = b.f32(0.02);
     let facing = b.cmp(CmpOp::Gt, ndl, floor);
-    let out = b.sel(facing, dist, zero);
+    let out = b.sel(facing, packed, zero);
     b.output(OutKind::Color(0), 3, out);
     b.finish()
 }

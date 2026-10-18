@@ -112,6 +112,7 @@ impl Shadows {
         vp: &[[f32; 4]; 4],
         eye: [f32; 3],
         forget: bool,
+        jitter: bool,
     ) {
         let sphere = [at[0], at[1] + 0.95, at[2], 1.35];
         let mut un = vec![0u32; u::WORDS];
@@ -145,7 +146,7 @@ impl Shadows {
         }
         set(u::PREV_CAM, &pcam);
         set(u::ALPHA, &[BLEND]);
-        set(u::JITTER, &[SUN_RADIUS]);
+        set(u::JITTER, &[if jitter { SUN_RADIUS } else { 0.0 }]);
         set(u::RESET, &[if reset { 1.0 } else { 0.0 }]);
         // Two unit vectors perpendicular to the sun and to each other.
         let a = if sun[0].abs() < 0.9 {
@@ -158,6 +159,7 @@ impl Shadows {
         set(u::SUN_U, &su);
         set(u::SUN_V, &sv);
         set(u::PREV_SPHERE, &psphere);
+        set(u::CAM, &eye);
         un[u::W as usize] = self.w;
         un[u::H as usize] = self.h;
         un[u::FRAME as usize] = self.frame;
@@ -180,6 +182,31 @@ impl Shadows {
         );
         f.barrier();
         self.cur = before;
+    }
+
+    /// How much the mask changed since the frame before, for the log: the
+    /// share of texels (with a distance) whose share of the sun moved by
+    /// more than 0.3, and the share that sits at 0 or 1 beside a texel in
+    /// between (a test aid for flicker).
+    pub fn flicker(&self) -> String {
+        let (w, h) = (self.w as usize, self.h as usize);
+        let (mut a, mut b) = (vec![0u32; w * h * 2], vec![0u32; w * h * 2]);
+        self.masks[1 - self.cur].read_words(0, &mut a);
+        self.masks[self.cur].read_words(0, &mut b);
+        let f = |v: &[u32], i: usize| f32::from_bits(v[2 * i + 1]);
+        let used: Vec<usize> = (0..w * h)
+            .filter(|&i| f32::from_bits(a[2 * i]) > 0.0 && f32::from_bits(b[2 * i]) > 0.0)
+            .collect();
+        let moved = used
+            .iter()
+            .filter(|&&i| (f(&a, i) - f(&b, i)).abs() > 0.3)
+            .count();
+        let n = used.len().max(1) as f32;
+        format!(
+            "flicker {:.2}% of {} texels moved by 0.3",
+            100.0 * moved as f32 / n,
+            used.len()
+        )
     }
 
     /// What the last mask holds, as text for the log (a test aid): texels

@@ -260,6 +260,7 @@ fn main() {
     let mut inp = Input::default();
     // `lumen lab [MODE [ROOM]]` starts with the Lab open (a test aid: the
     // shell can read what the game prints).
+    let mut walk = false;
     let mut g_frames = 0u32;
     let mut refused_run = 0u32;
     let mut lab_mode: Option<Lab> = None;
@@ -268,6 +269,11 @@ fn main() {
         let mut lab = Lab::new();
         lab.shadow_mode = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(0);
         lab.room = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(0);
+        if let Some(t) = args.get(4).and_then(|a| a.parse::<f32>().ok()) {
+            tod = t;
+            time_rate = 0.0;
+        }
+        walk = args.get(5).map(String::as_str) == Some("walk");
         lab_mode = Some(lab);
     }
     let mut last = g.seconds();
@@ -366,6 +372,10 @@ fn main() {
         if quit {
             break;
         }
+        if walk {
+            inp.mv = [0.0, 0.7];
+            inp.look = [0.35, 0.0];
+        }
         yaw -= inp.look[0] * 2.4 * dt;
         pitch = (pitch - inp.look[1] * 1.5 * dt).clamp(-0.15, 1.25);
         tod = (tod + time_rate * dt) % 1.0;
@@ -463,11 +473,23 @@ fn main() {
             let parts: [[[f32; 4]; 3]; 6] =
                 std::array::from_fn(|k| [pose[k].0[0], pose[k].0[1], pose[k].0[2]]);
             if mode != 2 {
-                sh.trace(&mut f, sky.sun_dir, &parts, me.pos, &vp.0, eye, mode == 5);
+                sh.trace(
+                    &mut f,
+                    sky.sun_dir,
+                    &parts,
+                    me.pos,
+                    &vp.0,
+                    eye,
+                    mode == 5 || mode == 7,
+                    mode != 6 && mode != 7,
+                );
             }
             f.screen();
-            if mode == 4 && g_frames % 120 == 60 {
-                println!("lumen: {}", sh.describe());
+            if lab_mode.is_some() && g_frames % 120 == 60 {
+                println!("lumen: mode {} {}", mode, sh.flicker());
+                if mode == 4 {
+                    println!("lumen: {}", sh.describe());
+                }
             }
         }
         f.clear(hor);
@@ -476,7 +498,7 @@ fn main() {
             (Some(view), true) => view,
             _ => &assets.pipes.lit,
         });
-        d.shadow_on = rt_on && matches!(mode, 0 | 4 | 5);
+        d.shadow_on = rt_on && matches!(mode, 0 | 4..=7);
         d.draw(&mut f, &assets.terrain, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.trees, &vp, &id, white, 0.0);
         d.draw(&mut f, &assets.rocks, &vp, &id, white, 0.0);

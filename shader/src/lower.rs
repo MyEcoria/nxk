@@ -813,25 +813,7 @@ impl Gen<'_> {
     /// A short body of arithmetic on numbers: every instruction can
     /// carry the guard.
     fn predicable(&self, b: &[Inst]) -> bool {
-        if b.len() > 6 || self.guard.is_some() {
-            return false;
-        }
-        b.iter().all(|i| {
-            let ok = matches!(
-                i,
-                Inst::Const { .. }
-                    | Inst::Mov { .. }
-                    | Inst::Un { .. }
-                    | Inst::Bin { .. }
-                    | Inst::Fma { .. }
-                    | Inst::Sel { .. }
-            );
-            let mut nums = true;
-            crate::regalloc::visit_regs(i, &mut |r| {
-                nums &= self.ty(r) != Ty::Bool;
-            });
-            ok && nums
-        })
+        self.guard.is_none() && crate::regalloc::short_alu(self.p, b)
     }
 
     fn loop_(&mut self, max_iter: u32, body: &[Inst]) -> Result<(), Error> {
