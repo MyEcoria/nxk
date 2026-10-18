@@ -235,7 +235,7 @@ fn main() {
     let terrain = world::Terrain::new();
     let tmesh = terrain.mesh();
     let scenery = world::scatter(&terrain, 0x1D2C_3B4A);
-    let assets = match load(&g, &tmesh, &scenery) {
+    let mut assets = match load(&g, &tmesh, &scenery) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("lumen: assets: errno {}", -e);
@@ -428,7 +428,7 @@ fn main() {
         let mut f = g.frame();
         let id = Mat4::IDENTITY;
         let white = [1.0; 4];
-        if let (true, Some(sh)) = (rt_on, assets.shadows.as_ref()) {
+        if let (true, Some(sh)) = (rt_on, assets.shadows.as_mut()) {
             // Positions at reduced resolution, then one ray per texel.
             let (draws, tris) = (d.draws, d.tris);
             f.target(&sh.target);
@@ -445,7 +445,7 @@ fn main() {
             let parts: [[[f32; 4]; 3]; 6] =
                 std::array::from_fn(|k| [pose[k].0[0], pose[k].0[1], pose[k].0[2]]);
             if mode != 2 {
-                sh.trace(&mut f, sky.sun_dir, &parts, me.pos);
+                sh.trace(&mut f, sky.sun_dir, &parts, me.pos, &vp.0, eye);
             }
             f.screen();
         }

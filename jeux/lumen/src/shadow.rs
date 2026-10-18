@@ -31,14 +31,27 @@ const PARTS: [([f32; 3], [f32; 3]); BOXES] = [
     ([-0.105, -0.74, -0.12], [0.105, 0.0, 0.16]),
 ];
 
+/// The angular radius of the sun's disc for the penumbrae, as a tangent
+/// (about 1.5 degrees: wider than the real sun, so that it shows).
+const SUN_RADIUS: f32 = 0.026;
+/// The weight of a new sample in the accumulated mask.
+const BLEND: f32 = 0.15;
+
 pub struct Shadows {
     scene: Rc<RtScene>,
     kernel: Shader,
     pub target: RenderTarget,
-    pub mask: Buffer,
+    /// Two masks, two words a texel (distance, share of the sun): the
+    /// kernel writes one and reads the other, then they swap.
+    masks: [Buffer; 2],
+    cur: usize,
     pub pipeline: Pipeline,
     pub w: u32,
     pub h: u32,
+    frame: u32,
+    /// The last frame: the view-projection, the camera, the sun and the
+    /// figure's sphere (None before the first).
+    prev: Option<([[f32; 4]; 4], [f32; 3], [f32; 3], [f32; 4])>,
 }
 
 impl Shadows {
@@ -63,7 +76,10 @@ impl Shadows {
                 clamp: true,
             },
         )?;
-        let mask = g.buffer_zeroed((w * h) as usize)?;
+        let masks = [
+            g.buffer_zeroed((w * h * 2) as usize)?,
+            g.buffer_zeroed((w * h * 2) as usize)?,
+        ];
         let kernel = g.shader(&shadow::kernel(shadow::Slots::default()))?;
         let fs = g.shader(&position_fragment())?;
         let mut d = PipelineDesc::new(vs, &fs, stride, attrs);
@@ -73,55 +89,85 @@ impl Shadows {
             scene,
             kernel,
             target,
-            mask,
+            masks,
+            cur: 0,
             pipeline,
             w,
             h,
+            frame: 0,
+            prev: None,
         })
     }
 
     /// The ray pass, after the positions are drawn: `parts`: the figure's
     /// model matrices (rows of a 3 x 4, rotation then translation), `at`
-    /// its position.
+    /// its position; `vp` and `eye`: this frame's camera.
+    #[allow(clippy::too_many_arguments)]
     pub fn trace(
-        &self,
+        &mut self,
         f: &mut Frame,
         sun: [f32; 3],
         parts: &[[[f32; 4]; 3]; BOXES],
         at: [f32; 3],
+        vp: &[[f32; 4]; 4],
+        eye: [f32; 3],
     ) {
-        let mut un = vec![0.0f32; u::WORDS];
-        un[u::SUN as usize..u::SUN as usize + 3].copy_from_slice(&sun);
-        un[u::T_MAX as usize] = REACH;
-        un[u::INV_W as usize] = 1.0 / self.w as f32;
-        un[u::INV_H as usize] = 1.0 / self.h as f32;
-        un[u::SPHERE as usize..u::SPHERE as usize + 4].copy_from_slice(&[
-            at[0],
-            at[1] + 0.95,
-            at[2],
-            1.35,
-        ]);
+        let sphere = [at[0], at[1] + 0.95, at[2], 1.35];
+        let mut un = vec![0u32; u::WORDS];
+        let mut set = |at: u16, v: &[f32]| {
+            for (k, x) in v.iter().enumerate() {
+                un[at as usize + k] = x.to_bits();
+            }
+        };
+        set(u::SUN, &sun);
+        set(u::T_MAX, &[REACH]);
+        set(u::INV_W, &[1.0 / self.w as f32, 1.0 / self.h as f32]);
+        set(u::SPHERE, &sphere);
         for (k, m) in parts.iter().enumerate() {
-            let o = u::BOXES as usize + k * BOX_WORDS as usize;
+            let o = u::BOXES + (k as u16) * BOX_WORDS;
             for a in 0..3 {
                 // The world direction of local axis a: column a of the rotation.
-                for r in 0..3 {
-                    un[o + 3 * a + r] = m[r][a];
-                }
-                un[o + 12 + a] = PARTS[k].0[a];
-                un[o + 15 + a] = PARTS[k].1[a];
+                let col = [m[0][a], m[1][a], m[2][a]];
+                set(o + 3 * a as u16, &col);
+                set(o + 12 + a as u16, &[PARTS[k].0[a]]);
+                set(o + 15 + a as u16, &[PARTS[k].1[a]]);
             }
-            for r in 0..3 {
-                un[o + 9 + r] = m[r][3];
-            }
+            set(o + 9, &[m[0][3], m[1][3], m[2][3]]);
         }
-        let mut words: Vec<u32> = un.iter().map(|v| v.to_bits()).collect();
-        words[u::W as usize] = self.w;
-        words[u::H as usize] = self.h;
+        // The last frame's camera; the history is forgotten on the first
+        // frame and when the sun jumped (a change of the time of day).
+        let (pvp, pcam, psun, psphere) = self.prev.unwrap_or((*vp, eye, sun, sphere));
+        let cos = sun[0] * psun[0] + sun[1] * psun[1] + sun[2] * psun[2];
+        let reset = self.prev.is_none() || cos < 0.999_95;
+        for (r, row) in pvp.iter().enumerate() {
+            set(u::PREV_VP + 4 * r as u16, row);
+        }
+        set(u::PREV_CAM, &pcam);
+        set(u::ALPHA, &[BLEND]);
+        set(u::JITTER, &[SUN_RADIUS]);
+        set(u::RESET, &[if reset { 1.0 } else { 0.0 }]);
+        // Two unit vectors perpendicular to the sun and to each other.
+        let a = if sun[0].abs() < 0.9 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let su = crate::meshes::normalize(crate::meshes::cross(sun, a));
+        let sv = crate::meshes::normalize(crate::meshes::cross(sun, su));
+        set(u::SUN_U, &su);
+        set(u::SUN_V, &sv);
+        set(u::PREV_SPHERE, &psphere);
+        un[u::W as usize] = self.w;
+        un[u::H as usize] = self.h;
+        un[u::FRAME as usize] = self.frame;
+        self.frame = self.frame.wrapping_add(1);
+        self.prev = Some((*vp, eye, sun, sphere));
+        let (now, before) = (self.cur, 1 - self.cur);
         f.barrier();
         f.bind_texture(0, self.target.texture());
-        f.bind_buffer(0, &self.mask);
-        f.uniforms(&words);
+        f.bind_buffer(0, &self.masks[now]);
+        f.bind_buffer(1, &self.masks[before]);
+        f.uniforms(&un);
         self.scene.bind(f);
         f.dispatch(
             &self.kernel,
@@ -132,5 +178,6 @@ impl Shadows {
             ],
         );
         f.barrier();
+        self.cur = before;
     }
 }
