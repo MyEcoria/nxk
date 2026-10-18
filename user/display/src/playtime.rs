@@ -1,5 +1,5 @@
 //! Time played per game, counted by display around the games it starts,
-//! in `/config/playtime.cfg`: one `NAME total week week_time order` line
+//! in the user's `playtime.cfg` (`users::playtime_path`): one `NAME total week week_time order` line
 //! per game (seconds; `week`: the week of `week_time`, Monday first, 0
 //! while the clock is unset; `order`: larger was started later).
 
@@ -9,8 +9,8 @@ use alloc::vec::Vec;
 
 use libnx::fs;
 
-const DIR: &str = "/config";
-const FILE: &str = "/config/playtime.cfg";
+/// Before users existed: the first user takes it over.
+pub const LEGACY: &str = "/config/playtime.cfg";
 /// 2001-01-01: the clock service has set the wall clock past it.
 const CLOCK_SET_S: u64 = 978_307_200;
 
@@ -51,8 +51,8 @@ fn span(secs: u64) -> String {
 
 impl Playtime {
     /// The file, or `None` while the card is not readable.
-    pub fn load() -> Option<Self> {
-        let text = match fs::read(FILE) {
+    pub fn load(path: &str) -> Option<Self> {
+        let text = match fs::read(path) {
             Ok(t) => String::from_utf8_lossy(&t).into_owned(),
             Err(e) if e == -libnx::abi::err::ENOENT && fs::statfs().is_ok() => String::new(),
             Err(_) => return None,
@@ -151,9 +151,4 @@ impl Playtime {
             _ => "NOT PLAYED YET".into(),
         }
     }
-}
-
-pub fn save(text: &str) -> Result<(), i64> {
-    let _ = fs::mkdir(DIR);
-    fs::write(FILE, text.as_bytes())
 }

@@ -12,9 +12,11 @@
 extern crate alloc;
 
 mod art;
+mod avatar;
 mod backlight;
 mod config;
 mod controllers;
+mod flow;
 mod font;
 mod games;
 mod home;
@@ -29,6 +31,8 @@ mod status;
 mod term;
 mod theme;
 mod ui;
+mod users;
+mod userspage;
 mod widgets;
 
 use alloc::collections::VecDeque;
@@ -46,6 +50,7 @@ use libnx::abi::rights::{DMA, DUP, GRANT, MAP, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
 use libnx::drv::{self, Mmio};
+use libnx::fs;
 use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
 use libnx::ns::Service;
@@ -178,8 +183,12 @@ type Event = (u64, u64, u64, u64, u64, u64);
 enum Job {
     Act(Action),
     Save(config::Config),
-    /// `playtime.cfg`'s new text.
-    SavePlay(String),
+    /// A user's `playtime.cfg`: its path and new text.
+    SavePlay(String, String),
+    /// A user's `profile.cfg`.
+    Profile(users::Profile),
+    /// A user's directory, or a game's saves, to erase.
+    RemoveTree(String),
     SleepCpu(u64),
 }
 
@@ -246,7 +255,18 @@ impl Launcher {
             ui.toast(format!("{} is running", r.title), now);
             return false;
         }
-        match libnx::process::spawn_args(&[&exe]) {
+        let Some(user) = ui.users.active() else {
+            ui.toast("Nobody is playing: set up a user first".into(), now);
+            return false;
+        };
+        // The game keeps its data in the user's own directory.
+        let dir = users::save_dir(&user.id, &name);
+        users::mkdirs(&dir);
+        let mut env = libnx::process::current_env();
+        env.push(format!("NXK_SAVE_DIR={}", dir));
+        env.push(format!("NXK_USER={}", user.name));
+        env.push(format!("NXK_USER_ID={}", user.id));
+        match libnx::process::spawn_with(&libnx::process::Strings::new(&[&exe], &env)) {
             Ok(h) => {
                 let (q, notif) = (self.exits.clone(), self.notif);
                 let spawned = thread::spawn(move || {
@@ -342,8 +362,16 @@ fn work(w: &Worker, notif: u32) -> ! {
                 let _ = cfg.save();
                 continue;
             }
-            Job::SavePlay(text) => {
-                let _ = playtime::save(&text);
+            Job::SavePlay(path, text) => {
+                let _ = fs::write(&path, text.as_bytes());
+                continue;
+            }
+            Job::Profile(p) => {
+                let _ = users::write_profile(&p);
+                continue;
+            }
+            Job::RemoveTree(path) => {
+                let _ = users::remove_tree(&path);
                 continue;
             }
             Job::SleepCpu(mhz) => {
@@ -418,7 +446,11 @@ fn work(w: &Worker, notif: u32) -> ! {
             | Action::Launch(_)
             | Action::Brightness(_)
             | Action::Save
-            | Action::Sleep => continue,
+            | Action::Sleep
+            | Action::UserSave(..)
+            | Action::UserActivate(_)
+            | Action::UserDelete(_)
+            | Action::EraseSave(..) => continue,
         };
         w.done.lock().push_back(done);
         let _ = sys::notify_signal(notif, EV_DONE);
@@ -526,6 +558,31 @@ fn give_back(dc: &Mmio, w: usize, pa: u32) {
     flip(dc, pa);
 }
 
+/// The play time file of the user playing.
+fn play_path(ui: &Ui) -> Option<String> {
+    ui.users.active().map(|p| users::playtime_path(&p.id))
+}
+
+/// User `i` plays: their theme and play time, the library in their order.
+/// True if the play time was read (it may be saved).
+fn activate(ui: &mut Ui, i: usize) -> bool {
+    let Some(p) = ui.users.list.get(i) else {
+        return false;
+    };
+    let (id, light) = (p.id.clone(), p.light);
+    ui.users.current = Some(i);
+    ui.apply_theme(light);
+    let _ = users::write_last(&id);
+    let loaded = playtime::Playtime::load(&users::playtime_path(&id));
+    let ok = loaded.is_some();
+    ui.play = loaded.unwrap_or_default();
+    let games = ui.take_games();
+    ui.set_games(games);
+    ui.usel = i;
+    ui.want_saves();
+    ok
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -617,6 +674,7 @@ fn main() -> i32 {
         ui.cfg.brightness = b.percent();
     }
     let mut cfg_loaded = false;
+    let mut users_loaded = false;
     let mut play_loaded = false;
     let mut save_at: u64 = 0;
     let mut sleeping = false;
@@ -705,6 +763,113 @@ fn main() -> i32 {
         }};
     }
 
+    // What an action asks of the main loop.
+    macro_rules! run_action {
+        ($action:expr, $now:expr) => {{
+            let now = $now;
+            match $action {
+                Some(Action::ClearLogs) => msgs.clear(),
+                Some(Action::Launch(i)) => {
+                    if launcher.launch(&mut ui, i) && play_loaded {
+                        if let Some(path) = play_path(&ui) {
+                            worker
+                                .jobs
+                                .lock()
+                                .push_back(Job::SavePlay(path, ui.play.text()));
+                            worker.wake.notify_one();
+                        }
+                    }
+                }
+                Some(Action::Brightness(pct)) => {
+                    if let Some(b) = &bl {
+                        b.set(pct);
+                    }
+                    save_at = now + 800_000_000;
+                }
+                Some(Action::Volume(pct)) => {
+                    set_volume!(pct, now);
+                }
+                Some(Action::Save) => {
+                    save_at = 0;
+                    let mut q = worker.jobs.lock();
+                    q.push_back(Job::Save(ui.cfg));
+                    if let Some(p) = ui.users.take_dirty().and_then(|i| ui.users.list.get(i)) {
+                        q.push_back(Job::Profile(p.clone()));
+                    }
+                    drop(q);
+                    worker.wake.notify_one();
+                }
+                Some(Action::Flight(off)) => {
+                    save_at = 0;
+                    let mut q = worker.jobs.lock();
+                    q.push_back(Job::Save(ui.cfg));
+                    q.push_back(Job::Act(Action::Flight(off)));
+                    drop(q);
+                    worker.wake.notify_one();
+                }
+                Some(Action::Sleep) => {
+                    enter_sleep!();
+                }
+                Some(Action::UserSave(i, play)) => {
+                    if let Some(p) = ui.users.list.get(i).cloned() {
+                        if let Err(e) = users::write_profile(&p) {
+                            ui.toast(format!("users: {}", libnx::abi::err::name(e)), now);
+                        }
+                        if play {
+                            // The first user takes over the play time counted before users.
+                            if ui.users.list.len() == 1 {
+                                if let Ok(old) = fs::read(playtime::LEGACY) {
+                                    let _ = fs::write(&users::playtime_path(&p.id), &old);
+                                    let _ = fs::remove_file(playtime::LEGACY);
+                                }
+                            }
+                            play_loaded = activate(&mut ui, i);
+                        }
+                    }
+                }
+                Some(Action::UserActivate(i)) => {
+                    if launcher.running.is_some() {
+                        ui.toast("Close the game first".into(), now);
+                    } else {
+                        play_loaded = activate(&mut ui, i);
+                        if ui.page == ui::USERS {
+                            ui.go(ui::LIBRARY);
+                        }
+                    }
+                }
+                Some(Action::UserDelete(i)) => {
+                    if launcher.running.is_some() {
+                        ui.toast("Close the game first".into(), now);
+                    } else if let Some(dir) = ui.users.list.get(i).map(|p| p.dir()) {
+                        worker.jobs.lock().push_back(Job::RemoveTree(dir));
+                        worker.wake.notify_one();
+                        if let Some(n) = ui.remove_user(i) {
+                            play_loaded = activate(&mut ui, n);
+                        }
+                    }
+                }
+                Some(Action::EraseSave(u, k)) => {
+                    let path = ui
+                        .users
+                        .list
+                        .get(u)
+                        .zip(ui.saves.get(k))
+                        .map(|(p, (game, _))| users::save_dir(&p.id, game));
+                    if let Some(path) = path {
+                        worker.jobs.lock().push_back(Job::RemoveTree(path));
+                        worker.wake.notify_one();
+                        ui.saves.remove(k);
+                    }
+                }
+                Some(a) => {
+                    worker.jobs.lock().push_back(Job::Act(a));
+                    worker.wake.notify_one();
+                }
+                None => {}
+            }
+        }};
+    }
+
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
         let now = time::now_ns();
@@ -756,12 +921,30 @@ fn main() -> i32 {
                     dirty = true;
                 }
             }
-            // Read once the card is: saving before would lose its lines.
-            if !play_loaded && now >= next_scan {
-                if let Some(pt) = playtime::Playtime::load() {
-                    ui.play = pt;
-                    play_loaded = true;
+            // The users come with the card; their play time is read when
+            // one of them starts playing (saving before would lose its lines).
+            if cfg_loaded && !users_loaded {
+                if let Some((list, last)) = users::load() {
+                    users_loaded = true;
+                    ui.users = users::Users::new(list);
+                    let pick = last
+                        .and_then(|id| ui.users.list.iter().position(|p| p.id == id))
+                        .unwrap_or(0);
+                    match ui.users.list.get(pick) {
+                        None => ui.start_setup(),
+                        Some(p) if p.pin.is_some() => ui.start_verify(pick, true),
+                        Some(_) => play_loaded = activate(&mut ui, pick),
+                    }
+                    dirty = true;
                 }
+            }
+            if let Some(id) = ui.take_saves_request() {
+                ui.set_saves(&id, users::saves(&id));
+                dirty = true;
+            }
+            if let Some(a) = ui.tick(now) {
+                run_action!(Some(a), now);
+                dirty = true;
             }
             if ui.page == ui::LIBRARY && now >= next_scan {
                 let found = games::scan(ui.take_games());
@@ -835,7 +1018,7 @@ fn main() -> i32 {
                 wake = wake.min(next_scan);
             }
             if ui.animating() {
-                wake = wake.min(now + 16_000_000);
+                wake = wake.min(now + ui.frame_ns());
             }
         }
         if let Some(g) = &game {
@@ -1009,45 +1192,7 @@ fn main() -> i32 {
                         }
                         a
                     };
-                    match action {
-                        Some(Action::ClearLogs) => msgs.clear(),
-                        Some(Action::Launch(i)) => {
-                            if launcher.launch(&mut ui, i) && play_loaded {
-                                worker.jobs.lock().push_back(Job::SavePlay(ui.play.text()));
-                                worker.wake.notify_one();
-                            }
-                        }
-                        Some(Action::Brightness(pct)) => {
-                            if let Some(b) = &bl {
-                                b.set(pct);
-                            }
-                            save_at = now + 800_000_000;
-                        }
-                        Some(Action::Volume(pct)) => {
-                            set_volume!(pct, now);
-                        }
-                        Some(Action::Save) => {
-                            save_at = 0;
-                            worker.jobs.lock().push_back(Job::Save(ui.cfg));
-                            worker.wake.notify_one();
-                        }
-                        Some(Action::Flight(off)) => {
-                            save_at = 0;
-                            let mut q = worker.jobs.lock();
-                            q.push_back(Job::Save(ui.cfg));
-                            q.push_back(Job::Act(Action::Flight(off)));
-                            drop(q);
-                            worker.wake.notify_one();
-                        }
-                        Some(Action::Sleep) => {
-                            enter_sleep!();
-                        }
-                        Some(a) => {
-                            worker.jobs.lock().push_back(Job::Act(a));
-                            worker.wake.notify_one();
-                        }
-                        None => {}
-                    }
+                    run_action!(action, now);
                     dirty = true;
                 }
             }
@@ -1059,8 +1204,13 @@ fn main() -> i32 {
                         let secs = (now - r.since) / 1_000_000_000;
                         ui.play.ended(&r.name, secs, time::realtime_ns());
                         if play_loaded {
-                            worker.jobs.lock().push_back(Job::SavePlay(ui.play.text()));
-                            worker.wake.notify_one();
+                            if let Some(path) = play_path(&ui) {
+                                worker
+                                    .jobs
+                                    .lock()
+                                    .push_back(Job::SavePlay(path, ui.play.text()));
+                                worker.wake.notify_one();
+                            }
                         }
                     }
                     let title = run.map(|r| r.title);

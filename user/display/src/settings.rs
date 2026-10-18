@@ -16,7 +16,7 @@ use crate::theme::pal;
 use crate::ui::{Id, Ui, HEADER_RULE_Y, LOGS, M, NETWORK, RULE_Y, SYSTEM, TERMINAL, W};
 use crate::widgets::{battery, icon, press, slider, switch, Icon, Tone};
 
-pub const CATS: [&str; 8] = [
+pub const CATS: [&str; 9] = [
     "Display",
     "Sound",
     "Internet",
@@ -25,6 +25,7 @@ pub const CATS: [&str; 8] = [
     "Power",
     "Battery",
     "System",
+    "Users",
 ];
 const SLEEP_LABELS: [&str; 5] = ["Never", "1 min", "5 min", "10 min", "30 min"];
 /// The left category sidebar, and the chosen category's right column.
@@ -60,22 +61,22 @@ impl Ui {
     pub(crate) fn settings(&mut self, s: &mut Screen, d: &Data) {
         let p = pal();
         for (i, name) in CATS.iter().enumerate() {
-            let y = 120 + i * 64;
+            let y = 120 + i * 54;
             let on = self.cat == i;
             let down = self.pressed == Some(Id::Cat(i));
             if on || down {
-                s.fill_round(M, y, LW, 56, 6, press(p.surface, down));
+                s.fill_round(M, y, LW, 48, 6, press(p.surface, down));
             }
             if on {
-                s.fill_round(M + 10, y + 12, 5, 32, 2, p.accent);
+                s.fill_round(M + 10, y + 10, 5, 28, 2, p.accent);
             }
             let (f, c) = if on {
                 (Face::BodyB, p.accent)
             } else {
                 (Face::Body, p.dim)
             };
-            s.label(M + 32, y + 28, name, f, c);
-            self.zone(Id::Cat(i), M, y, LW, 56, 6);
+            s.label(M + 32, y + 24, name, f, c);
+            self.zone(Id::Cat(i), M, y, LW, 48, 6);
         }
         s.fill(
             M + LW + 22,
@@ -93,9 +94,45 @@ impl Ui {
             4 => self.cat_performance(s, d),
             5 => self.cat_power(s, d),
             6 => self.cat_battery(s, d),
-            _ => self.cat_system(s, d),
+            7 => self.cat_system(s, d),
+            _ => self.cat_users(s),
         }
         self.page_hints(s);
+    }
+
+    fn cat_users(&mut self, s: &mut Screen) {
+        let p = pal();
+        let n = self.users.list.len();
+        let who = self.users.active().map_or("-".into(), |u| u.name.clone());
+        row(s, Y, "Playing now", &who, p.accent);
+        rule(s, Y + 24);
+        row(
+            s,
+            Y + 48,
+            "Users",
+            &format!("{} of {}", n, crate::users::MAX_USERS),
+            p.dim,
+        );
+        rule(s, Y + 72);
+        s.label(
+            X,
+            Y + 116,
+            "Each user has a profile and their own",
+            Face::Small,
+            p.dim,
+        );
+        s.label(X, Y + 144, "save data in every game.", Face::Small, p.dim);
+        self.button(
+            s,
+            Id::OpenPage(crate::ui::USERS),
+            X,
+            Y + 190,
+            XR - X,
+            56,
+            "Manage Users",
+            Tone::Accent,
+            true,
+        );
     }
 
     fn cat_sound(&mut self, s: &mut Screen) {

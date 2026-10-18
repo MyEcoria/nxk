@@ -191,7 +191,12 @@ impl Ui {
             if i < n {
                 game_icon(s, &self.games[i], x, ICON_Y);
                 if i == last_idx {
-                    game_badge(s, x, ICON_Y);
+                    game_badge(
+                        s,
+                        x,
+                        ICON_Y,
+                        self.users.active().map(|u| (u.color, u.glyph)),
+                    );
                 }
                 if sel_btn.is_none() && self.home == i {
                     s.ring_round(
@@ -336,10 +341,15 @@ fn game_icon(s: &mut Screen, g: &GameInfo, x: usize, y: usize) {
 }
 
 /// Switch 2 bottom-left avatar and black status pill on the last-played game card.
-fn game_badge(s: &mut Screen, x: usize, y: usize) {
+fn game_badge(s: &mut Screen, x: usize, y: usize, user: Option<(u8, u8)>) {
     let ay = y + ICON - 56;
-    if let Some(img) = art::get(art::UI, art::AVATAR_SMALL) {
-        s.image(&img, x + 12, ay, 44, 44, 22);
+    match user {
+        Some((c, g)) => crate::avatar::avatar(s, x + 34, ay + 22, 22, c, g),
+        None => {
+            if let Some(img) = art::get(art::UI, art::AVATAR_SMALL) {
+                s.image(&img, x + 12, ay, 44, 44, 22);
+            }
+        }
     }
     s.ring(x + 34, ay + 22, 22, 2, crate::theme::rgb(0x2E2E2E));
     let (px, py, pw, ph) = (x + 64, ay + 2, 180, 40);

@@ -283,7 +283,8 @@ The library (GAMES, the first page of `display`) lists `/games/NAME`
 directories: the program `NAME`, `game.txt` (`title=`, `publisher=`,
 `version=`, `description=`, `color=RRGGBB`) and `cover.bin` (its art,
 `tools/mkcovers.py`), re-read every 8 s; the time played goes to
-`/config/playtime.cfg`. `mksd-hw.sh` installs the ones built from
+`/users/ID/playtime.cfg` of the user playing (users and their save
+data: `/users/ID/`, README "Users and save data"). `mksd-hw.sh` installs the ones built from
 `jeux/`; for a card in the console,
 `./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
 `-c "mkdir /games/NAME"` in an earlier call).

@@ -13,6 +13,7 @@ use libnx::abi::proto::{cpufreq, fan, gpu, input, power};
 use crate::art;
 use crate::backlight::MIN_PCT;
 use crate::config::{Config, SLEEP_MIN};
+use crate::flow::Flow;
 use crate::font::{self, Face};
 use crate::games::GameInfo;
 use crate::playtime::Playtime;
@@ -21,6 +22,7 @@ use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
 use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
 use crate::theme::{self, pal};
+use crate::users::Users;
 use crate::widgets::{battery, button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
 use crate::Messages;
 
@@ -46,6 +48,7 @@ pub const TERMINAL: usize = 3;
 pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
 pub const CONTROLLERS: usize = 6;
+pub const USERS: usize = 7;
 
 const TOAST_NS: u64 = 4_000_000_000;
 const FAN_STEP: u64 = 10;
@@ -115,6 +118,33 @@ pub enum Id {
     SheetClose,
     No,
     Yes,
+    // Users page.
+    UserRow(usize),
+    UserAdd,
+    UserSwitch,
+    UserUnlock,
+    UserRename,
+    UserLook,
+    UserPin,
+    UserDelete,
+    /// Erase the saves of a game, by index in `Ui::saves`.
+    SaveErase(usize),
+    SavesPrev,
+    SavesNext,
+    // User flows: the keyboard (a lowercase letter or digit), the avatar
+    // choices, the PIN pad and the buttons under every step.
+    Key(u8),
+    KeySpace,
+    KeyBack,
+    KeyShift,
+    Glyph(usize),
+    Color(usize),
+    Pin(usize),
+    PinBack,
+    FlowNext,
+    FlowBack,
+    FlowSkip,
+    LockOther,
 }
 
 /// What a tap asks the service to do.
@@ -151,6 +181,14 @@ pub enum Action {
     BtPair(bool),
     /// Forget the controller at this address (`bt::FORGET`).
     BtForget(u64),
+    /// Write user `n`'s profile; the flag: it also starts playing.
+    UserSave(usize, bool),
+    /// User `n` plays now.
+    UserActivate(usize),
+    /// Erase user `n` from the card.
+    UserDelete(usize),
+    /// Erase user `n`'s saves of the game at this index of `Ui::saves`.
+    EraseSave(usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -213,7 +251,18 @@ pub struct Ui {
     pub(crate) cpu_sent: bool,
     pub(crate) gpu: Seen<Gpu>,
     pub(crate) gpu_sent: bool,
-    zones: Vec<Zone>,
+    pub(crate) zones: Vec<Zone>,
+    /// The user flow on screen (setup, new user, PIN...), and whether its
+    /// step is sliding in this frame.
+    pub(crate) flow: Option<Flow>,
+    pub(crate) sliding: bool,
+    pub users: Users,
+    /// Users page: the profile shown, what each game keeps for it, and
+    /// the page of that list.
+    pub(crate) usel: usize,
+    pub(crate) saves: Vec<(String, u64)>,
+    pub(crate) saves_req: bool,
+    pub(crate) saves_page: usize,
     /// What the gamepad has selected outside the home row.
     pub(crate) focus: Option<Id>,
     focus_at: (usize, usize),
@@ -266,6 +315,13 @@ impl Ui {
             gpu: Seen::Unknown,
             gpu_sent: false,
             zones: Vec::new(),
+            flow: None,
+            sliding: false,
+            users: Users::default(),
+            usel: 0,
+            saves: Vec::new(),
+            saves_req: false,
+            saves_page: 0,
             focus: None,
             focus_at: (W / 2, H / 2),
             games: Vec::new(),
@@ -291,6 +347,12 @@ impl Ui {
     pub fn apply_config(&mut self, c: Config) {
         self.cfg = c;
         theme::set(c.light);
+    }
+
+    /// The playing user's theme is in force.
+    pub fn apply_theme(&mut self, light: bool) {
+        self.cfg.light = light;
+        theme::set(light);
     }
 
     /// A fan request came back.
@@ -390,7 +452,17 @@ impl Ui {
     }
 
     pub fn animating(&self) -> bool {
-        self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5
+        self.flow.is_some() || (self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5)
+    }
+
+    /// Time between two frames of an animation: the flows redraw often
+    /// but change little, the home row's scroll moves all of it.
+    pub fn frame_ns(&self) -> u64 {
+        if self.flow.is_some() {
+            33_000_000
+        } else {
+            16_000_000
+        }
     }
 
     pub fn toast(&mut self, text: String, now: u64) {
@@ -442,7 +514,7 @@ impl Ui {
     }
 
     /// The zone nearest to the selection in the direction of `code`.
-    fn step_focus(&mut self, code: u64) {
+    pub(crate) fn step_focus(&mut self, code: u64) {
         let (dx, dy): (i64, i64) = match code {
             input::BTN_LEFT => (-1, 0),
             input::BTN_RIGHT => (1, 0),
@@ -558,6 +630,9 @@ impl Ui {
     pub fn pad(&mut self, code: u64) -> Option<Action> {
         use input::*;
         let open = self.overlay();
+        if self.flow.is_some() && !open {
+            return self.flow_pad(code);
+        }
         if self.page == LIBRARY && !open {
             if let Some(a) = self.home_pad(code) {
                 return a;
@@ -643,6 +718,10 @@ impl Ui {
         if page == LOGS {
             self.unread = 0;
         }
+        if page == USERS {
+            self.usel = self.users.current.unwrap_or(0);
+            self.want_saves();
+        }
     }
 
     pub(crate) fn confirm(
@@ -663,7 +742,18 @@ impl Ui {
     }
 
     pub(crate) fn tap(&mut self, id: Id) -> Option<Action> {
+        if self.flow.is_some() {
+            if let Some(a) = self.flow_tap(id) {
+                return a;
+            }
+        }
+        if let Some(a) = self.users_tap(id) {
+            return a;
+        }
         match id {
+            Id::AvatarHome if self.page == LIBRARY && self.users.active().is_some() => {
+                self.go(USERS)
+            }
             Id::AvatarHome if self.page == LIBRARY => return self.set_theme(!self.cfg.light),
             Id::AvatarHome => self.go(LIBRARY),
             Id::Scrim => {
@@ -817,6 +907,29 @@ impl Ui {
                 }
                 return a;
             }
+            Id::UserRow(_)
+            | Id::UserAdd
+            | Id::UserSwitch
+            | Id::UserUnlock
+            | Id::UserRename
+            | Id::UserLook
+            | Id::UserPin
+            | Id::UserDelete
+            | Id::SaveErase(_)
+            | Id::SavesPrev
+            | Id::SavesNext
+            | Id::Key(_)
+            | Id::KeySpace
+            | Id::KeyBack
+            | Id::KeyShift
+            | Id::Glyph(_)
+            | Id::Color(_)
+            | Id::Pin(_)
+            | Id::PinBack
+            | Id::FlowNext
+            | Id::FlowBack
+            | Id::FlowSkip
+            | Id::LockOther => {}
             Id::LogSize => self.log_scale = 3 - self.log_scale,
             Id::LogClear => return Some(Action::ClearLogs),
             Id::TermSize => self.term_scale = 3 - self.term_scale,
@@ -843,6 +956,10 @@ impl Ui {
         }
         self.cfg.light = light;
         theme::set(light);
+        if let Some(i) = self.users.current {
+            self.users.list[i].light = light;
+            self.users.touch();
+        }
         Some(Action::Save)
     }
 
@@ -855,16 +972,22 @@ impl Ui {
         self.cpu = d.cpu;
         self.gpu = d.gpu;
         s.clear(p.bg);
-        match self.page {
-            LIBRARY => self.home_page(s, d),
-            SETTINGS => self.settings(s, d),
-            NETWORK => self.network(s, d),
-            SYSTEM => self.system(s, d),
-            CONTROLLERS => self.controllers(s, d),
-            TERMINAL => self.terminal(s, d, term, now),
-            _ => self.logs(s, msgs),
+        self.sliding = false;
+        if self.flow.is_some() {
+            self.flow_screen(s, now);
+        } else {
+            match self.page {
+                LIBRARY => self.home_page(s, d),
+                SETTINGS => self.settings(s, d),
+                NETWORK => self.network(s, d),
+                SYSTEM => self.system(s, d),
+                CONTROLLERS => self.controllers(s, d),
+                USERS => self.users_page(s),
+                TERMINAL => self.terminal(s, d, term, now),
+                _ => self.logs(s, msgs),
+            }
+            self.top_bar(s, d);
         }
-        self.top_bar(s, d);
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
         }
@@ -899,8 +1022,8 @@ impl Ui {
                 volume_hud(s, HEADER_RULE_Y + 16, self.cfg.volume);
             }
         }
-        // The home row shows its own selection.
-        if self.page == LIBRARY && !self.overlay() {
+        // The home row shows its own selection; a sliding step has no zones yet.
+        if (self.page == LIBRARY && self.flow.is_none() && !self.overlay()) || self.sliding {
             return;
         }
         if self
@@ -969,12 +1092,26 @@ impl Ui {
         let p = pal();
         let cy = STATUS_Y;
         if self.page == LIBRARY {
-            if let Some(img) = art::get(art::UI, art::AVATAR) {
-                s.image(&img, 64, cy - 30, 60, 60, 30);
+            match self.users.active() {
+                Some(u) => crate::avatar::avatar(s, 94, cy, 30, u.color, u.glyph),
+                None => {
+                    if let Some(img) = art::get(art::UI, art::AVATAR) {
+                        s.image(&img, 64, cy - 30, 60, 60, 30);
+                    }
+                }
             }
             s.ring(94, cy, 31, 2, p.rule);
             self.zone(Id::AvatarHome, 64, cy - 30, 60, 60, 30);
             let from = self.status(s, d, W - 64, cy, p.bg);
+            self.zone(Id::StatusQuick, from - 12, cy - 28, W - from + 12, 56, 8);
+        } else if self.page == USERS {
+            if let Some(u) = self.users.active() {
+                crate::avatar::avatar(s, 78, cy, 20, u.color, u.glyph);
+            }
+            let tw = s.label(112, cy, "Users", Face::Title, p.text);
+            self.zone(Id::AvatarHome, 46, cy - 32, tw + 80, 64, 8);
+            s.fill(30, HEADER_RULE_Y, W - 60, 1, p.rule);
+            let from = self.status(s, d, W - 58, cy, p.bg);
             self.zone(Id::StatusQuick, from - 12, cy - 28, W - from + 12, 56, 8);
         } else {
             let k = match self.page {
