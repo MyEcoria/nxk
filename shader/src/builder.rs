@@ -61,6 +61,11 @@ impl Builder {
         self.local_words = n;
     }
 
+    /// Registers made so far.
+    pub fn reg_count(&self) -> usize {
+        self.types.len()
+    }
+
     pub fn ty(&self, r: Reg) -> Ty {
         self.types[r.0 as usize]
     }

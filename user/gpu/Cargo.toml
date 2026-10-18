@@ -6,3 +6,4 @@ description = "GM20B GPU: power-up, secure boot of FECS, 2D engine, compute kern
 
 [dependencies]
 libnx = { path = "../libnx" }
+nxk-shader = { path = "../../shader" }

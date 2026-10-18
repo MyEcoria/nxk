@@ -28,10 +28,12 @@ mod pll;
 mod power;
 mod push;
 mod qmd;
-mod sass;
 mod stats;
 
 use alloc::vec::Vec;
+
+// The SASS encoders live with the shader compiler.
+pub(crate) use nxk_shader::sass;
 
 use libnx::abi::err::{EAGAIN, EINVAL, EIO, ENODEV, ERANGE, ETIMEDOUT};
 use libnx::abi::proto::{clk, gpu as proto, power as psu};

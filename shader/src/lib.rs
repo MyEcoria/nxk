@@ -7,9 +7,13 @@
 extern crate alloc;
 
 pub mod builder;
+pub mod emit;
 pub mod fmath;
 pub mod interp;
 pub mod ir;
+pub mod lower;
+pub mod regalloc;
+pub mod sass;
 pub mod validate;
 pub mod wire;
 
@@ -19,5 +23,9 @@ pub use validate::{validate, Info};
 
 #[cfg(test)]
 extern crate std;
+#[cfg(test)]
+mod lower_tests;
+#[cfg(test)]
+mod sassim;
 #[cfg(test)]
 mod tests;

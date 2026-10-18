@@ -140,6 +140,7 @@ name = "gpu"
 version = "0.1.0"
 dependencies = [
  "libnx",
+ "nxk-shader",
 ]
 
 [[package]]
@@ -240,6 +241,10 @@ dependencies = [
 
 [[package]]
 name = "nxk-abi"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-shader"
 version = "0.1.0"
 
 [[package]]

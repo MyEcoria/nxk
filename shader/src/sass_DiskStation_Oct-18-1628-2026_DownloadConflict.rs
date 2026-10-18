@@ -3,12 +3,10 @@
 //! Every group of three instructions follows a 64-bit scheduling word:
 //! stall cycles, scoreboards set and waited on. Checked against envyas
 //! output in Mesa (gallium/drivers/nouveau/codegen/lib/gm107.asm.h):
-//! `rustc --edition 2021 --test user/gpu/src/sass.rs -o sass && ./sass`.
+//! `cd shader && cargo test`.
 
 // Encoders the kernels do not use yet stay, checked against envyas.
 #![cfg_attr(not(test), allow(dead_code))]
-
-extern crate alloc;
 
 use alloc::vec::Vec;
 
@@ -42,6 +40,38 @@ impl Sched {
 
     pub const fn wait(self, mask: u8) -> Self {
         Self(self.0 | (mask as u64 & 0x3F) << 11)
+    }
+
+    pub const fn stalls(self) -> u8 {
+        (self.0 & 0xF) as u8
+    }
+
+    pub const fn with_stall(self, n: u8) -> Self {
+        Self(self.0 & !0xF | (n as u64 & 0xF))
+    }
+
+    /// Scoreboard this instruction sets when its result is written
+    /// (`None`: none).
+    pub const fn wr_bar(self) -> Option<u8> {
+        let b = (self.0 >> 5 & 7) as u8;
+        if b == 7 {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    pub const fn rd_bar(self) -> Option<u8> {
+        let b = (self.0 >> 8 & 7) as u8;
+        if b == 7 {
+            None
+        } else {
+            Some(b)
+        }
+    }
+
+    pub const fn wait_mask(self) -> u8 {
+        (self.0 >> 11 & 0x3F) as u8
     }
 }
 
@@ -132,6 +162,11 @@ pub fn iadd32i(d: u8, a: u8, v: i32) -> u64 {
 /// `x` adds CC in (high half).
 pub fn iadd_c(d: u8, a: u8, off: u32, carry: bool, x: bool) -> u64 {
     op(0x4C10) | reg(d, 0) | reg(a, 8) | cb(off) | (x as u64) << 43 | (carry as u64) << 47
+}
+
+/// ISETP against `c[idx][off]`.
+pub fn isetp_cb(p: u8, a: u8, idx: u8, off: u32, cmp: Cmp, signed: bool) -> u64 {
+    isetp(0x4B60, p, a, cmp, signed) | cbi(idx, off)
 }
 
 /// ISETP.cmp.AND p, PT, a, b, PT (u32 unless `signed`).
@@ -266,6 +301,256 @@ pub fn tex_b(d: u8, coords: u8, handle: u8) -> u64 {
     op(0xDEB8) | reg(d, 0) | reg(coords, 8) | reg(handle, 20) | DIM_2D << 28 | 0xF << 31
 }
 
+// Encoders of the shader compiler (`lower`). Opcodes and fields as NAK's
+// sm50.rs places them; the registers of vector operands are consecutive.
+
+/// FADD d = a + b (`neg_b`: a - b), saturated to 0..1 if `sat`.
+pub fn fadd(d: u8, a: u8, b: u8, neg_b: bool, sat: bool) -> u64 {
+    op(0x5C58) | reg(d, 0) | reg(a, 8) | reg(b, 20) | (neg_b as u64) << 45 | (sat as u64) << 50
+}
+
+/// FMNMX: the smaller (`min`) or the larger of a and b; a NaN loses.
+pub fn fmnmx(d: u8, a: u8, b: u8, min: bool) -> u64 {
+    op(0x5C60) | reg(d, 0) | reg(a, 8) | reg(b, 20) | (PT as u64) << 39 | (!min as u64) << 42
+}
+
+#[derive(Clone, Copy)]
+pub enum Logic {
+    And = 0,
+    Or = 1,
+    Xor = 2,
+    /// `b` alone (use RZ for `a`).
+    PassB = 3,
+}
+
+/// LOP d = a op b, either operand complemented first on request.
+pub fn lop(d: u8, a: u8, b: u8, how: Logic, not_a: bool, not_b: bool) -> u64 {
+    op(0x5C40)
+        | reg(d, 0)
+        | reg(a, 8)
+        | reg(b, 20)
+        | (not_a as u64) << 39
+        | (not_b as u64) << 40
+        | (how as u64) << 41
+        | (PT as u64) << 48
+}
+
+/// LOP32I d = a op imm (And, Or, Xor).
+pub fn lop32i(d: u8, a: u8, imm: u32, how: Logic) -> u64 {
+    assert!(!matches!(how, Logic::PassB));
+    op(0x0400) | reg(d, 0) | reg(a, 8) | (imm as u64) << 20 | (how as u64) << 53
+}
+
+/// SHL d = a << (b mod 32).
+pub fn shl_r(d: u8, a: u8, b: u8) -> u64 {
+    op(0x5C48) | reg(d, 0) | reg(a, 8) | reg(b, 20) | 1 << 39
+}
+
+/// SHR d = a >> (b mod 32), arithmetic if `signed`.
+pub fn shr_r(d: u8, a: u8, b: u8, signed: bool) -> u64 {
+    op(0x5C28) | reg(d, 0) | reg(a, 8) | reg(b, 20) | 1 << 39 | (signed as u64) << 48
+}
+
+/// IMUL d = low 32 bits of a * b.
+pub fn imul(d: u8, a: u8, b: u8) -> u64 {
+    op(0x5C38) | reg(d, 0) | reg(a, 8) | reg(b, 20)
+}
+
+/// IMNMX: min or max, signed or unsigned.
+pub fn imnmx(d: u8, a: u8, b: u8, min: bool, signed: bool) -> u64 {
+    op(0x5C20)
+        | reg(d, 0)
+        | reg(a, 8)
+        | reg(b, 20)
+        | (PT as u64) << 39
+        | (!min as u64) << 42
+        | (signed as u64) << 48
+}
+
+/// IADD d = a - b.
+pub fn isub(d: u8, a: u8, b: u8) -> u64 {
+    op(0x5C10) | reg(d, 0) | reg(a, 8) | reg(b, 20) | 1 << 48
+}
+
+/// I2I.S32 d = |a|.
+pub fn iabs(d: u8, a: u8) -> u64 {
+    op(0x5CE0) | reg(d, 0) | reg(a, 20) | 2 << 8 | 2 << 10 | 1 << 12 | 1 << 13 | 1 << 49
+}
+
+/// F2F.F32.F32.FLOOR.
+pub fn ffloor(d: u8, a: u8) -> u64 {
+    op(0x5CA8) | reg(d, 0) | reg(a, 20) | 2 << 8 | 2 << 10 | 1 << 39 | 1 << 42
+}
+
+/// F2I.S32 / F2I.U32 of a float, truncating and saturating.
+pub fn f2i(d: u8, a: u8, signed: bool) -> u64 {
+    op(0x5CB0) | reg(d, 0) | reg(a, 20) | 2 << 8 | 2 << 10 | (signed as u64) << 12 | 3 << 39
+}
+
+/// I2F.F32.S32 / .U32.
+pub fn i2f(d: u8, a: u8, signed: bool) -> u64 {
+    op(0x5CB8) | reg(d, 0) | reg(a, 20) | 2 << 8 | 2 << 10 | (signed as u64) << 13
+}
+
+/// MUFU function codes.
+pub const MUFU_COS: u8 = 0;
+pub const MUFU_SIN: u8 = 1;
+pub const MUFU_EX2: u8 = 2;
+pub const MUFU_LG2: u8 = 3;
+pub const MUFU_RCP: u8 = 4;
+pub const MUFU_RSQ: u8 = 5;
+pub const MUFU_SQRT: u8 = 8;
+
+pub fn mufu(d: u8, a: u8, func: u8) -> u64 {
+    op(0x5080) | reg(d, 0) | reg(a, 8) | (func as u64) << 20
+}
+
+/// RRO: range reduction before MUFU.SIN / COS (`exp2` false) or EX2.
+pub fn rro(d: u8, a: u8, exp2: bool) -> u64 {
+    op(0x5C90) | reg(d, 0) | reg(a, 20) | (exp2 as u64) << 39
+}
+
+/// Float comparisons (FSETP codes).
+#[derive(Clone, Copy)]
+pub enum FCmp {
+    Lt = 0x01,
+    Eq = 0x02,
+    Le = 0x03,
+    Gt = 0x04,
+    Ge = 0x06,
+    /// True with a NaN, as C's `!=`.
+    NeU = 0x0D,
+}
+
+/// FSETP.cmp p = a cmp b.
+pub fn fsetp(p: u8, a: u8, b: u8, cmp: FCmp) -> u64 {
+    op(0x5BB0)
+        | (PT as u64)
+        | (p as u64) << 3
+        | reg(a, 8)
+        | reg(b, 20)
+        | (PT as u64) << 39
+        | (cmp as u64) << 48
+}
+
+/// ISETP.cmp.AND p = (a cmp b) && acc (a predicate, `not_acc` inverts it).
+pub fn isetp_acc(p: u8, a: u8, b: u8, cmp: Cmp, signed: bool, acc: u8, not_acc: bool) -> u64 {
+    isetp_r(p, a, b, cmp, signed) & !(0xF << 39) | (acc as u64) << 39 | (not_acc as u64) << 42
+}
+
+/// SEL d = pred ? a : b (`not` inverts the predicate).
+pub fn sel(d: u8, a: u8, b: u8, pred: u8, not: bool) -> u64 {
+    op(0x5CA0) | reg(d, 0) | reg(a, 8) | reg(b, 20) | (pred as u64) << 39 | (not as u64) << 42
+}
+
+#[derive(Clone, Copy)]
+pub enum PLogic {
+    And = 0,
+    Or = 1,
+    Xor = 2,
+}
+
+/// PSETP: d = ((s0 ^ n0) op0 (s1 ^ n1)) op1 (s2 ^ n2); `d2` takes the
+/// same with the first term inverted (PT: dropped).
+#[allow(clippy::too_many_arguments)]
+pub fn psetp(
+    d: u8,
+    d2: u8,
+    s0: (u8, bool),
+    op0: PLogic,
+    s1: (u8, bool),
+    op1: PLogic,
+    s2: (u8, bool),
+) -> u64 {
+    op(0x5090)
+        | (d2 as u64)
+        | (d as u64) << 3
+        | (s0.0 as u64) << 12
+        | (s0.1 as u64) << 15
+        | (op0 as u64) << 24
+        | (s1.0 as u64) << 29
+        | (s1.1 as u64) << 32
+        | (s2.0 as u64) << 39
+        | (s2.1 as u64) << 42
+        | (op1 as u64) << 45
+}
+
+/// KIL: the thread stops, its pixel is dropped.
+pub fn kil() -> u64 {
+    op(0xE330) | 0xF
+}
+
+pub fn sync() -> u64 {
+    op(0xF0F8) | 0xF
+}
+
+pub fn brk() -> u64 {
+    op(0xE340) | 0xF
+}
+
+pub fn cont() -> u64 {
+    op(0xE350) | 0xF
+}
+
+/// A control op with its target still to patch (`Asm::mark_target`).
+pub fn op_word(opcode: u64) -> u64 {
+    op(opcode) | 0xF
+}
+
+/// The control ops with a target (patched by `Asm::ctl`).
+pub const BRA: u64 = 0xE240;
+pub const SSY: u64 = 0xE290;
+pub const PBK: u64 = 0xE2A0;
+pub const PCNT: u64 = 0xE2B0;
+
+/// LDG / STG of 1, 2 or 4 words (consecutive registers, aligned to the
+/// width), 64-bit address in the even pair `a`.
+pub fn ldg_n(d: u8, a: u8, words: u8) -> u64 {
+    op(0xEED0) | reg(d, 0) | reg(a, 8) | 1 << 45 | (mem_type(words) as u64) << 48
+}
+
+pub fn stg_n(a: u8, v: u8, words: u8) -> u64 {
+    op(0xEED8) | reg(v, 0) | reg(a, 8) | 1 << 45 | (mem_type(words) as u64) << 48
+}
+
+fn mem_type(words: u8) -> u8 {
+    match words {
+        1 => 4,
+        2 => 5,
+        4 => 6,
+        _ => panic!("access width"),
+    }
+}
+
+/// ATOM.ADD.U32 d = [a]; [a] += v.
+pub fn atom_add(d: u8, a: u8, v: u8) -> u64 {
+    op(0xED00) | reg(d, 0) | reg(a, 8) | reg(v, 20) | 1 << 48
+}
+
+/// LDC d = c[idx][off + r]: a constant buffer word picked by a register
+/// (a byte offset).
+pub fn ldc(d: u8, r: u8, idx: u8, off: u32) -> u64 {
+    assert!(off < 1 << 16 && idx < 32);
+    op(0xEF90) | reg(d, 0) | reg(r, 8) | (off as u64) << 20 | (idx as u64) << 36 | 4 << 48
+}
+
+/// IADD with the 64-bit constant `c[idx][off]`: low half (`high` false,
+/// sets the carry) or high half (adds it in).
+pub fn iadd_cb(d: u8, a: u8, idx: u8, off: u32, high: bool) -> u64 {
+    op(0x4C10)
+        | reg(d, 0)
+        | reg(a, 8)
+        | cbi(idx, off)
+        | (high as u64) << 43
+        | (!high as u64) << 47
+}
+
+/// TEX.B with an explicit level: the coordinates and the level are in
+/// consecutive registers from `coords`.
+pub fn tex_b_lod(d: u8, coords: u8, handle: u8) -> u64 {
+    tex_b(d, coords, handle) | 3 << 37
+}
+
 /// A position in the code a branch can target.
 #[derive(Clone, Copy)]
 pub struct Label(usize);
@@ -300,11 +585,48 @@ impl Asm {
     /// Here, padded to the start of a group (branches never land on a
     /// scheduling word).
     pub fn label(&mut self) -> Label {
+        let l = self.new_label();
+        self.place(l);
+        l
+    }
+
+    /// A label to place later (a forward target).
+    pub fn new_label(&mut self) -> Label {
+        self.labels.push(usize::MAX);
+        Label(self.labels.len() - 1)
+    }
+
+    /// Bind `l` here, padded as `label` does.
+    pub fn place(&mut self, l: Label) {
         while !self.insns.len().is_multiple_of(3) {
             self.emit(nop(), Sched::stall(0));
         }
-        self.labels.push(self.insns.len());
-        Label(self.labels.len() - 1)
+        self.labels[l.0] = self.insns.len();
+    }
+
+    /// A control op with a relative target (`BRA`, `SSY`, `PBK`, `PCNT`).
+    pub fn ctl(&mut self, opcode: u64, l: Label, p: u8, not: bool, s: Sched) {
+        self.fixups.push((self.insns.len(), l));
+        self.emit(when(op(opcode) | 0xF, p, not), s);
+    }
+
+    /// Patch the target of the control op at index `i` (emitted with
+    /// `op_word`) with label `l`.
+    pub fn mark_target(&mut self, i: usize, l: Label) {
+        self.fixups.push((i, l));
+    }
+
+    pub fn len(&self) -> usize {
+        self.insns.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.insns.is_empty()
+    }
+
+    /// The scheduling of the last instruction emitted.
+    pub fn last_sched(&mut self) -> Option<&mut Sched> {
+        self.insns.last_mut().map(|(_, s)| s)
     }
 
     /// Branch to `l` if predicate `p` (inverted if `not`) holds.
@@ -320,6 +642,7 @@ impl Asm {
 
     pub fn finish(mut self) -> Vec<u64> {
         for &(i, Label(l)) in &self.fixups {
+            assert!(self.labels[l] != usize::MAX, "label never placed");
             let rel = Self::addr(self.labels[l]) - Self::addr(i) - 8;
             self.insns[i].0 |= ((rel as u64) & 0xFF_FFFF) << 20;
         }

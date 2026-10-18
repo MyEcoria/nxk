@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 pub const MAX_REGS: usize = 192;
 pub const MAX_INSTS: usize = 4096;
-pub const MAX_DEPTH: usize = 16;
+pub const MAX_DEPTH: usize = 8;
 pub const MAX_BUFFERS: usize = 8;
 pub const MAX_TEXTURES: usize = 16;
 pub const MAX_UNIFORM_WORDS: usize = 4096;
@@ -17,7 +17,7 @@ pub const MAX_LOCAL_WORDS: usize = 128;
 pub const MAX_VARYINGS: usize = 14;
 pub const MAX_ATTRS: usize = 16;
 pub const MAX_TARGETS: usize = 8;
-pub const MAX_LOOP_ITERS: u32 = 1 << 20;
+pub const MAX_LOOP_ITERS: u32 = 0x7FFFF;
 
 /// A virtual register; its type is `Program::reg_types[id]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

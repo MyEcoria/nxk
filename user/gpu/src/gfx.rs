@@ -18,7 +18,7 @@ use crate::mmu::Vm;
 use crate::push::{Push, SET_OBJECT, SUBC_3D};
 use crate::sass::{
     ald, ast, exit, fadd_c, ffma_cb, fmul, fmul_c, ipa, mov, mov32i, mov_cb, mufu_rcp, tex_b, Asm,
-    Interp, Sched, RZ,
+    IpaMode, Sched, RZ,
 };
 
 pub const MAXWELL_B: u32 = 0xB197;
@@ -333,7 +333,7 @@ fn flat_vs() -> Vec<u64> {
 fn flat_fs() -> Vec<u64> {
     let mut a = Asm::new();
     for c in 0..4u8 {
-        a.emit(ipa(c, A_GENERIC0 + 4 * c as u32, Interp::Pass, RZ), sets(0));
+        a.emit(ipa(c, A_GENERIC0 + 4 * c as u32, IpaMode::Pass, RZ), sets(0));
     }
     a.emit(exit(), Sched::stall(5).wait(0x3F));
     a.finish()
@@ -375,7 +375,7 @@ fn lit_vs() -> Vec<u64> {
 fn lit_fs() -> Vec<u64> {
     let mut a = Asm::new();
     // 1/w, then the perspective-correct normal (R4-R6) and color (R8-R11).
-    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), sets(0));
+    a.emit(ipa(0, A_FRAG_W, IpaMode::Pass, RZ), sets(0));
     // The attributes are interpolated divided by w: w itself is the
     // reciprocal of the interpolated 1/w.
     a.emit(mufu_rcp(0, 0), sets(0).wait(1 << 0));
@@ -393,7 +393,7 @@ fn lit_fs() -> Vec<u64> {
     {
         let s = sets(1);
         a.emit(
-            ipa(d, addr, Interp::PassMulW, 0),
+            ipa(d, addr, IpaMode::PassMulW, 0),
             if k == 0 { s.wait(1 << 0) } else { s },
         );
     }
@@ -454,7 +454,7 @@ fn tex_vs() -> Vec<u64> {
 /// color = vertex color * texel * (ambient + diffuse * saturate(N . L)).
 fn tex_fs() -> Vec<u64> {
     let mut a = Asm::new();
-    a.emit(ipa(0, A_FRAG_W, Interp::Pass, RZ), sets(0));
+    a.emit(ipa(0, A_FRAG_W, IpaMode::Pass, RZ), sets(0));
     a.emit(mufu_rcp(0, 0), sets(0).wait(1 << 0));
     // Normal R4-R6, color R8-R11, texture coordinates R16-R17: TEX takes
     // the coordinates, and the handle in a vector of its own (R20).
@@ -474,7 +474,7 @@ fn tex_fs() -> Vec<u64> {
     {
         let s = sets(1);
         a.emit(
-            ipa(d, addr, Interp::PassMulW, 0),
+            ipa(d, addr, IpaMode::PassMulW, 0),
             if k == 0 { s.wait(1 << 0) } else { s },
         );
     }
