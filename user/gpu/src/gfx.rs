@@ -257,6 +257,11 @@ pub fn attr_word(offset: u32, format: u32) -> Option<u32> {
     (offset < 1 << 14).then_some(width << 21 | ty << 27 | offset << 7)
 }
 
+/// Program header offsets of the built-in flat shaders and their registers.
+pub const FLAT_VS_AT: u32 = FLAT_VS as u32;
+pub const FLAT_FS_AT: u32 = FLAT_FS as u32;
+pub const FLAT_GPRS: u32 = 8;
+
 /// A vertex attribute slot that feeds nothing: inactive, but with a valid
 /// format (R32_G32_B32_A32 float, as NVK writes it), or the front end
 /// refuses the value (data error at SET_VERTEX_ATTRIBUTE_A).

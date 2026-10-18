@@ -486,3 +486,28 @@ fn threaded_programs_match_per_thread() {
         }
     }
 }
+
+#[test]
+fn dump_constant_pair() {
+    let mut b = Builder::new(Stage::Vertex);
+    for c in 0..4u8 {
+        let p = b.input(0, c);
+        b.output(OutKind::Position, c, p);
+    }
+    let vs = compile(&b.finish()).unwrap();
+    let mut b = Builder::new(Stage::Fragment);
+    for (c, v) in [0.4f32, 0.2, 0.1, 1.0].into_iter().enumerate() {
+        let r = b.f32(v);
+        b.output(OutKind::Color(0), c as u8, r);
+    }
+    let fs = compile(&b.finish()).unwrap();
+    for (n, c) in [("vs", &vs), ("fs", &fs)] {
+        std::println!("{n}: gprs {} header {:08x?}", c.gprs, c.header);
+        for g in c.code.chunks(4) {
+            std::println!("  sched {:016x}", g[0]);
+            for w in &g[1..] {
+                std::println!("    {w:016x}");
+            }
+        }
+    }
+}

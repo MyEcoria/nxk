@@ -185,6 +185,16 @@ pub fn report(r: &Regs, what: &str) {
     // The GPC and TPC traps behind a GR exception (nouveau
     // gf100_gr_trap_gpc / _tpc / _mp): GPC exception, then per TPC the
     // exception, TEX, and MP warp and global errors.
+    // The GR trap sources (nouveau gf100_gr_trap_intr): dispatch, M2MF,
+    // shader (its program header error bits and stage), ROP/CCACHE.
+    println!(
+        "[gpu] {}: traps dispatch {:#x} m2mf {:#x} shader {:#x} ccache {:#x}",
+        what,
+        r.rd(0x400804),
+        r.rd(0x404600),
+        r.rd(0x405840),
+        r.rd(0x408030)
+    );
     println!("[gpu] {}: GPC trap {:#x}", what, r.rd(0x502C90));
     for tpc in 0..2u32 {
         let t = 0x504000 + tpc * 0x800;

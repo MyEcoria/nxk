@@ -184,16 +184,172 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
     Ok((ok, ns))
 }
 
-/// Vertex and fragment shaders of the IR drawing a triangle, from the
-/// simplest pair to one with a varying, a uniform, a texture and a
-/// discard: the first that fails (or hangs the GPU) names the feature.
-pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
+/// A shader of a draw case: a built-in one (program header offset,
+/// registers) or one of the IR.
+enum Sh<'a> {
+    Builtin(u32, u32),
+    Ir(&'a Program),
+}
+
+/// One triangle through a custom pipeline, the centre pixel against
+/// `want`. A hang resets the GPU: the next case starts it again.
+fn draw_case(g: &mut Gpu, name: &str, vs: Sh, fs: Sh, u: [f32; 4], want: u32) -> Res<(bool, u64)> {
     const W: u32 = 64;
     const H: u32 = 64;
     let e = |(e, _): (i64, &str)| -e;
     let regs = g.regs;
+    let compile = |s: &Sh| -> core::result::Result<Option<lower::Compiled>, lower::Error> {
+        match s {
+            Sh::Builtin(..) => Ok(None),
+            Sh::Ir(p) => lower::compile(p).map(Some),
+        }
+    };
+    let (cv, cf) = match (compile(&vs), compile(&fs)) {
+        (Ok(v), Ok(f)) => (v, f),
+        (v, f) => {
+            println!(
+                "[gpu] IR draw ({}): does not compile: vertex {:?}, fragment {:?}",
+                name,
+                v.err(),
+                f.err()
+            );
+            return Ok((false, 0));
+        }
+    };
+    let d = g.dev(0)?;
+    let img = Dma::new((W * H * 4) as usize).map_err(e)?;
+    let vb = Dma::new(4096).map_err(e)?;
+    let tex_bytes = proto::tiled_bytes(8, 8, proto::tex_block_log2(8));
+    let tex = Dma::new(tex_bytes).map_err(e)?;
+    // Every texel the same: (255, 128, 64, 255) in R, G, B, A order.
+    for i in 0..tex_bytes / 4 {
+        tex.w32(i * 4, 0xFF40_80FF);
+    }
+    let s = crate::engine::Surface {
+        va: d.vm.map(&img, false).map_err(e)?,
+        width: W,
+        height: H,
+        pitch: W * 4,
+        format: proto::FMT_A8B8G8R8 as u32,
+    };
+    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    let tva =
+        d.vm.map_kind(&tex, false, mmu::KIND_GENERIC_16BX2, 1 << 17)
+            .map_err(e)?;
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let img8 = gfx::TexImage {
+        va: tva,
+        width: 8,
+        height: 8,
+        format: proto::TF_RGBA8,
+        block_log2: proto::tex_block_log2(8),
+        levels: 1,
+    };
+    d.gfx.set_texture(0, &img8, 0);
+    // Installed shaders: (header, registers, block, length).
+    let place = |d: &mut crate::Dev, sh: &Sh, c: &Option<lower::Compiled>| match (sh, c) {
+        (Sh::Builtin(at, gprs), _) => Some((*at, *gprs, 0, 0)),
+        (_, Some(c)) => d
+            .gfx
+            .install(&c.header, &c.code)
+            .map(|(h, b, l)| (h, c.gprs.next_multiple_of(8).max(8), b, l)),
+        _ => None,
+    };
+    let (Some(v), Some(f)) = (place(d, &vs, &cv), place(d, &fs, &cf)) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let mut attrs = Vec::new();
+    attrs.push(attr_word(0, proto::AF_F32X4).unwrap());
+    attrs.push(attr_word(16, proto::AF_F32X4).unwrap());
+    attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
+    let custom = Custom {
+        vs: v.0,
+        vs_gprs: v.1,
+        fs: f.0,
+        fs_gprs: f.1,
+        stride: 32,
+        attrs,
+        inst_stride: 0,
+        flags: 0,
+        blend: proto::BLEND_NONE,
+        depth: proto::DEPTH_LESS,
+    };
+    // One big triangle with a flat colour.
+    let tri: [f32; 24] = [
+        -1.0, -1.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0, //
+        3.0, -1.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0,
+    ];
+    for (i, x) in tri.iter().enumerate() {
+        vb.w32(i * 4, x.to_bits());
+    }
+    let target = gfx::Target {
+        color: gfx::Color::Linear(s),
+        depth: None,
+    };
+    img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    d.gfx.clear(&mut p, &target, [0.1, 0.2, 0.3, 1.0]);
+    d.gfx.pipeline_custom(&mut p, &target, &custom);
+    let bits: Vec<u32> = u.iter().map(|x| x.to_bits()).collect();
+    let desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+    let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+    handles[0] = gfx::Gfx::texture_handle(0);
+    let staged = d.gfx.uniforms(&mut p, &bits)
+        && d.gfx.cbuf(&mut p, 2, &desc)
+        && d.gfx.cbuf(&mut p, 3, &handles);
+    if !staged {
+        return Err(-libnx::abi::err::ENOSPC);
+    }
+    let lay = Layout {
+        stride: custom.stride,
+        attrs: &custom.attrs,
+        inst_stride: 0,
+    };
+    d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
+    let near = |a: u32, b: u32, tol: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= tol)
+    };
+    match g.run(p, BATCH_TIMEOUT_US) {
+        Ok(ns) => {
+            let got = img.r32(((H / 2 * W + W / 2) * 4) as usize);
+            println!(
+                "[gpu] IR draw ({}): centre {:#010x}, expected {:#010x}",
+                name, got, want
+            );
+            let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+            for sh in [v, f] {
+                if sh.3 != 0 {
+                    d.gfx.uninstall(sh.2, sh.3);
+                }
+            }
+            d.gfx.clear_texture(0);
+            let _ = d.vm.unmap(s.va, img.len() as u64);
+            let _ = d.vm.unmap(vbv, vb.len() as u64);
+            let _ = d.vm.unmap(tva, tex.len() as u64);
+            let _ = mmu::invalidate(&regs, &d.vm);
+            Ok((near(got, want, 2), ns))
+        }
+        Err(err) => {
+            let n = |c: &Option<lower::Compiled>| c.as_ref().map_or(0, |c| c.code.len());
+            println!(
+                "[gpu] IR draw ({}): the GPU hung ({}); vertex {} words, fragment {} words",
+                name,
+                err,
+                n(&cv),
+                n(&cf)
+            );
+            Ok((false, 0))
+        }
+    }
+}
 
-    // Vertex shaders: position only, or position and color through.
+/// Vertex and fragment shaders of the IR drawing a triangle, from the
+/// built-in pair through the custom path up to varying, uniform, texture
+/// and discard: the first that fails (or hangs the GPU) names the cause.
+pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
+    // Vertex shaders: position only, or position and colour through.
     let mut b = Builder::new(Stage::Vertex);
     for c in 0..4u8 {
         let p = b.input(0, c);
@@ -256,168 +412,83 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
             b.output(OutKind::Color(0), c, r);
         }
     });
-
-    let d = g.dev(0)?;
-    let img = Dma::new((W * H * 4) as usize).map_err(e)?;
-    let vb = Dma::new(4096).map_err(e)?;
-    let tex_bytes = proto::tiled_bytes(8, 8, proto::tex_block_log2(8));
-    let tex = Dma::new(tex_bytes).map_err(e)?;
-    // Every texel the same: (255, 128, 64, 255) in R, G, B, A order.
-    for i in 0..tex_bytes / 4 {
-        tex.w32(i * 4, 0xFF40_80FF);
-    }
-    let s = crate::engine::Surface {
-        va: d.vm.map(&img, false).map_err(e)?,
-        width: W,
-        height: H,
-        pitch: W * 4,
-        format: proto::FMT_A8B8G8R8 as u32,
-    };
-    let vbv = d.vm.map(&vb, false).map_err(e)?;
-    let tva =
-        d.vm.map_kind(&tex, false, mmu::KIND_GENERIC_16BX2, 1 << 17)
-            .map_err(e)?;
-    mmu::invalidate(&regs, &d.vm).map_err(e)?;
-    let img8 = gfx::TexImage {
-        va: tva,
-        width: 8,
-        height: 8,
-        format: proto::TF_RGBA8,
-        block_log2: proto::tex_block_log2(8),
-        levels: 1,
-    };
-    d.gfx.set_texture(0, &img8, 0);
-    let mut attrs = Vec::new();
-    attrs.push(attr_word(0, proto::AF_F32X4).unwrap());
-    attrs.push(attr_word(16, proto::AF_F32X4).unwrap());
-    attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
-    // One big triangle with a flat color.
-    let tri: [f32; 24] = [
-        -1.0, -1.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0, //
-        3.0, -1.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0, //
-        -1.0, 3.0, 0.5, 1.0, 0.8, 0.4, 0.6, 1.0,
-    ];
-    for (i, x) in tri.iter().enumerate() {
-        vb.w32(i * 4, x.to_bits());
-    }
-    let target = gfx::Target {
-        color: gfx::Color::Linear(s),
-        depth: None,
-    };
-    let px = |x: u32, y: u32| img.r32(((y * W + x) * 4) as usize);
-    let near = |a: u32, b: u32, tol: u32| {
-        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= tol)
-    };
-    let clear = [0.1f32, 0.2, 0.3, 1.0];
-    let clear_px = 0xFF00_0000 | 77 << 16 | 51 << 8 | 26;
+    let hv = Sh::Builtin(gfx::FLAT_VS_AT, gfx::FLAT_GPRS);
+    let hf = Sh::Builtin(gfx::FLAT_FS_AT, gfx::FLAT_GPRS);
     let rgb = |r: u32, g: u32, b: u32| 0xFF00_0000 | b << 16 | g << 8 | r;
     let uni = [0.5f32, 1.0, 0.25, 1.0];
-    // (name, vertex, fragment, uniforms, expected pixel).
-    let cases: [(&str, &Program, &Program, [f32; 4], u32); 6] = [
-        ("constant colour", &vs_pos, &fs_const, uni, rgb(102, 51, 26)),
-        ("varying", &vs_full, &fs_varying, uni, rgb(204, 102, 153)),
-        ("uniform", &vs_full, &fs_uniform, uni, rgb(102, 102, 38)),
-        ("texture", &vs_full, &fs_texture, uni, rgb(255, 128, 64)),
-        ("all together", &vs_full, &fs_full, uni, rgb(102, 51, 10)),
+    let clear_px = rgb(26, 51, 77);
+    let (mut ok, mut ns) = (true, 0u64);
+    // Each case builds on the one before.
+    let cases: [(&str, Sh, Sh, [f32; 4], u32); 9] = [
+        (
+            "built-in pair, custom path",
+            hv,
+            hf,
+            uni,
+            rgb(204, 102, 153),
+        ),
+        (
+            "IR vertex, built-in fragment",
+            Sh::Ir(&vs_full),
+            Sh::Builtin(gfx::FLAT_FS_AT, gfx::FLAT_GPRS),
+            uni,
+            rgb(204, 102, 153),
+        ),
+        (
+            "built-in vertex, IR fragment",
+            Sh::Builtin(gfx::FLAT_VS_AT, gfx::FLAT_GPRS),
+            Sh::Ir(&fs_varying),
+            uni,
+            rgb(204, 102, 153),
+        ),
+        (
+            "constant colour",
+            Sh::Ir(&vs_pos),
+            Sh::Ir(&fs_const),
+            uni,
+            rgb(102, 51, 26),
+        ),
+        (
+            "varying",
+            Sh::Ir(&vs_full),
+            Sh::Ir(&fs_varying),
+            uni,
+            rgb(204, 102, 153),
+        ),
+        (
+            "uniform",
+            Sh::Ir(&vs_full),
+            Sh::Ir(&fs_uniform),
+            uni,
+            rgb(102, 102, 38),
+        ),
+        (
+            "texture",
+            Sh::Ir(&vs_full),
+            Sh::Ir(&fs_texture),
+            uni,
+            rgb(255, 128, 64),
+        ),
+        (
+            "all together",
+            Sh::Ir(&vs_full),
+            Sh::Ir(&fs_full),
+            uni,
+            rgb(102, 51, 10),
+        ),
         (
             "discard",
-            &vs_full,
-            &fs_full,
+            Sh::Ir(&vs_full),
+            Sh::Ir(&fs_full),
             [-1.0, 1.0, 0.25, 1.0],
             clear_px,
         ),
     ];
-    let (mut ok, mut ns) = (true, 0u64);
     for (name, vs, fs, u, want) in cases {
-        let (cv, cf) = match (lower::compile(vs), lower::compile(fs)) {
-            (Ok(v), Ok(f)) => (v, f),
-            (v, f) => {
-                println!(
-                    "[gpu] IR draw ({}): does not compile: vertex {:?}, fragment {:?}",
-                    name,
-                    v.err(),
-                    f.err()
-                );
-                ok = false;
-                continue;
-            }
-        };
-        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
-        let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
-            return Err(-libnx::abi::err::ENOSPC);
-        };
-        let Some((fh, fblock, flen)) = d.gfx.install(&cf.header, &cf.code) else {
-            return Err(-libnx::abi::err::ENOSPC);
-        };
-        let custom = Custom {
-            vs: vh,
-            vs_gprs: cv.gprs.next_multiple_of(8).max(8),
-            fs: fh,
-            fs_gprs: cf.gprs.next_multiple_of(8).max(8),
-            stride: 32,
-            attrs: attrs.clone(),
-            inst_stride: 0,
-            flags: 0,
-            blend: proto::BLEND_NONE,
-            depth: proto::DEPTH_LESS,
-        };
-        img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
-        let mut p = Push::default();
-        d.gfx.begin(&mut p);
-        d.gfx.clear(&mut p, &target, clear);
-        d.gfx.pipeline_custom(&mut p, &target, &custom);
-        let bits: Vec<u32> = u.iter().map(|x| x.to_bits()).collect();
-        let desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
-        let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
-        handles[0] = gfx::Gfx::texture_handle(0);
-        let staged = d.gfx.uniforms(&mut p, &bits)
-            && d.gfx.cbuf(&mut p, 2, &desc)
-            && d.gfx.cbuf(&mut p, 3, &handles);
-        if !staged {
-            return Err(-libnx::abi::err::ENOSPC);
-        }
-        let lay = Layout {
-            stride: custom.stride,
-            attrs: &custom.attrs,
-            inst_stride: 0,
-        };
-        d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
-        match g.run(p, BATCH_TIMEOUT_US) {
-            Ok(t) => ns += t,
-            Err(err) => {
-                println!(
-                    "[gpu] IR draw ({}): the GPU hung ({}); vertex {} instructions, {} registers, fragment {} instructions, {} registers",
-                    name,
-                    err,
-                    cv.code.len(),
-                    cv.gprs,
-                    cf.code.len(),
-                    cf.gprs
-                );
-                return Ok((false, ns));
-            }
-        }
-        let got = px(W / 2, H / 2);
-        println!(
-            "[gpu] IR draw ({}): centre {:#010x}, corner {:#010x}, expected {:#010x}",
-            name,
-            got,
-            px(1, 1),
-            want
-        );
-        if !near(got, want, 2) {
-            ok = false;
-        }
-        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
-        d.gfx.uninstall(vblock, vlen);
-        d.gfx.uninstall(fblock, flen);
+        let (pass, t) = draw_case(g, name, vs, fs, u, want)?;
+        ok &= pass;
+        ns += t;
     }
-    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
-    d.gfx.clear_texture(0);
-    let _ = d.vm.unmap(s.va, img.len() as u64);
-    let _ = d.vm.unmap(vbv, vb.len() as u64);
-    let _ = d.vm.unmap(tva, tex.len() as u64);
-    let _ = mmu::invalidate(&regs, &d.vm);
     Ok((ok, ns))
 }
 

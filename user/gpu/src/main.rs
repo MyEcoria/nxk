@@ -1283,32 +1283,28 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
 
 /// The shader compiler on the GPU: random compute programs, and a draw.
 fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
-    let (mut pass, mut ns) = (0, 0);
-    let (ok, t) = irtest::compute(g)?;
-    ns += t;
-    if ok {
-        pass |= proto::T3_IR_COMPUTE;
+    type Case = fn(&mut Gpu) -> core::result::Result<(bool, u64), i64>;
+    let cases: [(u64, &str, Case); 4] = [
+        (proto::T3_IR_COMPUTE, "compute", irtest::compute),
+        (proto::T3_IR_DRAW, "draw", irtest::draw),
+        (proto::T3_IR_INSTANCE, "instanced", irtest::instanced),
+        (proto::T3_IR_TARGET, "targets", irtest::targets),
+    ];
+    let (mut pass, mut run, mut ns) = (0, 0, 0);
+    // A hang resets the GPU: the next test starts it again.
+    for (bit, name, f) in cases {
+        run |= bit;
+        match f(g) {
+            Ok((ok, t)) => {
+                ns += t;
+                if ok {
+                    pass |= bit;
+                }
+            }
+            Err(e) => println!("[gpu] IR {}: stopped, errno {}", name, -e),
+        }
     }
-    let (ok, t) = irtest::draw(g)?;
-    ns += t;
-    if ok {
-        pass |= proto::T3_IR_DRAW;
-    }
-    let (ok, t) = irtest::instanced(g)?;
-    ns += t;
-    if ok {
-        pass |= proto::T3_IR_INSTANCE;
-    }
-    let (ok, t) = irtest::targets(g)?;
-    ns += t;
-    if ok {
-        pass |= proto::T3_IR_TARGET;
-    }
-    Ok((
-        pass,
-        proto::T3_IR_COMPUTE | proto::T3_IR_DRAW | proto::T3_IR_INSTANCE | proto::T3_IR_TARGET,
-        ns,
-    ))
+    Ok((pass, run, ns))
 }
 
 /// `n` words of `m` against `want`; the first wrong one reported.
@@ -1464,7 +1460,10 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
         proto::COPY => reply(copy(g, m)),
         proto::COMPUTE => reply(compute(g, m)),
         proto::TEST => {
-            match test(g).and_then(|a| test3d(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2))) {
+            match test(g)
+                .and_then(|a| test3d(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2)))
+                .and_then(|a| test_ir(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2)))
+            {
                 Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
                 Err(e) => Msg::error(e),
             }
