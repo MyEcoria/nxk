@@ -489,7 +489,9 @@ impl Gen<'_> {
                 let a = self.addr();
                 self.emit(
                     when(atom_add(d, a, s), P_TEMP_A, false),
-                    Eff::var(&[d], &[a, a + 1, s]).preds(&[P_TEMP_A], &[]),
+                    Eff::var(&[d], &[a, a + 1, s])
+                        .preds(&[P_TEMP_A], &[])
+                        .read_barrier(),
                 );
             }
             Inst::LocalLoad { dst, index } => {
@@ -498,7 +500,7 @@ impl Gen<'_> {
                 self.fx(mov(d, RZ), &[d], &[]);
                 self.emit(
                     when(ldl(d, t, 0), P_TEMP_A, false),
-                    Eff::var(&[d], &[t]).preds(&[P_TEMP_A], &[]),
+                    Eff::var(&[d], &[t]).preds(&[P_TEMP_A], &[]).read_barrier(),
                 );
             }
             Inst::LocalStore { index, src } => {
