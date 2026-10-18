@@ -317,6 +317,25 @@ impl LitUniforms {
     }
 }
 
+/// The next mip level of a `w` x `h` RGBA8 image (rows from the top): each
+/// texel the rounded average of the 2 x 2 above it (an odd edge repeats).
+fn halve(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = alloc::vec![0u8; nw as usize * nh as usize * 4];
+    for y in 0..nh {
+        for x in 0..nw {
+            let (x0, y0) = ((2 * x).min(w - 1), (2 * y).min(h - 1));
+            let (x1, y1) = ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1));
+            for c in 0..4 {
+                let t = |px: u32, py: u32| src[(py as usize * w as usize + px as usize) * 4 + c] as u32;
+                let sum = t(x0, y0) + t(x1, y0) + t(x0, y1) + t(x1, y1);
+                out[(y as usize * nw as usize + x as usize) * 4 + c] = ((sum + 2) / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// Vertices and indices in GPU-visible memory.
 pub struct Mesh {
     _vertices: Shm,
@@ -494,24 +513,71 @@ impl Graphics {
         rgba: &[u8],
         sampling: Sampling,
     ) -> Result<Texture> {
-        if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+        self.texture_levels(width, height, rgba, sampling, false)
+    }
+
+    /// `texture` with a chain of mip levels down to 1 x 1, each the
+    /// average of 2 x 2 texels of the one before (made here, on the CPU):
+    /// the GPU blends two levels by the size of the pixel on the texture
+    /// (trilinear; the nearest level with `Sampling::nearest`), so far
+    /// ground and small objects stay clean.
+    pub fn texture_mipped(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        sampling: Sampling,
+    ) -> Result<Texture> {
+        self.texture_levels(width, height, rgba, sampling, true)
+    }
+
+    fn texture_levels(
+        &self,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        sampling: Sampling,
+        mips: bool,
+    ) -> Result<Texture> {
+        if width == 0
+            || height == 0
+            || width > 8192
+            || height > 8192
+            || rgba.len() != width as usize * height as usize * 4
+        {
             return Err(-nxk_abi::err::EINVAL);
         }
         let bl = gpu::tex_block_log2(height);
-        let bytes = gpu::tiled_bytes(width, height, bl);
+        let levels = if mips { gpu::max_levels(width, height) } else { 1 };
+        let bytes = gpu::mip_bytes(width, height, 4, bl, levels);
         let mut tiled = alloc::vec![0u8; bytes];
-        for y in 0..height {
-            for x in 0..width {
-                let at = gpu::tiled_offset(width, x, y, 4, bl);
-                let from = (y as usize * width as usize + x as usize) * 4;
-                tiled[at..at + 4].copy_from_slice(&rgba[from..from + 4]);
+        let mut cur = rgba.to_vec();
+        for level in 0..levels {
+            let (w, h) = (gpu::level_extent(width, level), gpu::level_extent(height, level));
+            let base = gpu::level_offset(width, height, 4, bl, level);
+            let lbl = gpu::level_block_log2(bl, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let at = base + gpu::tiled_offset(w, x, y, 4, lbl);
+                    let from = (y as usize * w as usize + x as usize) * 4;
+                    tiled[at..at + 4].copy_from_slice(&cur[from..from + 4]);
+                }
+            }
+            if level + 1 < levels {
+                cur = halve(&cur, w, h);
             }
         }
         let mem = Shm::new(bytes, shm::UNCACHED)?;
         mem.write(0, &tiled);
         let m = Msg::from_words(
             gpu::TEXTURE_ATTACH,
-            &[width as u64 | (height as u64) << 32, sampling.flags()],
+            &[
+                width as u64 | (height as u64) << 32,
+                sampling.flags(),
+                gpu::TF_RGBA8,
+                0,
+                levels as u64,
+            ],
         );
         let id = word(&self.gpu.call_with(m, mem.handle())?, 0);
         Ok(Texture {

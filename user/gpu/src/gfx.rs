@@ -572,10 +572,12 @@ pub struct TexImage {
     pub height: u32,
     pub format: u64,
     pub block_log2: u32,
+    /// Mip levels, 1..=15.
+    pub levels: u32,
 }
 
 /// Texture header (TIC, `TEXHEAD_BL`, as NIL's `nvb097_fill_image_view_desc`
-/// writes it): block-linear, 2D, one level, normalized.
+/// writes it): block-linear, 2D, normalized.
 fn tic(t: &TexImage) -> [u32; 8] {
     const SIZES_RGBA8: u32 = 8;
     const SIZES_R32: u32 = 0x0F;
@@ -613,6 +615,9 @@ fn tic(t: &TexImage) -> [u32; 8] {
     bits(&mut w, 99, 101, t.block_log2);
     // LOD quality as NIL sets it.
     bits(&mut w, 112, 114, 0b111);
+    // Last level of the chain, and of the view (from level 0).
+    bits(&mut w, 124, 127, t.levels - 1);
+    bits(&mut w, 228, 231, t.levels - 1);
     bits(&mut w, 128, 143, t.width - 1);
     bits(&mut w, 151, 154, TWO_D);
     bits(&mut w, 157, 159, BORDER_FROM_SAMPLER);
@@ -623,13 +628,16 @@ fn tic(t: &TexImage) -> [u32; 8] {
     w
 }
 
-/// Sampler (TSC): filter and wrap mode, no mipmaps, transparent border.
-fn tsc(flags: u64) -> [u32; 8] {
+/// Sampler (TSC): filter and wrap mode, a blend of two levels (the
+/// nearest with `TEX_NEAREST`) if the texture has several, transparent border.
+fn tsc(flags: u64, levels: u32) -> [u32; 8] {
     const WRAP: u32 = 0;
     const CLAMP_TO_EDGE: u32 = 2;
     const POINT: u32 = 1;
     const LINEAR: u32 = 2;
     const MIP_NONE: u32 = 1;
+    const MIP_POINT: u32 = 2;
+    const MIP_LINEAR: u32 = 3;
     const AUTO_SPAN_SEAM: u32 = 2;
     let (filter, wrap) = (
         if flags & proto::TEX_NEAREST != 0 {
@@ -651,7 +659,12 @@ fn tsc(flags: u64) -> [u32; 8] {
     bits(&mut w, 17, 19, 1);
     bits(&mut w, 32, 34, filter); // magnification
     bits(&mut w, 36, 37, filter); // minification
-    bits(&mut w, 38, 39, MIP_NONE);
+    let mip = match (levels > 1, flags & proto::TEX_NEAREST != 0) {
+        (false, _) => MIP_NONE,
+        (true, true) => MIP_POINT,
+        (true, false) => MIP_LINEAR,
+    };
+    bits(&mut w, 38, 39, mip);
     bits(&mut w, 40, 41, AUTO_SPAN_SEAM);
     bits(&mut w, 76, 87, 0xFFF); // LOD clamp up to the last level
     w
@@ -723,7 +736,7 @@ impl Gfx {
     /// invalidates the caches).
     pub fn set_texture(&self, id: usize, img: &TexImage, flags: u64) {
         self.tics.words(id * POOL_ENTRY, &tic(img));
-        self.tscs.words(id * POOL_ENTRY, &tsc(flags));
+        self.tscs.words(id * POOL_ENTRY, &tsc(flags, img.levels));
     }
 
     pub fn clear_texture(&self, id: usize) {

@@ -255,6 +255,7 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         height: 8,
         format: proto::TF_RGBA8,
         block_log2: proto::tex_block_log2(8),
+        levels: 1,
     };
     d.gfx.set_texture(0, &img8, 0);
     let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {

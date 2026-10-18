@@ -248,7 +248,7 @@ impl Client {
 
     /// `h`: the client's shm with the image, which this takes (closed on
     /// error too). The pool entries go in `gfx`. `block`: 0 for the
-    /// automatic block height, else log2 of GOBs + 1.
+    /// automatic block height, else log2 of GOBs + 1; `levels`: 0 for one.
     #[allow(clippy::too_many_arguments)]
     pub fn attach_texture(
         &mut self,
@@ -260,6 +260,7 @@ impl Client {
         flags: u64,
         format: u64,
         block: u64,
+        levels: u64,
     ) -> Res<u64> {
         let held = Held::Raw(h);
         if width == 0
@@ -268,9 +269,11 @@ impl Client {
             || height > 8192
             || flags & !(proto::TEX_NEAREST | proto::TEX_CLAMP) != 0
             || block > 6
+            || levels > proto::max_levels(width, height) as u64
         {
             return Err(-EINVAL);
         }
+        let levels = levels.max(1) as u32;
         let bpp = proto::tf_bytes(format);
         color_format(format).ok_or(-EINVAL)?;
         let block_log2 = if block == 0 {
@@ -281,7 +284,7 @@ impl Client {
         if proto::level_block_log2(block_log2, height) != block_log2 {
             return Err(-EINVAL);
         }
-        let bytes = proto::tiled_bytes_bpp(width, height, bpp, block_log2) as u64;
+        let bytes = proto::mip_bytes(width, height, bpp, block_log2, levels) as u64;
         let pg = pages(h, bytes)?;
         let i = slot(&mut self.texs, MAX_TEXTURES)?;
         let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
@@ -293,6 +296,7 @@ impl Client {
             height,
             format,
             block_log2,
+            levels,
         };
         gfx.set_texture(i, &img, flags);
         self.texs[i] = Some(Tex {

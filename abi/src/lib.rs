@@ -1525,13 +1525,18 @@ pub mod proto {
         }
         pub const DEPTH_BLOCK_LOG2: u32 = 4;
         /// A texture to sample: handle 0 = shm with the `DMA` right
-        /// holding a block-linear image, `tiled_bytes_bpp(width, height,
-        /// tf_bytes(format), block height)` long; words: width | height
-        /// << 32, flags (`TEX_*`), format (`TF_*`, 0: RGBA8, bytes in R,
-        /// G, B, A order), block height (0: `tex_block_log2` of the
-        /// height; n: log2 of GOBs + 1, no taller than the image needs,
-        /// a render target's). Reply: word 0 = texture ID (its own
-        /// numbering). The image is sampled normalized, without mipmaps.
+        /// holding a block-linear image, `mip_bytes(width, height,
+        /// tf_bytes(format), block height, levels)` long (the levels back
+        /// to back, each with `level_block_log2`'s block height); words:
+        /// width | height << 32, flags (`TEX_*`), format (`TF_*`, 0: RGBA8,
+        /// bytes in R, G, B, A order), block height (0: `tex_block_log2`
+        /// of the height; n: log2 of GOBs + 1, no taller than the image
+        /// needs, a render target's), levels (0: 1; at most `max_levels`).
+        /// Reply: word 0 = texture ID (its own numbering). Coordinates are
+        /// normalized; with several levels a sample blends two of them
+        /// (`TEX_NEAREST`: takes the nearest), the level chosen by the
+        /// size of the pixel on the texture (`Tex` of the IR) or by the
+        /// shader (`sample_lod`).
         pub const TEXTURE_ATTACH: u32 = 19;
         /// word 0 = texture ID.
         pub const TEXTURE_DETACH: u32 = 20;

@@ -684,7 +684,7 @@ fn attach_shared(
     let id = if texture {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
-            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1], m.mr[2], m.mr[3])
+            .attach_texture(&mut d.vm, &d.gfx, h, w, ht, m.mr[1], m.mr[2], m.mr[3], m.mr[4])
     } else if target {
         let (w, ht) = (m.mr[0] as u32, (m.mr[0] >> 32) as u32);
         d.client
@@ -1181,6 +1181,7 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
         height: 16,
         format: proto::TF_RGBA8,
         block_log2: tt.block_log2,
+        levels: 1,
     };
     d.gfx.set_texture(near_id, &texdesc, proto::TEX_NEAREST);
     d.gfx.set_texture(lin_id, &texdesc, proto::TEX_CLAMP);

@@ -98,8 +98,12 @@ then sample (`RenderTarget::texture`): RGBA8, R32F (shadow maps), RGBA16F
 same memory as a target and as a texture (`TARGET_ATTACH`,
 `TEXTURE_ATTACH` with the same format and block height); `Frame::target`
 switches to it and back (`Frame::screen`), waits for the pass before and
-drops the texture caches, so the next pass samples what was drawn. Not
-yet run on the console's GPU (the emulator draws nothing).
+drops the texture caches, so the next pass samples what was drawn.
+`Graphics::texture_mipped` makes the chain of mip levels on the CPU (a
+2 x 2 average per level, in the block-linear layout of `abi`'s
+`gpu_layout.rs`) and the sampler blends two levels, trilinear; a shader
+may also pick the level (`sample_lod`). None of this has run on the
+console's GPU yet (the emulator draws nothing).
 
 ### Users and save data
 
@@ -358,7 +362,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Storage | SD, FAT32, file API | eMMC, ext4 |
 | Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
 | Bluetooth | BCM4356 on UART-D (patch RAM, 3 Mbaud), pairing (SSP), HID host for Joy-Cons and Pro Controllers, reconnection on a button press (a Pro Controller on an Erista) | Joy-Cons on hardware, rumble, motion sensors, players, Bluetooth audio, BLE |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), speakers (codec, audio hub), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps, audio quality in games, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power and volume buttons (read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
+| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), speakers (codec, audio hub), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps and float render targets (written, not yet run on the console), audio quality in games, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power and volume buttons (read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
 | Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC, an emulated Bluetooth controller), debugger (gdb), L4T comparison, USB-C terminal | |
 

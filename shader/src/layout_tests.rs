@@ -101,3 +101,29 @@ fn four_byte_swizzle_is_unchanged() {
 fn formats() {
     assert_eq!([0, 1, 2, 3, 4].map(tf_bytes), [4, 4, 8, 16, 0]);
 }
+
+/// What `nxgfx::texture_mipped` writes: every texel of every level lands
+/// inside its own level, nothing overlaps.
+#[test]
+fn a_mip_chain_packs_its_levels() {
+    for (w, h, bpp) in [(256u32, 256u32, 4u32), (100, 37, 4), (64, 8, 8), (33, 65, 16)] {
+        let bl = (0..=4).rev().find(|&b| level_block_log2(b, h) == b).unwrap();
+        let levels = max_levels(w, h);
+        let mut seen = HashSet::new();
+        for level in 0..levels {
+            let (lw, lh) = (level_extent(w, level), level_extent(h, level));
+            let lbl = level_block_log2(bl, lh);
+            let (base, size) = (level_offset(w, h, bpp, bl, level), level_bytes(w, h, bpp, bl, level));
+            for y in 0..lh {
+                for x in 0..lw {
+                    let o = tiled_offset(lw, x, y, bpp, lbl);
+                    assert!(o + bpp as usize <= size);
+                    for k in 0..bpp as usize {
+                        assert!(seen.insert(base + o + k));
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&b| b < mip_bytes(w, h, bpp, bl, levels)));
+    }
+}
