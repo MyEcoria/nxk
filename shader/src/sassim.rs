@@ -32,6 +32,10 @@ pub struct Sim<'a> {
     /// The thread's local memory (words).
     pub local: Vec<u32>,
     pub steps: u64,
+    /// Modelled cycles of the thread alone (no memory latency beyond the
+    /// scoreboard model), and the times each instruction ran.
+    pub cycles: u64,
+    pub hist: Vec<u32>,
     cur_addr: core::cell::Cell<i64>,
 }
 
@@ -74,6 +78,8 @@ impl<'a> Sim<'a> {
             killed: false,
             local: Vec::new(),
             steps: 0,
+            cycles: 0,
+            hist: Vec::new(),
             cur_addr: core::cell::Cell::new(0),
         }
     }
@@ -225,6 +231,11 @@ impl<'a> Sim<'a> {
             }
             let issue = t.cycle;
             t.cycle += stall.max(1);
+            self.cycles = t.cycle;
+            if self.hist.len() < n {
+                self.hist.resize(n, 0);
+            }
+            self.hist[pc] += 1;
 
             // Execute.
             let mut next = pc + 1;

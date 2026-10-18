@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+pub mod align;
 pub mod builder;
 pub mod emit;
 pub mod fmath;

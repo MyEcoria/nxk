@@ -13,7 +13,7 @@
 
 use alloc::vec::Vec;
 
-use super::{EMPTY, HIT_WORDS, LEAF, MISS, NODE_WORDS, RAY_WORDS, STACK_WORDS, TRI_WORDS};
+use super::{HIT_WORDS, LEAF, MISS, NODE_WORDS, RAY_WORDS, STACK_WORDS, TRI_WORDS};
 use crate::{Builder, CmpOp, Program, Reg, Stage, Ty};
 
 /// Threads per group.
@@ -76,7 +76,18 @@ pub fn any_hit(s: Slots) -> Program {
     traversal(s, true)
 }
 
+/// The closest-hit kernel with the number of inner nodes and leaves it
+/// visited in the hit's `u` and `v` words (a profile aid).
+#[cfg(test)]
+pub fn closest_hit_counted(s: Slots) -> Program {
+    traversal_ex(s, false, true)
+}
+
 fn traversal(s: Slots, any: bool) -> Program {
+    traversal_ex(s, any, false)
+}
+
+fn traversal_ex(s: Slots, any: bool, counted: bool) -> Program {
     let mut b = Builder::new(Stage::Compute);
     b.local_size(GROUP as u16, 1, 1);
     b.local_words(STACK_WORDS as u16);
@@ -87,11 +98,11 @@ fn traversal(s: Slots, any: bool) -> Program {
     let id = b.uadd(g64, tid);
     let count = b.uniform(0, Ty::U32);
     let live = b.cmp(CmpOp::Lt, id, count);
-    b.if_(live, |b| ray(b, s, id, any));
+    b.if_(live, |b| ray(b, s, id, any, counted));
     b.finish()
 }
 
-fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
+fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool, counted: bool) {
     let three = b.u32(RAY_WORDS.trailing_zeros());
     let rbase = b.shl(id, three);
     let w0 = b.load_n(s.rays, rbase, 0, &[Ty::F32; 4]);
@@ -99,7 +110,32 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
     let o = [w0[0], w0[1], w0[2]];
     let t_min = w0[3];
     let d = [w1[0], w1[1], w1[2]];
-    let inv = [b.frcp(d[0]), b.frcp(d[1]), b.frcp(d[2])];
+    // Slab distances as one FMA each: t = plane * inv + off, with off =
+    // -origin * inv. A direction too small to invert is nudged so that
+    // inv stays finite (infinities would make NaNs of the products).
+    let (zero_f, tiny) = (b.f32(0.0), b.f32(1e-20));
+    let mut inv = [zero_f; 3];
+    let mut off = [zero_f; 3];
+    for a in 0..3 {
+        let m = b.fabs(d[a]);
+        let small = b.cmp(CmpOp::Lt, m, tiny);
+        let safe = b.sel(small, tiny, d[a]);
+        inv[a] = b.frcp(safe);
+        let p = b.fmul(o[a], inv[a]);
+        off[a] = b.fneg(p);
+    }
+    // A negative direction enters at the max plane and leaves at the min
+    // plane: the word offsets of the planes the near and far distances
+    // come from, per axis.
+    let mut near_at = [b.u32(0); 3];
+    let mut far_at = [b.u32(0); 3];
+    for a in 0..3 {
+        let neg = b.cmp(CmpOp::Lt, inv[a], zero_f);
+        let (min_at, max_at) = (b.u32(4 + 4 * a as u32), b.u32(16 + 4 * a as u32));
+        near_at[a] = b.sel(neg, max_at, min_at);
+        far_at[a] = b.sel(neg, min_at, max_at);
+    }
+    let guard = b.f32(1.000_000_5);
     let best_t = b.copy(w1[3]);
     let (best_u, best_v) = (b.f32(0.0), b.f32(0.0));
     let best_id = b.u32(MISS);
@@ -110,8 +146,8 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
     let sp = b.u32(0);
     let cur = b.u32(0);
     let leaf_bit = b.u32(LEAF);
-    let empty = b.u32(EMPTY);
     let need_pop = b.bool(false);
+    let (n_inner, n_leaf) = (b.u32(0), b.u32(0));
 
     b.loop_(MAX_STEPS, |b| {
         let bit = b.and(cur, leaf_bit);
@@ -119,6 +155,10 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
         b.if_else(
             is_leaf,
             |b| {
+                if counted {
+                    let nl = b.uadd(n_leaf, one);
+                    b.mov(n_leaf, nl);
+                }
                 // Leaf: LEAF | first << 3 | (count - 1).
                 let seven = b.u32(7);
                 let three = b.u32(3);
@@ -194,40 +234,35 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
                 b.mov(need_pop, t);
             },
             |b| {
+                if counted {
+                    let ni = b.uadd(n_inner, one);
+                    b.mov(n_inner, ni);
+                }
                 // Inner node: four boxes.
                 let five = b.u32(NODE_WORDS.trailing_zeros());
                 let nbase = b.shl(cur, five);
                 let refs = b.load_n(s.nodes, nbase, 0, &[Ty::U32; 4]);
-                let mut mins: Vec<Vec<Reg>> = Vec::new();
-                let mut maxs: Vec<Vec<Reg>> = Vec::new();
-                for a in 0..3u16 {
-                    mins.push(b.load_n(s.nodes, nbase, 4 + 4 * a, &[Ty::F32; 4]));
-                    maxs.push(b.load_n(s.nodes, nbase, 16 + 4 * a, &[Ty::F32; 4]));
+                let mut near: Vec<Vec<Reg>> = Vec::new();
+                let mut far: Vec<Vec<Reg>> = Vec::new();
+                for a in 0..3 {
+                    let i = b.uadd(nbase, near_at[a]);
+                    near.push(b.load_n(s.nodes, i, 0, &[Ty::F32; 4]));
+                    let j = b.uadd(nbase, far_at[a]);
+                    far.push(b.load_n(s.nodes, j, 0, &[Ty::F32; 4]));
                 }
                 let mut key = [inf; 4];
                 let mut rf = [zero; 4];
                 for k in 0..4 {
-                    let tn = b.copy(t_min);
-                    let tf = b.copy(best_t);
+                    let (mut tn, mut tf) = (t_min, best_t);
                     for a in 0..3 {
-                        let lo = {
-                            let x = b.fsub(mins[a][k], o[a]);
-                            b.fmul(x, inv[a])
-                        };
-                        let hi = {
-                            let x = b.fsub(maxs[a][k], o[a]);
-                            b.fmul(x, inv[a])
-                        };
-                        let near = b.fmin(lo, hi);
-                        let far = b.fmax(lo, hi);
-                        let n2 = b.fmax(tn, near);
-                        b.mov(tn, n2);
-                        let f2 = b.fmin(tf, far);
-                        b.mov(tf, f2);
+                        let lo = b.fma(near[a][k], inv[a], off[a]);
+                        tn = b.fmax(tn, lo);
+                        let hi = b.fma(far[a][k], inv[a], off[a]);
+                        tf = b.fmin(tf, hi);
                     }
+                    let tf = b.fmul(tf, guard);
+                    // An empty child's box is (+inf, -inf): never hit.
                     let h = b.cmp(CmpOp::Le, tn, tf);
-                    let present = b.cmp(CmpOp::Ne, refs[k], empty);
-                    let h = b.band(h, present);
                     key[k] = b.sel(h, tn, inf);
                     rf[k] = refs[k];
                 }
@@ -285,6 +320,10 @@ fn ray(b: &mut Builder, s: Slots, id: Reg, any: bool) {
         let two = b.u32(HIT_WORDS.trailing_zeros());
         let hbase = b.shl(id, two);
         let (tb, ub, vb) = (b.fbits(best_t), b.fbits(best_u), b.fbits(best_v));
-        b.store(s.hits, hbase, 0, &[tb, ub, vb, best_id]);
+        if counted {
+            b.store(s.hits, hbase, 0, &[tb, n_inner, n_leaf, best_id]);
+        } else {
+            b.store(s.hits, hbase, 0, &[tb, ub, vb, best_id]);
+        }
     }
 }

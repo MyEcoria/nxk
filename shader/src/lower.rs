@@ -80,6 +80,7 @@ pub fn compile(p: &Program) -> Result<Compiled, Error> {
         w_reg: wants_w.then_some(w_reg),
         loop_idx: 0,
         guard: None,
+        tz: crate::align::trailing_zeros(p),
         tp: 0,
     };
     // Colors not written read as zero.
@@ -223,6 +224,8 @@ struct Gen<'a> {
     w_reg: Option<u8>,
     loop_idx: usize,
     guard: Option<(u8, bool)>,
+    /// Known trailing zero bits of each register (`align`).
+    tz: Vec<u8>,
     /// Which temporary predicate (P5 / P6) comes next.
     tp: u8,
 }
@@ -700,7 +703,9 @@ impl Gen<'_> {
             isetp_cb(P_TEMP_A, i, CB_BUFFERS, desc + 8, Cmp::Lt, false),
             Eff::fixed(&[], &[i]).preds(&[], &[P_TEMP_A]),
         );
-        if n > 1 {
+        let aligned =
+            self.tz[index.0 as usize] >= n.trailing_zeros() as u8 && offset as u32 % n as u32 == 0;
+        if n > 1 && !aligned {
             self.fx(lop32i(t1, i, n as u32 - 1, Logic::And), &[t1], &[i]);
             self.emit(
                 isetp_acc(P_TEMP_A, t1, RZ, Cmp::Eq, false, P_TEMP_A, false),
@@ -720,9 +725,14 @@ impl Gen<'_> {
         let n = dsts.len() as u8;
         self.buf_addr(buf, index, offset, n);
         let ad = self.addr();
+        // The allocator puts the results of a vector load in consecutive
+        // registers, aligned to the width: written in place.
+        let own: Vec<u8> = dsts.iter().map(|&d| self.g(d)).collect();
+        let in_place = n == 1
+            || own[0] % n == 0 && own.iter().enumerate().all(|(k, &r)| r == own[0] + k as u8);
         let blk = self.sb();
-        let regs: Vec<u8> = if n == 1 {
-            alloc::vec![self.g(dsts[0])]
+        let regs: Vec<u8> = if in_place {
+            own.clone()
         } else {
             (0..n).map(|k| blk + k).collect()
         };
@@ -733,9 +743,8 @@ impl Gen<'_> {
             when(ldg_n(regs[0], ad, n), P_TEMP_A, false),
             Eff::var(&regs, &[ad, ad + 1]).preds(&[P_TEMP_A], &[]),
         );
-        if n > 1 {
-            for (k, d) in dsts.iter().enumerate() {
-                let d = self.g(*d);
+        if !in_place {
+            for (k, &d) in own.iter().enumerate() {
                 self.fx(mov(d, blk + k as u8), &[d], &[blk + k as u8]);
             }
         }

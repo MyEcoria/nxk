@@ -211,6 +211,27 @@ pub fn allocate(p: &Program, base: u8) -> Result<Alloc, TooMany> {
     }
     items.sort_by_key(|i| (i.first, i.v));
 
+    // The results of a vector load take consecutive registers, aligned to
+    // the width, so that the load can write them in place.
+    let mut group_of: Vec<Option<usize>> = alloc::vec![None; n];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    walk(&p.body, &mut |i| {
+        if let Inst::BufLoad { dsts, .. } = i {
+            let mut v: Vec<usize> = dsts.iter().map(|d| d.0 as usize).collect();
+            let fresh = v
+                .iter()
+                .all(|&d| group_of[d].is_none() && p.reg_types[d] != Ty::Bool);
+            v.dedup();
+            if dsts.len() > 1 && fresh && v.len() == dsts.len() {
+                for &d in &v {
+                    group_of[d] = Some(groups.len());
+                }
+                groups.push(dsts.iter().map(|d| d.0 as usize).collect());
+            }
+        }
+    });
+    let mut placed = alloc::vec![false; groups.len()];
+
     let mut locs = alloc::vec![Loc::Gpr(255); n];
     let mut counters = alloc::vec![255u8; w.loops.len()];
     let mut gpr_busy = [false; 256];
@@ -229,6 +250,25 @@ pub fn allocate(p: &Program, base: u8) -> Result<Alloc, TooMany> {
                 true
             }
         });
+        if it.v < n {
+            if let Some(g) = group_of[it.v] {
+                if placed[g] {
+                    continue;
+                }
+                placed[g] = true;
+                let width = groups[g].len();
+                let r = (base as usize..=255 - width)
+                    .find(|&r| r % width == 0 && (r..r + width).all(|x| !gpr_busy[x]))
+                    .ok_or(TooMany)?;
+                for (k, &v) in groups[g].iter().enumerate() {
+                    gpr_busy[r + k] = true;
+                    top = top.max((r + k) as u16 + 1);
+                    locs[v] = Loc::Gpr((r + k) as u8);
+                    active.push((w.ranges[v].last, Loc::Gpr((r + k) as u8)));
+                }
+                continue;
+            }
+        }
         let mut loc = None;
         if it.pred_ok {
             if let Some(q) = pred_busy.iter().position(|b| !b) {
