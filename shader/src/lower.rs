@@ -462,7 +462,10 @@ impl Gen<'_> {
             Inst::UniformIdx { dst, base, index } => {
                 let (d, x, t) = (self.g(*dst), self.g(*index), self.t0());
                 self.fx(shl(t, x, 2), &[t], &[x]);
-                self.vr(ldc(d, t, CB_UNIFORMS, 4 * *base as u32), &[d], &[t]);
+                self.emit(
+                    ldc(d, t, CB_UNIFORMS, 4 * *base as u32),
+                    Eff::var(&[d], &[t]).read_barrier(),
+                );
             }
             Inst::BufLoad {
                 buf,

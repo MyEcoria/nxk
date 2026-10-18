@@ -213,6 +213,15 @@ impl<'a> Sim<'a> {
                         for &r in reads.iter().filter(|&&r| r != 255) {
                             t.pend_r[r] = Some(br);
                         }
+                    } else if matches!(family(op), Op::Ldg | Op::Ldl | Op::Atom | Op::Ldc) {
+                        // A load queues behind the others and takes its
+                        // address registers when it gets its turn: they stay
+                        // in use until its result is waited on (the console
+                        // gave wrong rays when scratch address registers
+                        // were rewritten earlier).
+                        for &r in reads.iter().filter(|&&r| r != 255) {
+                            t.pend_r[r] = Some(bw);
+                        }
                     } else {
                         for &r in &reads {
                             t.read_until[r] = t.cycle + READ_WINDOW;

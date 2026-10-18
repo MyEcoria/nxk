@@ -559,6 +559,13 @@ program that vanished without closing them (crash) are reclaimed.
    followed by an L2 flush; memory the CPU reads while a batch runs must
    stay volatile.
 
+10. GPU loads read their sources late: a load queues behind the others and takes
+    its address registers when its turn comes, so scratch registers rewritten
+    right after it can corrupt it. With vector loads written in place (no copy
+    to wait on), 33,480 of 65,536 rays came out wrong. Loads, local loads and
+    atomics signal a read scoreboard, and a write to their sources waits on it;
+    the simulator keeps their sources in use until the result is waited on.
+
 ## L4T comparison
 
 See `bench/README.md` and `bench/RESULTS.md`. In the emulator, creating

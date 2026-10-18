@@ -1028,6 +1028,21 @@ within 5 s.
     Mrays/s), `gpu test` 15/15, Lumen 60 fps (its ray room 59 fps, was
     about 30). `gpu test` prints `probe` lines (empty launch, FFMA and
     load chains) for tuning.
+40. 18/10/2026, Erista, **the ray kernels after a compiler pass**: vector loads
+    written in place (no copy out of a scratch quad), box tests of one FMA
+    per bound, 36% fewer instructions per ray on the simulator (closest hit
+    6555 to 4164). On the console the first build gave 33,480 of 65,536 rays
+    wrong: queued loads read their address registers late and the next
+    load rewrote them (the simulator reads at issue, so it agreed with the
+    reference). Loads, local loads and atomics now signal a read
+    scoreboard; rays are right (0 differ), closest hit 45.9 ms, any hit
+    28.0 ms (1.42 and 2.33 Mrays/s; 53 and 35 ms before). Time follows
+    the loads, not the instruction count: serialised, the cheaper kernel
+    took the same 54 ms. Lumen: 60 fps, its ray room a steady 16.7 ms
+    frames. A game started with `run` from the shell is not owned by
+    `display`: after HOME the library is back and the GPU is switched off,
+    but the process is still alive (`ps`); a `--reload gpu` in that state
+    left the console unresponsive until a reboot.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
