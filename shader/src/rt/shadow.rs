@@ -211,9 +211,9 @@ pub fn kernel(s: Slots) -> Program {
             let (nx, ny) = (b.fmul(clip[0], rw), b.fmul(clip[1], rw));
             let (wf, hf) = (b.u2f(w), b.u2f(h));
             let (hw, hh) = (b.fmul(wf, half), b.fmul(hf, half));
-            let mhh = b.fneg(hh);
             let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
-            let (hx, hy) = (b.fma(nx, hw, ox), b.fma(ny, mhh, oy));
+            // The viewport: window = ndc * size / 2 + size / 2, both axes.
+            let (hx, hy) = (b.fma(nx, hw, ox), b.fma(ny, hh, oy));
             let (hx, hy) = (b.fadd(hx, half), b.fadd(hy, half));
             let (hx, hy) = (b.ffloor(hx), b.ffloor(hy));
             let (wmax, hmax) = (b.fsub(wf, one_f), b.fsub(hf, one_f));
@@ -362,7 +362,20 @@ pub fn lit_factor(
     tol: Reg,
     low: [Reg; 2],
 ) -> Reg {
-    lit_factor_ex(b, buf, px, py, dist, tol, low).0
+    lit_factor_ex(b, buf, px, py, dist, tol, low).factor
+}
+
+/// What `lit_factor_ex` worked out.
+pub struct Filtered {
+    pub factor: Reg,
+    /// The texels agreed well enough to be filtered.
+    pub strong: Reg,
+    /// Some texel had a distance.
+    pub any: Reg,
+    /// The smallest distance error among the four texels, in tolerances.
+    pub err: Reg,
+    /// The sum of the filter's weights.
+    pub weight: Reg,
 }
 
 /// `lit_factor`, whether the texels agreed well enough to be filtered
@@ -376,7 +389,7 @@ pub fn lit_factor_ex(
     dist: Reg,
     tol: Reg,
     low: [Reg; 2],
-) -> (Reg, Reg, Reg) {
+) -> Filtered {
     let (zero, one) = (b.f32(0.0), b.f32(1.0));
     let (x0, y0) = (b.ffloor(px), b.ffloor(py));
     let (fx, fy) = (b.fsub(px, x0), b.fsub(py, y0));
@@ -435,5 +448,12 @@ pub fn lit_factor_ex(
     let rcp = b.frcp(denom);
     let mean = b.fmul(sum_l, rcp);
     let any = b.cmp(CmpOp::Lt, best_e, huge);
-    (b.sel(strong, mean, best_l), strong, any)
+    let err = b.fmul(best_e, inv_tol);
+    Filtered {
+        factor: b.sel(strong, mean, best_l),
+        strong,
+        any,
+        err,
+        weight: sum_w,
+    }
 }

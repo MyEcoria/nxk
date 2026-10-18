@@ -194,7 +194,7 @@ impl Shadows {
             .count();
         let mut col = String::new();
         let x = w / 2;
-        for y in (0..h).step_by(16) {
+        for y in (0..h).step_by(8) {
             let i = y * w + x;
             col.push_str(&format!(
                 " {:.1}/{:.2}",

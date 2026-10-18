@@ -39,7 +39,8 @@ fn view_projection(eye: [f32; 3], pitch: f32) -> [[f32; 4]; 4] {
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     [
         [1.0 / HALF, 0.0, 0.0, -eye[0] / HALF],
-        [0.0, up[1] / HALF, up[2] / HALF, -dot(eye, up) / HALF],
+        // Window y grows downward with NDC y, as the console's viewport has it.
+        [0.0, -up[1] / HALF, -up[2] / HALF, dot(eye, up) / HALF],
         [0.0, 0.0, 0.0, 0.0],
         [0.0, fwd[1], fwd[2], -dot(eye, fwd)],
     ]

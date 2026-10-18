@@ -1,7 +1,7 @@
 //! The game's shaders, written in the IR: one lit vertex and fragment pair
 //! for everything solid (a sun, a hemisphere light, distance fog, gamma).
 
-use nxgfx::ir::rt::shadow::lit_factor_ex as shadow_factor;
+use nxgfx::ir::rt::shadow::{lit_factor_ex as shadow_factor, Filtered};
 use nxgfx::ir::{Builder, CmpOp, OutKind, Program, Reg, Stage, Ty};
 
 /// Uniform words: the model-view-projection rows, the model rows (3x4,
@@ -83,13 +83,7 @@ pub fn vertex() -> Program {
 /// The sun's share at this pixel from the mask (buffer slot 0), and
 /// whether the filter had texels to work with. `n`: the unit normal, `w`:
 /// the world position, `cam`: the camera, `dist`: the distance to it.
-fn mask_factor(
-    b: &mut Builder,
-    n: [Reg; 3],
-    w: [Reg; 3],
-    cam: [Reg; 3],
-    dist: Reg,
-) -> (Reg, Reg, Reg) {
+fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: Reg) -> Filtered {
     let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
     let low = [
         b.uniform(U_SHADOW_W, Ty::F32),
@@ -99,10 +93,11 @@ fn mask_factor(
     let (nx, ny) = (b.fmul(clip[0], rw), b.fmul(clip[1], rw));
     let half = b.f32(0.5);
     let (hw, hh) = (b.fmul(low[0], half), b.fmul(low[1], half));
-    let mhh = b.fneg(hh);
     let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
+    // The viewport maps NDC to the window as x * size / 2 + size / 2, both
+    // axes (the panel's matrix has already turned y down).
     let px = b.fma(nx, hw, ox);
-    let py = b.fma(ny, mhh, oy);
+    let py = b.fma(ny, hh, oy);
     // Neighbouring texels of a surface seen at a grazing angle are far
     // apart in depth: the tolerance grows as the view turns flat.
     let to_cam = [
@@ -160,7 +155,7 @@ pub fn fragment() -> Program {
     let on = b.uniform(U_SHADOW_ON, Ty::F32);
     let enabled = b.cmp(CmpOp::Gt, on, zero);
     b.if_(enabled, |b| {
-        let (f, _, _) = mask_factor(b, n, w, cam, dist);
+        let f = mask_factor(b, n, w, cam, dist).factor;
         b.mov(shadow, f);
     });
     let col = [b.input(1, 0), b.input(1, 1), b.input(1, 2), b.input(1, 3)];
@@ -262,17 +257,18 @@ pub fn mask_view_fragment() -> Program {
     ];
     let d2 = dot3(&mut b, d, d);
     let dist = b.fsqrt(d2);
-    let (f, strong, any) = mask_factor(&mut b, n, w, cam, dist);
-    let (one, zero, mid, hi) = (b.f32(1.0), b.f32(0.0), b.f32(0.6), b.f32(0.4));
-    let red_weak = b.sel(any, one, zero);
-    let green_weak = b.sel(any, f, mid);
-    let blue_weak = b.sel(any, hi, one);
-    let red = b.sel(strong, f, red_weak);
-    let green = b.sel(strong, f, green_weak);
-    let blue = b.sel(strong, f, blue_weak);
-    b.output(OutKind::Color(0), 0, red);
-    b.output(OutKind::Color(0), 1, green);
-    b.output(OutKind::Color(0), 2, blue);
+    let m = mask_factor(&mut b, n, w, cam, dist);
+    let (one, zero) = (b.f32(1.0), b.f32(0.0));
+    // Red: the smallest distance error in tolerances; green: the filter's
+    // weights (a quarter of them is plenty); blue: the factor.
+    let err = b.fsat(m.err);
+    let quarter = b.f32(4.0);
+    let weight = b.fmul(m.weight, quarter);
+    let weight = b.fsat(weight);
+    let _ = (zero, m.strong, m.any);
+    b.output(OutKind::Color(0), 0, err);
+    b.output(OutKind::Color(0), 1, weight);
+    b.output(OutKind::Color(0), 2, m.factor);
     b.output(OutKind::Color(0), 3, one);
     b.finish()
 }
