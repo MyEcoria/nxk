@@ -61,6 +61,9 @@ struct Buf {
     va: u64,
     len: u64,
     held: Held,
+    /// Physical pages, and whether they are mapped cached in L2.
+    pg: Vec<u64>,
+    cached: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -73,12 +76,15 @@ struct Tgt {
     image: Image,
     bytes: u64,
     _held: Held,
+    pg: Vec<u64>,
 }
 
 struct Tex {
     va: u64,
     bytes: u64,
     _held: Held,
+    pg: Vec<u64>,
+    cached: bool,
 }
 
 /// A compiled shader of the client, in a program region.
@@ -153,9 +159,55 @@ impl Client {
         let va = vm
             .alloc(pg.len() as u64 * PAGE, PAGE)
             .map_err(|(e, _)| -e)?;
-        vm.map_at(va, &pg, false).map_err(|(e, _)| -e)?;
-        self.bufs[i] = Some(Buf { va, len, held });
+        // Data the GPU reads (and compute writes) is cached in L2; memory
+        // that is also a render target stays volatile.
+        let cached = !self.shares_target(&pg);
+        if cached {
+            vm.map_at_cached(va, &pg, 0)
+        } else {
+            vm.map_at(va, &pg, false)
+        }
+        .map_err(|(e, _)| -e)?;
+        self.bufs[i] = Some(Buf {
+            va,
+            len,
+            held,
+            pg,
+            cached,
+        });
         Ok(i as u64)
+    }
+
+    /// Whether any of `pg` backs a render target.
+    fn shares_target(&self, pg: &[u64]) -> bool {
+        let mut t: Vec<u64> = self
+            .tgts
+            .iter()
+            .flatten()
+            .flat_map(|t| t.pg.iter().copied())
+            .collect();
+        t.sort_unstable();
+        pg.iter().any(|p| t.binary_search(p).is_ok())
+    }
+
+    /// A new target's pages: buffers and textures on the same memory
+    /// go back to volatile mappings (a target is written past L2).
+    fn make_volatile(&mut self, vm: &mut Vm, pg: &[u64]) {
+        let mut sorted = pg.to_vec();
+        sorted.sort_unstable();
+        let hit = |p: &[u64]| p.iter().any(|x| sorted.binary_search(x).is_ok());
+        for b in self.bufs.iter_mut().flatten() {
+            if b.cached && hit(&b.pg) {
+                let _ = vm.map_at(b.va, &b.pg, false);
+                b.cached = false;
+            }
+        }
+        for t in self.texs.iter_mut().flatten() {
+            if t.cached && hit(&t.pg) {
+                let _ = vm.map_at_kind(t.va, &t.pg, false, mmu::KIND_GENERIC_16BX2);
+                t.cached = false;
+            }
+        }
     }
 
     pub fn detach_buffer(&mut self, vm: &mut Vm, id: u64) -> Res<()> {
@@ -223,6 +275,7 @@ impl Client {
         let i = slot(&mut self.tgts, MAX_TARGETS)?;
         let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
         vm.map_at_kind(va, &pg, false, mk).map_err(|(e, _)| -e)?;
+        self.make_volatile(vm, &pg);
         let image = match image {
             Image::Color(c) => Image::Color(Tiled { va, ..c }),
             Image::Depth(d) => Image::Depth(Depth { va, ..d }),
@@ -231,6 +284,7 @@ impl Client {
             image,
             bytes,
             _held: held,
+            pg,
         });
         Ok(i as u64)
     }
@@ -291,8 +345,13 @@ impl Client {
         let pg = pages(h, bytes)?;
         let i = slot(&mut self.texs, MAX_TEXTURES)?;
         let va = vm.alloc(bytes, 1 << 17).map_err(|(e, _)| -e)?;
-        vm.map_at_kind(va, &pg, false, mmu::KIND_GENERIC_16BX2)
-            .map_err(|(e, _)| -e)?;
+        let cached = !self.shares_target(&pg);
+        if cached {
+            vm.map_at_cached(va, &pg, mmu::KIND_GENERIC_16BX2)
+        } else {
+            vm.map_at_kind(va, &pg, false, mmu::KIND_GENERIC_16BX2)
+        }
+        .map_err(|(e, _)| -e)?;
         let img = TexImage {
             va,
             width,
@@ -306,6 +365,8 @@ impl Client {
             va,
             bytes,
             _held: held,
+            pg,
+            cached,
         });
         Ok(i as u64)
     }

@@ -4,7 +4,7 @@
 //! 128 MiB, so VAs below 64 GiB), a 256 KiB small-page table per PDE used.
 //! Everything goes through the video-memory aperture, which on Tegra is
 //! DRAM at its physical address, and is volatile (not cached in L2), as
-//! Horizon sets it up.
+//! Horizon sets it up, except the data of clients (`map_at_cached`).
 
 extern crate alloc;
 
@@ -83,11 +83,30 @@ impl Vm {
         privileged: bool,
         kind: u8,
     ) -> Result<()> {
+        self.map_pages(va, pages, privileged, kind, false)
+    }
+
+    /// The pages of a client's data (vertices, trees, textures) cached in
+    /// L2: the channel invalidates L2 before every batch and flushes it
+    /// after, so the CPU and the GPU see each other's writes between
+    /// batches. Not for memory the CPU reads while a batch runs.
+    pub fn map_at_cached(&mut self, va: u64, pages: &[u64], kind: u8) -> Result<()> {
+        self.map_pages(va, pages, false, kind, true)
+    }
+
+    fn map_pages(
+        &mut self,
+        va: u64,
+        pages: &[u64],
+        privileged: bool,
+        kind: u8,
+        cached: bool,
+    ) -> Result<()> {
         for (k, &pa) in pages.iter().enumerate() {
             let v = va + k as u64 * PAGE;
             let pte = (pa >> 8)
                 | PTE_VALID
-                | PTE_VOL
+                | if cached { 0 } else { PTE_VOL }
                 | (kind as u64) << PTE_KIND_SHIFT
                 | if privileged { PTE_PRIV } else { 0 };
             let pt = self.pt(v)?;
@@ -112,6 +131,16 @@ impl Vm {
     /// Map contiguous DMA memory somewhere; its GPU address.
     pub fn map(&mut self, m: &Dma, privileged: bool) -> Result<u64> {
         self.map_kind(m, privileged, KIND_PITCH, PAGE)
+    }
+
+    /// Like `map`, cached in L2 (`map_at_cached`).
+    pub fn map_cached(&mut self, m: &Dma) -> Result<u64> {
+        let va = self.alloc(m.len() as u64, PAGE)?;
+        let pages: Vec<u64> = (0..m.len() as u64 / PAGE)
+            .map(|k| m.pa + k * PAGE)
+            .collect();
+        self.map_at_cached(va, &pages, KIND_PITCH)?;
+        Ok(va)
     }
 
     /// Like `map`, as storage of `kind`, `align`ed (a block-linear surface

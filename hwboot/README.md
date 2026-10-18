@@ -1017,6 +1017,17 @@ within 5 s.
     The `restart` command only works from the first shell: a `run
     /bin/shell` inside it takes the console input for good, and only a
     reboot gets it back.
+39. 18/10/2026, Erista, **GPU memory caching**: the ray kernels took 171 ms
+    (closest) and 98 ms (any hit) for 65,536 rays; an empty launch is 19 us
+    and the FFMA bench 305 GFLOP/s, so the time was memory. Every GMMU page
+    was volatile (L2 bypass); a chain of dependent loads over a 16 KB table
+    ran 17 times faster on cached pages (56 ms to 3.2 ms for 65,536
+    threads), 3 times faster over 256 KB, and the same over 4 MB (DRAM
+    bound, past the 256 KB L2). Client buffers and textures are now mapped
+    cached (`Vm::map_at_cached`): rays 53 ms and 35 ms (1.23 and 1.86
+    Mrays/s), `gpu test` 15/15, Lumen 60 fps (its ray room 59 fps, was
+    about 30). `gpu test` prints `probe` lines (empty launch, FFMA and
+    load chains) for tuning.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

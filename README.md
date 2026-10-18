@@ -550,6 +550,15 @@ program that vanished without closing them (crash) are reclaimed.
    fuzzer of `gpu test` keeps arguments within six radians). The shader
    self-test of `gpu test` found each of them.
 
+9. GPU memory: pages the GMMU maps volatile bypass L2, and a dependent load
+   from them costs a DRAM round trip. A 16 KB table chased by 65,536
+   threads took 56 ms volatile, 3 ms cached. `gpu` maps what a client
+   attaches (buffers, textures) cached; targets, scanout images,
+   semaphores, pushbuffers and the GPU's own structures stay volatile.
+   That is coherent because every batch is preceded by an L2 invalidate and
+   followed by an L2 flush; memory the CPU reads while a batch runs must
+   stay volatile.
+
 ## L4T comparison
 
 See `bench/README.md` and `bench/RESULTS.md`. In the emulator, creating

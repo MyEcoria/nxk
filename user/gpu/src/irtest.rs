@@ -79,9 +79,9 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
     let out = Dma::new(OUT_WORDS * 4).map_err(e)?;
     let atom = Dma::new(16).map_err(e)?;
     let vas = [
-        d.vm.map(&inb, false).map_err(e)?,
-        d.vm.map(&out, false).map_err(e)?,
-        d.vm.map(&atom, false).map_err(e)?,
+        d.vm.map_cached(&inb).map_err(e)?,
+        d.vm.map_cached(&out).map_err(e)?,
+        d.vm.map_cached(&atom).map_err(e)?,
     ];
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     let (mut ok, mut ns, mut bad_seeds) = (true, 0u64, 0u32);
@@ -302,7 +302,7 @@ fn draw_case(g: &mut Gpu, name: &str, vs: Sh, fs: Sh, u: [f32; 4], want: u32) ->
         pitch: W * 4,
         format: proto::FMT_A8B8G8R8 as u32,
     };
-    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    let vbv = d.vm.map_cached(&vb).map_err(e)?;
     let tva =
         d.vm.map_kind(&tex, false, mmu::KIND_GENERIC_16BX2, 1 << 17)
             .map_err(e)?;
@@ -619,8 +619,8 @@ pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
         format: proto::FMT_A8B8G8R8 as u32,
     };
     let (vbv, ibv) = (
-        d.vm.map(&vb, false).map_err(e)?,
-        d.vm.map(&ib, false).map_err(e)?,
+        d.vm.map_cached(&vb).map_err(e)?,
+        d.vm.map_cached(&ib).map_err(e)?,
     );
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
@@ -790,7 +790,7 @@ fn targets_one(g: &mut Gpu, tf1: u64, name1: &'static str) -> Res<(bool, u64)> {
         pitch: PITCH,
         format: proto::FMT_A8B8G8R8 as u32,
     };
-    let vbv = d.vm.map(&vb, false).map_err(e)?;
+    let vbv = d.vm.map_cached(&vb).map_err(e)?;
     for (i, x) in [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0].iter().enumerate() {
         vb.w32(i * 4, x.to_bits());
     }
@@ -1026,7 +1026,7 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
     ];
     let mut vas = [0u64; 4];
     for (k, m) in mems.iter().enumerate() {
-        vas[k] = d.vm.map(m, false).map_err(e)?;
+        vas[k] = d.vm.map_cached(m).map_err(e)?;
     }
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     let mut desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
@@ -1110,13 +1110,14 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         // reciprocal is approximate): a few in a thousand.
         let pass = wrong * 500 <= RAYS;
         println!(
-            "[gpu] IR rays ({}): {} of {} rays differ from the CPU, {} hit; {} us, {} Mrays/s ({} registers)",
+            "[gpu] IR rays ({}): {} of {} rays differ from the CPU, {} hit; {} us, {}.{:02} Mrays/s ({} registers)",
             name,
             wrong,
             RAYS,
             hits,
             t / 1000,
-            RAYS as u64 * 1000 / t.max(1),
+            RAYS as u64 * 100 / (t / 1000).max(1) / 100,
+            RAYS as u64 * 100 / (t / 1000).max(1) % 100,
             c.gprs
         );
         ok &= pass;
@@ -1126,5 +1127,8 @@ pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
         let _ = d.vm.unmap(vas[k], m.len() as u64);
     }
     let _ = mmu::invalidate(&regs, &d.vm);
+    if let Err(e) = crate::probe::run(g) {
+        println!("[gpu] probe: errno {}", -e);
+    }
     Ok((ok, ns_total))
 }

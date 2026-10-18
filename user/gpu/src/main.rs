@@ -28,6 +28,7 @@ mod kernels;
 mod mmu;
 mod pll;
 mod power;
+mod probe;
 mod push;
 mod qmd;
 mod slm;
@@ -958,8 +959,8 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
             .map_err(e)?;
     tiled.va = d.vm.map_kind(&timg, false, kind, 1 << 17).map_err(e)?;
     let (vbv, ibv) = (
-        d.vm.map(&vb, false).map_err(e)?,
-        d.vm.map(&ib, false).map_err(e)?,
+        d.vm.map_cached(&vb).map_err(e)?,
+        d.vm.map_cached(&ib).map_err(e)?,
     );
     mmu::invalidate(&regs, &d.vm).map_err(e)?;
     let flat = gfx::Target {
