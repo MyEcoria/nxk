@@ -19,6 +19,7 @@ pub mod audio;
 pub mod canvas;
 pub mod math;
 pub mod os;
+pub mod raytrace;
 pub mod shaders;
 
 use alloc::vec::Vec;

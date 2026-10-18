@@ -1,0 +1,5 @@
+title=Lumen
+publisher=nxk
+version=0.1.0
+description=Run through a valley from dawn to night, collect the lights; a hidden Lab tests the GPU
+color=FFB347

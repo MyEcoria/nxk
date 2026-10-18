@@ -387,7 +387,48 @@ def cover_plain(title, color):
     return img
 
 
-GAMES = {"cube": cover_cube, "starlane": cover_starlane}
+def cover_lumen():
+    """Lumen: a valley at dusk, pine silhouettes, a light to collect."""
+    w = h = ICON * SS
+    rng = random.Random(11)
+    img = gradient(w, h, [(0, (22, 26, 70)), (0.35, (88, 62, 140)), (0.55, (238, 128, 96)), (0.64, (255, 196, 120)), (1, (255, 196, 120))]).convert("RGBA")
+    cx, cy = w // 2, int(h * 0.50)
+    # The sun low on the horizon and its rays.
+    sun = layer(img)
+    sd = ImageDraw.Draw(sun)
+    for i in range(14):
+        a = i * math.pi / 7
+        sd.polygon([(cx, cy), (cx + math.cos(a - 0.05) * w, cy + math.sin(a - 0.05) * w), (cx + math.cos(a + 0.05) * w, cy + math.sin(a + 0.05) * w)], fill=(255, 226, 170, 26))
+    sd.ellipse((cx - 100, cy - 100, cx + 100, cy + 100), fill=(255, 238, 190, 230))
+    glow(img, sun, 36)
+    for base, rough, col in [(0.58, 110, (112, 82, 150)), (0.66, 80, (82, 70, 122)), (0.76, 60, (50, 62, 96)), (0.88, 36, (28, 40, 70))]:
+        pts = ridge(rng, w, h * base, rough)
+        ImageDraw.Draw(img).polygon(pts + [(w, h), (0, h)], fill=col + (255,))
+    # Pines along the foreground.
+    d = ImageDraw.Draw(img)
+    for _ in range(26):
+        x = rng.uniform(-20, w + 20)
+        base = h * rng.uniform(0.86, 1.0)
+        ph = rng.uniform(120, 260)
+        for k in range(3):
+            tw = ph * (0.30 - 0.07 * k)
+            top = base - ph * (0.45 + 0.28 * k)
+            d.polygon([(x, top - ph * 0.30), (x - tw, top + ph * 0.18), (x + tw, top + ph * 0.18)], fill=(14, 28, 40, 255))
+    # The light: a golden orb with a halo.
+    lx, ly = int(w * 0.5), int(h * 0.70)
+    halo = layer(img)
+    ImageDraw.Draw(halo).ellipse((lx - 150, ly - 150, lx + 150, ly + 150), fill=(255, 220, 110, 170))
+    glow(img, halo, 54, 0.9)
+    orb = layer(img)
+    od = ImageDraw.Draw(orb)
+    od.polygon([(lx, ly - 70), (lx + 52, ly), (lx, ly + 70), (lx - 52, ly)], fill=(255, 236, 150, 255))
+    od.polygon([(lx, ly - 70), (lx + 52, ly), (lx, ly)], fill=(255, 250, 215, 255))
+    img.alpha_composite(orb)
+    logo(img, "LUMEN", cx, int(h * 0.16), 200, [(0, (255, 255, 255)), (1, (255, 206, 110))], (40, 24, 70), glow_c=(255, 220, 150))
+    return img
+
+
+GAMES = {"cube": cover_cube, "starlane": cover_starlane, "lumen": cover_lumen}
 
 
 # The UI's own art: glyphs in `col`, about 0.55 x `s` across.

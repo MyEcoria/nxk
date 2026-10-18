@@ -116,6 +116,26 @@ coordinates as varying 0), for post-processing passes
 (`Frame::draw_fullscreen`). None of this has run on the console's GPU yet
 (the emulator draws nothing; `gpu irtest` checks the instanced draw there).
 
+### Raytracing and Lumen
+
+The GPU has no ray-tracing hardware, so rays are a compute shader's job.
+`nxk_shader::rt` builds a four-wide BVH on the CPU (binned SAH; 40,000
+triangles in about 35 ms on the PC), and two traversal kernels written in
+the IR (closest hit and any hit, the stack in the thread's local memory)
+answer buffers of rays; `Graphics::rt_scene` uploads a scene and
+`Frame::trace` records a query. A game shoots a few rays per pixel at
+reduced resolution (shadows, ambient occlusion) next to its raster passes.
+
+`jeux/lumen` is the game built on all of this: a valley from dawn to
+night to run through, third person (left stick, right stick for the
+camera, A to jump, R to run), a sun and sky that follow the time of day,
+24 lights to collect, all drawn by its own IR shaders. L + R + Minus
+opens its hidden **Lab**: frame-time strip and counters, a draw-call
+stress room, a particle room (additive blending from a buffer rewritten
+each frame) and a ray room that traces a 96 x 54 grid of camera rays and
+their shadow rays into the valley's 41,000 triangles and shows them as a
+heat map.
+
 ### Users and save data
 
 The console has users. On the first start `display` runs a setup (name

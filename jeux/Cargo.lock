@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen"
+version = "0.1.0"
+dependencies = [
+ "nxgfx",
+]
+
+[[package]]
 name = "nxgfx"
 version = "0.1.0"
 dependencies = [
