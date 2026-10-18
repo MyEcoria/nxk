@@ -208,8 +208,15 @@ impl<'a> Sim<'a> {
                     for &r in writes.iter().filter(|&&r| r != 255) {
                         t.pend_w[r] = Some(bw);
                     }
-                    for &r in &reads {
-                        t.read_until[r] = t.cycle + READ_WINDOW;
+                    if let Some(br) = bar_for(rd) {
+                        t.bar_done[br as usize] = t.cycle + VAR_LATENCY / 2;
+                        for &r in reads.iter().filter(|&&r| r != 255) {
+                            t.pend_r[r] = Some(br);
+                        }
+                    } else {
+                        for &r in &reads {
+                            t.read_until[r] = t.cycle + READ_WINDOW;
+                        }
                     }
                 } else if let Some(br) = bar_for(rd) {
                     t.bar_done[br as usize] = t.cycle + VAR_LATENCY;

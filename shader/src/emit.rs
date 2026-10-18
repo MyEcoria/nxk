@@ -37,6 +37,10 @@ pub struct Eff<'a> {
     pub w: &'a [u8],
     pub pr: &'a [u8],
     pub pw: &'a [u8],
+    /// A `Var` instruction that also signals when it has read its
+    /// sources: a load queues behind the others, and the scratch registers
+    /// of its address must not be rewritten before it has taken them.
+    pub rd_bar: bool,
 }
 
 impl<'a> Eff<'a> {
@@ -47,6 +51,7 @@ impl<'a> Eff<'a> {
             w,
             pr: &[],
             pw: &[],
+            rd_bar: false,
         }
     }
 
@@ -57,6 +62,7 @@ impl<'a> Eff<'a> {
             w,
             pr: &[],
             pw: &[],
+            rd_bar: false,
         }
     }
 
@@ -67,6 +73,7 @@ impl<'a> Eff<'a> {
             w: &[],
             pr: &[],
             pw: &[],
+            rd_bar: false,
         }
     }
 
@@ -77,7 +84,14 @@ impl<'a> Eff<'a> {
             w: &[],
             pr,
             pw: &[],
+            rd_bar: false,
         }
+    }
+
+    /// Signal a second scoreboard once the sources are read.
+    pub fn read_barrier(mut self) -> Self {
+        self.rd_bar = true;
+        self
     }
 
     /// Also reads predicates `pr` / writes predicates `pw`.
@@ -202,8 +216,17 @@ impl Emitter {
                     for &r in e.w.iter().filter(|&&r| r != RZ) {
                         self.pend_w[r as usize] = bar;
                     }
-                    for &r in e.r.iter().filter(|&&r| r != RZ) {
-                        self.war[r as usize] = self.war[r as usize].max(issue + READ_WINDOW);
+                    if e.rd_bar {
+                        let rbar = self.next_bar;
+                        self.next_bar = (self.next_bar + 1) % 6;
+                        s = s.rd(rbar);
+                        for &r in e.r.iter().filter(|&&r| r != RZ) {
+                            self.pend_r[r as usize] = rbar;
+                        }
+                    } else {
+                        for &r in e.r.iter().filter(|&&r| r != RZ) {
+                            self.war[r as usize] = self.war[r as usize].max(issue + READ_WINDOW);
+                        }
                     }
                 } else {
                     s = s.rd(bar);

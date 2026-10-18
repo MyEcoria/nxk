@@ -230,6 +230,8 @@ struct Gen<'a> {
     tp: u8,
 }
 
+/// Vector loads write their results where the allocator put them.
+const IN_PLACE_LOADS: bool = true;
 const P_TEMP_A: u8 = 5;
 const P_TEMP_B: u8 = 6;
 
@@ -729,7 +731,9 @@ impl Gen<'_> {
         // registers, aligned to the width: written in place.
         let own: Vec<u8> = dsts.iter().map(|&d| self.g(d)).collect();
         let in_place = n == 1
-            || own[0] % n == 0 && own.iter().enumerate().all(|(k, &r)| r == own[0] + k as u8);
+            || IN_PLACE_LOADS
+                && own[0] % n == 0
+                && own.iter().enumerate().all(|(k, &r)| r == own[0] + k as u8);
         let blk = self.sb();
         let regs: Vec<u8> = if in_place {
             own.clone()
@@ -741,7 +745,9 @@ impl Gen<'_> {
         }
         self.emit(
             when(ldg_n(regs[0], ad, n), P_TEMP_A, false),
-            Eff::var(&regs, &[ad, ad + 1]).preds(&[P_TEMP_A], &[]),
+            Eff::var(&regs, &[ad, ad + 1])
+                .preds(&[P_TEMP_A], &[])
+                .read_barrier(),
         );
         if !in_place {
             for (k, &d) in own.iter().enumerate() {
