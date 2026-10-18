@@ -137,12 +137,24 @@ game shoots them in screen order, at reduced resolution.
 `jeux/lumen` is the game built on all of this: a valley from dawn to
 night to run through, third person (left stick, right stick for the
 camera, A to jump, R to run), a sun and sky that follow the time of day,
-24 lights to collect, all drawn by its own IR shaders. L + R + Minus
-opens its hidden **Lab**: frame-time strip and counters, a draw-call
-stress room, a particle room (additive blending from a buffer rewritten
-each frame) and a ray room that traces a 96 x 54 grid of camera rays and
-their shadow rays into the valley's 41,000 triangles and shows them as a
-heat map.
+24 lights to collect, all drawn by its own IR shaders. Its **sun shadows
+are ray traced**: a pre-pass draws the world positions of what the camera
+sees at a quarter of the resolution into an RGBA32F target, an 8 x 4
+compute kernel (`nxk_shader::rt::shadow`) shoots one any-hit ray per texel
+toward the sun over the valley's BVH (built once at load) and over the six
+boxes of the moving figure, and the lit shader filters the mask per pixel
+with a joint bilateral upsample (distance weights that follow the slope).
+At 1280 x 720 it holds 60 fps; the GPU is busy 52% without the shadows and
+about 82% with them (pre-pass 1 ms, rays 2.4 ms, mask lookup 0.8 ms). The
+render targets of a game that draws upright on the panel are 720 wide and
+1280 high (`Graphics::panel` turns the picture a quarter), so a mask for
+the screen is too. L + R + Minus opens its hidden **Lab**: frame-time
+strip and counters, a draw-call stress room, a particle room (additive
+blending from a buffer rewritten each frame), a ray room that traces a
+96 x 54 grid of camera rays and their shadow rays into the valley's 41,000
+triangles and shows them as a heat map, and, on the Overview, Up / Down
+steps through the shadows' cost (all, no mask in the lit shader, positions
+only, none) and shows the mask itself.
 
 ### Users and save data
 

@@ -1059,6 +1059,23 @@ within 5 s.
     tables read through L2 changed nothing; the default mode behaves as
     `.cg` (L2 only). A game launched from the library (A) is killed by HOME
     (`ps` shows no process afterwards), so `--reload gpu` is safe after that.
+42. 18/10/2026, Erista, **ray-traced shadows in Lumen**: `gpu test` gained a
+    case for the data path (a float target, a compute kernel sampling it
+    with TEX, a fragment shader loading the kernel's buffer: passed at the
+    first run, 16/16). In the game, a quarter-resolution pre-pass of world
+    positions, an 8 x 4 any-hit kernel and a bilateral filter in the lit
+    shader: 60 fps, GPU busy 52% before and 82-88% with the shadows (the Lab's
+    Overview steps through the parts: pre-pass 1 ms, rays 2.4 ms, mask lookup
+    0.8 ms). Three things the first captures showed: the panel's quarter
+    turn makes the screen images 720 x 1280, so a 320 x 180 target had
+    texels of 2.25 x 7.1 pixels (a 180 x 320 one has 4 x 4); a depth
+    tolerance that ignores the slope rejects every neighbouring texel on
+    ground seen at a grazing angle and leaves two grey levels, no ramp;
+    the filter's temporaries took the lit shader from 55 registers to 67
+    (52 once the mask is looked up before the lighting reads its
+    uniforms). The console ran out of battery during the session (a USB-C
+    port from a PC does not keep up with 768 MHz and the screen): charge it
+    from a charger for long sessions.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

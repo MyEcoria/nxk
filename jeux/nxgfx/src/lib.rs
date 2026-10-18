@@ -598,6 +598,10 @@ impl Graphics {
         })
     }
 
+    /// A target meant to match the screen is 720 wide and 1280 high, not
+    /// 1280 x 720: the panel turns the picture a quarter (`Graphics::panel`),
+    /// and the images follow it.
+    ///
     /// An image to draw on and then sample, `width` x `height` pixels of
     /// `format`, with a depth buffer if `depth`. Its texture is sampled
     /// as `sampling` says (clamped is what a shadow map or a post-process
