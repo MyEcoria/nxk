@@ -382,11 +382,11 @@ fn work(w: &Worker, notif: u32) -> ! {
                         .map(|_| ()),
                 )
             }
-            Action::Volume(pct) => Done::Audio(
-                AUDIO
-                    .call(&Msg::from_words(audio::VOLUME, &[pct as u64]))
-                    .map(|_| None),
-            ),
+            // Silent on failure: also replayed at boot, and `audio` logs its own errors.
+            Action::Volume(pct) => Done::Audio(Ok(AUDIO
+                .call(&Msg::from_words(audio::VOLUME, &[pct as u64]))
+                .ok()
+                .and(None))),
             Action::Music => Done::Audio(
                 AUDIO
                     .call(&Msg::new(audio::MUSIC, 0, 0))
