@@ -7,13 +7,14 @@
 
 use alloc::vec::Vec;
 
-pub const MAX_REGS: usize = 192;
+pub const MAX_REGS: usize = 1024;
 pub const MAX_INSTS: usize = 4096;
 pub const MAX_DEPTH: usize = 8;
 pub const MAX_BUFFERS: usize = 8;
 pub const MAX_TEXTURES: usize = 16;
 pub const MAX_UNIFORM_WORDS: usize = 1024;
-pub const MAX_LOCAL_WORDS: usize = 128;
+/// Scratch words per thread (256 bytes: what the gpu service reserves per lane).
+pub const MAX_LOCAL_WORDS: usize = 64;
 pub const MAX_VARYINGS: usize = 14;
 pub const MAX_ATTRS: usize = 16;
 pub const MAX_TARGETS: usize = 8;

@@ -29,6 +29,8 @@ pub struct Sim<'a> {
     pub sregs: BTreeMap<u8, u32>,
     pub regs: [u32; 256],
     pub killed: bool,
+    /// The thread's local memory (words).
+    pub local: Vec<u32>,
     pub steps: u64,
     cur_addr: core::cell::Cell<i64>,
 }
@@ -70,6 +72,7 @@ impl<'a> Sim<'a> {
             sregs: BTreeMap::new(),
             regs: [0; 256],
             killed: false,
+            local: Vec::new(),
             steps: 0,
             cur_addr: core::cell::Cell::new(0),
         }
@@ -420,6 +423,15 @@ impl Sim<'_> {
             Op::Stg => {
                 let n = words_of(bits(w, 48, 3)) as usize;
                 e.reads = (0..n).map(|k| d + k).chain([a, a + 1]).collect();
+                e.store = true;
+            }
+            Op::Ldl => {
+                e.reads = std::vec![a];
+                e.writes = std::vec![d];
+                e.var = true;
+            }
+            Op::Stl => {
+                e.reads = std::vec![d, a];
                 e.store = true;
             }
             Op::Atom => {
@@ -829,6 +841,20 @@ impl Sim<'_> {
                     .ok_or(format!("store outside any buffer at {addr:#x}"))?
                     .copy_from_slice(&vals);
             }
+            Op::Ldl => {
+                let at = (self.regs[a] as u64 + bits(w, 20, 24)) as usize;
+                if !at.is_multiple_of(4) || at / 4 >= self.local.len() {
+                    return Err(format!("local load outside the thread's memory at {at}"));
+                }
+                setd(self, self.local[at / 4]);
+            }
+            Op::Stl => {
+                let at = (self.regs[a] as u64 + bits(w, 20, 24)) as usize;
+                if !at.is_multiple_of(4) || at / 4 >= self.local.len() {
+                    return Err(format!("local store outside the thread's memory at {at}"));
+                }
+                self.local[at / 4] = self.regs[d];
+            }
             Op::Atom => {
                 let addr = self.regs[a] as u64 | (self.regs[a + 1] as u64) << 32;
                 let add = self.regs[bits(w, 20, 8) as usize];
@@ -920,6 +946,8 @@ enum Op {
     Ldc,
     Ldg,
     Stg,
+    Ldl,
+    Stl,
     Atom,
     Tex,
     Nop,
@@ -1011,6 +1039,10 @@ fn family(op: u16) -> Op {
         Op::Ldg
     } else if m(0xFFF8, 0xEED8) {
         Op::Stg
+    } else if m(0xFFF8, 0xEF40) {
+        Op::Ldl
+    } else if m(0xFFF8, 0xEF50) {
+        Op::Stl
     } else if m(0xFF00, 0xED00) {
         Op::Atom
     } else if m(0xFFFF, 0xDEB8) {

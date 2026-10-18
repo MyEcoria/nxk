@@ -90,6 +90,7 @@ struct Shader {
     block: u32,
     len: u32,
     gprs: u32,
+    local_bytes: u32,
     block_dim: [u32; 3],
     uniform_words: u32,
     /// Pipelines built on it.
@@ -353,13 +354,6 @@ impl Client {
             libnx::drv::report("gpu", &alloc::format!("shader: {e:?}"));
             -EINVAL
         })?;
-        if c.stage == Stage::Compute && c.info.textures != 0 {
-            libnx::drv::report(
-                "gpu",
-                "shader: textures in compute shaders are not supported yet",
-            );
-            return Err(-EINVAL);
-        }
         let gprs = c.gprs.next_multiple_of(8).max(8);
         let block_dim = prog.local_size.map(|v| v as u32);
         let (at, block, len) = match c.stage {
@@ -388,6 +382,7 @@ impl Client {
             block,
             len,
             gprs,
+            local_bytes: c.local_bytes,
             block_dim,
             uniform_words: c.info.uniform_words as u32,
             users: 0,
@@ -728,6 +723,7 @@ impl Client {
             grid: groups,
             block: sh.block_dim,
             cbs: &cbs,
+            local_bytes: sh.local_bytes,
         });
         gfx.ubo_write(at, &q.bytes());
         // Earlier draws are done first, later ones see the results.

@@ -44,6 +44,8 @@ const SEND_SIGNALING_PCAS_B: u32 = 0x2BC;
 const PCAS_INVALIDATE_SCHEDULE: u32 = 3;
 const LOCAL_MEMORY_WINDOW: u32 = 0x77C;
 const PROGRAM_REGION_A: u32 = 0x1608;
+const SET_TEX_SAMPLER_POOL_A: u32 = 0x155C;
+const SET_TEX_HEADER_POOL_A: u32 = 0x1574;
 
 /// A linear surface in GPU memory.
 #[derive(Clone, Copy)]
@@ -203,7 +205,7 @@ impl Compute {
 
     /// Channel setup: both classes bound, compute's program region and
     /// memory windows (NVK `nvk_push_dispatch_state_init`).
-    pub fn setup(&self, p: &mut Push) {
+    pub fn setup(&self, p: &mut Push, pools: (u64, u64, u32)) {
         p.inc(SUBC_2D, SET_OBJECT, &[FERMI_TWOD_A]);
         p.inc(SUBC_COMPUTE, SET_OBJECT, &[MAXWELL_COMPUTE_B]);
         p.inc(
@@ -213,6 +215,19 @@ impl Compute {
         );
         p.inc(SUBC_COMPUTE, LOCAL_MEMORY_WINDOW, &[0xFF << 24]);
         p.inc(SUBC_COMPUTE, SHARED_MEMORY_WINDOW, &[0xFE << 24]);
+        // The texture pools the 3D class samples through: a compute shader
+        // fetches texels with the same handles.
+        let (headers, samplers, last) = pools;
+        p.inc(
+            SUBC_COMPUTE,
+            SET_TEX_SAMPLER_POOL_A,
+            &[(samplers >> 32) as u32, samplers as u32, last],
+        );
+        p.inc(
+            SUBC_COMPUTE,
+            SET_TEX_HEADER_POOL_A,
+            &[(headers >> 32) as u32, headers as u32, last],
+        );
     }
 
     /// `k` over `threads` threads with constant buffer `cb`; one launch

@@ -26,6 +26,8 @@ pub struct Launch3<'a> {
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub cbs: &'a [(u64, u32)],
+    /// Bytes of local memory per thread (a multiple of 16).
+    pub local_bytes: u32,
 }
 
 impl Qmd {
@@ -45,6 +47,7 @@ impl Qmd {
             grid: [l.grid, 1, 1],
             block: [l.block, 1, 1],
             cbs: &[(l.cb0, l.cb0_size)],
+            local_bytes: 0,
         })
     }
 
@@ -74,6 +77,7 @@ impl Qmd {
             q.set(967 + o, 960 + o, va >> 32);
             q.set(991 + o, 975 + o, size as u64);
         }
+        q.set(1463, 1440, l.local_bytes as u64); // SHADER_LOCAL_MEMORY_LOW_SIZE
         q.set(1503, 1496, l.regs as u64);
         q.set(1535, 1528, 0x30); // SASS_VERSION
         q
@@ -134,8 +138,10 @@ mod tests {
                 (0x2_0000_0200, 0x80),
                 (0x3_0000_0300, 0x100),
             ],
+            local_bytes: 64,
         });
         let w = &q.0;
+        assert_eq!(w[45] & 0xFF_FFFF, 64);
         assert_eq!((w[12], w[13]), (3, 4 | 5 << 16));
         assert_eq!(w[18] & 0xFFFF_0000, 8 << 16);
         assert_eq!(w[19], 4 | 2 << 16);

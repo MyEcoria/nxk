@@ -522,6 +522,17 @@ fn mem_type(words: u8) -> u8 {
     }
 }
 
+/// LDL / STL of one word at the thread's local byte offset `r` + `off`.
+pub fn ldl(d: u8, r: u8, off: u32) -> u64 {
+    assert!(off < 1 << 24);
+    op(0xEF40) | reg(d, 0) | reg(r, 8) | (off as u64) << 20 | 4 << 48
+}
+
+pub fn stl(r: u8, v: u8, off: u32) -> u64 {
+    assert!(off < 1 << 24);
+    op(0xEF50) | reg(v, 0) | reg(r, 8) | (off as u64) << 20 | 4 << 48
+}
+
 /// ATOM.ADD.U32 d = [a]; [a] += v.
 pub fn atom_add(d: u8, a: u8, v: u8) -> u64 {
     op(0xED00) | reg(d, 0) | reg(a, 8) | reg(v, 20) | 1 << 48

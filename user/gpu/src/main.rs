@@ -30,6 +30,7 @@ mod pll;
 mod power;
 mod push;
 mod qmd;
+mod slm;
 mod stats;
 
 use alloc::vec::Vec;
@@ -85,6 +86,7 @@ struct Dev {
     _ctx: gr::ChanCtx,
     compute: Compute,
     gfx: Gfx,
+    _slm: slm::Slm,
     client: client::Client,
     topo: gr::Topo,
     surfaces: Vec<Option<(Surface, u32)>>,
@@ -354,11 +356,13 @@ impl Gpu {
         self.at(proto::STAGE_CHANNEL);
         let compute = Compute::new(&mut vm)?;
         let gfx = Gfx::new(&mut vm)?;
+        let slm = slm::Slm::new(&mut vm, topo.tpc_total as u64)?;
         mmu::invalidate(&r, &vm)?;
         chan.schedule(&r)?;
         let mut p = Push::default();
-        compute.setup(&mut p);
+        compute.setup(&mut p, gfx.pools());
         gfx.setup(&mut p);
+        slm.setup(&mut p);
         chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US, false)?;
         self.dev = Some(Dev {
             vm,
@@ -369,6 +373,7 @@ impl Gpu {
             _ctx: ctx,
             compute,
             gfx,
+            _slm: slm,
             client: client::Client::default(),
             topo,
             surfaces: Vec::new(),
@@ -1284,11 +1289,12 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
 /// The shader compiler on the GPU: random compute programs, and a draw.
 fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     type Case = fn(&mut Gpu) -> core::result::Result<(bool, u64), i64>;
-    let cases: [(u64, &str, Case); 4] = [
+    let cases: [(u64, &str, Case); 5] = [
         (proto::T3_IR_COMPUTE, "compute", irtest::compute),
         (proto::T3_IR_DRAW, "draw", irtest::draw),
         (proto::T3_IR_INSTANCE, "instanced", irtest::instanced),
         (proto::T3_IR_TARGET, "targets", irtest::targets),
+        (proto::T3_IR_RAYS, "rays", irtest::rays),
     ];
     let (mut pass, mut run, mut ns) = (0, 0, 0);
     // A hang resets the GPU: the next test starts it again.

@@ -86,6 +86,9 @@ pub fn both_t(
         s.sregs.insert(SR_CTAID_X + k, 0);
     }
     s.regs[255] = 0;
+    // Local memory starts as junk, as on the hardware: a program writes
+    // before it reads.
+    s.local = vec![0xDEAD_BEEF; p.local_words as usize];
     s.run().map_err(|e| std::format!("sim: {e}"))?;
     let out: Vec<Vec<u32>> = s.mem.iter().map(|(_, v)| v.clone()).collect();
     Ok((ref_bufs, out))
@@ -95,7 +98,12 @@ pub fn check(p: &Program, uniforms: &[u32], bufs: &[Vec<u32>]) -> Result<(), Str
     check_t(p, uniforms, bufs, 5)
 }
 
-pub fn check_t(p: &Program, uniforms: &[u32], bufs: &[Vec<u32>], tid: u32) -> Result<(), String> {
+pub(crate) fn check_t(
+    p: &Program,
+    uniforms: &[u32],
+    bufs: &[Vec<u32>],
+    tid: u32,
+) -> Result<(), String> {
     let (r, s) = both_t(p, uniforms, bufs, tid)?;
     for (bi, (x, y)) in r.iter().zip(&s).enumerate() {
         for (i, (&a, &b)) in x.iter().zip(y).enumerate() {
@@ -558,4 +566,43 @@ fn mufu_error_sensitivity_of_seed_10() {
         })
         .fold(0.0f32, f32::max);
     std::println!("worst relative move of an output for a 2e-6 error: {worst}");
+}
+
+#[test]
+fn local_memory_round_trip() {
+    let mut b = Builder::new(Stage::Compute);
+    b.local_words(16);
+    let tid = b.builtin(Builtin::LocalIdX);
+    let z = b.u32(0);
+    // A stack: push tid-derived values, pop them in reverse.
+    let sp = b.u32(0);
+    let one = b.u32(1);
+    b.loop_(6, |b| {
+        let v = b.uadd(sp, tid);
+        let v = b.umul(v, v);
+        b.local_store(sp, v);
+        let n = b.uadd(sp, one);
+        b.mov(sp, n);
+    });
+    let acc = b.u32(0);
+    b.loop_(6, |b| {
+        let n = b.usub(sp, one);
+        b.mov(sp, n);
+        let v = b.local_load(sp, Ty::U32);
+        let k = b.u32(31);
+        let a = b.umul(acc, k);
+        let a = b.uadd(a, v);
+        b.mov(acc, a);
+    });
+    // Out of range: a load gives 0, a store does nothing.
+    let far = b.u32(500);
+    let x = b.local_load(far, Ty::U32);
+    b.local_store(far, acc);
+    let y = b.uadd(acc, x);
+    b.store(0, z, 0, &[y]);
+    let p = b.finish();
+    for tid in [0, 3, 31] {
+        let r = check_t(&p, &[], &[vec![0; 4]], tid);
+        assert!(r.is_ok(), "thread {tid}: {}", r.unwrap_err());
+    }
 }

@@ -281,7 +281,19 @@ fn gen_block(
                 let srcs: Vec<Reg> = (0..w).map(|_| pick(rng, &pools.u)).collect();
                 b.store(1, idx, 0, &srcs);
             }
-            _ if threaded => {}
+            _ if threaded => {
+                // Local memory: words 0-3 were written at the start.
+                let u = pick(rng, &pools.u);
+                let m = b.u32(3);
+                let idx = b.and(u, m);
+                if roll(rng, 2) == 0 {
+                    let v = pick(rng, &pools.u);
+                    b.local_store(idx, v);
+                } else {
+                    let v = b.local_load(idx, Ty::U32);
+                    pools.u.push(v);
+                }
+            }
             _ => {
                 let u = pick(rng, &pools.u);
                 let m = b.u32(3);
@@ -339,6 +351,14 @@ pub fn random_program(seed: u64, threaded: bool) -> Program {
         pools.f.push(f);
         pools.u.push(u);
         pools.i.push(i);
+    }
+    if threaded {
+        b.local_words(8);
+        for k in 0..4u32 {
+            let i = b.u32(k);
+            let v = pools.u[k as usize];
+            b.local_store(i, v);
+        }
     }
     for k in 0..3 {
         let c = b.cmp(cmp_of(k), pools.f[k], pools.f[k + 1]);

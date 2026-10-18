@@ -44,7 +44,7 @@ fn err<T>(m: &'static str) -> R<T> {
 }
 
 #[derive(Clone, Copy)]
-struct Set([u64; 3]);
+struct Set([u64; MAX_REGS / 64]);
 
 impl Set {
     fn has(&self, r: Reg) -> bool {
@@ -56,8 +56,8 @@ impl Set {
     }
 
     fn and(&mut self, o: &Set) {
-        for i in 0..3 {
-            self.0[i] &= o.0[i];
+        for (a, b) in self.0.iter_mut().zip(&o.0) {
+            *a &= b;
         }
     }
 }
@@ -91,7 +91,7 @@ pub fn validate(p: &Program) -> R<Info> {
         p,
         info: Info::default(),
     };
-    let mut defs = Set([0; 3]);
+    let mut defs = Set([0; MAX_REGS / 64]);
     c.body(&p.body, &mut defs, 0, 0)?;
     if c.info.insts > MAX_INSTS {
         return err("program too long");

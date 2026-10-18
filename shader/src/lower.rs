@@ -46,14 +46,13 @@ pub struct Compiled {
     pub header: [u32; SPH_WORDS],
     /// Registers per thread.
     pub gprs: u32,
+    /// Bytes of local memory per thread (a multiple of 16).
+    pub local_bytes: u32,
     pub info: Info,
 }
 
 pub fn compile(p: &Program) -> Result<Compiled, Error> {
     let info = validate(p).map_err(Error::Invalid)?;
-    if p.local_words != 0 {
-        return Err(Error::Unsupported("local memory"));
-    }
     let mut frag_targets = 0u8;
     for &(k, _) in &info.outputs {
         if let OutKind::Color(t) = k {
@@ -106,16 +105,26 @@ pub fn compile(p: &Program) -> Result<Compiled, Error> {
         return Err(Error::Registers);
     }
     let code = g.e.finish();
-    let header = match p.stage {
+    let mut header = match p.stage {
         Stage::Vertex => vertex_header(&info),
         Stage::Fragment => fragment_header(&info, wants_w),
         Stage::Compute => [0; SPH_WORDS],
     };
+    if p.stage != Stage::Compute && p.local_words != 0 {
+        // SHADER_LOCAL_MEMORY_LOW_SIZE, bits 32-55.
+        setf(
+            &mut header,
+            32,
+            (p.local_words as u32 * 4).next_multiple_of(16),
+        );
+        setf(&mut header, DOES_LOAD_OR_STORE, 1);
+    }
     Ok(Compiled {
         stage: p.stage,
         code,
         header,
         gprs,
+        local_bytes: (p.local_words as u32 * 4).next_multiple_of(16),
         info,
     })
 }
@@ -478,8 +487,22 @@ impl Gen<'_> {
                     Eff::var(&[d], &[a, a + 1, s]).preds(&[P_TEMP_A], &[]),
                 );
             }
-            Inst::LocalLoad { .. } | Inst::LocalStore { .. } => {
-                return Err(Error::Unsupported("local memory"))
+            Inst::LocalLoad { dst, index } => {
+                let (d, x, t) = (self.g(*dst), self.g(*index), self.t0());
+                self.local_check(x, t);
+                self.fx(mov(d, RZ), &[d], &[]);
+                self.emit(
+                    when(ldl(d, t, 0), P_TEMP_A, false),
+                    Eff::var(&[d], &[t]).preds(&[P_TEMP_A], &[]),
+                );
+            }
+            Inst::LocalStore { index, src } => {
+                let (x, s, t) = (self.g(*index), self.g(*src), self.t0());
+                self.local_check(x, t);
+                self.emit(
+                    when(stl(t, s, 0), P_TEMP_A, false),
+                    Eff::store(&[t, s]).preds(&[P_TEMP_A], &[]),
+                );
             }
             Inst::Tex {
                 tex,
@@ -651,6 +674,17 @@ impl Gen<'_> {
     }
 
     // Memory.
+
+    /// `t` = the byte offset of local word `x`, and P5 whether it is one of
+    /// the program's words.
+    fn local_check(&mut self, x: u8, t: u8) {
+        let words = self.p.local_words as i32;
+        self.emit(
+            isetp_i(P_TEMP_A, x, words, Cmp::Lt, false),
+            Eff::fixed(&[], &[x]).preds(&[], &[P_TEMP_A]),
+        );
+        self.fx(shl(t, x, 2), &[t], &[x]);
+    }
 
     /// Address of `buf[index + offset]` in the pair `addr()`, and in
     /// P5 whether the `n`-word access is aligned and inside.

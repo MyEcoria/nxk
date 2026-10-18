@@ -775,6 +775,12 @@ impl Gfx {
         id as u32 | (id as u32) << 20
     }
 
+    /// Texture header pool, sampler pool (GPU addresses) and the last
+    /// index of both.
+    pub fn pools(&self) -> (u64, u64, u32) {
+        (self.tics_va, self.tscs_va, MAX_TEXTURES as u32 - 1)
+    }
+
     /// Channel setup: the class bound, the state that stays.
     pub fn setup(&self, p: &mut Push) {
         p.inc(SUBC_3D, SET_OBJECT, &[MAXWELL_B]);
