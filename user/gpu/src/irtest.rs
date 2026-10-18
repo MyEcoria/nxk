@@ -172,6 +172,7 @@ pub fn compute(g: &mut Gpu) -> Res<(bool, u64)> {
             grid: [1, 1, 1],
             block: [THREADS, 1, 1],
             cbs: &cbs,
+            local_bytes: c.local_bytes,
         });
         d.gfx.ubo_write(qat, &q.bytes());
         d.gfx.barrier(&mut p);
@@ -971,4 +972,159 @@ pub fn targets(g: &mut Gpu) -> Res<(bool, u64)> {
         ns += t;
     }
     Ok((ok, ns))
+}
+
+/// Closest-hit and any-hit traversal of a wide BVH on the GPU: 65536
+/// rays through 4000 triangles against the CPU walk of the same tree,
+/// with the rate it manages.
+pub fn rays(g: &mut Gpu) -> Res<(bool, u64)> {
+    use nxk_shader::rt::{self, demo, kernel, trace};
+    const RAYS: usize = 65_536;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+    let tris = demo::soup(4000, 3.0, 1);
+    let bvh = match rt::build(&tris) {
+        Ok(b) => b,
+        Err(err) => {
+            println!("[gpu] IR rays: the tree does not build: {:?}", err);
+            return Ok((false, 0));
+        }
+    };
+    let rs = demo::rays(RAYS, 2);
+    let ray_words: Vec<u32> = rs.iter().flat_map(|r| r.words()).collect();
+    let slots = kernel::Slots::default();
+    let (closest, any) = match (
+        lower::compile(&kernel::closest_hit(slots)),
+        lower::compile(&kernel::any_hit(slots)),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            println!(
+                "[gpu] IR rays: does not compile: {:?} {:?}",
+                a.err(),
+                b.err()
+            );
+            return Ok((false, 0));
+        }
+    };
+
+    let d = g.dev(0)?;
+    let mk = |words: usize| Dma::new(words.max(1) * 4);
+    let rays_m = mk(ray_words.len()).map_err(e)?;
+    let hits_m = mk(RAYS * rt::HIT_WORDS).map_err(e)?;
+    let nodes_m = mk(bvh.nodes.len()).map_err(e)?;
+    let tris_m = mk(bvh.tris.len()).map_err(e)?;
+    rays_m.words(0, &ray_words);
+    nodes_m.words(0, &bvh.nodes);
+    tris_m.words(0, &bvh.tris);
+    let mems = [&rays_m, &hits_m, &nodes_m, &tris_m];
+    let lens = [
+        ray_words.len(),
+        RAYS * rt::HIT_WORDS,
+        bvh.nodes.len(),
+        bvh.tris.len(),
+    ];
+    let mut vas = [0u64; 4];
+    for (k, m) in mems.iter().enumerate() {
+        vas[k] = d.vm.map(m, false).map_err(e)?;
+    }
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let mut desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+    for k in 0..4 {
+        desc[4 * k] = vas[k] as u32;
+        desc[4 * k + 1] = (vas[k] >> 32) as u32;
+        desc[4 * k + 2] = lens[k] as u32;
+    }
+    let handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+    let (mut ok, mut ns_total) = (true, 0u64);
+    for (name, c, words) in [("closest", &closest, rt::HIT_WORDS), ("any", &any, 1)] {
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        let Some((at, len)) = d.compute.install(&c.code) else {
+            return Err(-libnx::abi::err::ENOSPC);
+        };
+        for i in 0..RAYS * words {
+            hits_m.w32(i * 4, GARBAGE);
+        }
+        let mut p = Push::default();
+        d.gfx.begin(&mut p);
+        let stage = |gfx: &mut gfx::Gfx, w: &[u32]| gfx.stage(w).ok_or(-libnx::abi::err::ENOSPC);
+        let cbs = [
+            stage(&mut d.gfx, &[0; 64])?,
+            stage(&mut d.gfx, &[RAYS as u32])?,
+            stage(&mut d.gfx, &desc)?,
+            stage(&mut d.gfx, &handles)?,
+        ];
+        let (qat, qva) = d
+            .gfx
+            .alloc_ubo(crate::qmd::SIZE)
+            .ok_or(-libnx::abi::err::ENOSPC)?;
+        let q = Qmd::new3(&Launch3 {
+            program: at,
+            regs: c.gprs.next_multiple_of(8).max(8),
+            grid: [(RAYS as u32).div_ceil(kernel::GROUP), 1, 1],
+            block: [kernel::GROUP, 1, 1],
+            cbs: &cbs,
+            local_bytes: c.local_bytes,
+        });
+        d.gfx.ubo_write(qat, &q.bytes());
+        d.gfx.barrier(&mut p);
+        d.compute.launch(&mut p, qva);
+        d.gfx.barrier(&mut p);
+        let t = g.run(p, BATCH_TIMEOUT_US);
+        let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+        d.compute.uninstall(at, len);
+        let t = match t {
+            Ok(t) => t,
+            Err(err) => {
+                println!("[gpu] IR rays ({}): the GPU hung ({})", name, err);
+                return Ok((false, ns_total));
+            }
+        };
+        ns_total += t;
+        // Against the CPU walk of the same tree.
+        let mut wrong = 0usize;
+        let mut hits = 0usize;
+        for (i, r) in rs.iter().enumerate() {
+            if name == "any" {
+                let want = trace::occluded(&bvh, r);
+                let got = hits_m.r32(i * 4) != 0;
+                hits += got as usize;
+                wrong += (want != got) as usize;
+            } else {
+                let want = trace::trace(&bvh, r);
+                let w: [u32; 4] = core::array::from_fn(|k| hits_m.r32((i * 4 + k) * 4));
+                let got = (w[3] != rt::MISS).then(|| (f32::from_bits(w[0]), w[3]));
+                hits += got.is_some() as usize;
+                let same = match (want, got) {
+                    (None, None) => true,
+                    (Some(a), Some((t, id))) => {
+                        fmath::abs(a.t - t) <= 1e-3 * fmath::abs(a.t).max(1.0)
+                            || a.id == id && fmath::abs(a.t - t) <= 1e-2 * fmath::abs(a.t).max(1.0)
+                    }
+                    _ => false,
+                };
+                wrong += !same as usize;
+            }
+        }
+        // Rays grazing an edge may fall either way (the hardware's
+        // reciprocal is approximate): a few in a thousand.
+        let pass = wrong * 500 <= RAYS;
+        println!(
+            "[gpu] IR rays ({}): {} of {} rays differ from the CPU, {} hit; {} us, {} Mrays/s ({} registers)",
+            name,
+            wrong,
+            RAYS,
+            hits,
+            t / 1000,
+            RAYS as u64 * 1000 / t.max(1),
+            c.gprs
+        );
+        ok &= pass;
+    }
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    for (k, m) in mems.iter().enumerate() {
+        let _ = d.vm.unmap(vas[k], m.len() as u64);
+    }
+    let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((ok, ns_total))
 }
