@@ -1039,10 +1039,11 @@ within 5 s.
     28.0 ms (1.42 and 2.33 Mrays/s; 53 and 35 ms before). Time follows
     the loads, not the instruction count: serialised, the cheaper kernel
     took the same 54 ms. Lumen: 60 fps, its ray room a steady 16.7 ms
-    frames. A game started with `run` from the shell is not owned by
-    `display`: after HOME the library is back and the GPU is switched off,
-    but the process is still alive (`ps`); a `--reload gpu` in that state
-    left the console unresponsive until a reboot.
+    frames. A `--reload gpu` with Lumen still on screen (started with
+    `run` from the shell, in its ray room) left the console unresponsive
+    until a reboot. Separately: such a game is not owned by `display`;
+    after HOME the library is back and the GPU is switched off, but the
+    process is still alive (`ps`). A reload in that state has not been tried.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
