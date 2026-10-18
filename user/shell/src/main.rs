@@ -23,6 +23,12 @@ use libnx::{console, env, ns, print, println, process, sys, time};
 /// Outcome of the running command: 0, `-errno`, or a program's exit code.
 static STATUS: AtomicI64 = AtomicI64::new(0);
 
+/// The shell is one thread: its background jobs (name, process handle),
+/// for `jobs` and `kill`.
+struct Jobs(core::cell::RefCell<Vec<(String, u32)>>);
+unsafe impl Sync for Jobs {}
+static JOBS: Jobs = Jobs(core::cell::RefCell::new(Vec::new()));
+
 fn fail(e: i64) {
     STATUS.store(e, Ordering::Relaxed);
 }
@@ -146,6 +152,8 @@ fn command(line: &str) {
         "help" => help(),
         "echo" => echo(&argv[1..]),
         "ps" => ps(),
+        "jobs" => jobs(),
+        "kill" => kill(argv.get(1).copied().unwrap_or("")),
         "mem" => mem(),
         "cpu" => cpu(),
         "uptime" => println!("{} ms since boot", time::now_ns() / 1_000_000),
@@ -216,6 +224,7 @@ fn help() {
     println!("  fbecho TEXT     print TEXT on the screen");
     println!("  events [N]      show N input events (touchscreen, keyboard)");
     println!("  run PROG ARGS.. run PROG (trailing &: background); bare PROG works");
+    println!("  jobs            background programs; kill N|NAME ends one");
     println!("  env             environment variables");
     println!("  export NAME=VAL set a variable (passed to spawned programs)");
     println!("  unset NAME      remove a variable");
@@ -494,6 +503,8 @@ fn run(argv: &[&str]) {
     };
     if bg {
         println!("[{} started in background]", name);
+        JOBS.0.borrow_mut().push((String::from(name), h));
+        return;
     } else {
         let code = process::wait(h);
         STATUS.store(code, Ordering::Relaxed);
@@ -505,6 +516,47 @@ fn run(argv: &[&str]) {
         }
     }
     let _ = sys::handle_close(h);
+}
+
+/// Background jobs still running (the ones that ended are let go).
+fn jobs() {
+    let mut j = JOBS.0.borrow_mut();
+    j.retain(|(_, h)| {
+        let done = sys::process_wait_timeout(*h, 1_000).is_ok();
+        if done {
+            let _ = sys::handle_close(*h);
+        }
+        !done
+    });
+    if j.is_empty() {
+        println!("  no background jobs");
+    }
+    for (i, (name, _)) in j.iter().enumerate() {
+        println!("  [{}] {}", i + 1, name);
+    }
+}
+
+/// End a background job of this shell, by its number in `jobs` or its name.
+fn kill(which: &str) {
+    let mut j = JOBS.0.borrow_mut();
+    let at = match which.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= j.len() => Some(n - 1),
+        _ => j
+            .iter()
+            .rposition(|(name, _)| name.rsplit('/').next() == Some(which)),
+    };
+    match at {
+        Some(i) => {
+            let (name, h) = j.remove(i);
+            let _ = sys::process_kill(h);
+            let _ = sys::handle_close(h);
+            println!("  {} killed", name);
+        }
+        None => {
+            println!("kill: no such background job (see 'jobs')");
+            fail(-err::ENOENT);
+        }
+    }
 }
 
 fn as_bytes_mut<T>(v: &mut [T]) -> &mut [u8] {
