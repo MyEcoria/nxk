@@ -1000,7 +1000,23 @@ within 5 s.
     moves through the menus; Starlane was played with the Pro
     Controller.
 
-## Hardware test (once the SD card is back in the PC)
+38. 18/10/2026, Erista, the **shader compiler**: `gpu` reloaded
+    (`--reload gpu`), then `gpu test`. 14/14: the classic ten, 16 random
+    programs of the IR on 64 threads (divergent `if`, loops with break and
+    continue, atomics-free) giving the CPU reference's words, nine draws
+    from the built-in pair through the custom path up to varying, uniform,
+    texture and discard, four instanced triangles, and R32F, RGBA16F and
+    RGBA32F targets rendered then sampled back. Three things the hardware
+    refused first: a vertex attribute slot marked inactive needs the
+    RGBA32 float format too (data error at `SET_VERTEX_ATTRIBUTE_A`); a
+    pixel shader with no input and no position.w declared hangs the
+    shader unit (the header now always declares it); and a pitch-linear
+    target of 64 bytes per row stops the front end at the first draw (use
+    256). A sine of an argument of 2e5 differs from the exact one by
+    tens of percent: the fuzzer keeps sine arguments within six.
+    The `restart` command only works from the first shell: a `run
+    /bin/shell` inside it takes the console input for good, and only a
+    reboot gets it back.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

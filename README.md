@@ -523,6 +523,13 @@ program that vanished without closing them (crash) are reclaimed.
    buffer the CPU rewrote can get stale data. The kernel turns it off at
    boot, so uncached `shm` buffers stay coherent for DMA.
 
+8. GPU shaders: a vertex attribute slot declared inactive still needs the
+   RGBA32 float format; a pixel shader with no input must still declare
+   position.w in its header; a pitch-linear render target wants rows of at
+   least 256 bytes; the hardware's sine is exact only near zero (the
+   fuzzer of `gpu test` keeps arguments within six radians). The shader
+   self-test of `gpu test` found each of them.
+
 ## L4T comparison
 
 See `bench/README.md` and `bench/RESULTS.md`. In the emulator, creating
