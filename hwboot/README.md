@@ -1101,6 +1101,8 @@ within 5 s.
     `bl33.prev`, `bl31.prev`), then the console was restarted: AutoRCM, so
     `hwboot/inject.sh` for hekate and a tap on More Configs, nxk. The battery
     fell from 31% to 15% in an hour on the PC's USB: use a charger.
+    The Lab's ray room together with the shadows runs at 30 fps (33 ms
+    frames; 59 fps before the shadows): both together exceed a frame.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
