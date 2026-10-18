@@ -1034,7 +1034,8 @@ fn audio_cmd(argv: &[&str]) {
 }
 
 /// `gpu`: state, clock, rail and chip; `gpu on|off`; `gpu test`: the
-/// 2D and compute self-test; `gpu bench [MS]`: FFMA throughput;
+/// 2D and compute self-test; `gpu irtest`: the shader compiler's, on
+/// random programs and a draw; `gpu bench [MS]`: FFMA throughput;
 /// `gpu clock`, `gpu sweep`: sys-clk's steps.
 fn gpu_cmd(argv: &[&str]) {
     match argv.get(1).copied() {
@@ -1048,13 +1049,14 @@ fn gpu_cmd(argv: &[&str]) {
         (Some("on"), None) => Msg::from_words(gpu::POWER, &[1]),
         (Some("off"), None) => Msg::from_words(gpu::POWER, &[0]),
         (Some("test"), None) => Msg::new(gpu::TEST, 0, 0),
+        (Some("irtest"), None) => Msg::new(gpu::TEST_IR, 0, 0),
         (Some("bench"), None) => Msg::from_words(gpu::BENCH, &[1000]),
         (Some("bench"), Some(Ok(ms))) if (1..=10_000).contains(&ms) => {
             Msg::from_words(gpu::BENCH, &[ms])
         }
         _ => {
             println!(
-                "usage: gpu [on|off|test|bench [MS]|clock [MHZ] [force]|sweep [force]|load [MS]]"
+                "usage: gpu [on|off|test|irtest|bench [MS]|clock [MHZ] [force]|sweep [force]|load [MS]]"
             );
             fail(-err::EINVAL);
             return;
@@ -1062,7 +1064,7 @@ fn gpu_cmd(argv: &[&str]) {
     };
     let Some(h) = service("gpu") else { return };
     match ipc::call(h, &req).and_then(ipc::checked) {
-        Ok(m) if req.label() == gpu::TEST => {
+        Ok(m) if req.label() == gpu::TEST || req.label() == gpu::TEST_IR => {
             let (pass, run, ns) = (m.mr[0], m.mr[1], m.mr[2]);
             for (bit, name) in [
                 (gpu::T_FILL2D, "2D fill"),
@@ -1075,12 +1077,13 @@ fn gpu_cmd(argv: &[&str]) {
                 (gpu::T3_DEPTH, "3D depth"),
                 (gpu::T3_LIT, "3D lit quad"),
                 (gpu::T3_TEXTURE, "3D textured quad"),
+                (gpu::T3_IR_COMPUTE, "IR compute vs reference"),
+                (gpu::T3_IR_DRAW, "IR vertex+fragment draw"),
             ] {
-                let r = match (pass & bit != 0, run & bit != 0) {
-                    (true, _) => "ok",
-                    (false, true) => "FAILED",
-                    _ => "not run",
-                };
+                if run & bit == 0 {
+                    continue;
+                }
+                let r = if pass & bit != 0 { "ok" } else { "FAILED" };
                 println!("  {:<13} {}", name, r);
             }
             println!(
