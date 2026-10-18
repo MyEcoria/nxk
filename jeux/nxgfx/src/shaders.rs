@@ -115,6 +115,10 @@ pub struct PipelineDesc<'a> {
     pub stride: u32,
     /// Attribute n (byte offset, format) feeds the vertex shader's input n.
     pub attributes: &'a [(u32, Attr)],
+    /// Bytes per instance, and the attributes read from an instance's data
+    /// (`Frame::draw_instanced`): they feed the inputs after `attributes`.
+    pub instance_stride: u32,
+    pub instance_attributes: &'a [(u32, Attr)],
     pub cull: Cull,
     pub depth_test: bool,
     pub depth_write: bool,
@@ -134,6 +138,8 @@ impl<'a> PipelineDesc<'a> {
             fragment,
             stride,
             attributes,
+            instance_stride: 0,
+            instance_attributes: &[],
             cull: Cull::Back,
             depth_test: true,
             depth_write: true,
@@ -200,9 +206,13 @@ impl Graphics {
             DepthFunc::Equal => gpu::DEPTH_EQUAL,
             DepthFunc::Always => gpu::DEPTH_ALWAYS,
         };
-        w[gpu::PD_COUNT] = d.attributes.len() as u32;
+        w[gpu::PD_COUNT] = (d.attributes.len() + d.instance_attributes.len()) as u32;
+        w[gpu::PD_INSTANCE_STRIDE] = d.instance_stride;
         for (offset, a) in d.attributes {
             w.push(offset | a.code() << 16);
+        }
+        for (offset, a) in d.instance_attributes {
+            w.push(offset | a.code() << 16 | gpu::AT_INSTANCE);
         }
         let mem = Shm::new(w.len() * 4, shm::UNCACHED)?;
         mem.write_words(0, &w);
@@ -225,5 +235,45 @@ impl Graphics {
     pub fn buffer_zeroed(&self, words: usize) -> Result<Buffer> {
         let zero = alloc::vec![0u32; words.max(1)];
         self.buffer_from(&zero)
+    }
+}
+
+/// A triangle that covers the whole target (corners (-1, -1), (3, -1),
+/// (-1, 3) of the clip space), for passes that run a fragment shader on
+/// every pixel: post-processing, shadow or HDR resolves. Its vertex
+/// shader passes the position and sends the texture coordinates of the
+/// pixel (0, 0 at the first row and column, 1, 1 past the last) as
+/// varying 0, components 0 and 1.
+pub struct Fullscreen {
+    vertex: Shader,
+    pub(crate) vb: Buffer,
+}
+
+static FULLSCREEN_ATTRIBUTES: [(u32, Attr); 1] = [(0, Attr::F32x2)];
+
+impl Fullscreen {
+    pub fn vertex(&self) -> &Shader {
+        &self.vertex
+    }
+
+    /// A pipeline made of the triangle's vertex shader and `fragment`:
+    /// no culling, no depth test or write, no blending (change the fields
+    /// before `pipeline_from` if the pass needs more).
+    pub fn pipeline_desc<'a>(&'a self, fragment: &'a Shader) -> PipelineDesc<'a> {
+        let mut d = PipelineDesc::new(&self.vertex, fragment, 8, &FULLSCREEN_ATTRIBUTES);
+        d.cull = Cull::None;
+        d.depth_test = false;
+        d.depth_write = false;
+        d
+    }
+}
+
+impl Graphics {
+    /// The fullscreen triangle (`Frame::draw_fullscreen`).
+    pub fn fullscreen(&self) -> Result<Fullscreen> {
+        let vertex = self.shader(&nxk_shader::stock::fullscreen_vertex())?;
+        let corners: [f32; 6] = [-1.0, -1.0, 3.0, -1.0, -1.0, 3.0];
+        let vb = self.buffer_from(&corners)?;
+        Ok(Fullscreen { vertex, vb })
     }
 }

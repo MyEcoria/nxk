@@ -33,7 +33,7 @@ pub use math::{vec3, Mat4, Vec3};
 pub use nxk_shader as ir;
 pub use os::{now_ns, sleep_ns, Result};
 pub use shaders::{
-    Attr, Blend, Buffer, Cull, DepthFunc, Pipeline, PipelineDesc, Shader,
+    Attr, Blend, Buffer, Cull, DepthFunc, Fullscreen, Pipeline, PipelineDesc, Shader,
 };
 
 /// What failed while opening the console's services, and the errno.
@@ -892,6 +892,56 @@ impl Frame<'_> {
         self.push(
             gpu::CMD_DRAW_INDEXED,
             &[vb.id as u32, 0, vertices, ib.id as u32, 0, indices, 0, indices],
+        );
+    }
+
+    /// Triangles from a buffer of vertices, no indices: `vertices` of the
+    /// pipeline's stride, drawn in threes.
+    pub fn draw_vertices(&mut self, vb: &Buffer, vertices: u32) {
+        self.push(gpu::CMD_DRAW, &[vb.id as u32, 0, vertices, 0, vertices]);
+    }
+
+    /// A pass over every pixel of the target: `f`'s triangle, with the
+    /// pipeline of `Fullscreen::pipeline_desc` in use.
+    pub fn draw_fullscreen(&mut self, f: &Fullscreen) {
+        self.draw_vertices(&f.vb, 3);
+    }
+
+    /// `draw_buffers` once for each of `instances` instances (1 to
+    /// 4096): the shader sees the instance number as `InstanceId`, and
+    /// reads the pipeline's instance attributes from `data`, one
+    /// `PipelineDesc::instance_stride` of it per instance (none if the
+    /// pipeline has no instance attributes). Custom pipelines only.
+    pub fn draw_instanced(
+        &mut self,
+        vb: &Buffer,
+        vertices: u32,
+        ib: &Buffer,
+        indices: u32,
+        data: Option<&Buffer>,
+        instances: u32,
+    ) {
+        let d = data.map_or(gpu::NO_TARGET, |b| b.id as u32);
+        self.push(
+            gpu::CMD_DRAW_INDEXED_INSTANCED,
+            &[
+                vb.id as u32, 0, vertices, ib.id as u32, 0, indices, 0, indices, d, 0, instances,
+            ],
+        );
+    }
+
+    /// `draw_vertices` for each of `instances` instances, as `draw_instanced`.
+    pub fn draw_vertices_instanced(
+        &mut self,
+        vb: &Buffer,
+        vertices: u32,
+        data: Option<&Buffer>,
+        instances: u32,
+    ) {
+        let d = data.map_or(gpu::NO_TARGET, |b| b.id as u32);
+        self.push(
+            gpu::CMD_DRAW_INSTANCED,
+            &[vb.id as u32, 0, vertices, 0, vertices, d, 0, instances],
         );
     }
 

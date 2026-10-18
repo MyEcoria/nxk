@@ -1605,6 +1605,9 @@ pub mod proto {
         /// expected pixel.
         pub const T3_IR_COMPUTE: u64 = 1024;
         pub const T3_IR_DRAW: u64 = 2048;
+        /// Four instances of a triangle, moved and colored from the
+        /// instance stream and `InstanceId`, land on the expected pixels.
+        pub const T3_IR_INSTANCE: u64 = 4096;
         /// Compile a shader written in `nxk-shader`'s IR: handle 0 = shm
         /// (readable, `MAP` right) holding its wire words; word 0 = number
         /// of words. Reply: word 0 = shader ID, word 1 = registers per
@@ -1621,9 +1624,10 @@ pub mod proto {
         pub const PIPELINE_DETACH: u32 = 24;
         /// Words of a pipeline description: vertex shader ID, fragment
         /// shader ID, bytes per vertex, `PF_*` flags, `BLEND_*`, `DEPTH_*`,
-        /// the number of attributes, then that many words
-        /// (`offset | format << 16`); attribute n feeds the vertex
-        /// shader's input n.
+        /// the number of attributes, bytes per instance (0: no attribute
+        /// per instance), then that many words (`offset | format << 16`,
+        /// plus `AT_INSTANCE` for one read from the instance's data);
+        /// attribute n feeds the vertex shader's input n.
         pub const PD_VERTEX: usize = 0;
         pub const PD_FRAGMENT: usize = 1;
         pub const PD_STRIDE: usize = 2;
@@ -1631,7 +1635,11 @@ pub mod proto {
         pub const PD_BLEND: usize = 4;
         pub const PD_DEPTH: usize = 5;
         pub const PD_COUNT: usize = 6;
-        pub const PD_ATTRS: usize = 7;
+        pub const PD_INSTANCE_STRIDE: usize = 7;
+        pub const PD_ATTRS: usize = 8;
+        /// Attribute word flag: the attribute is in the instance's data
+        /// (`PD_INSTANCE_STRIDE` bytes per instance), not the vertex's.
+        pub const AT_INSTANCE: u32 = 1 << 31;
         pub const MAX_ATTRIBUTES: usize = 16;
         /// Vertex attribute formats.
         pub const AF_F32X1: u32 = 1;
@@ -1674,6 +1682,18 @@ pub mod proto {
         /// Nothing before this is still running when the commands after
         /// it start (a pass that reads what the last wrote).
         pub const CMD_BARRIER: u32 = 12;
+        /// `[vertex buffer, byte offset, vertices, first, count, instance
+        /// buffer, byte offset, instances]`: `CMD_DRAW` repeated for
+        /// `instances` instances, 1..=`MAX_INSTANCES`. The shader sees
+        /// the instance number as `InstanceId`; the pipeline's
+        /// `AT_INSTANCE` attributes advance one `PD_INSTANCE_STRIDE` per
+        /// instance in the instance buffer (`NO_TARGET` if it has none).
+        pub const CMD_DRAW_INSTANCED: u32 = 13;
+        /// `[vertex buffer, byte offset, vertices, index buffer, byte
+        /// offset, indices, first, count, instance buffer, byte offset,
+        /// instances]`: `CMD_DRAW_INDEXED` repeated, as `CMD_DRAW_INSTANCED`.
+        pub const CMD_DRAW_INDEXED_INSTANCED: u32 = 14;
+        pub const MAX_INSTANCES: u32 = 4096;
         pub const SHADER_BUFFERS: usize = 8;
         pub const SHADER_TEXTURES: usize = 16;
     }

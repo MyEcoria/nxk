@@ -102,8 +102,17 @@ drops the texture caches, so the next pass samples what was drawn.
 `Graphics::texture_mipped` makes the chain of mip levels on the CPU (a
 2 x 2 average per level, in the block-linear layout of `abi`'s
 `gpu_layout.rs`) and the sampler blends two levels, trilinear; a shader
-may also pick the level (`sample_lod`). None of this has run on the
-console's GPU yet (the emulator draws nothing).
+may also pick the level (`sample_lod`).
+
+`Frame::draw_instanced` draws a mesh once per instance (up to 4096): the
+shader sees `InstanceId` and the pipeline's instance attributes
+(`PipelineDesc::instance_stride`, `instance_attributes`) advance through
+a buffer one instance at a time; the service issues one `BEGIN` per
+instance, the way Mesa's nvc0 driver does. `Graphics::fullscreen` is a
+triangle that covers the target with a stock vertex shader (texture
+coordinates as varying 0), for post-processing passes
+(`Frame::draw_fullscreen`). None of this has run on the console's GPU yet
+(the emulator draws nothing; `gpu irtest` checks the instanced draw there).
 
 ### Users and save data
 

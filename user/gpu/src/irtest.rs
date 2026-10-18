@@ -275,6 +275,7 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         fs_gprs: cf.gprs.next_multiple_of(8).max(8),
         stride: 32,
         attrs,
+        inst_stride: 0,
         flags: 0,
         blend: proto::BLEND_NONE,
         depth: proto::DEPTH_LESS,
@@ -328,6 +329,7 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
         let lay = Layout {
             stride: custom.stride,
             attrs: &custom.attrs,
+            inst_stride: 0,
         };
         d.gfx.draw_layout(&mut p, &lay, vbv, 3, 0, 3);
         ns += g.run(p, BATCH_TIMEOUT_US)?;
@@ -350,6 +352,161 @@ pub fn draw(g: &mut Gpu) -> Res<(bool, u64)> {
     let _ = d.vm.unmap(s.va, img.len() as u64);
     let _ = d.vm.unmap(vbv, vb.len() as u64);
     let _ = d.vm.unmap(tva, tex.len() as u64);
+    let _ = mmu::invalidate(&regs, &d.vm);
+    Ok((ok, ns))
+}
+
+/// Four instances of one triangle: the vertex shader moves each by its
+/// own offset (attribute 1, read from the instance stream) and colors it
+/// from the instance's data and from `InstanceId`.
+pub fn instanced(g: &mut Gpu) -> Res<(bool, u64)> {
+    const W: u32 = 64;
+    const H: u32 = 64;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+
+    let mut b = Builder::new(Stage::Vertex);
+    let (x, y) = (b.input(0, 0), b.input(0, 1));
+    let (dx, dy) = (b.input(1, 0), b.input(1, 1));
+    let (px, py) = (b.fadd(x, dx), b.fadd(y, dy));
+    let (z, one, quarter) = (b.f32(0.5), b.f32(1.0), b.f32(0.25));
+    for (c, r) in [px, py, z, one].into_iter().enumerate() {
+        b.output(OutKind::Position, c as u8, r);
+    }
+    let id = b.builtin(nxk_shader::Builtin::InstanceId);
+    let idf = b.u2f(id);
+    let blue = b.fmul(idf, quarter);
+    for (c, r) in [b.input(1, 2), b.input(1, 3), blue, one].into_iter().enumerate() {
+        b.output(OutKind::Varying(0), c as u8, r);
+    }
+    let vs = b.finish();
+    let mut b = Builder::new(Stage::Fragment);
+    for c in 0..4u8 {
+        let v = b.input_as(0, c, Interp::Perspective);
+        b.output(OutKind::Color(0), c, v);
+    }
+    let fs = b.finish();
+    let (cv, cf) = match (lower::compile(&vs), lower::compile(&fs)) {
+        (Ok(v), Ok(f)) => (v, f),
+        (v, f) => {
+            println!(
+                "[gpu] IR instanced: does not compile: vertex {:?}, fragment {:?}",
+                v.err(),
+                f.err()
+            );
+            return Ok((false, 0));
+        }
+    };
+
+    let d = g.dev(0)?;
+    let img = Dma::new((W * H * 4) as usize).map_err(e)?;
+    let vb = Dma::new(4096).map_err(e)?;
+    let ib = Dma::new(4096).map_err(e)?;
+    let s = crate::engine::Surface {
+        va: d.vm.map(&img, false).map_err(e)?,
+        width: W,
+        height: H,
+        pitch: W * 4,
+        format: proto::FMT_A8B8G8R8 as u32,
+    };
+    let (vbv, ibv) = (d.vm.map(&vb, false).map_err(e)?, d.vm.map(&ib, false).map_err(e)?);
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let Some((vh, vblock, vlen)) = d.gfx.install(&cv.header, &cv.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let Some((fh, fblock, flen)) = d.gfx.install(&cf.header, &cf.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let mut attrs = Vec::new();
+    attrs.push(attr_word(0, proto::AF_F32X2).unwrap());
+    attrs.push(attr_word(0, proto::AF_F32X4).unwrap() | gfx::INSTANCE_STREAM);
+    attrs.resize(proto::MAX_ATTRIBUTES, gfx::ATTR_INACTIVE);
+    let custom = Custom {
+        vs: vh,
+        vs_gprs: cv.gprs.next_multiple_of(8).max(8),
+        fs: fh,
+        fs_gprs: cf.gprs.next_multiple_of(8).max(8),
+        stride: 8,
+        attrs,
+        inst_stride: 16,
+        flags: 0,
+        blend: proto::BLEND_NONE,
+        depth: proto::DEPTH_LESS,
+    };
+    // A small triangle; each instance: offset (x, y), then two color
+    // channels.
+    let tri: [f32; 6] = [-0.2, -0.2, 0.2, -0.2, 0.0, 0.2];
+    for (i, v) in tri.iter().enumerate() {
+        vb.w32(i * 4, v.to_bits());
+    }
+    let inst: [[f32; 4]; 4] = [
+        [-0.5, -0.5, 1.0, 0.0],
+        [0.5, -0.5, 0.0, 1.0],
+        [-0.5, 0.5, 1.0, 1.0],
+        [0.5, 0.5, 0.5, 0.5],
+    ];
+    for (i, v) in inst.iter().flatten().enumerate() {
+        ib.w32(i * 4, v.to_bits());
+    }
+    let target = gfx::Target {
+        color: gfx::Color::Linear(s),
+        depth: None,
+    };
+    img.words(0, &alloc::vec![0xDEAD_BEEF; (W * H) as usize]);
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    d.gfx.clear(&mut p, &target, [0.1, 0.2, 0.3, 1.0]);
+    d.gfx.pipeline_custom(&mut p, &target, &custom);
+    let desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+    let handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+    let staged = d.gfx.uniforms(&mut p, &[0])
+        && d.gfx.cbuf(&mut p, 2, &desc)
+        && d.gfx.cbuf(&mut p, 3, &handles);
+    if !staged {
+        return Err(-libnx::abi::err::ENOSPC);
+    }
+    let lay = Layout {
+        stride: custom.stride,
+        attrs: &custom.attrs,
+        inst_stride: custom.inst_stride,
+    };
+    let instances = gfx::Instances { va: ibv, count: 4 };
+    d.gfx
+        .draw_layout_instanced(&mut p, &lay, vbv, 3, 0, 3, &instances);
+    let ns = g.run(p, BATCH_TIMEOUT_US)?;
+    let px = |x: u32, y: u32| img.r32(((y * W + x) * 4) as usize);
+    let near = |a: u32, b: u32| {
+        (0..4).all(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF) <= 2)
+    };
+    // The triangle of instance i is around (16 + 32 x, 16 + 32 y); the
+    // pixel word is A, B, G, R from the top byte.
+    let word = |r: u32, g: u32, b: u32| 0xFF00_0000 | b << 16 | g << 8 | r;
+    let mut ok = true;
+    let clear_px = word(26, 51, 77);
+    for (x, y, want, name) in [
+        (16, 16, word(255, 0, 0), "instance 0"),
+        (48, 16, word(0, 255, 64), "instance 1"),
+        (16, 48, word(255, 255, 128), "instance 2"),
+        (48, 48, word(128, 128, 191), "instance 3"),
+        (32, 32, clear_px, "between"),
+        (2, 2, clear_px, "corner"),
+    ] {
+        let got = px(x, y);
+        println!(
+            "[gpu] IR instanced ({}): {:#010x}, expected {:#010x}",
+            name, got, want
+        );
+        if !near(got, want) {
+            ok = false;
+        }
+    }
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    d.gfx.uninstall(vblock, vlen);
+    d.gfx.uninstall(fblock, flen);
+    for (va, len) in [(s.va, img.len()), (vbv, vb.len()), (ibv, ib.len())] {
+        let _ = d.vm.unmap(va, len as u64);
+    }
     let _ = mmu::invalidate(&regs, &d.vm);
     Ok((ok, ns))
 }

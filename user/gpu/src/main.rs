@@ -1293,7 +1293,16 @@ fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     if ok {
         pass |= proto::T3_IR_DRAW;
     }
-    Ok((pass, proto::T3_IR_COMPUTE | proto::T3_IR_DRAW, ns))
+    let (ok, t) = irtest::instanced(g)?;
+    ns += t;
+    if ok {
+        pass |= proto::T3_IR_INSTANCE;
+    }
+    Ok((
+        pass,
+        proto::T3_IR_COMPUTE | proto::T3_IR_DRAW | proto::T3_IR_INSTANCE,
+        ns,
+    ))
 }
 
 /// `n` words of `m` against `want`; the first wrong one reported.

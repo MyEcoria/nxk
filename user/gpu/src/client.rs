@@ -18,8 +18,8 @@ use nxk_shader::{wire, Stage};
 
 use crate::engine::Compute;
 use crate::gfx::{
-    attr_word, color_format, Color, Custom, Depth, Gfx, Layout, Pipe, Target, TexImage, Tiled,
-    ATTR_INACTIVE, LIT_UBO_WORDS, MAX_TEXTURES,
+    attr_word, color_format, Color, Custom, Depth, Gfx, Instances, Layout, Pipe, Target, TexImage,
+    Tiled, ATTR_INACTIVE, INSTANCE_STREAM, LIT_UBO_WORDS, MAX_TEXTURES,
 };
 use crate::mmu::{self, Vm, PAGE};
 use crate::push::Push;
@@ -29,6 +29,8 @@ const MAX_BUFFERS: usize = 64;
 const MAX_TARGETS: usize = 16;
 /// Pushbuffer words a stream may fill (the pushbuffer holds 64 Ki).
 const MAX_WORDS: usize = 48_000;
+/// What a stream may fill at most, instanced draws included.
+const MAX_PUSH_WORDS: usize = 64_000;
 /// Largest uniform block of a draw, in words.
 const MAX_UNIFORM_WORDS: usize = 1024;
 const MAX_SHADERS: usize = 64;
@@ -436,22 +438,36 @@ impl Client {
         if stride == 0 || stride > 1024 || !stride.is_multiple_of(4) {
             return Err(-EINVAL);
         }
+        let inst_stride = w[proto::PD_INSTANCE_STRIDE];
+        if inst_stride > 1024 || !inst_stride.is_multiple_of(4) {
+            return Err(-EINVAL);
+        }
         let mut attrs = Vec::new();
+        let mut per_instance = false;
         for k in 0..n {
             let a = w[proto::PD_ATTRS + k];
-            let (offset, format) = (a & 0xFFFF, a >> 16);
-            let word = attr_word(offset, format).ok_or(-EINVAL)?;
-            // The attribute lies inside the vertex.
+            let inst = a & proto::AT_INSTANCE != 0;
+            let (offset, format) = (a & 0xFFFF, (a >> 16) & 0x7FFF);
+            let mut word = attr_word(offset, format).ok_or(-EINVAL)?;
+            // The attribute lies inside the vertex or the instance.
             let size = match format {
                 proto::AF_F32X1 | proto::AF_U8X4_UNORM => 4,
                 proto::AF_F32X2 => 8,
                 proto::AF_F32X3 => 12,
                 _ => 16,
             };
-            if offset + size > stride {
+            if inst {
+                per_instance = true;
+                word |= INSTANCE_STREAM;
+            }
+            if offset + size > if inst { inst_stride } else { stride } {
                 return Err(-EINVAL);
             }
             attrs.push(word);
+        }
+        // A stride without an attribute that uses it is a mistake.
+        if per_instance != (inst_stride != 0) {
+            return Err(-EINVAL);
         }
         attrs.resize(proto::MAX_ATTRIBUTES, ATTR_INACTIVE);
         let (vs, fs) = (w[proto::PD_VERTEX], w[proto::PD_FRAGMENT]);
@@ -473,6 +489,7 @@ impl Client {
             fs_gprs: f.gprs,
             stride,
             attrs,
+            inst_stride,
             flags: w[proto::PD_FLAGS],
             blend,
             depth: w[proto::PD_DEPTH],
@@ -652,6 +669,22 @@ impl Client {
         Ok(())
     }
 
+    /// The instance data of an instanced draw of `n` instances with
+    /// pipeline `pl`: `buf` at `off` holds `n` strides of it, or is
+    /// `NO_TARGET` when the pipeline reads none. `used`: words pushed.
+    fn instances(&self, pl: &Pipeline, used: usize, buf: u32, off: u32, n: u32) -> Res<Instances> {
+        if n == 0 || n > proto::MAX_INSTANCES || used + Gfx::instanced_words(n) > MAX_PUSH_WORDS {
+            return Err(-EINVAL);
+        }
+        let stride = pl.custom.inst_stride;
+        let va = match (stride, buf) {
+            (0, proto::NO_TARGET) => 0,
+            (0, _) | (_, proto::NO_TARGET) => return Err(-EINVAL),
+            _ => self.span(buf, off, n as u64 * stride as u64)?,
+        };
+        Ok(Instances { va, count: n })
+    }
+
     fn pipeline(&self, id: u32) -> Res<&Pipeline> {
         self.pipelines
             .get(id as usize)
@@ -826,10 +859,14 @@ impl Client {
                         }
                         Cur::Custom(pid) => {
                             let pl = self.pipeline(pid)?;
+                            if pl.custom.inst_stride != 0 {
+                                return Err(-EINVAL);
+                            }
                             self.flush_custom(gfx, &mut p, pl, &mut st)?;
                             let lay = Layout {
                                 stride: pl.custom.stride,
                                 attrs: &pl.custom.attrs,
+                                inst_stride: 0,
                             };
                             let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
                             gfx.draw_layout(&mut p, &lay, va, vertices, f, c);
@@ -851,15 +888,62 @@ impl Client {
                         }
                         Cur::Custom(pid) => {
                             let pl = self.pipeline(pid)?;
+                            if pl.custom.inst_stride != 0 {
+                                return Err(-EINVAL);
+                            }
                             self.flush_custom(gfx, &mut p, pl, &mut st)?;
                             let lay = Layout {
                                 stride: pl.custom.stride,
                                 attrs: &pl.custom.attrs,
+                                inst_stride: 0,
                             };
                             let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
                             gfx.draw_indexed_layout(&mut p, &lay, va, vertices, iva, indices, f, c);
                         }
                     }
+                }
+                (proto::CMD_DRAW_INSTANCED, &[vb, off, vertices, f, c, ib, ioff, n]) => {
+                    let Some(Cur::Custom(pid)) = cur else {
+                        return Err(-EINVAL);
+                    };
+                    if c == 0 || c % 3 != 0 || f as u64 + c as u64 > vertices as u64 {
+                        return Err(-EINVAL);
+                    }
+                    let pl = self.pipeline(pid)?;
+                    let inst = self.instances(pl, p.words.len(), ib, ioff, n)?;
+                    self.flush_custom(gfx, &mut p, pl, &mut st)?;
+                    let lay = Layout {
+                        stride: pl.custom.stride,
+                        attrs: &pl.custom.attrs,
+                        inst_stride: pl.custom.inst_stride,
+                    };
+                    let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
+                    gfx.draw_layout_instanced(&mut p, &lay, va, vertices, f, c, &inst);
+                }
+                (
+                    proto::CMD_DRAW_INDEXED_INSTANCED,
+                    &[vb, off, vertices, ib, ioff, indices, f, c, inb, inoff, n],
+                ) => {
+                    let Some(Cur::Custom(pid)) = cur else {
+                        return Err(-EINVAL);
+                    };
+                    if c == 0 || c % 3 != 0 || f as u64 + c as u64 > indices as u64 || vertices == 0
+                    {
+                        return Err(-EINVAL);
+                    }
+                    let pl = self.pipeline(pid)?;
+                    let inst = self.instances(pl, p.words.len(), inb, inoff, n)?;
+                    let iva = self.span(ib, ioff, indices as u64 * 2)?;
+                    self.flush_custom(gfx, &mut p, pl, &mut st)?;
+                    let lay = Layout {
+                        stride: pl.custom.stride,
+                        attrs: &pl.custom.attrs,
+                        inst_stride: pl.custom.inst_stride,
+                    };
+                    let va = self.span(vb, off, vertices as u64 * lay.stride as u64)?;
+                    gfx.draw_indexed_layout_instanced(
+                        &mut p, &lay, va, vertices, iva, indices, f, c, &inst,
+                    );
                 }
                 _ => return Err(-EINVAL),
             }

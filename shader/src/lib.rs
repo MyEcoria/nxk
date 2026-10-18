@@ -15,6 +15,7 @@ pub mod ir;
 pub mod lower;
 pub mod regalloc;
 pub mod sass;
+pub mod stock;
 pub mod validate;
 pub mod wire;
 

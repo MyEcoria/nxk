@@ -49,6 +49,7 @@ const SET_SAMPLER_BINDING: u32 = 0x1234;
 const INVALIDATE_SAMPLER_CACHE: u32 = 0x1330;
 const INVALIDATE_TEXTURE_HEADER_CACHE: u32 = 0x1334;
 const INVALIDATE_TEXTURE_DATA_CACHE: u32 = 0x1338;
+const SET_VERTEX_STREAM_INSTANCE_A: u32 = 0x1880;
 const SET_BLEND: u32 = 0x1360;
 const SET_BLEND_SEPARATE_FOR_ALPHA: u32 = 0x133C;
 const SET_BLEND_COLOR_OP: u32 = 0x1340;
@@ -82,6 +83,8 @@ const TYPE_PIXEL: u32 = 5;
 const GROUP_VERTEX: u32 = 0;
 const GROUP_PIXEL: u32 = 4;
 const PRIM_TRIANGLES: u32 = 4;
+/// `BEGIN`'s instance field: the next instance of the draw (1 << 26).
+const INSTANCE_NEXT: u32 = 1 << 26;
 /// Linear (pitch) layout in `SET_COLOR_TARGET_MEMORY`.
 const LAYOUT_PITCH: u32 = 1 << 12;
 const ZT_FORMAT_ZF32: u32 = 0x0A;
@@ -206,7 +209,20 @@ impl Pipe {
 pub struct Layout<'a> {
     pub stride: u32,
     pub attrs: &'a [u32],
+    /// Bytes per instance in stream 1 (0: none; attributes of `attrs`
+    /// that read it are marked by `attr_stream`).
+    pub inst_stride: u32,
 }
+
+/// Where the instances' data is, and how many of them.
+#[derive(Clone, Copy)]
+pub struct Instances {
+    pub va: u64,
+    pub count: u32,
+}
+
+/// Stream of the per-instance data.
+pub const INSTANCE_STREAM: u32 = 1;
 
 /// A client pipeline: its shaders (program header offsets), their
 /// registers, and the draw state.
@@ -219,6 +235,8 @@ pub struct Custom {
     pub stride: u32,
     /// One word per attribute slot, 16 of them.
     pub attrs: Vec<u32>,
+    /// Bytes per instance (0: no attribute reads the instance stream).
+    pub inst_stride: u32,
     pub flags: u32,
     pub blend: u32,
     pub depth: u32,
@@ -1078,6 +1096,7 @@ impl Gfx {
         let lay = Layout {
             stride: pipe.stride(),
             attrs: &attrs,
+            inst_stride: 0,
         };
         self.draw_layout(p, &lay, vb, vertices, first, count);
     }
@@ -1116,6 +1135,7 @@ impl Gfx {
         let lay = Layout {
             stride: pipe.stride(),
             attrs: &attrs,
+            inst_stride: 0,
         };
         self.draw_indexed_layout(p, &lay, vb, vertices, ib, indices, first, count);
     }
@@ -1150,5 +1170,116 @@ impl Gfx {
         p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES]);
         p.inc(SUBC_3D, DRAW_INDEX_BUFFER, &[count]);
         p.inc(SUBC_3D, END, &[0]);
+    }
+
+    /// Stream 1 of the instances' data, advancing one instance at a time.
+    fn instance_stream(&self, p: &mut Push, lay: &Layout, inst: &Instances) {
+        if lay.inst_stride == 0 {
+            return;
+        }
+        let m = SET_VERTEX_STREAM_A_FORMAT + 16 * INSTANCE_STREAM;
+        let va = inst.va;
+        p.inc(
+            SUBC_3D,
+            m,
+            &[
+                lay.inst_stride | 1 << 12,
+                (va >> 32) as u32,
+                va as u32,
+                1, // frequency: every instance
+            ],
+        );
+        let end = va + inst.count as u64 * lay.inst_stride as u64 - 1;
+        p.inc(
+            SUBC_3D,
+            SET_VERTEX_STREAM_LIMIT_A_A + 8 * INSTANCE_STREAM,
+            &[(end >> 32) as u32, end as u32],
+        );
+        p.immd(
+            SUBC_3D,
+            SET_VERTEX_STREAM_INSTANCE_A + 4 * INSTANCE_STREAM,
+            1,
+        );
+    }
+
+    /// Stream 1 off again: later draws read stream 0 alone.
+    fn end_instances(&self, p: &mut Push, lay: &Layout) {
+        if lay.inst_stride != 0 {
+            let m = SET_VERTEX_STREAM_A_FORMAT + 16 * INSTANCE_STREAM;
+            p.inc(SUBC_3D, m, &[0]);
+            p.immd(
+                SUBC_3D,
+                SET_VERTEX_STREAM_INSTANCE_A + 4 * INSTANCE_STREAM,
+                0,
+            );
+        }
+    }
+
+    /// Words `draw_layout_instanced` pushes at most for `n` instances.
+    pub const fn instanced_words(n: u32) -> usize {
+        64 + 8 * n as usize
+    }
+
+    /// `draw_layout` once per instance (Gallium's sequence: a BEGIN per
+    /// instance, with the instance counter going on from the second).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_layout_instanced(
+        &self,
+        p: &mut Push,
+        lay: &Layout,
+        vb: u64,
+        vertices: u32,
+        first: u32,
+        count: u32,
+        inst: &Instances,
+    ) {
+        self.stream(p, lay, vb, vertices);
+        self.instance_stream(p, lay, inst);
+        for i in 0..inst.count {
+            let next = if i == 0 { 0 } else { INSTANCE_NEXT };
+            p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES | next]);
+            p.inc(SUBC_3D, SET_VERTEX_ARRAY_START, &[first]);
+            p.inc(SUBC_3D, DRAW_VERTEX_ARRAY, &[count]);
+            p.inc(SUBC_3D, END, &[0]);
+        }
+        self.end_instances(p, lay);
+    }
+
+    /// `draw_indexed_layout` once per instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_layout_instanced(
+        &self,
+        p: &mut Push,
+        lay: &Layout,
+        vb: u64,
+        vertices: u32,
+        ib: u64,
+        indices: u32,
+        first: u32,
+        count: u32,
+        inst: &Instances,
+    ) {
+        self.stream(p, lay, vb, vertices);
+        self.instance_stream(p, lay, inst);
+        let end = ib + indices as u64 * 2 - 1;
+        p.inc(
+            SUBC_3D,
+            SET_INDEX_BUFFER_A,
+            &[
+                (ib >> 32) as u32,
+                ib as u32,
+                (end >> 32) as u32,
+                end as u32,
+                1, // two bytes
+                first,
+            ],
+        );
+        for i in 0..inst.count {
+            let next = if i == 0 { 0 } else { INSTANCE_NEXT };
+            p.inc(SUBC_3D, BEGIN, &[PRIM_TRIANGLES | next]);
+            p.inc(SUBC_3D, DRAW_INDEX_BUFFER, &[count]);
+            p.inc(SUBC_3D, END, &[0]);
+        }
+        self.end_instances(p, lay);
     }
 }
