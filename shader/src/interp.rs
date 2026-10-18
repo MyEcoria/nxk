@@ -98,6 +98,15 @@ fn approx(v: f32) -> f32 {
     v * (1.0 + f32::from_bits(MUFU_ERROR_BITS.load(core::sync::atomic::Ordering::Relaxed)))
 }
 
+/// The multi-function unit flushes denormals, in and out.
+pub fn ftz(v: f32) -> f32 {
+    if v != 0.0 && v.abs() < f32::MIN_POSITIVE {
+        0.0 * v.signum()
+    } else {
+        v
+    }
+}
+
 fn f(x: u32) -> f32 {
     f32::from_bits(x)
 }
@@ -323,13 +332,13 @@ impl Run<'_, '_> {
         match op {
             UnOp::FNeg => a ^ 0x8000_0000,
             UnOp::FAbs => a & 0x7FFF_FFFF,
-            UnOp::FRcp => fl(approx(fmath::rcp(x))),
-            UnOp::FRsq => fl(approx(fmath::rsq(x))),
-            UnOp::FSqrt => fl(approx(fmath::sqrt(x))),
-            UnOp::FSin => fl(fmath::sin(approx_arg(x))),
-            UnOp::FCos => fl(fmath::cos(approx_arg(x))),
-            UnOp::FEx2 => fl(approx(fmath::ex2(x))),
-            UnOp::FLg2 => fl(approx(fmath::lg2(x))),
+            UnOp::FRcp => fl(ftz(approx(fmath::rcp(ftz(x))))),
+            UnOp::FRsq => fl(ftz(approx(fmath::rsq(ftz(x))))),
+            UnOp::FSqrt => fl(ftz(approx(fmath::sqrt(ftz(x))))),
+            UnOp::FSin => fl(ftz(fmath::sin(approx_arg(ftz(x))))),
+            UnOp::FCos => fl(ftz(fmath::cos(approx_arg(ftz(x))))),
+            UnOp::FEx2 => fl(ftz(approx(fmath::ex2(ftz(x))))),
+            UnOp::FLg2 => fl(ftz(approx(fmath::lg2(ftz(x))))),
             UnOp::FFloor => fl(fmath::floor(x)),
             // NaN gives 0 (clamp would keep it), as the hardware's .SAT.
             #[allow(clippy::manual_clamp)]

@@ -135,7 +135,7 @@ impl Lab {
             2 => format!("{} PARTICLES (UP/DOWN)", self.particles),
             3 => match &self.rays {
                 Some(r) => format!(
-                    "{} RAYS+{} SHADOW, {} TRIS, BVH {:.0} MS",
+                    "{} RAYS+{} SHADOW  {} TRIS  BVH {:.0} MS",
                     RAYS, RAYS, r.triangles, r.build_ms
                 ),
                 None => "BUILDING...".into(),
@@ -166,7 +166,7 @@ impl Lab {
             c.rect(30.0 + i as f32 * 3.4, base - h, 2.6, h, col);
         }
         // Behind everything else: a canvas keeps the first thing drawn.
-        c.rect(16.0, 16.0, 440.0, 190.0, [0.0, 0.0, 0.0, 1.0]);
+        c.rect(16.0, 16.0, 590.0, 190.0, [0.0, 0.0, 0.0, 1.0]);
     }
 
     /// Vertices of `n` billboards around the player, moving.

@@ -183,7 +183,7 @@ pub fn scatter(t: &Terrain, seed: u32) -> Scenery {
         let (x, z) = (rng.range(-HALF + 6.0, HALF - 6.0), rng.range(-HALF + 6.0, HALF - 6.0));
         let y = t.height(x, z);
         let n = t.normal(x, z);
-        if (x * x + z * z).sqrt() < 9.0 || n[1] < 0.84 || !(WATER + 0.9..17.0).contains(&y) {
+        if (x * x + z * z).sqrt() < 18.0 || n[1] < 0.84 || !(WATER + 0.9..17.0).contains(&y) {
             continue;
         }
         let s = rng.range(0.8, 1.5);

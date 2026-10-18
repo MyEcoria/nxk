@@ -191,10 +191,16 @@ fn main() {
     let mut world_tris: Option<Vec<Triangle>> = None;
     let mut last = g.seconds();
     let started = last;
+    let (mut fps_n, mut fps_t) = (0u32, last);
     let mut bg = Canvas::background();
     let mut hud = Canvas::new();
     loop {
         let now = g.seconds();
+        if now - fps_t >= 5.0 {
+            println!("lumen: {:.1} fps", fps_n as f32 / (now - fps_t));
+            fps_n = 0;
+            fps_t = now;
+        }
         let dt = (now - last).clamp(0.001, 0.05);
         last = now;
         // Input.
@@ -408,7 +414,7 @@ fn main() {
                         };
                         vb.write_words(0, words);
                         f.use_pipeline(&assets.pipes.add);
-                        d.u[U_TINT as usize..U_TINT as usize + 4].copy_from_slice(&[1.0; 4]);
+                        d.u[U_TINT as usize..U_TINT as usize + 4].copy_from_slice(&[0.3, 0.3, 0.3, 1.0]);
                         for r in 0..3 {
                             for c in 0..4 {
                                 d.u[U_MODEL as usize + 4 * r + c] = id.0[r][c];
@@ -419,7 +425,7 @@ fn main() {
                                 d.u[U_MVP as usize + 4 * r + c] = vp.0[r][c];
                             }
                         }
-                        d.u[U_EMISSIVE as usize] = 1.5;
+                        d.u[U_EMISSIVE as usize] = 0.3;
                         f.uniforms_f32(&d.u);
                         f.draw_buffers(vb, lab.particles * 4, ib, lab.particles * 6);
                         d.draws += 1;
@@ -463,8 +469,9 @@ fn main() {
                 }
                 None => break,
             }
-        } else if let Some(lab) = lab_mode.as_mut() {
-            if lab.room == 3 {
+        } else {
+            fps_n += 1;
+            if let Some(lab) = lab_mode.as_mut().filter(|l| l.room == 3) {
                 if let Some(r) = lab.rays.as_mut() {
                     r.collect();
                 }

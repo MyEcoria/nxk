@@ -711,7 +711,7 @@ impl Sim<'_> {
                 }
             }
             Op::Mufu => {
-                let x = f(ra);
+                let x = crate::interp::ftz(f(ra));
                 let r = match bits(w, 20, 4) {
                     0 => crate::fmath::cos(x * (2.0 * core::f32::consts::PI)),
                     1 => crate::fmath::sin(x * (2.0 * core::f32::consts::PI)),
@@ -722,7 +722,7 @@ impl Sim<'_> {
                     8 => crate::fmath::sqrt(x),
                     k => return Err(format!("MUFU {k}")),
                 };
-                setd(self, r.to_bits());
+                setd(self, crate::interp::ftz(r).to_bits());
             }
             Op::Rro => {
                 // The input is in radians: MUFU takes turns, EX2 as is.
