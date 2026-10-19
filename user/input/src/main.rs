@@ -2,7 +2,8 @@
 //! when its interrupt line (GPIO X1) says it has events; without the
 //! line, polled while a client waits (100 Hz with a finger down, 25 Hz
 //! for 3 s after, then 2 Hz). Clients wait via READ, each for the kinds
-//! it asks; drivers inject via INJECT.
+//! it asks; drivers inject via INJECT. Asleep (`SUSPEND`) the controller is
+//! powered off and not read; the buttons go on, `RESUME` starts it again.
 
 #![no_std]
 #![no_main]
@@ -13,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{self, EINVAL, EIO, ETIMEDOUT};
-use libnx::abi::proto::{input as proto, power};
+use libnx::abi::proto::{input as proto, power, RESUME, SUSPEND};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::i2c::I2c;
 use libnx::ipc::{self, Msg, Received};
@@ -108,6 +109,15 @@ fn wait_event(i2c: &I2c, id: u8, status: u8, ms: u64) -> bool {
     }
 }
 
+/// The touch controller's supply, MAX77620 LDO6, through `power`.
+fn supply(on: bool) -> Result<(), i64> {
+    let ep = ns::wait_for_timeout("power", 2_000_000_000)?;
+    let mut m = Msg::new(power::TOUCH_POWER, 1, 0);
+    m.mr[0] = on as u64;
+    ipc::checked(ipc::call(ep, &m)?)?;
+    Ok(())
+}
+
 /// hekate `touch_power_on`: Nyx powers the panel off (`hw_deinit`)
 /// before chaining to nxk. Reset held while LDO6 and I2C3 come up.
 fn power_on(gpio: &Mmio, pinmux: &Mmio) -> Result<(), i64> {
@@ -116,10 +126,7 @@ fn power_on(gpio: &Mmio, pinmux: &Mmio) -> Result<(), i64> {
     gpio.w32(port(PORT_J, GPIO_OUT_MSK), RESET << 8);
     gpio.w32(port(PORT_J, GPIO_OE_MSK), RESET << 8 | RESET);
     time::sleep_us(20);
-    let ep = ns::wait_for_timeout("power", 2_000_000_000)?;
-    let mut m = Msg::new(power::TOUCH_POWER, 1, 0);
-    m.mr[0] = 1;
-    ipc::checked(ipc::call(ep, &m)?)?;
+    supply(true)?;
     for p in PINMUX_I2C3 {
         pinmux.w32(p, PINMUX_INPUT_ENABLE);
     }
@@ -130,6 +137,13 @@ fn power_on(gpio: &Mmio, pinmux: &Mmio) -> Result<(), i64> {
     gpio.w32(port(PORT_J, GPIO_OUT_MSK), RESET << 8 | RESET);
     time::sleep_ms(10);
     Ok(())
+}
+
+/// hekate `touch_power_off`: reset low, then LDO6 off. The I2C3 clock
+/// stays on: `i2c` programs a bus once, a reset clock would lose it.
+fn power_off(gpio: &Mmio) -> Result<(), i64> {
+    gpio.w32(port(PORT_J, GPIO_OUT_MSK), RESET << 8);
+    supply(false)
 }
 
 /// hekate `touch_init`: system reset, finger mode, sensing on. Returns
@@ -211,6 +225,13 @@ impl TouchIrq {
     fn off(&self) {
         self.gpio.w32(port(PORT_X, GPIO_INT_ENB_MSK), PIN << 8);
         self.gpio.w32(port(PORT_X, GPIO_INT_CLR), PIN);
+    }
+
+    /// The line armed again (level low still pending raises it at once).
+    fn on(&self) {
+        self.gpio.w32(port(PORT_X, GPIO_INT_CLR), PIN);
+        self.gpio
+            .w32(port(PORT_X, GPIO_INT_ENB_MSK), PIN << 8 | PIN);
     }
 }
 
@@ -469,6 +490,28 @@ fn poll_touch(i2c: &I2c, out: &mut VecDeque<Event>, mut down: bool) -> bool {
     down
 }
 
+/// Sleep: the interrupt line off first (an unpowered controller may
+/// pull it low), then the controller. Always leaves touch stopped.
+fn touch_suspend(gpio: &Mmio, line: Option<&TouchIrq>) -> Result<(), i64> {
+    if let Some(l) = line {
+        l.off();
+    }
+    power_off(gpio)
+}
+
+/// Wake: the boot sequence again, then the line armed. On failure the
+/// controller is powered down again and touch stays stopped.
+fn touch_resume(i2c: &I2c, pads: &(Mmio, Mmio), line: Option<&TouchIrq>) -> Result<(), i64> {
+    if let Err(e) = touch_start(i2c, &pads.0, &pads.1) {
+        let _ = power_off(&pads.0);
+        return Err(e);
+    }
+    if let Some(l) = line {
+        l.on();
+    }
+    Ok(())
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -482,6 +525,7 @@ fn main() -> i32 {
         (Err(e), _) | (_, Err(e)) => Err(e),
     };
     let touch = started.is_ok();
+    let pads = started.as_ref().ok().copied();
     let mut keys = None;
     let line = match started {
         Ok((gpio, pinmux)) => {
@@ -515,6 +559,9 @@ fn main() -> i32 {
     // The touch line is given up (stuck low): its interrupt stays bound
     // for the buttons.
     let mut line_off = false;
+    // Asleep: the controller is off, no touch reads. The power button
+    // (PMIC), the volume buttons and INJECT go on.
+    let mut suspended = false;
 
     let mut queue: VecDeque<Event> = VecDeque::new();
     // Waiting readers: reply token, deadline (0: none), kinds wanted.
@@ -526,7 +573,7 @@ fn main() -> i32 {
         // Poll only while a reader waits or a finger is down (else idle);
         // wake up for the nearest reader deadline too.
         let near = time::now_ns() < contact + NEAR_NS;
-        let polled = touch && (line.is_none() || line_off);
+        let polled = touch && !suspended && (line.is_none() || line_off);
         let mut wait = match (polled, down, readers.is_empty()) {
             (true, true, _) => POLL_NS,
             (true, false, false) if near => POLL_NEAR_NS,
@@ -562,7 +609,7 @@ fn main() -> i32 {
             k.update(time::now_ns(), &mut queue);
         }
         power_key.update(&i2c, time::now_ns(), &mut queue);
-        if polled || irq && line.is_some() {
+        if polled || irq && line.is_some() && !suspended {
             let n = q0.min(queue.len());
             down = poll_touch(&i2c, &mut queue, down);
             let seen = down || queue.len() != n;
@@ -583,7 +630,7 @@ fn main() -> i32 {
                 }
             }
         }
-        if irq && line_off {
+        if irq && (line_off || suspended) {
             if let (Some(l), Some(k)) = (&line, &keys) {
                 k.ack();
                 l.irq.ack();
@@ -612,6 +659,28 @@ fn main() -> i32 {
                     e[..n].copy_from_slice(&rx.msg.mr[..n]);
                     queue.push_back(Event(e));
                     let _ = ipc::reply(&Msg::new(0, 0, 0));
+                }
+                SUSPEND | RESUME => {
+                    let r = match pads.as_ref().filter(|_| touch) {
+                        Some(p) if rx.msg.label() == SUSPEND && !suspended => {
+                            suspended = true;
+                            down = false;
+                            touch_suspend(&p.0, line.as_ref())
+                        }
+                        Some(p) if rx.msg.label() == RESUME && suspended => {
+                            let r = touch_resume(&i2c, p, line.as_ref());
+                            suspended = r.is_err();
+                            line_off = false;
+                            stuck = 0;
+                            contact = time::now_ns();
+                            r
+                        }
+                        _ => Ok(()),
+                    };
+                    let _ = ipc::reply(&match r {
+                        Ok(()) => Msg::new(0, 0, 0),
+                        Err(e) => Msg::error(e),
+                    });
                 }
                 _ => {
                     let _ = ipc::reply(&Msg::error(-EINVAL));
