@@ -1149,6 +1149,27 @@ within 5 s.
     faces stay lit. On the PC, 30 walking frames leave 22 of 1200 texels off
     the truth with the four-texel history as with the nearest texel.
 
+46. 19/10/2026, Erista, `--reload gpu` and `display`, games `--put`:
+    **the volume indicator and the drawer over a game**. Window C (window
+    B scans out black and underflows on this board) blends the UI's
+    image, premultiplied, over Lumen: VOL_UP / VOL_DOWN show the pill,
+    `+` opens the drawer (brightness, volume, Flight Mode), the D-pad
+    moves in it, B closes it; HOME still ends the game. No underflow on
+    A or C. The game's `FLIP` were answered by `display`'s loop, which
+    also redraws the overlay (5 ms drawing, 10 ms copying to the
+    uncached image): 33 to 49 ms gaps, 2 to 4 frames lost in 4 s of
+    drawer. Polling bit 1 alone (window A's request) let flips return
+    early, 71/s on a 60 Hz panel: the wait stays on bits 0 and 1. With
+    `FLIP` and `EVENT` on their own endpoint and thread (priority 8,
+    `SCANOUT`'s handle 3, the registers under one lock): 59 to 60 flips/s,
+    longest gap 16 ms, no frame late, idle or moving through the drawer.
+    Touch over the game: the brightness slider drags, a tap beside the
+    drawer closes it. `SNAPSHOT` holds the lock while it copies the game's
+    image (one capture showed a block of the next frame's clear color
+    otherwise). Window C is not double-buffered: a redraw may show half
+    old for one frame where it changes. The boot image's `display` still
+    speaks the old protocol: after a reboot, games need `--reload display`.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
