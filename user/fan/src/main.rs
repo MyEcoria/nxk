@@ -1,13 +1,15 @@
 //! fan: the fan on PWM channel 1, its 5V rail and its tachometer, as
 //! hekate bdk/thermal/fan.c. Every 2 s its speed follows the SoC
 //! temperature (`power`) with Nyx's steps, full speed from 60 C; or a
-//! duty set by hand. Nyx stops it before chaining to nxk.
+//! duty set by hand. Nyx stops it before chaining to nxk. Asleep
+//! (`proto::SUSPEND`): fan and rail off, the temperature only watched
+//! slowly, full speed if the SoC gets hot; `RESUME` returns to the mode.
 
 #![no_std]
 #![no_main]
 
 use libnx::abi::err::{self, EINVAL, ENODEV, ETIMEDOUT};
-use libnx::abi::proto::{clk, fan as proto, power};
+use libnx::abi::proto::{clk, fan as proto, power, RESUME, SUSPEND};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
 use libnx::ns::{self, Service};
@@ -74,6 +76,8 @@ const PMC_PWR_DET_VAL: usize = 0x400 + 0xE4;
 const PMC_GPIO: u32 = 1 << 21;
 
 const PERIOD_NS: u64 = 2_000_000_000;
+/// Temperature check asleep: the SoC idles, so rarely.
+const SLEEP_PERIOD_NS: u64 = 8_000_000_000;
 const CALL_NS: u64 = 200_000_000;
 /// Speed measured this long after a change (spin-up), then each minute.
 const SETTLE_NS: u64 = 3_000_000_000;
@@ -237,6 +241,10 @@ struct Control {
     rpm: Option<u64>,
     /// Next speed measurement (0: none planned).
     measure_at: u64,
+    /// Asleep: fan off unless hot, nothing measured.
+    asleep: bool,
+    /// Just woken: the loop reads the temperature at once.
+    woke: bool,
 }
 
 impl Control {
@@ -263,9 +271,11 @@ impl Control {
     fn target(&mut self, cur: u32) -> u32 {
         let c = self.temp.map(|t| t.div_euclid(1000));
         self.hot = c.is_some_and(|c| c >= HOT_C || self.hot && c >= COOL_C);
-        match (c, self.manual) {
+        let manual = self.manual.filter(|_| !self.asleep);
+        match (c, manual) {
             _ if self.hot => FULL,
-            _ if self.lost() => self.manual.unwrap_or(0).max(SAFE),
+            _ if self.lost() => manual.unwrap_or(0).max(SAFE),
+            _ if self.asleep => 0,
             (_, Some(m)) => m,
             (Some(c), None) => nyx_duty(c, cur),
             (None, None) => cur,
@@ -302,7 +312,11 @@ fn step(fan: &mut Fan, ctl: &mut Control) {
     if duty != fan.duty {
         fan.set(duty);
         ctl.rpm = None;
-        ctl.measure_at = time::now_ns() + SETTLE_NS;
+        ctl.measure_at = if ctl.asleep {
+            0
+        } else {
+            time::now_ns() + SETTLE_NS
+        };
     }
 }
 
@@ -325,6 +339,23 @@ fn request(fan: &mut Fan, ctl: &mut Control, m: &Msg) -> Msg {
             }
             None => Msg::error(-ENODEV),
         },
+        SUSPEND => {
+            ctl.asleep = true;
+            ctl.measure_at = 0;
+            ctl.read();
+            step(fan, ctl);
+            // Nothing left on the rail once its users let go.
+            fan.power(fan.duty != 0 || fan.users != 0);
+            Msg::new(0, 0, 0)
+        }
+        RESUME => {
+            if ctl.asleep {
+                ctl.asleep = false;
+                ctl.woke = true;
+                step(fan, ctl);
+            }
+            Msg::new(0, 0, 0)
+        }
         proto::RAIL => {
             let bit = m.mr[0];
             if !matches!(bit, proto::RAIL_JC_R | proto::RAIL_JC_L) {
@@ -396,6 +427,8 @@ fn main() -> i32 {
         hot: false,
         rpm: None,
         measure_at: 0,
+        asleep: false,
+        woke: false,
     };
     if let Some(f) = fan.as_mut() {
         ctl.read();
@@ -436,10 +469,16 @@ fn main() -> i32 {
         }
         let Some(f) = fan.as_mut() else { continue };
         let now = time::now_ns();
-        if now >= tick {
+        let woke = core::mem::take(&mut ctl.woke);
+        if now >= tick || woke {
             ctl.read();
             step(f, &mut ctl);
-            tick = now + PERIOD_NS;
+            let period = if ctl.asleep {
+                SLEEP_PERIOD_NS
+            } else {
+                PERIOD_NS
+            };
+            tick = now + period;
         }
         if ctl.measure_at != 0 && now >= ctl.measure_at {
             ctl.rpm = f.measure();
