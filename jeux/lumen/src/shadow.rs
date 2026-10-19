@@ -186,27 +186,28 @@ impl Shadows {
 
     /// How much the mask changed since the frame before, for the log: the
     /// share of texels (with a distance) whose share of the sun moved by
-    /// more than 0.3, and the share that sits at 0 or 1 beside a texel in
-    /// between (a test aid for flicker).
+    /// more than 0.3, over one texel in `STRIDE` (the masks are read back
+    /// word by word from uncached memory).
     pub fn flicker(&self) -> String {
-        let (w, h) = (self.w as usize, self.h as usize);
-        let tw = TEXEL_WORDS;
-        let (mut a, mut b) = (vec![0u32; w * h * tw], vec![0u32; w * h * tw]);
-        self.masks[1 - self.cur].read_words(0, &mut a);
-        self.masks[self.cur].read_words(0, &mut b);
-        let f = |v: &[u32], i: usize| f32::from_bits(v[tw * i + 1]);
-        let used: Vec<usize> = (0..w * h)
-            .filter(|&i| f32::from_bits(a[tw * i]) > 0.0 && f32::from_bits(b[tw * i]) > 0.0)
-            .collect();
-        let moved = used
-            .iter()
-            .filter(|&&i| (f(&a, i) - f(&b, i)).abs() > 0.3)
-            .count();
-        let n = used.len().max(1) as f32;
+        const STRIDE: usize = 16;
+        let (w, h, tw) = (self.w as usize, self.h as usize, TEXEL_WORDS);
+        let mut moved = 0;
+        let mut used = 0;
+        let (mut a, mut b) = ([0u32; 2], [0u32; 2]);
+        for i in (0..w * h).step_by(STRIDE) {
+            self.masks[1 - self.cur].read_words(tw * i, &mut a);
+            self.masks[self.cur].read_words(tw * i, &mut b);
+            let f = |v: [u32; 2]| (f32::from_bits(v[0]), f32::from_bits(v[1]));
+            let ((da, ca), (db, cb)) = (f(a), f(b));
+            if da > 0.0 && db > 0.0 {
+                used += 1;
+                moved += ((ca - cb).abs() > 0.3) as usize;
+            }
+        }
         format!(
             "flicker {:.2}% of {} texels moved by 0.3",
-            100.0 * moved as f32 / n,
-            used.len()
+            100.0 * moved as f32 / used.max(1) as f32,
+            used
         )
     }
 

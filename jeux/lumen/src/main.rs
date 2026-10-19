@@ -261,6 +261,9 @@ fn main() {
     // `lumen lab [MODE [ROOM]]` starts with the Lab open (a test aid: the
     // shell can read what the game prints).
     let mut walk = false;
+    // Started with `lab` from the shell: log the mask's flicker (a test
+    // aid that reads the masks back, which costs a frame now and then).
+    let mut measure = false;
     let mut g_frames = 0u32;
     let mut refused_run = 0u32;
     let mut lab_mode: Option<Lab> = None;
@@ -275,6 +278,7 @@ fn main() {
         }
         walk = args.get(5).map(String::as_str) == Some("walk");
         lab_mode = Some(lab);
+        measure = true;
     }
     let mut last = g.seconds();
     let started = last;
@@ -485,7 +489,7 @@ fn main() {
                 );
             }
             f.screen();
-            if lab_mode.is_some() && g_frames % 120 == 60 {
+            if measure && lab_mode.is_some() && g_frames % 120 == 60 {
                 println!("lumen: mode {} {}", mode, sh.flicker());
                 if mode == 4 {
                     println!("lumen: {}", sh.describe());
