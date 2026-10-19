@@ -4,7 +4,9 @@
 //! (`fan`), handshaken at 1 Mbaud, switched to 3 Mbaud, polled every
 //! 15 ms. Buttons and sticks go to `input` as `KIND_BUTTON` and
 //! `KIND_STICK` events. Joy-Cons only run from the rail here: no
-//! charging, no Bluetooth pairing data.
+//! charging, no Bluetooth pairing data. Asleep (`proto::SUSPEND`): rails
+//! released, UART clocks off, pads parked, no polling; `RESUME` handshakes
+//! the attached Joy-Cons again as at boot.
 
 #![no_std]
 #![no_main]
@@ -14,7 +16,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use libnx::abi::proto::joycon as proto;
-use libnx::abi::proto::{clk, fan, input};
+use libnx::abi::proto::{clk, fan, input, RESUME, SUSPEND};
 use libnx::drv::{self, Mmio};
 use libnx::ipc::{self, Msg};
 use libnx::jc;
@@ -144,6 +146,8 @@ const DEBOUNCE: u8 = 3;
 const RAIL_REFRESH_NS: u64 = 5_000_000_000;
 const STATS_POLLS: u32 = 600;
 
+const UARTS: [u64; 2] = [clk::UARTB, clk::UARTC];
+
 static FAN: Service = Service::new("fan", 10_000_000_000);
 static INPUT: Service = Service::new("input", 10_000_000_000);
 
@@ -229,6 +233,19 @@ impl Pads {
         self.output(PORT_CC, 1 << 3, true);
         self.pinmux.w32(PM_GPIO_PK3, PM_DRIVE_4X | PM_PULL_DOWN | 2);
         self.output(PORT_K, 1 << 3, true);
+    }
+
+    /// Asleep: UART lines hi-Z (the Joy-Cons are unpowered, nothing may
+    /// drive into them) and charge enables low, as hekate `jc_deinit`.
+    fn park(&self) {
+        for idx in [1, 2] {
+            let base = 0xE4 + 0x10 * idx;
+            for off in [0, 4, 8, 12] {
+                self.pinmux.w32(base + off, PM_INPUT_ENABLE | PM_TRISTATE);
+            }
+        }
+        self.output(PORT_CC, 1 << 3, false);
+        self.output(PORT_K, 1 << 3, false);
     }
 
     /// Joy-Cons attached (right, left): the TX pads turned into inputs
@@ -588,6 +605,18 @@ impl Jc {
         self.battery = proto::BATTERY_UNKNOWN;
     }
 
+    /// Detached and idle, as at boot: the next samples attach it again.
+    fn reset(&mut self, out: &mut Vec<[u64; input::WORDS]>) {
+        self.release(out);
+        self.present = false;
+        self.seen = false;
+        self.streak = 0;
+        self.ready = false;
+        self.awaiting = None;
+        self.retry_at = 0;
+        self.fails = 0;
+    }
+
     fn state(&self) -> u64 {
         match (self.present, self.ready) {
             (false, _) => proto::ST_ABSENT,
@@ -609,6 +638,71 @@ fn set_rail(side: Side, on: bool) -> Result<(), i64> {
 fn flush(out: &mut Vec<[u64; input::WORDS]>) {
     for e in out.drain(..) {
         let _ = INPUT.call_timeout(&Msg::from_words(input::INJECT, &e), 100_000_000);
+    }
+}
+
+/// Sleep: pads and polling stopped, rails released, then the UARTs'
+/// clocks gated (their registers must not be touched after).
+fn suspend(jcs: &mut [Jc; 2], pads: &Pads, out: &mut Vec<[u64; input::WORDS]>) {
+    for jc in jcs.iter_mut() {
+        jc.reset(out);
+    }
+    flush(out);
+    for jc in jcs.iter() {
+        if let Err(e) = set_rail(jc.side, false) {
+            println!("[joycon] {}: 5V rail release: error {}", jc.side.name(), e);
+        }
+    }
+    pads.park();
+    for dev in UARTS {
+        let _ = libnx::clk::disable(dev);
+    }
+}
+
+/// Wake: clocks, pads and rails back; detection and handshakes follow
+/// from the main loop. Err: the clock that would not start (still asleep).
+fn resume(jcs: &[Jc; 2], pads: &Pads) -> Result<(), i64> {
+    for dev in UARTS {
+        libnx::clk::enable(dev)?;
+    }
+    pads.setup();
+    for jc in jcs {
+        if let Err(e) = set_rail(jc.side, true) {
+            println!("[joycon] {}: 5V rail: error {}", jc.side.name(), e);
+        }
+    }
+    Ok(())
+}
+
+/// One request; `suspended` follows SUSPEND and RESUME (both idempotent).
+fn handle(
+    label: u32,
+    jcs: &mut [Jc; 2],
+    pads: &Pads,
+    out: &mut Vec<[u64; input::WORDS]>,
+    suspended: &mut bool,
+) -> Msg {
+    match label {
+        proto::STATUS => {
+            let (r, l) = (&jcs[0], &jcs[1]);
+            Msg::from_words(0, &[l.state(), r.state(), l.battery, r.battery])
+        }
+        SUSPEND => {
+            if !*suspended {
+                suspend(jcs, pads, out);
+                *suspended = true;
+            }
+            Msg::new(0, 0, 0)
+        }
+        RESUME if !*suspended => Msg::new(0, 0, 0),
+        RESUME => match resume(jcs, pads) {
+            Ok(()) => {
+                *suspended = false;
+                Msg::new(0, 0, 0)
+            }
+            Err(e) => Msg::error(e),
+        },
+        _ => Msg::error(-libnx::abi::err::EINVAL),
     }
 }
 
@@ -654,7 +748,21 @@ fn main() -> i32 {
     let mut out: Vec<[u64; input::WORDS]> = Vec::new();
     let mut rail_at = time::now_ns() + RAIL_REFRESH_NS;
     let mut raw_last = (false, false);
+    let mut suspended = false;
     loop {
+        // Asleep: blocked until a request, no wakeups.
+        while let (true, Some(ep)) = (suspended, ep) {
+            let Ok(rx) = ipc::recv(ep) else {
+                time::sleep_ms(10);
+                continue;
+            };
+            let reply = handle(rx.msg.label(), &mut jcs, &pads, &mut out, &mut suspended);
+            let _ = ipc::reply_to(rx.token, &reply);
+            if !suspended {
+                rail_at = time::now_ns() + RAIL_REFRESH_NS;
+                raw_last = (false, false);
+            }
+        }
         let tick = time::now_ns();
         // Attach and detach, after a few samples in agreement.
         let (r, l) = pads.detect();
@@ -802,14 +910,11 @@ fn main() -> i32 {
             let Ok(rx) = ipc::recv_timeout(ep, next - now) else {
                 continue;
             };
-            let reply = match rx.msg.label() {
-                proto::STATUS => {
-                    let (r, l) = (&jcs[0], &jcs[1]);
-                    Msg::from_words(0, &[l.state(), r.state(), l.battery, r.battery])
-                }
-                _ => Msg::error(-libnx::abi::err::EINVAL),
-            };
+            let reply = handle(rx.msg.label(), &mut jcs, &pads, &mut out, &mut suspended);
             let _ = ipc::reply_to(rx.token, &reply);
+            if suspended {
+                break;
+            }
         }
     }
 }
