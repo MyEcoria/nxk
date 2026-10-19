@@ -89,10 +89,11 @@ fn expected(sc: &Scene, cam: [f32; 3], pos: &[[f32; 4]], normals: &[[f32; 3]]) -
                 t_max: 80.0,
             };
             let blocked = trace::occluded(&sc.bvh, &ray)
-                || sc
-                    .boxes
-                    .iter()
-                    .any(|b| hits_box(b, o, sc.sun, shadow::T_MIN, 80.0));
+                || sc.boxes.iter().any(|b| {
+                    let f = shadow::FIGURE_BIAS;
+                    let fo = [p[0] + n[0] * f, p[1] + n[1] * f, p[2] + n[2] * f];
+                    hits_box(b, fo, sc.sun, shadow::FIGURE_T_MIN, 80.0)
+                });
             (dist, if blocked { 0.0 } else { 1.0 })
         })
         .collect()
@@ -251,6 +252,59 @@ fn a_point_moving_a_texel_a_frame_still_traces() {
         .count();
     std::println!("one texel a frame: {missed} points never traced");
     assert_eq!(missed, 0);
+}
+
+/// A box a few centimetres from a lit surface, toward the sun, shades it
+/// (an arm over the body): the boxes' rays start just off the surface.
+#[test]
+fn a_box_just_above_a_surface_shades_it() {
+    use super::shadow_demo as sd;
+    let mut sc = scene();
+    let p = [0.0f32, 20.0, 10.0];
+    let (n, packed) = sd::quantize([0.0, 1.0, 0.0]);
+    let sun = sc.sun;
+    // A 0.2 m cube whose centre is 0.18 m from the point along the sun.
+    let c = [
+        p[0] + sun[0] * 0.18,
+        p[1] + sun[1] * 0.18,
+        p[2] + sun[2] * 0.18,
+    ];
+    sc.boxes = vec![[
+        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, c[0], c[1], c[2], -0.1, -0.1, -0.1, 0.1, 0.1,
+        0.1,
+    ]];
+    while sc.boxes.len() < shadow::BOXES {
+        sc.boxes.push([
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 900.0, 900.0, 900.0, 0.0, 0.0, 0.0, 0.1,
+            0.1, 0.1,
+        ]);
+    }
+    let _ = n;
+    let (w, h) = (8, 4);
+    let mut pos = Positions {
+        w,
+        h,
+        texels: vec![[p[0], p[1], p[2], packed]; w * h],
+    };
+    let eye = [0.0, 23.0, 0.0];
+    let f = sd::Frame {
+        eye,
+        prev: (eye, PITCH),
+        number: 0,
+        jitter: 0.0,
+        reset: true,
+    };
+    let mut un = sd::uniforms(&sc, w, h, &f);
+    for (k, v) in [p[0], p[1], p[2], 2.0].iter().enumerate() {
+        un[u::SPHERE as usize + k] = v.to_bits();
+    }
+    // Under the valley's own ground the scene's ray could be blocked too:
+    // read the figure's share alone (the share over the scene's).
+    let out = sd::reference(&sc, &mut pos, &vec![0; TW * w * h], &un);
+    let (share, scene) = (f32::from_bits(out[1]), f32::from_bits(out[2]));
+    let figure = if scene > 0.0 { share / scene } else { 0.0 };
+    std::println!("box just above: share {share}, scene {scene}");
+    assert!(scene > 0.0 && figure < 0.01, "share {share}, scene {scene}");
 }
 
 #[test]

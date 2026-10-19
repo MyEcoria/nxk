@@ -1,7 +1,9 @@
 //! The game's shaders, written in the IR: one lit vertex and fragment pair
 //! for everything solid (a sun, a hemisphere light, distance fog, gamma).
 
-use nxgfx::ir::rt::shadow::{lit_factor_ex as shadow_factor, pack_normal as shadow_pack, Filtered};
+use nxgfx::ir::rt::shadow::{
+    self, lit_factor_ex as shadow_factor, pack_normal as shadow_pack, Filtered,
+};
 use nxgfx::ir::{Builder, CmpOp, OutKind, Program, Reg, Stage, Ty};
 
 /// Uniform words: the model-view-projection rows, the model rows (3x4,
@@ -80,10 +82,9 @@ pub fn vertex() -> Program {
     b.finish()
 }
 
-/// The sun's share at this pixel from the mask (buffer slot 0), and
-/// whether the filter had texels to work with. `n`: the unit normal, `w`:
-/// the world position, `cam`: the camera, `dist`: the distance to it.
-fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: Reg) -> Filtered {
+/// This pixel in texel coordinates of the mask (texel centres at whole
+/// numbers), and the mask's size.
+fn mask_coords(b: &mut Builder) -> (Reg, Reg, [Reg; 2]) {
     let clip = [b.input(3, 0), b.input(3, 1), b.input(3, 2)];
     let low = [
         b.uniform(U_SHADOW_W, Ty::F32),
@@ -96,8 +97,14 @@ fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: R
     let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
     // The viewport maps NDC to the window as x * size / 2 + size / 2, both
     // axes (the panel's matrix has already turned y down).
-    let px = b.fma(nx, hw, ox);
-    let py = b.fma(ny, hh, oy);
+    (b.fma(nx, hw, ox), b.fma(ny, hh, oy), low)
+}
+
+/// The sun's share at this pixel from the mask (buffer slot 0), and
+/// whether the filter had texels to work with. `n`: the unit normal, `w`:
+/// the world position, `cam`: the camera, `dist`: the distance to it.
+fn mask_factor(b: &mut Builder, n: [Reg; 3], w: [Reg; 3], cam: [Reg; 3], dist: Reg) -> Filtered {
+    let (px, py, low) = mask_coords(b);
     // Neighbouring texels of a surface seen at a grazing angle are far
     // apart in depth: the tolerance grows as the view turns flat.
     let to_cam = [
@@ -252,9 +259,29 @@ pub fn mask_view_fragment() -> Program {
     let weight = b.fmul(m.weight, quarter);
     let weight = b.fsat(weight);
     let _ = (zero, m.strong, m.any);
+    // Red over all: the nearest texel traced because its history was
+    // rejected (its fourth word is 2).
+    let half = b.f32(0.5);
+    let (px, py, low) = mask_coords(&mut b);
+    let (px, py) = (b.fadd(px, half), b.fadd(py, half));
+    let (px, py) = (b.ffloor(px), b.ffloor(py));
+    let (xmax, ymax) = (b.fsub(low[0], one), b.fsub(low[1], one));
+    let (px, py) = (b.fmax(px, zero), b.fmax(py, zero));
+    let (px, py) = (b.fmin(px, xmax), b.fmin(py, ymax));
+    let (xu, yu, wu) = (b.f2u(px), b.f2u(py), b.f2u(low[0]));
+    let row = b.umul(yu, wu);
+    let at = b.uadd(row, xu);
+    let two_u = b.u32(2);
+    let at4 = b.shl(at, two_u);
+    let rec = b.load_n(0, at4, 0, &[Ty::F32; shadow::TEXEL_WORDS]);
+    let limit = b.f32(1.5);
+    let rejected = b.cmp(CmpOp::Gt, rec[3], limit);
+    let err = b.sel(rejected, one, err);
+    let weight = b.sel(rejected, zero, weight);
+    let factor = b.sel(rejected, zero, m.factor);
     b.output(OutKind::Color(0), 0, err);
     b.output(OutKind::Color(0), 1, weight);
-    b.output(OutKind::Color(0), 2, m.factor);
+    b.output(OutKind::Color(0), 2, factor);
     b.output(OutKind::Color(0), 3, one);
     b.finish()
 }

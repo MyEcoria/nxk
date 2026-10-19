@@ -36,10 +36,14 @@ pub const T_MIN: f32 = 0.10;
 /// `BIAS_SLOPE` times how much the light grazes it.
 pub const BIAS: f32 = 0.10;
 pub const BIAS_SLOPE: f32 = 0.15;
+/// The same for the figure's boxes, which are exact.
+pub const FIGURE_BIAS: f32 = 0.02;
+pub const FIGURE_T_MIN: f32 = 0.01;
 /// Oriented boxes of the moving figure that cast shadows.
 pub const BOXES: usize = 6;
 /// Words of a texel of the mask: the distance, the share of the sun, the
-/// scene's share alone (the accumulated one), and 1 if it traced.
+/// scene's share alone (the accumulated one), and 1 if it traced (2 if
+/// it did because its history was rejected).
 pub const TEXEL_WORDS: usize = 4;
 /// Words of a box: three axes (the world directions of its local x, y,
 /// z), the origin of its local frame, the minimum and the maximum corner
@@ -293,8 +297,11 @@ pub fn kernel(s: Slots) -> Program {
             b.mov(out_dist, dist);
             let n = unpack_normal(b, packed);
 
-            // Where this point was on the last frame's mask, and what that
-            // texel said (accepted when its distance agrees).
+            // Where this point was on the last frame's mask, and what the four
+            // texels around it said, each weighted by how near it is and by
+            // how well its distance agrees (a nearest texel snaps the history
+            // to the grid as the camera moves, and picks the wrong surface at
+            // edges).
             let m = |b: &mut Builder, r: u16, c: u16| b.uniform(u::PREV_VP + 4 * r + c, Ty::F32);
             let mut clip = [zero_f; 3];
             for (k, row) in [0u16, 1, 3].into_iter().enumerate() {
@@ -311,33 +318,13 @@ pub fn kernel(s: Slots) -> Program {
             let (wf, hf) = (b.u2f(w), b.u2f(h));
             let (hw, hh) = (b.fmul(wf, half), b.fmul(hf, half));
             let (ox, oy) = (b.fsub(hw, half), b.fsub(hh, half));
-            // The viewport: window = ndc * size / 2 + size / 2, both axes.
-            let (hx, hy) = (b.fma(nx, hw, ox), b.fma(ny, hh, oy));
-            let (hx, hy) = (b.fadd(hx, half), b.fadd(hy, half));
-            let (hx, hy) = (b.ffloor(hx), b.ffloor(hy));
+            // The viewport: window = ndc * size / 2 + size / 2, both axes;
+            // texel centres at whole numbers.
+            let (px, py) = (b.fma(nx, hw, ox), b.fma(ny, hh, oy));
+            let (x0, y0) = (b.ffloor(px), b.ffloor(py));
+            let (fx, fy) = (b.fsub(px, x0), b.fsub(py, y0));
+            let (gx, gy) = (b.fsub(one_f, fx), b.fsub(one_f, fy));
             let (wmax, hmax) = (b.fsub(wf, one_f), b.fsub(hf, one_f));
-            let in_x = {
-                let a = b.cmp(CmpOp::Ge, hx, zero_f);
-                let c = b.cmp(CmpOp::Le, hx, wmax);
-                b.band(a, c)
-            };
-            let in_y = {
-                let a = b.cmp(CmpOp::Ge, hy, zero_f);
-                let c = b.cmp(CmpOp::Le, hy, hmax);
-                b.band(a, c)
-            };
-            let inside = b.band(in_x, in_y);
-            let inside = b.band(inside, in_front);
-            let (cx, cy) = (b.fmax(hx, zero_f), b.fmax(hy, zero_f));
-            let (cx, cy) = (b.fmin(cx, wmax), b.fmin(cy, hmax));
-            let (xi, yi) = (b.f2u(cx), b.f2u(cy));
-            let row = b.umul(yi, w);
-            let hidx = b.uadd(row, xi);
-            let one_u = b.u32(1);
-            let two_u = b.u32(2);
-            let at4 = b.shl(hidx, two_u);
-            let past = b.load_n(s.hist, at4, 0, &[Ty::F32; TEXEL_WORDS]);
-            let (hd, hc, hf) = (past[0], past[2], past[3]);
             let pc = uni3(b, u::PREV_CAM);
             let rel = [
                 b.fsub(o[0], pc[0]),
@@ -346,16 +333,70 @@ pub fn kernel(s: Slots) -> Program {
             ];
             let r2 = dot(b, rel, rel);
             let prev_dist = b.fsqrt(r2);
-            let diff = b.fsub(hd, prev_dist);
-            let diff = b.fabs(diff);
             let (rel_tol, base_tol) = (b.f32(0.06), b.f32(0.2));
             let tol = b.fma(prev_dist, rel_tol, base_tol);
-            let agrees = b.cmp(CmpOp::Le, diff, tol);
-            let had = b.cmp(CmpOp::Gt, hd, zero_f);
+            let inv_tol = b.frcp(tol);
+            let one_u = b.u32(1);
+            let two_u = b.u32(2);
+            let (sum_w, sum_c, sum_t) = (b.copy(zero_f), b.copy(zero_f), b.copy(zero_f));
+            for j in 0..2 {
+                let yv = if j == 0 { y0 } else { b.fadd(y0, one_f) };
+                let in_y = {
+                    let a = b.cmp(CmpOp::Ge, yv, zero_f);
+                    let c = b.cmp(CmpOp::Le, yv, hmax);
+                    b.band(a, c)
+                };
+                let cy = b.fmax(yv, zero_f);
+                let cy = b.fmin(cy, hmax);
+                let yi = b.f2u(cy);
+                let row = b.umul(yi, w);
+                for i in 0..2 {
+                    let xv = if i == 0 { x0 } else { b.fadd(x0, one_f) };
+                    let in_x = {
+                        let a = b.cmp(CmpOp::Ge, xv, zero_f);
+                        let c = b.cmp(CmpOp::Le, xv, wmax);
+                        b.band(a, c)
+                    };
+                    let cx = b.fmax(xv, zero_f);
+                    let cx = b.fmin(cx, wmax);
+                    let xi = b.f2u(cx);
+                    let hidx = b.uadd(row, xi);
+                    let at4 = b.shl(hidx, two_u);
+                    let past = b.load_n(s.hist, at4, 0, &[Ty::F32; TEXEL_WORDS]);
+                    let (hd, hc, hfl) = (past[0], past[2], past[3]);
+                    let diff = b.fsub(hd, prev_dist);
+                    let diff = b.fabs(diff);
+                    let scaled = b.fmul(diff, inv_tol);
+                    let close = b.fsub(one_f, scaled);
+                    let close = b.fmax(close, zero_f);
+                    let bw = b.fmul(if i == 0 { gx } else { fx }, if j == 0 { gy } else { fy });
+                    let wt = b.fmul(bw, close);
+                    let had = b.cmp(CmpOp::Gt, hd, zero_f);
+                    let ok = b.band(in_x, in_y);
+                    let ok = b.band(ok, had);
+                    let wt = b.sel(ok, wt, zero_f);
+                    let nw = b.fadd(sum_w, wt);
+                    b.mov(sum_w, nw);
+                    let nc = b.fma(wt, hc, sum_c);
+                    b.mov(sum_c, nc);
+                    let was = b.cmp(CmpOp::Gt, hfl, half);
+                    let tw = b.sel(was, wt, zero_f);
+                    let nt = b.fadd(sum_t, tw);
+                    b.mov(sum_t, nt);
+                }
+            }
+            // Too little weight: the point was hidden or off the mask.
+            let enough = b.f32(0.05);
+            let agrees = b.cmp(CmpOp::Gt, sum_w, enough);
+            let denom = b.fmax(sum_w, enough);
+            let rcp = b.frcp(denom);
+            let hc = b.fmul(sum_c, rcp);
+            // The point traced last frame if most of its weight did.
+            let half_w = b.fmul(sum_w, half);
+            let traced_before = b.cmp(CmpOp::Gt, sum_t, half_w);
             let reset = b.uniform(u::RESET, Ty::F32);
             let keep = b.cmp(CmpOp::Le, reset, half);
-            let valid = b.band(inside, agrees);
-            let valid = b.band(valid, had);
+            let valid = b.band(in_front, agrees);
             let valid = b.band(valid, keep);
 
             // Half the texels trace this frame; one whose history was
@@ -370,10 +411,13 @@ pub fn kernel(s: Slots) -> Program {
             let mine = b.cmp(CmpOp::Eq, low_bit, zero_u);
             let invalid = b.bnot(valid);
             let trace = b.bor(mine, invalid);
-            let traced_before = b.cmp(CmpOp::Gt, hf, half);
             let stale = b.bnot(traced_before);
             let trace = b.bor(trace, stale);
+            // 1: traced; 2: traced because the history was rejected (the
+            // Lab's mask view shows those).
             let traced = b.sel(trace, one_f, zero_f);
+            let two_f = b.f32(2.0);
+            let traced = b.sel(invalid, two_f, traced);
             let cov = b.copy(hc);
             // `valid` is needed after the walk: kept as a number meanwhile, so
             // that no predicate is held across the traversal.
@@ -387,6 +431,7 @@ pub fn kernel(s: Slots) -> Program {
             let graze = b.fsub(one_f, lit_n);
             let (slope, base) = (b.f32(BIAS_SLOPE), b.f32(BIAS));
             let bias = b.fma(graze, slope, base);
+            let surface = o;
             let o = [
                 b.fma(n[0], bias, o[0]),
                 b.fma(n[1], bias, o[1]),
@@ -433,6 +478,16 @@ pub fn kernel(s: Slots) -> Program {
             // The figure, every frame and without history: the share of
             // four rays across the sun's disc that miss all its boxes.
             let figure = b.copy(one_f);
+            // The boxes are exact: their rays start just off the surface
+            // (the scene's offset is for flat triangles under smooth
+            // normals, and is wider than an arm is from the body).
+            let (lift, near) = (b.f32(FIGURE_BIAS), b.f32(FIGURE_T_MIN));
+            let o = [
+                b.fma(n[0], lift, surface[0]),
+                b.fma(n[1], lift, surface[1]),
+                b.fma(n[2], lift, surface[2]),
+            ];
+            let t_min = near;
             let close = near_sphere(b, u::SPHERE, o, sun);
             b.if_(close, |b| {
                 let quarter = b.f32(0.25);
