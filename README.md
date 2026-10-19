@@ -597,15 +597,16 @@ program that vanished without closing them (crash) are reclaimed.
     the simulator keeps their sources in use until the result is waited on.
     The multi-function unit and the conversions (`F2I`, `I2F`) do the same
     when their unit is busy: every variable-latency instruction now signals
-    a read scoreboard (before, a 4-cycle window let the shadow kernel lose a
-    few texels now and then, and a select feeding a conversion looked wrong).
+    a read scoreboard. Before, a 4-cycle window let Lumen's shadow kernel
+    get 18 to 103 of 4800 texels wrong in about half its launches; none in
+    96 since. `gpu test` launches that kernel 8 times per case against the
+    reference machine to catch the like.
 
 11. The reconvergence stack (SSY / PBK entries) spills to local memory past
-    its on-chip entries: a QMD or program header with no CRS size, and no
-    room for it in the local memory area, let deeply nested branches go
-    wrong. QMDs and IR headers declare 0x800 bytes per warp (as NVK and
-    nouveau) and `gpu` reserves it per warp; `gpu test` runs the shadow
-    kernel against the reference machine to catch the like.
+    its on-chip entries. QMDs and IR headers declare 0x800 bytes per warp
+    for it and `gpu` reserves them, as NVK and nouveau do; no failure was
+    seen here without it (the shadow kernel was clean in 96 launches with
+    a CRS size of 0), but nothing bounds the nesting depth either.
 
 ## L4T comparison
 

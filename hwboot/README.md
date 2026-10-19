@@ -1108,11 +1108,13 @@ within 5 s.
     jitter whole 8 x 4 groups went dark. `gpu test` now runs the shadow
     kernel on the console against the reference machine (80 x 60 texels,
     positions in an RGBA32F texture): 24 of 4800 texels wrong, varying from
-    run to run, while the simulator agreed. Two compiler/service fixes: a
-    read scoreboard on every variable-latency instruction (MUFU and the
-    conversions read their sources late too, trap 10) and a CRS spill area
-    in QMDs, headers and local memory (trap 11); then 0 of 4800, twice,
-    17/17, ray rates unchanged. The trail came from the checkerboard being
+    run to run, while the simulator agreed. The cure is a read scoreboard
+    on every variable-latency instruction (MUFU and the conversions read
+    their sources late too, trap 10): with each case launched 8 times, the
+    old emitter got 18 to 103 texels wrong in 15 of 32 launches, the new
+    one none in 96, with or without the CRS spill area that QMDs, headers
+    and local memory now declare as NVK does (trap 11). 17/17, ray rates
+    unchanged. The trail came from the checkerboard being
     the screen's: a point moving an odd number of texels a frame kept the
     same parity and never traced. A texel now also traces when its point did
     not trace last frame (a fourth word per texel), and the figure's boxes
