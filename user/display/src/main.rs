@@ -463,7 +463,8 @@ fn tell_sleepers(label: u32, order: impl Iterator<Item = &'static &'static Servi
 }
 
 /// Sleep's steps, off the UI loop. Asleep: the services' hardware off,
-/// window A stops fetching, CPU and GPU at their lowest step (an idle GPU
+/// windows A and the overlay's (`ov`; the UI loop programs it again
+/// awake) stop fetching, CPU and GPU at their lowest step (an idle GPU
 /// at 768 MHz drew 1.8 W, at 76.8 MHz 0.3 W). Awake: the picture and the
 /// game's held FLIP first, the services after.
 fn sleep_steps(
@@ -471,6 +472,7 @@ fn sleep_steps(
     at: u64,
     saved: &mut Option<Saved>,
     dc: &Mmio,
+    ov: Option<Win>,
     link: &Mutex<Link>,
     awake: &Condvar,
 ) {
@@ -480,6 +482,10 @@ fn sleep_steps(
         }
         tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
         window_a(dc, link, false);
+        if let Some(v) = ov {
+            let _l = link.lock();
+            overlay(dc, v, 0, 0, None);
+        }
         let cpu = CPUFREQ
             .call(&Msg::new(cpufreq::STATUS, 0, 0))
             .ok()
@@ -525,7 +531,14 @@ fn sleep_steps(
     );
 }
 
-fn work(w: &Worker, notif: u32, dc: Mmio, link: &Mutex<Link>, awake: &Condvar) -> ! {
+fn work(
+    w: &Worker,
+    notif: u32,
+    dc: Mmio,
+    ov: Option<Win>,
+    link: &Mutex<Link>,
+    awake: &Condvar,
+) -> ! {
     let mut saved: Option<Saved> = None;
     loop {
         let mut q = w.jobs.lock();
@@ -555,7 +568,7 @@ fn work(w: &Worker, notif: u32, dc: Mmio, link: &Mutex<Link>, awake: &Condvar) -
                 continue;
             }
             Job::Sleep(on, at) => {
-                sleep_steps(on, at, &mut saved, &dc, link, awake);
+                sleep_steps(on, at, &mut saved, &dc, ov, link, awake);
                 continue;
             }
         };
@@ -1157,7 +1170,8 @@ fn main() -> i32 {
     });
     {
         let (w2, l2, a2) = (worker.clone(), link.clone(), awake.clone());
-        thread::spawn(move || work(&w2, notif, dc, &l2, &a2)).expect("display: worker thread");
+        thread::spawn(move || work(&w2, notif, dc, ov_win, &l2, &a2))
+            .expect("display: worker thread");
     }
     let game_ep = sys::endpoint_create().expect("display: game endpoint");
     {
@@ -1277,6 +1291,7 @@ fn main() -> i32 {
                     $now.saturating_sub(since) / 1_000_000_000
                 );
                 worker.jobs.lock().push_back(Job::Sleep(false, $now));
+                ov_shown = None;
                 worker.wake.notify_one();
                 if let Some(b) = &bl {
                     b.set(ui.cfg.brightness);
@@ -1609,9 +1624,11 @@ fn main() -> i32 {
                 let now = time::now_ns();
                 let mut batch: Vec<Event> = touches.lock().drain(..).collect();
                 if sleeping {
+                    // Only the Power button wakes: a volume key in a bag must not.
                     let wake_ev = batch.iter().any(|&(kind, code, id, _, _, _)| {
-                        (kind == input::KIND_TOUCH && code == input::TOUCH_DOWN)
-                            || (kind == input::KIND_BUTTON && id == 1)
+                        kind == input::KIND_BUTTON
+                            && id == 1
+                            && matches!(code, input::BTN_POWER | input::BTN_POWER_LONG)
                     });
                     if wake_ev {
                         wake_sleep!(now);
