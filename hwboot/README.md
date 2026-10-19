@@ -1131,12 +1131,19 @@ within 5 s.
     frames; it now samples one texel in 16, only for a Lab started from the
     shell: 60.0 fps, max 16.8 ms with the shadows. The ray room's 30 fps is
     not the GPU (47% busy): `RENDER` runs the batch to its end before it
-    replies and `FLIP` then waits for the blank, so the CPU's frame (3 ms
-    here) and the GPU's never overlap; `present` took 30 ms with the heat
-    map's 5184 rectangles, 14.5 or 30 ms without. Still visible: the
-    quarter-resolution mask (4 x 4 pixels a texel) gives jagged shadow
-    edges where a tree's tier shades the next one and a coarse blot where an
-    arm shades the torso.
+    replies and `FLIP` then waits for the blank, so the CPU's frame and the
+    GPU's never overlap; the room's rays, heat map and readback take about
+    3 ms of CPU, and `present` 30 ms with the heat map's 5184 rectangles,
+    14.5 or 30 ms without. In the valley the CPU's whole frame is 0.2 ms
+    (1.1 ms when the flicker log samples): the budget there is the GPU's.
+    Walking to the trees, the shadow edges between tiers were jagged and
+    speckled: the history came from the nearest texel (the mask view, which
+    now paints texels whose history was rejected red, showed rejections at
+    silhouettes only). It now comes from the four texels around the point,
+    weighted by nearness and distance agreement: soft edges while walking,
+    for about 0.7 ms of GPU (72-81% busy in the Lab walk, 69-76% before).
+    The figure's boxes were tested from the scene's offset (10-25 cm), wider
+    than an arm is from the body; their rays now start 2 cm off.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

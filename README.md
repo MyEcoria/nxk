@@ -144,17 +144,20 @@ compute kernel (`nxk_shader::rt::shadow`) shoots one any-hit ray per texel
 toward the sun over the valley's BVH (built once at load), and the lit
 shader filters the mask per pixel with a joint bilateral upsample
 (distance weights that follow the slope). The valley's share accumulates
-over frames (history reprojected with the last camera, a sun disc of 1.5
-degrees jittered per texel and frame), which gives the edges penumbrae;
+over frames (history reprojected with the last camera from the four
+texels around the point, weighted by nearness and by distance agreement;
+a sun disc of 1.5 degrees jittered per texel and frame), which gives the
+edges penumbrae;
 half the texels trace each frame, plus every texel whose point did not
 trace the frame before (the checkerboard is the screen's, so a point
 moving an odd number of texels a frame would otherwise never trace and
 drag its old shadow along). The six boxes of the moving figure keep no
 history: four rays across the sun's disc test them every frame near its
-bounding sphere, so its shadow follows it without trail. At 1280 x 720
-it holds 60 fps; the GPU is busy 52% without the shadows and about 76% with
+bounding sphere, from 2 cm off the surface (an arm shades the body), so
+its shadow follows it without trail. At 1280 x 720
+it holds 60 fps; the GPU is busy 52% without the shadows and 72-81% with
 them (pre-pass 1 ms, rays about 1.2 ms with half the texels, mask lookup
-0.8 ms). The
+0.8 ms, history from four texels 0.7 ms); the CPU's frame is 0.2 ms. The
 render targets of a game that draws upright on the panel are 720 wide and
 1280 high (`Graphics::panel` turns the picture a quarter), so a mask for
 the screen is too. L + R + Minus opens its hidden **Lab**: frame-time
