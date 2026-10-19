@@ -1612,6 +1612,9 @@ pub mod proto {
         /// a compute kernel sampling it into a buffer, a fragment shader
         /// loading that buffer.
         pub const T3_IR_PATH: u64 = 1 << 15;
+        /// The ray-traced shadows' kernel against the reference machine:
+        /// without and with the sun's jitter, with history.
+        pub const T3_IR_SHADOWS: u64 = 1 << 16;
         /// Four instances of a triangle, moved and colored from the
         /// instance stream and `InstanceId`, land on the expected pixels.
         pub const T3_IR_INSTANCE: u64 = 4096;

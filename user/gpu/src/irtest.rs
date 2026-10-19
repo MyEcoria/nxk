@@ -1260,6 +1260,211 @@ pub fn path(g: &mut Gpu) -> Res<(bool, u64)> {
     Ok((bad == 0, ns))
 }
 
+/// The ray-traced shadows' kernel on the GPU against the reference
+/// machine: a valley with boxes seen by a camera (the pre-pass's positions
+/// worked out on the CPU, sampled from an RGBA32F texture), frames without
+/// and with the sun's jitter, then with history from a camera that moved.
+pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
+    use nxk_shader::rt::{shadow, shadow_demo as sd};
+    const W: usize = 80;
+    const H: usize = 60;
+    let c = match lower::compile(&shadow::kernel(shadow::Slots::default())) {
+        Ok(c) => c,
+        Err(err) => {
+            println!("[gpu] IR shadows: does not compile: {:?}", err);
+            return Ok((false, 0));
+        }
+    };
+    let sc = sd::scene();
+    let (eye, eye2, pitch) = ([0.0, 12.0, -34.0], [0.6, 12.2, -33.4], 0.3);
+    let (mut first, _) = sd::positions(&sc, W, H, eye, pitch);
+    let (mut second, _) = sd::positions(&sc, W, H, eye2, pitch);
+    let frame = |eye, number, jitter, reset| sd::Frame {
+        eye,
+        prev: ([0.0, 12.0, -34.0], 0.3),
+        number,
+        jitter,
+        reset,
+    };
+    let zeros = alloc::vec![0u32; 2 * W * H];
+    let (mut ok, mut ns) = (true, 0);
+    // The reference's masks of the first two frames are the history of
+    // the last two.
+    let mut kept: Vec<Vec<u32>> = Vec::new();
+    for (name, f, later, hist) in [
+        ("no jitter", frame(eye, 0, 0.0, true), false, None),
+        ("jitter", frame(eye, 5, 0.026, true), false, None),
+        ("history, no jitter", frame(eye2, 7, 0.0, false), true, Some(0)),
+        ("history, jitter", frame(eye2, 6, 0.026, false), true, Some(1)),
+    ] {
+        let pos = if later { &mut second } else { &mut first };
+        let hist = hist.map_or(&zeros, |k: usize| &kept[k]).clone();
+        let un = sd::uniforms(&sc, W, H, &f);
+        let want = sd::reference(&sc, pos, &hist, &un);
+        let Some((got, t)) = shadow_frame(g, &c, pos, &hist, &un, &sc.bvh)? else {
+            return Ok((false, ns));
+        };
+        ns += t;
+        let mut wrong = Vec::new();
+        for i in 0..W * H {
+            let (gd, gc) = (f32::from_bits(got[2 * i]), f32::from_bits(got[2 * i + 1]));
+            let (wd, wc) = (f32::from_bits(want[2 * i]), f32::from_bits(want[2 * i + 1]));
+            let off = fmath::abs(gd - wd) > 1e-3 * wd.max(1.0) || !(fmath::abs(gc - wc) <= 0.05);
+            if off {
+                wrong.push(i);
+            }
+        }
+        // Whole groups of 8 x 4 texels gone wrong together.
+        let (gw, gh) = (shadow::GROUP[0] as usize, shadow::GROUP[1] as usize);
+        let mut groups = 0;
+        for gy in 0..H / gh {
+            for gx in 0..W / gw {
+                let at = |k: usize| (gy * gh + k / gw) * W + gx * gw + k % gw;
+                let bad = |k: usize| wrong.binary_search(&at(k)).is_ok();
+                let all = (0..gw * gh).all(|k| bad(k) || pos.texels[at(k)][3] <= 0.0);
+                groups += (all && (0..gw * gh).any(bad)) as usize;
+            }
+        }
+        // A ray grazing an edge may fall either way: a few in a hundred.
+        let pass = wrong.len() * 50 <= W * H && groups == 0;
+        println!(
+            "[gpu] IR shadows ({}): {} of {} texels differ, {} whole groups; {} us ({} registers)",
+            name,
+            wrong.len(),
+            W * H,
+            groups,
+            t / 1000,
+            c.gprs
+        );
+        for &i in wrong.iter().take(4) {
+            println!(
+                "[gpu]   texel ({}, {}): {:?} / {:?}, expected {:?} / {:?}",
+                i % W,
+                i / W,
+                f32::from_bits(got[2 * i]),
+                f32::from_bits(got[2 * i + 1]),
+                f32::from_bits(want[2 * i]),
+                f32::from_bits(want[2 * i + 1])
+            );
+        }
+        ok &= pass;
+        kept.push(want);
+    }
+    Ok((ok, ns))
+}
+
+/// One launch of the shadow kernel: its mask and the time it took, or
+/// None if the GPU hung.
+fn shadow_frame(
+    g: &mut Gpu,
+    c: &lower::Compiled,
+    pos: &nxk_shader::rt::shadow_demo::Positions,
+    hist: &[u32],
+    un: &[u32],
+    bvh: &nxk_shader::rt::Bvh,
+) -> Res<Option<(Vec<u32>, u64)>> {
+    use nxk_shader::rt::shadow;
+    let e = |(e, _): (i64, &str)| -e;
+    let regs = g.regs;
+    let (w, h) = (pos.w as u32, pos.h as u32);
+    let mk = |words: usize| Dma::new((words.max(1) * 4).next_multiple_of(4096));
+    let out_m = mk(hist.len()).map_err(e)?;
+    let hist_m = mk(hist.len()).map_err(e)?;
+    let nodes_m = mk(bvh.nodes.len()).map_err(e)?;
+    let tris_m = mk(bvh.tris.len()).map_err(e)?;
+    out_m.words(0, &alloc::vec![GARBAGE; hist.len()]);
+    hist_m.words(0, hist);
+    nodes_m.words(0, &bvh.nodes);
+    tris_m.words(0, &bvh.tris);
+    // The positions as a block-linear RGBA32F image.
+    let (tf, bpp) = (proto::TF_RGBA32F, 16);
+    let bl = proto::tex_block_log2(h);
+    let tex = Dma::new(proto::tiled_bytes_bpp(w, h, bpp, bl).next_multiple_of(4096)).map_err(e)?;
+    for y in 0..h {
+        for x in 0..w {
+            let t = pos.texels[(y * w + x) as usize];
+            let at = proto::tiled_offset(w, x, y, bpp, bl);
+            tex.words(at, &t.map(f32::to_bits));
+        }
+    }
+    let d = g.dev(0)?;
+    let mems = [&out_m, &hist_m, &nodes_m, &tris_m];
+    let lens = [hist.len(), hist.len(), bvh.nodes.len(), bvh.tris.len()];
+    let mut vas = [0u64; 4];
+    for (k, m) in mems.iter().enumerate() {
+        vas[k] = d.vm.map_cached(m).map_err(e)?;
+    }
+    let tva = d
+        .vm
+        .map_kind(&tex, false, mmu::KIND_GENERIC_16BX2, 1 << 17)
+        .map_err(e)?;
+    mmu::invalidate(&regs, &d.vm).map_err(e)?;
+    let mut desc = alloc::vec![0u32; proto::SHADER_BUFFERS * 4];
+    for k in 0..4 {
+        desc[4 * k] = vas[k] as u32;
+        desc[4 * k + 1] = (vas[k] >> 32) as u32;
+        desc[4 * k + 2] = lens[k] as u32;
+    }
+    let mut handles = alloc::vec![0u32; proto::SHADER_TEXTURES];
+    handles[0] = gfx::Gfx::texture_handle(0);
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    d.gfx.set_texture(
+        0,
+        &gfx::TexImage {
+            va: tva,
+            width: w,
+            height: h,
+            format: tf,
+            block_log2: bl,
+            levels: 1,
+        },
+        proto::TEX_CLAMP | proto::TEX_NEAREST,
+    );
+    let Some((at, len)) = d.compute.install(&c.code) else {
+        return Err(-libnx::abi::err::ENOSPC);
+    };
+    let mut p = Push::default();
+    d.gfx.begin(&mut p);
+    let nospc = || -libnx::abi::err::ENOSPC;
+    let cbs = [
+        d.gfx.stage(&[0; 64]).ok_or_else(nospc)?,
+        d.gfx.stage(un).ok_or_else(nospc)?,
+        d.gfx.stage(&desc).ok_or_else(nospc)?,
+        d.gfx.stage(&handles).ok_or_else(nospc)?,
+    ];
+    let (qat, qva) = d.gfx.alloc_ubo(crate::qmd::SIZE).ok_or_else(nospc)?;
+    let q = Qmd::new3(&Launch3 {
+        program: at,
+        regs: c.gprs.next_multiple_of(8).max(8),
+        grid: [w.div_ceil(shadow::GROUP[0]), h.div_ceil(shadow::GROUP[1]), 1],
+        block: [shadow::GROUP[0], shadow::GROUP[1], 1],
+        cbs: &cbs,
+        local_bytes: c.local_bytes,
+    });
+    d.gfx.ubo_write(qat, &q.bytes());
+    d.gfx.barrier(&mut p);
+    d.compute.launch(&mut p, qva);
+    d.gfx.barrier(&mut p);
+    let t = g.run(p, BATCH_TIMEOUT_US);
+    let d = g.dev.as_mut().ok_or(-libnx::abi::err::ENODEV)?;
+    d.compute.uninstall(at, len);
+    d.gfx.clear_texture(0);
+    for (k, m) in mems.iter().enumerate() {
+        let _ = d.vm.unmap(vas[k], m.len() as u64);
+    }
+    let _ = d.vm.unmap(tva, tex.len() as u64);
+    let _ = mmu::invalidate(&regs, &d.vm);
+    let t = match t {
+        Ok(t) => t,
+        Err(err) => {
+            println!("[gpu] IR shadows: the GPU hung ({})", err);
+            return Ok(None);
+        }
+    };
+    let got = (0..hist.len()).map(|i| out_m.r32(i * 4)).collect();
+    Ok(Some((got, t)))
+}
+
 /// Closest-hit and any-hit traversal of a wide BVH on the GPU: 65536
 /// rays through 4000 triangles against the CPU walk of the same tree,
 /// with the rate it manages: random rays, then a camera's and the

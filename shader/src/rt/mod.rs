@@ -18,6 +18,7 @@ pub mod bvh;
 pub mod demo;
 pub mod kernel;
 pub mod shadow;
+pub mod shadow_demo;
 pub mod trace;
 
 pub use bvh::{build, BuildError, Bvh, Triangle};

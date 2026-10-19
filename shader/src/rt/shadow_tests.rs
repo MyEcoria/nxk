@@ -1,131 +1,26 @@
 use std::vec;
 use std::vec::Vec;
 
-use super::demo::{camera_rays_from, valley};
-use super::shadow::{self, u, BOXES, BOX_WORDS};
+use super::shadow;
 use super::*;
-use crate::interp::{run, Machine, Sampler};
+use crate::interp::{run, Machine};
 use crate::lower::{compile, CB_BUFFERS, CB_TEXTURES, CB_UNIFORMS};
 use crate::sass::{SR_CTAID_X, SR_TID_X};
 use crate::sassim::Sim;
-use crate::{Builder, Builtin, OutKind, Stage, Ty, MAX_ATTRS, MAX_BUFFERS};
+use crate::{Builder, OutKind, Stage, Ty, MAX_ATTRS, MAX_BUFFERS};
 
 const W: usize = 40;
 const H: usize = 30;
-const HALF: f32 = 0.577_350_3;
 
-/// The position target of a pre-pass: a texel per camera ray.
-struct Positions(Vec<[f32; 4]>);
-
-impl Sampler for Positions {
-    fn sample(&mut self, _: u8, u: f32, v: f32, _: Option<f32>) -> [f32; 4] {
-        let (x, y) = ((u * W as f32) as usize, (v * H as f32) as usize);
-        self.0[y.min(H - 1) * W + x.min(W - 1)]
-    }
-}
-
-struct Scene {
-    bvh: Bvh,
-    tris: Vec<Triangle>,
-    boxes: Vec<[f32; 18]>,
-    sun: [f32; 3],
-}
-
-/// The view-projection that maps a point to the texel grid the way
-/// `camera_rays_from` shoots it (rows, as the kernel reads them).
-fn view_projection(eye: [f32; 3], pitch: f32) -> [[f32; 4]; 4] {
-    let (sp, cp) = (pitch.sin(), pitch.cos());
-    let up = [0.0, cp, sp];
-    let fwd = [0.0, -sp, cp];
-    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    [
-        [1.0 / HALF, 0.0, 0.0, -eye[0] / HALF],
-        // Window y grows downward with NDC y, as the console's viewport has it.
-        [0.0, -up[1] / HALF, -up[2] / HALF, dot(eye, up) / HALF],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, fwd[1], fwd[2], -dot(eye, fwd)],
-    ]
-}
-
-/// What `pack_normal` stores, and what the kernel reads back from it.
-fn quantize(n: [f32; 3]) -> ([f32; 3], f32) {
-    let e = |v: f32| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 2047.0 + 0.5) as u32;
-    let (ex, ey) = (e(n[0]), e(n[1]));
-    let sign = (n[2] < 0.0) as u32;
-    let packed = (sign << 22 | ex << 11 | ey) as f32 + 1.0;
-    let (x, y) = (
-        ex as f32 / 2047.0 * 2.0 - 1.0,
-        ey as f32 / 2047.0 * 2.0 - 1.0,
-    );
-    let z = (1.0 - x * x - y * y).max(0.0).sqrt();
-    ([x, y, if sign == 1 { -z } else { z }], packed)
-}
-
-/// The pre-pass's texels: the surface point, the normal packed in w
-/// (0: no ray needed), and the normals as the kernel will read them.
-fn positions(sc: &Scene, eye: [f32; 3], pitch: f32) -> (Vec<[f32; 4]>, Vec<[f32; 3]>) {
-    let mut normals = Vec::new();
-    let pos = camera_rays_from(W, H, eye, pitch)
-        .iter()
-        .enumerate()
-        .map(|(i, r)| match trace::trace(&sc.bvh, r) {
-            // Every seventh texel is "no ray needed".
-            Some(h) if i % 7 != 3 => {
-                let v = sc.tris[h.id as usize].v;
-                let e1 = [v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]];
-                let e2 = [v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]];
-                let mut n = [
-                    e1[1] * e2[2] - e1[2] * e2[1],
-                    e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0],
-                ];
-                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-                let side = n[0] * r.dir[0] + n[1] * r.dir[1] + n[2] * r.dir[2];
-                let f = if side > 0.0 { -1.0 } else { 1.0 } / l;
-                n = [n[0] * f, n[1] * f, n[2] * f];
-                let (nq, packed) = quantize(n);
-                normals.push(nq);
-                [
-                    r.origin[0] + r.dir[0] * h.t,
-                    r.origin[1] + r.dir[1] * h.t,
-                    r.origin[2] + r.dir[2] * h.t,
-                    packed,
-                ]
-            }
-            _ => {
-                normals.push([0.0, 1.0, 0.0]);
-                [0.0; 4]
-            }
-        })
-        .collect();
-    (pos, normals)
-}
+use super::shadow_demo::{Positions, Scene};
 
 fn scene() -> Scene {
-    let tris = valley(40, 60, 3);
-    let bvh = build(&tris).unwrap();
-    let sun = {
-        let v = [0.45f32, 0.7, 0.3];
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        [v[0] / l, v[1] / l, v[2] / l]
-    };
-    // Six boxes standing near the middle of the view, turned about y.
-    let mut boxes = Vec::new();
-    for k in 0..BOXES {
-        let a = k as f32 * 0.7;
-        let (s, c) = (a.sin(), a.cos());
-        let origin = [-1.0 + k as f32 * 0.5, 0.5, 2.0 + (k % 2) as f32];
-        boxes.push([
-            c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c, origin[0], origin[1], origin[2], -0.4, 0.0, -0.3,
-            0.4, 1.4, 0.3,
-        ]);
-    }
-    Scene {
-        bvh,
-        tris,
-        boxes,
-        sun,
-    }
+    super::shadow_demo::scene()
+}
+
+fn positions(sc: &Scene, eye: [f32; 3], pitch: f32) -> (Vec<[f32; 4]>, Vec<[f32; 3]>) {
+    let (p, n) = super::shadow_demo::positions(sc, W, H, eye, pitch);
+    (p.texels, n)
 }
 
 /// The uniforms of a frame: `prev` the camera of the last one, `frame`
@@ -138,55 +33,22 @@ fn uniforms(
     jitter: f32,
     reset: bool,
 ) -> Vec<u32> {
-    let mut un = vec![0u32; u::WORDS];
-    un[u::W as usize] = W as u32;
-    un[u::H as usize] = H as u32;
-    let mut set = |at: u16, v: &[f32]| {
-        for (k, x) in v.iter().enumerate() {
-            un[at as usize + k] = x.to_bits();
-        }
+    let f = super::shadow_demo::Frame {
+        eye: cur,
+        prev,
+        number: frame,
+        jitter,
+        reset,
     };
-    set(u::SUN, &sc.sun);
-    set(u::T_MAX, &[80.0]);
-    set(u::INV_W, &[1.0 / W as f32, 1.0 / H as f32]);
-    set(u::SPHERE, &[0.0, 2.0, 2.5, 6.0]);
-    for (k, bx) in sc.boxes.iter().enumerate() {
-        set(u::BOXES + (k as u16) * BOX_WORDS, bx);
+    super::shadow_demo::uniforms(sc, W, H, &f)
+}
+
+fn texels(pos: &[[f32; 4]]) -> Positions {
+    Positions {
+        w: W,
+        h: H,
+        texels: pos.to_vec(),
     }
-    let vp = view_projection(prev.0, prev.1);
-    for (r, row) in vp.iter().enumerate() {
-        set(u::PREV_VP + 4 * r as u16, row);
-    }
-    set(u::PREV_CAM, &prev.0);
-    set(u::CAM, &cur);
-    set(u::ALPHA, &[0.15]);
-    set(u::JITTER, &[jitter]);
-    set(u::RESET, &[if reset { 1.0 } else { 0.0 }]);
-    // Two unit vectors perpendicular to the sun.
-    let s = sc.sun;
-    let a = if s[0].abs() < 0.9 {
-        [1.0, 0.0, 0.0]
-    } else {
-        [0.0, 1.0, 0.0]
-    };
-    let cross = |p: [f32; 3], q: [f32; 3]| {
-        [
-            p[1] * q[2] - p[2] * q[1],
-            p[2] * q[0] - p[0] * q[2],
-            p[0] * q[1] - p[1] * q[0],
-        ]
-    };
-    let norm = |v: [f32; 3]| {
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        [v[0] / l, v[1] / l, v[2] / l]
-    };
-    let su = norm(cross(s, a));
-    let sv = norm(cross(s, su));
-    set(u::SUN_U, &su);
-    set(u::SUN_V, &sv);
-    set(u::PREV_SPHERE, &[1.0e6, 0.0, 0.0, 0.1]);
-    un[u::FRAME as usize] = frame;
-    un
 }
 
 fn hits_box(b: &[f32; 18], o: [f32; 3], d: [f32; 3], t_min: f32, t_max: f32) -> bool {
@@ -249,34 +111,7 @@ fn differ(got: &[u32], want: &[(f32, f32)], tol: f32) -> usize {
 
 /// One frame of the kernel on the reference machine: its mask.
 fn frame(sc: &Scene, pos: &[[f32; 4]], hist: &[u32], un: &[u32]) -> Vec<u32> {
-    let p = shadow::kernel(shadow::Slots::default());
-    let mut bufs = vec![Vec::new(); MAX_BUFFERS];
-    bufs[0] = vec![0xAAAA_AAAA; 2 * W * H];
-    bufs[1] = hist.to_vec();
-    bufs[2] = sc.bvh.nodes.clone();
-    bufs[3] = sc.bvh.tris.clone();
-    let mut tex = Positions(pos.to_vec());
-    for gy in 0..H.div_ceil(4) {
-        for gx in 0..W.div_ceil(8) {
-            for ly in 0..4 {
-                for lx in 0..8 {
-                    let mut m = Machine {
-                        inputs: [[0; 4]; MAX_ATTRS],
-                        builtins: [0; 11],
-                        uniforms: un,
-                        buffers: &mut bufs,
-                        sampler: &mut tex,
-                    };
-                    m.builtins[Builtin::LocalIdX as usize] = lx;
-                    m.builtins[Builtin::LocalIdY as usize] = ly;
-                    m.builtins[Builtin::GroupIdX as usize] = gx as u32;
-                    m.builtins[Builtin::GroupIdY as usize] = gy as u32;
-                    run(&p, &mut m);
-                }
-            }
-        }
-    }
-    bufs.swap_remove(0)
+    super::shadow_demo::reference(sc, &mut texels(pos), hist, un)
 }
 
 /// The distance of each texel's point from `cam`; 0 for none.
@@ -381,6 +216,73 @@ fn the_jitter_makes_penumbrae() {
     assert!(soft > 3, "{soft}");
 }
 
+/// One frame of the compiled kernel on the simulator, a thread at a time.
+fn on_sim(sc: &Scene, pos: &Positions, hist: &[u32], un: &[u32]) -> Vec<u32> {
+    let (w, h) = (pos.w, pos.h);
+    let p = shadow::kernel(shadow::Slots::default());
+    let c = compile(&p).unwrap();
+    let base = |i: usize| 0x2_0000_0000u64 + 0x100_0000 * i as u64;
+    let mut out = vec![0xAAAA_AAAAu32; 2 * w * h];
+    for gy in 0..h.div_ceil(4) {
+        for gx in 0..w.div_ceil(8) {
+            for ly in 0..4u32 {
+                for lx in 0..8u32 {
+                    let (x, y) = (gx * 8 + lx as usize, gy * 4 + ly as usize);
+                    if x >= w || y >= h {
+                        continue;
+                    }
+                    let mut tex = Positions {
+                        w,
+                        h,
+                        texels: pos.texels.clone(),
+                    };
+                    let mut s = Sim::new(&c.code, &mut tex);
+                    s.cbuf[CB_UNIFORMS as usize] = un.to_vec();
+                    let bufs = [
+                        out.clone(),
+                        hist.to_vec(),
+                        sc.bvh.nodes.clone(),
+                        sc.bvh.tris.clone(),
+                    ];
+                    let mut desc = Vec::new();
+                    for (i, b) in bufs.iter().enumerate() {
+                        desc.extend([base(i) as u32, (base(i) >> 32) as u32, b.len() as u32, 0]);
+                    }
+                    s.cbuf[CB_BUFFERS as usize] = desc;
+                    s.cbuf[CB_TEXTURES as usize] = (0..8u32).collect();
+                    for (i, b) in bufs.into_iter().enumerate() {
+                        s.mem.push((base(i), b));
+                    }
+                    s.sregs.insert(SR_TID_X, lx);
+                    s.sregs.insert(SR_TID_X + 1, ly);
+                    s.sregs.insert(SR_TID_X + 2, 0);
+                    s.sregs.insert(SR_CTAID_X, gx as u32);
+                    s.sregs.insert(SR_CTAID_X + 1, gy as u32);
+                    s.sregs.insert(SR_CTAID_X + 2, 0);
+                    s.regs[255] = 0;
+                    s.local = vec![0xDEAD_BEEF; p.local_words as usize];
+                    s.run().unwrap();
+                    let i = 2 * (y * w + x);
+                    out[i] = s.mem[0].1[i];
+                    out[i + 1] = s.mem[0].1[i + 1];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Texels whose share differs by more than 0.05, or whose distance is not
+/// the same.
+fn mismatches(got: &[u32], want: &[u32]) -> Vec<usize> {
+    (0..got.len() / 2)
+        .filter(|&i| {
+            let (a, b) = (f32::from_bits(got[2 * i + 1]), f32::from_bits(want[2 * i + 1]));
+            (a - b).abs() > 0.05 || got[2 * i] != want[2 * i]
+        })
+        .collect()
+}
+
 #[test]
 fn the_compiled_shadow_kernel_matches_the_reference() {
     let sc = scene();
@@ -392,67 +294,38 @@ fn the_compiled_shadow_kernel_matches_the_reference() {
         .collect();
     let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.02, false);
     let want = frame(&sc, &pos, &hist, &un);
-    let p = shadow::kernel(shadow::Slots::default());
-    let c = compile(&p).unwrap();
-    let base = |i: usize| 0x2_0000_0000u64 + 0x100_0000 * i as u64;
-    let mut out = vec![0xAAAA_AAAAu32; 2 * W * H];
-    for gy in 0..H.div_ceil(4) {
-        for gx in 0..W.div_ceil(8) {
-            for ly in 0..4u32 {
-                for lx in 0..8u32 {
-                    let mut tex = Positions(pos.clone());
-                    let mut s = Sim::new(&c.code, &mut tex);
-                    s.cbuf[CB_UNIFORMS as usize] = un.clone();
-                    let bufs = [
-                        out.clone(),
-                        hist.clone(),
-                        sc.bvh.nodes.clone(),
-                        sc.bvh.tris.clone(),
-                    ];
-                    let mut desc = Vec::new();
-                    for (i, b) in bufs.iter().enumerate() {
-                        desc.extend([base(i) as u32, (base(i) >> 32) as u32, b.len() as u32, 0]);
-                    }
-                    s.cbuf[CB_BUFFERS as usize] = desc;
-                    s.cbuf[CB_TEXTURES as usize] = (0..8u32).collect();
-                    for (i, b) in bufs.iter().enumerate() {
-                        s.mem.push((base(i), b.clone()));
-                    }
-                    s.sregs.insert(SR_TID_X, lx);
-                    s.sregs.insert(SR_TID_X + 1, ly);
-                    s.sregs.insert(SR_TID_X + 2, 0);
-                    s.sregs.insert(SR_CTAID_X, gx as u32);
-                    s.sregs.insert(SR_CTAID_X + 1, gy as u32);
-                    s.sregs.insert(SR_CTAID_X + 2, 0);
-                    s.regs[255] = 0;
-                    s.local = vec![0xDEAD_BEEF; p.local_words as usize];
-                    s.run().unwrap();
-                    let (x, y) = (gx * 8 + lx as usize, gy * 4 + ly as usize);
-                    if x < W && y < H {
-                        let i = 2 * (y * W + x);
-                        out[i] = s.mem[0].1[i];
-                        out[i + 1] = s.mem[0].1[i + 1];
-                    }
-                }
-            }
-        }
-    }
-    let wrong = (0..W * H)
-        .filter(|&i| {
-            let (a, b) = (
-                f32::from_bits(out[2 * i + 1]),
-                f32::from_bits(want[2 * i + 1]),
-            );
-            (a - b).abs() > 0.05 || out[2 * i] != want[2 * i]
-        })
-        .count();
-    std::println!(
-        "compiled shadow kernel: {} registers, {} differ of {}",
-        c.gprs,
-        wrong,
-        W * H
-    );
+    let out = on_sim(&sc, &texels(&pos), &hist, &un);
+    let wrong = mismatches(&out, &want).len();
+    std::println!("compiled shadow kernel: {} differ of {}", wrong, W * H);
     assert!(wrong <= W * H / 50, "{wrong} texels differ");
+}
+
+/// The scene `gpu test` runs on the console (80 x 60, no jitter): the
+/// simulator must agree with the reference.
+#[test]
+fn the_consoles_scene_on_the_simulator() {
+    use super::shadow_demo as sd;
+    let (w, h) = (80, 60);
+    let sc = scene();
+    let (mut pos, _) = sd::positions(&sc, w, h, EYE, PITCH);
+    let f = sd::Frame {
+        eye: EYE,
+        prev: (EYE, PITCH),
+        number: 0,
+        jitter: 0.0,
+        reset: true,
+    };
+    let un = sd::uniforms(&sc, w, h, &f);
+    let zeros = vec![0u32; 2 * w * h];
+    let want = sd::reference(&sc, &mut pos, &zeros, &un);
+    let got = on_sim(&sc, &pos, &zeros, &un);
+    let wrong = mismatches(&got, &want);
+    std::println!(
+        "console's scene on the simulator: {} differ: {:?}",
+        wrong.len(),
+        wrong.iter().map(|i| (i % w, i / w)).collect::<Vec<_>>()
+    );
+    assert!(wrong.is_empty());
 }
 
 /// `lit_factor` on a mask given as signed distances (negative: in
@@ -473,7 +346,7 @@ fn factor(mask: &[f32], w: u32, h: u32, px: f32, py: f32, dist: f32) -> f32 {
     let mut bufs = vec![Vec::new(); MAX_BUFFERS];
     bufs[0] = records(mask);
     let uniforms = [px, py, dist, w as f32, h as f32].map(f32::to_bits);
-    let mut tex = Positions(vec![]);
+    let mut tex = crate::interp::NoTextures;
     let mut m = Machine {
         inputs: [[0; 4]; MAX_ATTRS],
         builtins: [0; 11],

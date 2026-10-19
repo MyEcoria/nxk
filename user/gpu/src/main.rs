@@ -1290,13 +1290,14 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
 /// The shader compiler on the GPU: random compute programs, and a draw.
 fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     type Case = fn(&mut Gpu) -> core::result::Result<(bool, u64), i64>;
-    let cases: [(u64, &str, Case); 6] = [
+    let cases: [(u64, &str, Case); 7] = [
         (proto::T3_IR_COMPUTE, "compute", irtest::compute),
         (proto::T3_IR_DRAW, "draw", irtest::draw),
         (proto::T3_IR_INSTANCE, "instanced", irtest::instanced),
         (proto::T3_IR_TARGET, "targets", irtest::targets),
         (proto::T3_IR_RAYS, "rays", irtest::rays),
         (proto::T3_IR_PATH, "path", irtest::path),
+        (proto::T3_IR_SHADOWS, "shadows", irtest::shadows),
     ];
     let (mut pass, mut run, mut ns) = (0, 0, 0);
     // A hang resets the GPU: the next test starts it again.
