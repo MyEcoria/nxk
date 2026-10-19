@@ -2,17 +2,21 @@
 //! positions of the visible surfaces at reduced resolution into an
 //! RGBA32F target (xyz: the point, pushed off the surface; w: the distance
 //! from the camera, 0 where no ray is needed). `kernel` reads that target
-//! and shoots an any-hit ray toward the sun per texel, over the scene's
-//! tree and over the boxes of the moving figure, and writes two words per
-//! texel: the distance (0 where no ray was needed) and the share of the
-//! sun that reaches it. The share is accumulated over frames: the texel's
-//! world position is projected with the last frame's camera, the mask of
-//! the last frame (the other buffer of a ping-pong pair) is read there,
-//! accepted when its distance agrees, and blended with a new sample; the
-//! ray leaves in a direction jittered inside the sun's disc, per texel and
-//! frame, which turns the edges into penumbrae; half the texels (a
-//! checkerboard that swaps every frame) trace and the rest keep their
-//! history, unless it was rejected. The lit fragment shader asks
+//! and shoots an any-hit ray toward the sun per texel over the scene's
+//! tree, and writes `TEXEL_WORDS` words per texel: the distance (0 where
+//! no ray was needed), the share of the sun that reaches it, the scene's
+//! share alone, and whether the texel traced. The scene's share is
+//! accumulated over frames: the texel's world position is projected with
+//! the last frame's camera, the mask of the last frame (the other buffer
+//! of a ping-pong pair) is read there, accepted when its distance agrees,
+//! and blended with a new sample; the ray leaves in a direction jittered
+//! inside the sun's disc, per texel and frame, which turns the edges into
+//! penumbrae; half the texels (a checkerboard that swaps every frame)
+//! trace and the rest keep their history, unless it was rejected or its
+//! point did not trace last frame. The moving figure's boxes keep no
+//! history: four rays across the sun's disc test them every frame, near
+//! its bounding sphere, and their share multiplies the scene's. The lit
+//! fragment shader asks
 //! `lit_factor` for the mask at its pixel: a joint bilateral upsample that
 //! weighs the four nearest texels by how close their distance is to its
 //! own.
@@ -34,6 +38,9 @@ pub const BIAS: f32 = 0.10;
 pub const BIAS_SLOPE: f32 = 0.15;
 /// Oriented boxes of the moving figure that cast shadows.
 pub const BOXES: usize = 6;
+/// Words of a texel of the mask: the distance, the share of the sun, the
+/// scene's share alone (the accumulated one), and 1 if it traced.
+pub const TEXEL_WORDS: usize = 4;
 /// Words of a box: three axes (the world directions of its local x, y,
 /// z), the origin of its local frame, the minimum and the maximum corner
 /// in that frame.
@@ -67,10 +74,8 @@ pub mod u {
     /// Two unit vectors perpendicular to the sun and to each other.
     pub const SUN_U: u16 = FRAME + 4;
     pub const SUN_V: u16 = FRAME + 7;
-    /// The figure's sphere in the last frame.
-    pub const PREV_SPHERE: u16 = FRAME + 10;
     /// The camera now.
-    pub const CAM: u16 = PREV_SPHERE + 4;
+    pub const CAM: u16 = FRAME + 10;
     pub const WORDS: usize = CAM as usize + 3;
 }
 
@@ -220,6 +225,19 @@ fn unpack_normal(b: &mut Builder, packed: Reg) -> [Reg; 3] {
     n
 }
 
+/// The unit direction `sun + ra * SUN_U + rb * SUN_V`.
+fn disc_dir(b: &mut Builder, sun: [Reg; 3], ra: Reg, rb: Reg) -> [Reg; 3] {
+    let (su, sv) = (uni3(b, u::SUN_U), uni3(b, u::SUN_V));
+    let mut d = sun;
+    for k in 0..3 {
+        let t0 = b.fma(su[k], ra, sun[k]);
+        d[k] = b.fma(sv[k], rb, t0);
+    }
+    let len2 = dot(b, d, d);
+    let rl = b.frsq(len2);
+    [b.fmul(d[0], rl), b.fmul(d[1], rl), b.fmul(d[2], rl)]
+}
+
 /// `v` modulo 1.
 fn fract(b: &mut Builder, v: Reg) -> Reg {
     let f = b.ffloor(v);
@@ -257,6 +275,8 @@ pub fn kernel(s: Slots) -> Program {
         // What this texel says: no distance, all lit, until a ray decides.
         let out_dist = b.copy(zero_f);
         let out_cov = b.copy(one_f);
+        let out_scene = b.copy(one_f);
+        let out_traced = b.copy(zero_f);
         let needed = b.cmp(CmpOp::Gt, packed, zero_f);
         b.if_(needed, |b| {
             // The point on the surface, its distance from the camera, and
@@ -314,9 +334,10 @@ pub fn kernel(s: Slots) -> Program {
             let row = b.umul(yi, w);
             let hidx = b.uadd(row, xi);
             let one_u = b.u32(1);
-            let at2 = b.shl(hidx, one_u);
-            let past = b.load_n(s.hist, at2, 0, &[Ty::F32; 2]);
-            let (hd, hc) = (past[0], past[1]);
+            let two_u = b.u32(2);
+            let at4 = b.shl(hidx, two_u);
+            let past = b.load_n(s.hist, at4, 0, &[Ty::F32; TEXEL_WORDS]);
+            let (hd, hc, hf) = (past[0], past[2], past[3]);
             let pc = uni3(b, u::PREV_CAM);
             let rel = [
                 b.fsub(o[0], pc[0]),
@@ -338,7 +359,9 @@ pub fn kernel(s: Slots) -> Program {
             let valid = b.band(valid, keep);
 
             // Half the texels trace this frame; one whose history was
-            // rejected always does.
+            // rejected, or whose point did not trace last frame, always does
+            // (a point that moves an odd number of texels a frame would
+            // never trace otherwise: the checkerboard is the screen's).
             let frame = b.uniform(u::FRAME, Ty::U32);
             let xy = b.uadd(x, y);
             let par = b.uadd(xy, frame);
@@ -347,11 +370,33 @@ pub fn kernel(s: Slots) -> Program {
             let mine = b.cmp(CmpOp::Eq, low_bit, zero_u);
             let invalid = b.bnot(valid);
             let trace = b.bor(mine, invalid);
+            let traced_before = b.cmp(CmpOp::Gt, hf, half);
+            let stale = b.bnot(traced_before);
+            let trace = b.bor(trace, stale);
+            let traced = b.sel(trace, one_f, zero_f);
             let cov = b.copy(hc);
             // `valid` is needed after the walk: kept as a number meanwhile, so
             // that no predicate is held across the traversal.
             let (one_n, zero_n) = (b.u32(1), b.u32(0));
             let valid_n = b.sel(valid, one_n, zero_n);
+            // The ray starts off the surface along the normal, more where
+            // the light grazes it.
+            let sun = uni3(b, u::SUN);
+            let sun_n = dot(b, n, sun);
+            let lit_n = b.fsat(sun_n);
+            let graze = b.fsub(one_f, lit_n);
+            let (slope, base) = (b.f32(BIAS_SLOPE), b.f32(BIAS));
+            let bias = b.fma(graze, slope, base);
+            let o = [
+                b.fma(n[0], bias, o[0]),
+                b.fma(n[1], bias, o[1]),
+                b.fma(n[2], bias, o[2]),
+            ];
+            // Hits closer than this are the surface's own (flat triangles
+            // against a smooth normal).
+            let t_min = b.f32(T_MIN);
+            let t_max = b.uniform(u::T_MAX, Ty::F32);
+            let radius = b.uniform(u::JITTER, Ty::F32);
             b.if_(trace, |b| {
                 // A direction in the sun's disc: a point of the R2
                 // sequence, shifted per texel, advancing with the frame.
@@ -373,44 +418,43 @@ pub fn kernel(s: Slots) -> Program {
                 let (a1, b1) = (fract(b, a0), fract(b, b0));
                 let (two_f, minus) = (b.f32(2.0), b.f32(-1.0));
                 let (a2, b2) = (b.fma(a1, two_f, minus), b.fma(b1, two_f, minus));
-                let radius = b.uniform(u::JITTER, Ty::F32);
                 let (ra, rb) = (b.fmul(a2, radius), b.fmul(b2, radius));
-                let sun = uni3(b, u::SUN);
-                let (su, sv) = (uni3(b, u::SUN_U), uni3(b, u::SUN_V));
-                let mut d = [zero_f; 3];
-                for k in 0..3 {
-                    let t0 = b.fma(su[k], ra, sun[k]);
-                    d[k] = b.fma(sv[k], rb, t0);
-                }
-                let len2 = dot(b, d, d);
-                let rl = b.frsq(len2);
-                let d = [b.fmul(d[0], rl), b.fmul(d[1], rl), b.fmul(d[2], rl)];
-                // Hits closer than this are the surface's own (flat
-                // triangles against a smooth normal).
-                let t_min = b.f32(T_MIN);
-                let t_max = b.uniform(u::T_MAX, Ty::F32);
-                // The ray starts off the surface along the normal, more
-                // where the light grazes it.
-                let sun_n = dot(b, n, sun);
-                let lit_n = b.fsat(sun_n);
-                let graze = b.fsub(one_f, lit_n);
-                let (slope, base) = (b.f32(BIAS_SLOPE), b.f32(BIAS));
-                let bias = b.fma(graze, slope, base);
-                let ro = [
-                    b.fma(n[0], bias, o[0]),
-                    b.fma(n[1], bias, o[1]),
-                    b.fma(n[2], bias, o[2]),
-                ];
-                let o = ro;
+                let d = disc_dir(b, sun, ra, rb);
                 let wk = walk(b, s.nodes, s.tris, o, d, t_min, t_max, true, false);
-                let blocked = b.copy(wk.found);
-                // The figure: a sphere test first, then its boxes.
-                let close = near_sphere(b, u::SPHERE, o, d);
-                let free = b.cmp(CmpOp::Eq, blocked, zero_u);
-                let test = b.band(close, free);
-                b.if_(test, |b| {
+                let shadowed = b.cmp(CmpOp::Ne, wk.found, zero_u);
+                let lit = b.sel(shadowed, zero_f, one_f);
+                let alpha = b.uniform(u::ALPHA, Ty::F32);
+                let delta = b.fsub(lit, hc);
+                let blend = b.fma(delta, alpha, hc);
+                let valid_again = b.cmp(CmpOp::Ne, valid_n, zero_n);
+                let fresh = b.sel(valid_again, blend, lit);
+                b.mov(cov, fresh);
+            });
+            // The figure, every frame and without history: the share of
+            // four rays across the sun's disc that miss all its boxes.
+            let figure = b.copy(one_f);
+            let close = near_sphere(b, u::SPHERE, o, sun);
+            b.if_(close, |b| {
+                let quarter = b.f32(0.25);
+                let (half_r, nhalf_r) = (b.fmul(radius, half), b.f32(0.0));
+                let nhalf_r = b.fsub(nhalf_r, half_r);
+                let ray = b.u32(0);
+                let (four, stride, count) =
+                    (b.u32(4), b.u32(BOX_WORDS as u32), b.u32(BOXES as u32));
+                b.loop_(4, |b| {
+                    // Offsets (-+ r/2, -+ r/2) from the ray's two low bits.
+                    let bit0 = b.and(ray, one_u);
+                    let sh = b.shr(ray, one_u);
+                    let bit1 = b.and(sh, one_u);
+                    let (p0, p1) = (
+                        b.cmp(CmpOp::Ne, bit0, zero_u),
+                        b.cmp(CmpOp::Ne, bit1, zero_u),
+                    );
+                    let ra = b.sel(p0, half_r, nhalf_r);
+                    let rb = b.sel(p1, half_r, nhalf_r);
+                    let d = disc_dir(b, sun, ra, rb);
+                    let blocked = b.copy(zero_u);
                     let k = b.u32(0);
-                    let (stride, count) = (b.u32(BOX_WORDS as u32), b.u32(BOXES as u32));
                     b.loop_(BOXES as u32, |b| {
                         let base = b.umul(k, stride);
                         let hit = hits_box(b, base, o, d, t_min, t_max);
@@ -421,37 +465,40 @@ pub fn kernel(s: Slots) -> Program {
                         let done = b.cmp(CmpOp::Ge, k, count);
                         b.break_if(done);
                     });
+                    let hit = b.cmp(CmpOp::Ne, blocked, zero_u);
+                    let less = b.fsub(figure, quarter);
+                    let nf = b.sel(hit, less, figure);
+                    b.mov(figure, nf);
+                    let nr = b.uadd(ray, one_u);
+                    b.mov(ray, nr);
+                    let done = b.cmp(CmpOp::Ge, ray, four);
+                    b.break_if(done);
                 });
-                let shadowed = b.cmp(CmpOp::Ne, blocked, zero_u);
-                let lit = b.sel(shadowed, zero_f, one_f);
-                // Near the figure, before or now, history lags behind it:
-                // the new sample counts for most.
-                let was = near_sphere(b, u::PREV_SPHERE, o, d);
-                let figure = b.bor(close, was);
-                let slow = b.uniform(u::ALPHA, Ty::F32);
-                let fast = b.f32(0.7);
-                let alpha = b.sel(figure, fast, slow);
-                let delta = b.fsub(lit, hc);
-                let blend = b.fma(delta, alpha, hc);
-                let valid_again = b.cmp(CmpOp::Ne, valid_n, zero_n);
-                let fresh = b.sel(valid_again, blend, lit);
-                b.mov(cov, fresh);
             });
-            b.mov(out_cov, cov);
+            let share = b.fmul(cov, figure);
+            b.mov(out_cov, share);
+            b.mov(out_scene, cov);
+            b.mov(out_traced, traced);
         });
         let row = b.umul(y, w);
         let at = b.uadd(row, x);
-        let one_u = b.u32(1);
-        let at2 = b.shl(at, one_u);
-        let (db, cb) = (b.fbits(out_dist), b.fbits(out_cov));
-        b.store(s.out, at2, 0, &[db, cb]);
+        let two_u = b.u32(2);
+        let at4 = b.shl(at, two_u);
+        let words = [
+            b.fbits(out_dist),
+            b.fbits(out_cov),
+            b.fbits(out_scene),
+            b.fbits(out_traced),
+        ];
+        b.store(s.out, at4, 0, &words);
     });
     b.finish()
 }
 
 /// The lit fragment shader's share of the sun: 1 when the pixel is lit, 0
 /// in shadow, between where the mask's four nearest texels disagree (the
-/// mask is `Slots::out`: two words a texel, the distance and the share).
+/// mask is `Slots::out`: `TEXEL_WORDS` words a texel, the distance and the
+/// share first).
 /// `px`, `py`: the pixel in texel coordinates of the mask, texel centres
 /// at whole numbers; `dist`: its distance from the camera; `tol`: how far
 /// from `dist` a texel's distance may be and still count (more on a
@@ -519,9 +566,9 @@ pub fn lit_factor_ex(
         for (i, xv) in xs.iter().enumerate() {
             let xu = b.f2u(*xv);
             let at = b.uadd(row, xu);
-            let one_u = b.u32(1);
-            let at2 = b.shl(at, one_u);
-            let rec = b.load_n(buf, at2, 0, &[Ty::F32; 2]);
+            let two_u = b.u32(2);
+            let at4 = b.shl(at, two_u);
+            let rec = b.load_n(buf, at4, 0, &[Ty::F32; 2]);
             let (s, cov) = (rec[0], rec[1]);
             let valid = b.cmp(CmpOp::Gt, s, zero);
             let e = {

@@ -108,7 +108,13 @@ impl Sampler for Positions {
 /// The pre-pass's texels seen from `eye`: the surface point, the normal
 /// packed in w (0: no ray needed, every seventh texel), and the normals
 /// as the kernel will read them.
-pub fn positions(sc: &Scene, w: usize, h: usize, eye: [f32; 3], pitch: f32) -> (Positions, Vec<[f32; 3]>) {
+pub fn positions(
+    sc: &Scene,
+    w: usize,
+    h: usize,
+    eye: [f32; 3],
+    pitch: f32,
+) -> (Positions, Vec<[f32; 3]>) {
     let mut normals = Vec::new();
     let texels = camera_rays_from(w, h, eye, pitch)
         .iter()
@@ -188,18 +194,17 @@ pub fn uniforms(sc: &Scene, w: usize, h: usize, f: &Frame) -> Vec<u32> {
     let su = normalize(cross(s, a));
     set(u::SUN_U, &su);
     set(u::SUN_V, &normalize(cross(s, su)));
-    set(u::PREV_SPHERE, &[1.0e6, 0.0, 0.0, 0.1]);
     un[u::FRAME as usize] = f.number;
     un
 }
 
-/// One frame of the kernel on the reference machine: its mask (two words
-/// a texel), from last frame's `hist`.
+/// One frame of the kernel on the reference machine: its mask
+/// (`shadow::TEXEL_WORDS` words a texel), from last frame's `hist`.
 pub fn reference(sc: &Scene, pos: &mut Positions, hist: &[u32], un: &[u32]) -> Vec<u32> {
     let (w, h) = (pos.w, pos.h);
     let p = shadow::kernel(shadow::Slots::default());
     let mut bufs = vec![Vec::new(); MAX_BUFFERS];
-    bufs[0] = vec![0xAAAA_AAAA; 2 * w * h];
+    bufs[0] = vec![0xAAAA_AAAA; shadow::TEXEL_WORDS * w * h];
     bufs[1] = hist.to_vec();
     bufs[2] = sc.bvh.nodes.clone();
     bufs[3] = sc.bvh.tris.clone();

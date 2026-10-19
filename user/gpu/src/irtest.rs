@@ -1286,7 +1286,8 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
         jitter,
         reset,
     };
-    let zeros = alloc::vec![0u32; 2 * W * H];
+    const TW: usize = shadow::TEXEL_WORDS;
+    let zeros = alloc::vec![0u32; TW * W * H];
     let (mut ok, mut ns) = (true, 0);
     // The reference's masks of the first two frames are the history of
     // the last two.
@@ -1307,9 +1308,10 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
         ns += t;
         let mut wrong = Vec::new();
         for i in 0..W * H {
-            let (gd, gc) = (f32::from_bits(got[2 * i]), f32::from_bits(got[2 * i + 1]));
-            let (wd, wc) = (f32::from_bits(want[2 * i]), f32::from_bits(want[2 * i + 1]));
-            let off = fmath::abs(gd - wd) > 1e-3 * wd.max(1.0) || !(fmath::abs(gc - wc) <= 0.05);
+            let word = |m: &[u32], k: usize| f32::from_bits(m[TW * i + k]);
+            let (gd, wd) = (word(&got, 0), word(&want, 0));
+            let off = fmath::abs(gd - wd) > 1e-3 * wd.max(1.0)
+                || (1..TW).any(|k| !(fmath::abs(word(&got, k) - word(&want, k)) <= 0.05));
             if off {
                 wrong.push(i);
             }
@@ -1338,13 +1340,11 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
         );
         for &i in wrong.iter().take(4) {
             println!(
-                "[gpu]   texel ({}, {}): {:?} / {:?}, expected {:?} / {:?}",
+                "[gpu]   texel ({}, {}): {:?}, expected {:?}",
                 i % W,
                 i / W,
-                f32::from_bits(got[2 * i]),
-                f32::from_bits(got[2 * i + 1]),
-                f32::from_bits(want[2 * i]),
-                f32::from_bits(want[2 * i + 1])
+                got[TW * i..TW * i + TW].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
+                want[TW * i..TW * i + TW].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>()
             );
         }
         ok &= pass;

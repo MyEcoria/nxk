@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use nxgfx::ir::rt::shadow::{self, u, BOXES, BOX_WORDS};
+use nxgfx::ir::rt::shadow::{self, u, BOXES, BOX_WORDS, TEXEL_WORDS};
 use nxgfx::raytrace::RtScene;
 use nxgfx::{
     Attr, Buffer, Cull, Frame, Graphics, Pipeline, PipelineDesc, RenderTarget, Sampling, Shader,
@@ -41,17 +41,18 @@ pub struct Shadows {
     scene: Rc<RtScene>,
     kernel: Shader,
     pub target: RenderTarget,
-    /// Two masks, two words a texel (distance, share of the sun): the
-    /// kernel writes one and reads the other, then they swap.
+    /// Two masks, `TEXEL_WORDS` words a texel (distance, share of the sun,
+    /// the scene's share, traced): the kernel writes one and reads the
+    /// other, then they swap.
     masks: [Buffer; 2],
     cur: usize,
     pub pipeline: Pipeline,
     pub w: u32,
     pub h: u32,
     frame: u32,
-    /// The last frame: the view-projection, the camera, the sun and the
-    /// figure's sphere (None before the first).
-    prev: Option<([[f32; 4]; 4], [f32; 3], [f32; 3], [f32; 4])>,
+    /// The last frame: the view-projection, the camera and the sun (None
+    /// before the first).
+    prev: Option<([[f32; 4]; 4], [f32; 3], [f32; 3])>,
 }
 
 impl Shadows {
@@ -77,8 +78,8 @@ impl Shadows {
             },
         )?;
         let masks = [
-            g.buffer_zeroed((w * h * 2) as usize)?,
-            g.buffer_zeroed((w * h * 2) as usize)?,
+            g.buffer_zeroed(w as usize * h as usize * TEXEL_WORDS)?,
+            g.buffer_zeroed(w as usize * h as usize * TEXEL_WORDS)?,
         ];
         let kernel = g.shader(&shadow::kernel(shadow::Slots::default()))?;
         let fs = g.shader(&position_fragment())?;
@@ -138,7 +139,7 @@ impl Shadows {
         }
         // The last frame's camera; the history is forgotten on the first
         // frame and when the sun jumped (a change of the time of day).
-        let (pvp, pcam, psun, psphere) = self.prev.unwrap_or((*vp, eye, sun, sphere));
+        let (pvp, pcam, psun) = self.prev.unwrap_or((*vp, eye, sun));
         let cos = sun[0] * psun[0] + sun[1] * psun[1] + sun[2] * psun[2];
         let reset = self.prev.is_none() || forget || cos < 0.999_95;
         for (r, row) in pvp.iter().enumerate() {
@@ -158,13 +159,12 @@ impl Shadows {
         let sv = crate::meshes::normalize(crate::meshes::cross(sun, su));
         set(u::SUN_U, &su);
         set(u::SUN_V, &sv);
-        set(u::PREV_SPHERE, &psphere);
         set(u::CAM, &eye);
         un[u::W as usize] = self.w;
         un[u::H as usize] = self.h;
         un[u::FRAME as usize] = self.frame;
         self.frame = self.frame.wrapping_add(1);
-        self.prev = Some((*vp, eye, sun, sphere));
+        self.prev = Some((*vp, eye, sun));
         let (now, before) = (self.cur, 1 - self.cur);
         f.barrier();
         f.bind_texture(0, self.target.texture());
@@ -190,12 +190,13 @@ impl Shadows {
     /// between (a test aid for flicker).
     pub fn flicker(&self) -> String {
         let (w, h) = (self.w as usize, self.h as usize);
-        let (mut a, mut b) = (vec![0u32; w * h * 2], vec![0u32; w * h * 2]);
+        let tw = TEXEL_WORDS;
+        let (mut a, mut b) = (vec![0u32; w * h * tw], vec![0u32; w * h * tw]);
         self.masks[1 - self.cur].read_words(0, &mut a);
         self.masks[self.cur].read_words(0, &mut b);
-        let f = |v: &[u32], i: usize| f32::from_bits(v[2 * i + 1]);
+        let f = |v: &[u32], i: usize| f32::from_bits(v[tw * i + 1]);
         let used: Vec<usize> = (0..w * h)
-            .filter(|&i| f32::from_bits(a[2 * i]) > 0.0 && f32::from_bits(b[2 * i]) > 0.0)
+            .filter(|&i| f32::from_bits(a[tw * i]) > 0.0 && f32::from_bits(b[tw * i]) > 0.0)
             .collect();
         let moved = used
             .iter()
@@ -214,10 +215,11 @@ impl Shadows {
     pub fn describe(&self) -> String {
         let m = &self.masks[1 - self.cur];
         let (w, h) = (self.w as usize, self.h as usize);
-        let mut all = vec![0u32; w * h * 2];
+        let tw = TEXEL_WORDS;
+        let mut all = vec![0u32; w * h * tw];
         m.read_words(0, &mut all);
         let used = (0..w * h)
-            .filter(|&i| f32::from_bits(all[2 * i]) > 0.0)
+            .filter(|&i| f32::from_bits(all[tw * i]) > 0.0)
             .count();
         let mut col = String::new();
         let x = w / 2;
@@ -225,8 +227,8 @@ impl Shadows {
             let i = y * w + x;
             col.push_str(&format!(
                 " {:.1}/{:.2}",
-                f32::from_bits(all[2 * i]),
-                f32::from_bits(all[2 * i + 1])
+                f32::from_bits(all[tw * i]),
+                f32::from_bits(all[tw * i + 1])
             ));
         }
         format!("mask: {} of {} texels have a distance;{}", used, w * h, col)

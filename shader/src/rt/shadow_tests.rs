@@ -1,7 +1,7 @@
 use std::vec;
 use std::vec::Vec;
 
-use super::shadow;
+use super::shadow::{self, u};
 use super::*;
 use crate::interp::{run, Machine};
 use crate::lower::{compile, CB_BUFFERS, CB_TEXTURES, CB_UNIFORMS};
@@ -11,6 +11,7 @@ use crate::{Builder, OutKind, Stage, Ty, MAX_ATTRS, MAX_BUFFERS};
 
 const W: usize = 40;
 const H: usize = 30;
+const TW: usize = shadow::TEXEL_WORDS;
 
 use super::shadow_demo::{Positions, Scene};
 
@@ -103,7 +104,7 @@ fn differ(got: &[u32], want: &[(f32, f32)], tol: f32) -> usize {
     want.iter()
         .enumerate()
         .filter(|(i, w)| {
-            let (d, c) = (f32::from_bits(got[2 * i]), f32::from_bits(got[2 * i + 1]));
+            let (d, c) = (f32::from_bits(got[TW * i]), f32::from_bits(got[TW * i + 1]));
             (d - w.0).abs() > 1e-3 * w.0.max(1.0) || (c - w.1).abs() > tol
         })
         .count()
@@ -136,7 +137,7 @@ fn the_shadow_kernel_matches_the_cpu() {
     let want = expected(&sc, EYE, &pos, &normals);
     // A first frame: no history, so every texel traces.
     let un = uniforms(&sc, EYE, (EYE, PITCH), 0, 0.0, false);
-    let out = frame(&sc, &pos, &vec![0; 2 * W * H], &un);
+    let out = frame(&sc, &pos, &vec![0; TW * W * H], &un);
     let shadowed = want.iter().filter(|w| w.0 > 0.0 && w.1 == 0.0).count();
     let lit = want.iter().filter(|w| w.0 > 0.0 && w.1 == 1.0).count();
     let wrong = differ(&out, &want, 1e-3);
@@ -149,31 +150,43 @@ fn the_shadow_kernel_matches_the_cpu() {
 fn history_is_found_where_the_point_was_and_half_the_texels_keep_it() {
     let sc = scene();
     let (pos, _) = positions(&sc, EYE, PITCH);
-    // The last frame said 0.5 everywhere, with the right distances.
-    let hist: Vec<u32> = dists(&pos, EYE)
-        .iter()
-        .flat_map(|d| [d.to_bits(), 0.5f32.to_bits()])
-        .collect();
+    // The last frame said 0.5 everywhere, with the right distances, and
+    // every texel had traced.
+    let hist_with = |traced: f32| -> Vec<u32> {
+        dists(&pos, EYE)
+            .iter()
+            .flat_map(|d| {
+                [
+                    d.to_bits(),
+                    0.5f32.to_bits(),
+                    0.5f32.to_bits(),
+                    traced.to_bits(),
+                ]
+            })
+            .collect()
+    };
+    let hist = hist_with(1.0);
     let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.0, false);
-    let out = frame(&sc, &pos, &hist, &un);
     let needed = pos.iter().filter(|p| p[3] > 0.0).count();
-    let kept = (0..W * H)
-        .filter(|&i| pos[i][3] > 0.0 && f32::from_bits(out[2 * i + 1]) == 0.5)
-        .count();
-    std::println!("history: {kept} of {needed} texels kept their 0.5");
-    // Half the texels do not trace; the history of the others is blended
-    // toward lit or shadow (0.575 or 0.425), the sphere's neighbours faster.
-    assert!(
-        kept > needed * 4 / 10 && kept < needed * 6 / 10,
-        "{kept} of {needed}"
-    );
-    // Forgetting history: all trace, none keeps 0.5.
-    let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.0, true);
+    // The scene's share kept as it was.
+    let kept = |out: &[u32]| {
+        (0..W * H)
+            .filter(|&i| pos[i][3] > 0.0 && f32::from_bits(out[TW * i + 2]) == 0.5)
+            .count()
+    };
     let out = frame(&sc, &pos, &hist, &un);
-    let kept = (0..W * H)
-        .filter(|&i| pos[i][3] > 0.0 && f32::from_bits(out[2 * i + 1]) == 0.5)
-        .count();
-    assert_eq!(kept, 0);
+    let k = kept(&out);
+    std::println!("history: {k} of {needed} texels kept their 0.5");
+    // Half the texels do not trace; the history of the others is blended
+    // toward lit or shadow (0.575 or 0.425).
+    assert!(
+        k > needed * 4 / 10 && k < needed * 6 / 10,
+        "{k} of {needed}"
+    );
+    // Forgetting history, or history whose points did not trace: all trace.
+    let un_reset = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.0, true);
+    assert_eq!(kept(&frame(&sc, &pos, &hist, &un_reset)), 0);
+    assert_eq!(kept(&frame(&sc, &pos, &hist_with(0.0), &un)), 0);
 }
 
 #[test]
@@ -182,7 +195,7 @@ fn a_moving_camera_keeps_the_picture_right() {
     let (eye0, eye1) = (EYE, [0.6, 12.2, -33.4]);
     let (pos0, _) = positions(&sc, eye0, PITCH);
     let un0 = uniforms(&sc, eye0, (eye0, PITCH), 0, 0.0, false);
-    let first = frame(&sc, &pos0, &vec![0; 2 * W * H], &un0);
+    let first = frame(&sc, &pos0, &vec![0; TW * W * H], &un0);
     let (pos1, normals1) = positions(&sc, eye1, PITCH);
     let want = expected(&sc, eye1, &pos1, &normals1);
     // Two frames on, the camera has moved: the history came through the
@@ -195,11 +208,56 @@ fn a_moving_camera_keeps_the_picture_right() {
     assert!(wrong <= W * H / 20, "{wrong} texels differ");
 }
 
+/// The camera pans one texel a frame: a point keeps the parity of its
+/// texel, so the checkerboard alone would never trace half of them. Over
+/// two frames every point must trace.
+#[test]
+fn a_point_moving_a_texel_a_frame_still_traces() {
+    use super::shadow_demo as sd;
+    let sc = scene();
+    let (pos, _) = positions(&sc, EYE, PITCH);
+    let d = dists(&pos, EYE);
+    // Last frame's view one texel to the right: the point of texel x was
+    // at x + 1, where the history holds its distance.
+    let shifted = |number: u32| {
+        let mut un = uniforms(&sc, EYE, (EYE, PITCH), number, 0.0, false);
+        let vp = sd::view_projection(EYE, PITCH);
+        for c in 0..4 {
+            let v = vp[0][c] + vp[3][c] * 2.0 / W as f32;
+            un[(u::PREV_VP + c as u16) as usize] = v.to_bits();
+        }
+        un
+    };
+    let hist: Vec<u32> = (0..W * H)
+        .flat_map(|i| {
+            let from = if i % W == 0 { 0.0 } else { d[i - 1] };
+            [
+                from.to_bits(),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ]
+        })
+        .collect();
+    let first = frame(&sc, &pos, &hist, &shifted(0));
+    // The second frame reads the first's mask one texel to the right too.
+    let second = frame(&sc, &pos, &first, &shifted(1));
+    let traced = |m: &[u32], i: usize| f32::from_bits(m[TW * i + 3]) > 0.5;
+    let missed = (0..W * H)
+        .filter(|&i| {
+            let x = i % W;
+            pos[i][3] > 0.0 && x + 1 < W && !traced(&second, i) && !traced(&first, i + 1)
+        })
+        .count();
+    std::println!("one texel a frame: {missed} points never traced");
+    assert_eq!(missed, 0);
+}
+
 #[test]
 fn the_jitter_makes_penumbrae() {
     let sc = scene();
     let (pos, _) = positions(&sc, EYE, PITCH);
-    let mut hist = vec![0u32; 2 * W * H];
+    let mut hist = vec![0u32; TW * W * H];
     let mut cams = (EYE, PITCH);
     for f in 0..24 {
         let un = uniforms(&sc, EYE, cams, f, 0.03, false);
@@ -208,7 +266,7 @@ fn the_jitter_makes_penumbrae() {
     }
     let soft = (0..W * H)
         .filter(|&i| {
-            let c = f32::from_bits(hist[2 * i + 1]);
+            let c = f32::from_bits(hist[TW * i + 1]);
             pos[i][3] > 0.0 && c > 0.1 && c < 0.9
         })
         .count();
@@ -222,7 +280,7 @@ fn on_sim(sc: &Scene, pos: &Positions, hist: &[u32], un: &[u32]) -> Vec<u32> {
     let p = shadow::kernel(shadow::Slots::default());
     let c = compile(&p).unwrap();
     let base = |i: usize| 0x2_0000_0000u64 + 0x100_0000 * i as u64;
-    let mut out = vec![0xAAAA_AAAAu32; 2 * w * h];
+    let mut out = vec![0xAAAA_AAAAu32; TW * w * h];
     for gy in 0..h.div_ceil(4) {
         for gx in 0..w.div_ceil(8) {
             for ly in 0..4u32 {
@@ -262,9 +320,8 @@ fn on_sim(sc: &Scene, pos: &Positions, hist: &[u32], un: &[u32]) -> Vec<u32> {
                     s.regs[255] = 0;
                     s.local = vec![0xDEAD_BEEF; p.local_words as usize];
                     s.run().unwrap();
-                    let i = 2 * (y * w + x);
-                    out[i] = s.mem[0].1[i];
-                    out[i + 1] = s.mem[0].1[i + 1];
+                    let i = TW * (y * w + x);
+                    out[i..i + TW].copy_from_slice(&s.mem[0].1[i..i + TW]);
                 }
             }
         }
@@ -275,10 +332,13 @@ fn on_sim(sc: &Scene, pos: &Positions, hist: &[u32], un: &[u32]) -> Vec<u32> {
 /// Texels whose share differs by more than 0.05, or whose distance is not
 /// the same.
 fn mismatches(got: &[u32], want: &[u32]) -> Vec<usize> {
-    (0..got.len() / 2)
+    (0..got.len() / TW)
         .filter(|&i| {
-            let (a, b) = (f32::from_bits(got[2 * i + 1]), f32::from_bits(want[2 * i + 1]));
-            (a - b).abs() > 0.05 || got[2 * i] != want[2 * i]
+            let (a, b) = (
+                f32::from_bits(got[TW * i + 1]),
+                f32::from_bits(want[TW * i + 1]),
+            );
+            (a - b).abs() > 0.05 || got[TW * i] != want[TW * i]
         })
         .collect()
 }
@@ -290,7 +350,10 @@ fn the_compiled_shadow_kernel_matches_the_reference() {
     let hist: Vec<u32> = dists(&pos, EYE)
         .iter()
         .enumerate()
-        .flat_map(|(i, d)| [d.to_bits(), ((i % 3) as f32 * 0.5).to_bits()])
+        .flat_map(|(i, d)| {
+            let c = ((i % 3) as f32 * 0.5).to_bits();
+            [d.to_bits(), c, c, ((i % 5 != 0) as u32 as f32).to_bits()]
+        })
         .collect();
     let un = uniforms(&sc, EYE, (EYE, PITCH), 1, 0.02, false);
     let want = frame(&sc, &pos, &hist, &un);
@@ -316,7 +379,7 @@ fn the_consoles_scene_on_the_simulator() {
         reset: true,
     };
     let un = sd::uniforms(&sc, w, h, &f);
-    let zeros = vec![0u32; 2 * w * h];
+    let zeros = vec![0u32; TW * w * h];
     let want = sd::reference(&sc, &mut pos, &zeros, &un);
     let got = on_sim(&sc, &pos, &zeros, &un);
     let wrong = mismatches(&got, &want);
@@ -362,7 +425,12 @@ fn records(mask: &[f32]) -> Vec<u32> {
     mask.iter()
         .flat_map(|v| {
             let cov = if *v < 0.0 { 0.0f32 } else { 1.0 };
-            [v.abs().to_bits(), cov.to_bits()]
+            [
+                v.abs().to_bits(),
+                cov.to_bits(),
+                cov.to_bits(),
+                1.0f32.to_bits(),
+            ]
         })
         .collect()
 }
