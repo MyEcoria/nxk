@@ -7,7 +7,7 @@ use alloc::format;
 use alloc::string::String;
 use core::fmt::Write;
 
-use libnx::abi::err::{EIO, ENODEV, ENXIO, ETIMEDOUT};
+use libnx::abi::err::{self, EIO, ENODEV, ENXIO, ETIMEDOUT};
 use libnx::abi::proto::{clk, power};
 use libnx::drv::Mmio;
 use libnx::ipc::{self, Msg};
@@ -714,6 +714,61 @@ impl Pcie {
             ));
         }
         self.enumerate(port)
+    }
+
+    /// Sleep, first half: AFI interrupts masked, PERST# asserted and
+    /// REFCLK stopped, then the module held in reset with its enable low
+    /// (Linux `tegra_pcie_port_disable`). The caller frees the rings
+    /// only after this: nothing may DMA into them later.
+    pub fn sleep_module(&self) {
+        // AFI and root ports answer only while PCIE is clocked: a read
+        // otherwise hangs the bus (a half-done wake may have left it off).
+        if libnx::clk::ready(clk::PCIE) {
+            let afi = self.afi();
+            afi.w32(AFI_INTR_MASK, 0);
+            afi.w32(AFI_AFI_INTR_ENABLE, 0);
+            afi.w32(AFI_SM_INTR_ENABLE, 0);
+            afi.w32(AFI_INTR_CODE, 0);
+            // PERST# first, REFCLK only once it is asserted.
+            for ctrl in AFI_PEX_CTRL {
+                afi.modify(ctrl, AFI_PEX_CTRL_RST, 0);
+                let _ = afi.r32(ctrl);
+                afi.modify(ctrl, AFI_PEX_CTRL_REFCLK_EN | AFI_PEX_CTRL_CLKREQ_EN, 0);
+            }
+        }
+        self.module_off();
+    }
+
+    /// Sleep, second half: link logic held, UPHY PLL down, AFI and PCIE
+    /// clocks stopped and in reset (`clk` leaves the partition and PLLE
+    /// on), then the PCIe/XUSB rail if asked. `bring_up` redoes all of it.
+    pub fn sleep_controller(&self, rail_off: bool) {
+        let _ = libnx::clk::disable(clk::PCIE_LINK);
+        self.uphy_pll_off();
+        if let Err(e) = libnx::clk::disable(clk::PCIE) {
+            println!("[wlan] PCIe clocks stay on ({})", err::name(e));
+        }
+        if !rail_off {
+            return;
+        }
+        let r = ns::wait_for_timeout("power", 5_000_000_000).and_then(|p| rail(p, false));
+        if let Err(e) = r {
+            println!("[wlan] PCIe rail stays on ({})", err::name(e));
+        }
+    }
+
+    /// UPHY PLL of the PCIe bricks off and in IDDQ, power under software
+    /// control so it stays down (the state `uphy_pll` starts from).
+    fn uphy_pll_off(&self) {
+        let p = &self.padctl;
+        p.modify(PADCTL_UPHY_PLL_P0_CTL1, 0, PLL_CTL1_PWR_OVRD);
+        p.modify(PADCTL_UPHY_PLL_P0_CTL1, PLL_CTL1_ENABLE, 0);
+        time::sleep_us(20);
+        p.modify(
+            PADCTL_UPHY_PLL_P0_CTL1,
+            0,
+            PLL_CTL1_IDDQ | PLL_CTL1_SLEEP_MASK,
+        );
     }
 
     /// Latched AFI error code and the address it hit, left in place: why

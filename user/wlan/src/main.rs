@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{self, EINVAL, EIO, ENETDOWN, ENOENT, ENOSYS, ETIMEDOUT};
-use libnx::abi::proto::{eth, wifi};
+use libnx::abi::proto::{self, eth, wifi};
 use libnx::abi::rights::{DUP, GRANT, SEND};
 use libnx::drv::{self, Irq, Mmio};
 use libnx::ipc::{self, Msg};
@@ -57,6 +57,9 @@ const CHECK_NS: u64 = 1_000_000_000;
 /// failure up to the maximum.
 const RETRY_FIRST_NS: u64 = 2_000_000_000;
 const RETRY_MAX_NS: u64 = 60_000_000_000;
+/// Sleep also cuts the PCIe/XUSB rail (PMIC LDO1). Off until it is
+/// shown that the USB-C console, on the same rail's name, survives it.
+const SUSPEND_RAIL_OFF: bool = false;
 
 /// The root complex, the chip's BAR0 and TCM, and the rings to its
 /// firmware when it runs.
@@ -102,6 +105,12 @@ struct Hw {
     /// Next recovery or rejoin attempt, and the wait after a failure.
     retry_at: u64,
     backoff: u64,
+    /// Asleep (`proto::SUSPEND`): chip, link and clocks are off, nothing
+    /// may touch them and nothing brings them back until `proto::RESUME`.
+    asleep: bool,
+    /// The root complex is powered down: the next bring-up is a full
+    /// one, and its registers are out of reach until then.
+    cold: bool,
 }
 
 /// The network in use: SSID, channel, signal (-dBm), and on a WPA2
@@ -132,7 +141,7 @@ impl Hw {
 
     /// Every network in range, remembered with its security.
     fn scan(&mut self, timeout: u64) -> Result<Vec<wl::Bss>, i64> {
-        if self.radio_off {
+        if self.radio_off || self.asleep {
             return Err(-ENETDOWN);
         }
         match self.dev(|d| d.scan(timeout)) {
@@ -151,7 +160,7 @@ impl Hw {
     /// Join by name, secured as the last scan saw it (one is run if the
     /// network was not in it).
     fn connect(&mut self, ssid: &[u8], psk: &[u8], timeout: u64) -> Result<(), i64> {
-        if self.radio_off {
+        if self.radio_off || self.asleep {
             return Err(-ENETDOWN);
         }
         let known = |hw: &Hw| {
@@ -315,7 +324,11 @@ impl Hw {
             now.saturating_sub(self.up_at) / 1_000_000_000,
             if joined { "joined" } else { "not joined" },
             self.rc.module_pins(),
-            self.rc.link_state(self.port, false),
+            if self.cold {
+                String::from("controller off")
+            } else {
+                self.rc.link_state(self.port, false)
+            },
             self.console.0
         );
         println!("[wlan] chip lost: {}", self.loss);
@@ -327,9 +340,16 @@ impl Hw {
     /// reset, link, endpoint, firmware. The old rings are freed only once
     /// the module is held in reset: nothing may DMA into them after.
     fn recover(&mut self) -> Result<String, String> {
-        let ep = self.rc.restart(self.port);
+        // After a sleep the whole controller is off: rail, clocks, UPHY.
+        let ep = if self.cold {
+            self.rc.bring_up()
+        } else {
+            self.rc.restart(self.port)
+        };
         self.mb = None;
         let ep = ep.map_err(|f| format!("{}: {}", f.step, err::name(f.err)))?;
+        self.cold = false;
+        self.port = ep.port;
         if ep.bars[0] != self.bars[0] || ep.bars[2] != self.bars[2] {
             return Err(format!(
                 "BARs moved to {:#x} and {:#x}",
@@ -371,12 +391,20 @@ impl Hw {
     /// wait before the next. The bring-up text when the chip came back
     /// (its interrupt line to re-arm).
     fn retry(&mut self, now: u64) -> Option<String> {
-        if !(self.gone || self.rejoin) || now < self.retry_at {
+        if self.asleep || !(self.gone || self.rejoin) || now < self.retry_at {
             return None;
         }
         let mut back = None;
+        let woke = self.cold;
         let failed = if self.gone {
             match self.recover() {
+                Ok(text) if woke => {
+                    println!("[wlan] chip back from sleep");
+                    // The rejoin takes the next turn: a queued SUSPEND or
+                    // `wifi status` is not kept waiting behind its 15 s.
+                    self.retry_at = now;
+                    return Some(text);
+                }
                 Ok(text) => {
                     self.recoveries += 1;
                     println!("[wlan] chip back after loss {}", self.losses);
@@ -405,6 +433,61 @@ impl Hw {
             );
         }
         back
+    }
+
+    /// Sleep: leave the network (remembered for the wake), hold the chip
+    /// in reset, take the PCIe link and root complex down. Idempotent. A
+    /// step in progress has finished by now: this is one loop turn.
+    fn suspend(&mut self) {
+        if self.asleep {
+            return;
+        }
+        let was_joined = self.joined.is_some();
+        if was_joined {
+            if let Some(Err(e)) = self.dev(|d| d.disconnect()) {
+                println!("[wlan] leave: {}", e);
+            }
+        }
+        self.rejoin = (was_joined || self.rejoin) && self.last.is_some() && !self.radio_off;
+        self.joined = None;
+        self.seen.clear();
+        self.rx.clear();
+        // `gone` keeps every firmware call, interrupt and health check off.
+        self.asleep = true;
+        self.gone = true;
+        self.rc.sleep_module();
+        self.mb = None;
+        self.rc.sleep_controller(SUSPEND_RAIL_OFF);
+        self.cold = true;
+        println!("[wlan] asleep, rejoin {}", self.rejoin);
+    }
+
+    /// Wake: the bring-up (and rejoin) is due at once, run by the loop
+    /// after the reply so the caller does not wait for it. No-op if awake.
+    fn resume(&mut self) {
+        if !self.asleep {
+            return;
+        }
+        self.asleep = false;
+        self.backoff = RETRY_FIRST_NS;
+        self.retry_at = 0;
+        println!("[wlan] waking");
+    }
+
+    /// `wifi status` text while asleep or waking, if either.
+    fn sleep_note(&self) -> Option<String> {
+        if self.asleep {
+            return Some(format!(
+                "; suspended: module off, PCIe link and clocks off, rail {}",
+                if SUSPEND_RAIL_OFF { "off" } else { "on" }
+            ));
+        }
+        self.cold.then(|| {
+            format!(
+                "; waking from sleep, bring-up in {} s",
+                self.retry_at.saturating_sub(time::now_ns()) / 1_000_000_000
+            )
+        })
     }
 
     /// The chip's interrupt (`brcmf_pcie_isr_thread`): causes cleared so
@@ -645,6 +728,8 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             recoveries: 0,
             retry_at: 0,
             backoff: 0,
+            asleep: false,
+            cold: false,
         },
         irq,
         what,
@@ -808,7 +893,9 @@ fn main() -> i32 {
             if hw.joined.is_some() && (wait == 0 || wait > POLL_NS) {
                 wait = POLL_NS;
             }
-            let next = if hw.gone || hw.rejoin {
+            let next = if hw.asleep {
+                0
+            } else if hw.gone || hw.rejoin {
                 hw.retry_at
             } else if hw.mb.is_some() {
                 hw.next_check
@@ -823,6 +910,11 @@ fn main() -> i32 {
             }
         }
         match ipc::recv_timeout(ep, wait) {
+            // Asleep or waking, the line stays masked: the AFI is off (a
+            // read would hang the bus) and the wake re-arms it.
+            Ok(rx)
+                if rx.msg.is_notify()
+                    && matches!(&backend, Backend::Chip(hw) if hw.asleep || hw.cold) => {}
             Ok(rx) if rx.msg.is_notify() => {
                 if let (Some(i), Backend::Chip(hw)) = (irq.as_ref(), &mut backend) {
                     let code = hw.rc.interrupt();
@@ -914,6 +1006,9 @@ fn main() -> i32 {
                         // The firmware's console as it is now: joins and
                         // failures show there first.
                         let live = match &backend {
+                            Backend::Chip(hw) if hw.asleep || hw.cold => {
+                                hw.sleep_note().unwrap_or_default()
+                            }
                             Backend::Chip(hw) if hw.gone => format!(
                                 "; chip lost ({} so far, {} recovered, next try in {} s), interrupts {}, PCIe errors {} (last AFI code {}); {}",
                                 hw.losses,
@@ -967,9 +1062,13 @@ fn main() -> i32 {
                                 }
                                 println!("[wlan] retry: {}", diag);
                             }
+                            // Asleep: only the wake brings the chip back.
+                            Backend::Chip(hw) if hw.asleep => {}
                             Backend::Chip(hw) => {
-                                let joined = hw.joined.is_some();
-                                hw.lost("recovery asked (wifi retry)", joined);
+                                if !hw.cold {
+                                    let joined = hw.joined.is_some();
+                                    hw.lost("recovery asked (wifi retry)", joined);
+                                }
                                 hw.retry_at = 0;
                                 if let Some(text) = hw.retry(time::now_ns()) {
                                     diag = text;
@@ -1008,6 +1107,20 @@ fn main() -> i32 {
                         let state = backend.state();
                         let (channel, signal, ssid) = backend.joined();
                         Some(ipc::pack_at(0, &[state, channel, signal, mac_word()], ssid))
+                    }
+                    // Sleep and wake, idempotent. The wake replies at once;
+                    // the bring-up runs at the top of the next turn.
+                    (_, proto::SUSPEND) => {
+                        if let Backend::Chip(hw) = &mut backend {
+                            hw.suspend();
+                        }
+                        Some(Msg::new(0, 0, 0))
+                    }
+                    (_, proto::RESUME) => {
+                        if let Backend::Chip(hw) = &mut backend {
+                            hw.resume();
+                        }
+                        Some(Msg::new(0, 0, 0))
                     }
                     _ => Some(Msg::error(-EINVAL)),
                 };
