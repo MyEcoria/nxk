@@ -1102,7 +1102,8 @@ within 5 s.
     `hwboot/inject.sh` for hekate and a tap on More Configs, nxk. The battery
     fell from 31% to 15% in an hour on the PC's USB: use a charger.
     The Lab's ray room together with the shadows runs at 30 fps (33 ms
-    frames; 59 fps before the shadows): both together exceed a frame.
+    frames; 59 fps before the shadows): both together exceed a frame
+    (the GPU is not the limit, see run 44).
 44. 19/10/2026, Erista, **shadows without strays or trails**: walking, the
     player's shadow came out as a checker with a trail of dots, and without
     jitter whole 8 x 4 groups went dark. `gpu test` now runs the shadow
@@ -1120,6 +1121,22 @@ within 5 s.
     not trace last frame (a fourth word per texel), and the figure's boxes
     are tested every frame outside the history. Walking by day and night:
     no trail, soft tree shadows, 58-59 fps, GPU 69-76% busy (as before).
+    After the boot image was updated and the console restarted: `gpu test`
+    17/17 from the image's own service; Lumen from the library, walked by
+    touch (`nxdbg.py down/move/up` on the left half): the shadow follows
+    without trail. Walking, the mask's flicker is 2.0-2.6% of texels, against
+    1.4-2.5% with neither jitter nor history: edges moving with the camera,
+    not noise. The 50 ms frames in the Lab's strip came from its flicker log
+    reading both masks back word by word from uncached memory every 120
+    frames; it now samples one texel in 16, only for a Lab started from the
+    shell: 60.0 fps, max 16.8 ms with the shadows. The ray room's 30 fps is
+    not the GPU (47% busy): `RENDER` runs the batch to its end before it
+    replies and `FLIP` then waits for the blank, so the CPU's frame (3 ms
+    here) and the GPU's never overlap; `present` took 30 ms with the heat
+    map's 5184 rectangles, 14.5 or 30 ms without. Still visible: the
+    quarter-resolution mask (4 x 4 pixels a texel) gives jagged shadow
+    edges where a tree's tier shades the next one and a coarse blot where an
+    arm shades the torso.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
