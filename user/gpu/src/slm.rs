@@ -12,6 +12,9 @@ use crate::push::{Push, SUBC_3D, SUBC_COMPUTE};
 
 /// Bytes of local memory per lane: the IR's `MAX_LOCAL_WORDS` words.
 pub const BYTES_PER_LANE: u32 = 256;
+/// Bytes per warp for the reconvergence stack past its on-chip entries
+/// (the shaders' headers and QMDs declare it).
+pub const CRS_BYTES_PER_WARP: u32 = nxk_shader::lower::CRS_BYTES_PER_WARP;
 /// Resident warps per SM on a GM20B.
 const WARPS_PER_SM: u64 = 64;
 
@@ -34,7 +37,7 @@ impl Slm {
     /// The area for a GPU of `tpc_count` TPCs (one SM each).
     pub fn new(vm: &mut Vm, tpc_count: u64) -> Result<Self> {
         // The hardware wants these alignments (NVK's comments).
-        let per_warp = (BYTES_PER_LANE as u64 * 32).next_multiple_of(0x200);
+        let per_warp = (BYTES_PER_LANE as u64 * 32 + CRS_BYTES_PER_WARP as u64).next_multiple_of(0x200);
         let per_tpc = (per_warp * WARPS_PER_SM).next_multiple_of(0x8000);
         let size = (per_tpc * tpc_count).next_multiple_of(0x20000);
         let mem = Dma::new(size as usize)?;

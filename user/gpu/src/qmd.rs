@@ -79,6 +79,9 @@ impl Qmd {
         }
         q.set(1463, 1440, l.local_bytes as u64); // SHADER_LOCAL_MEMORY_LOW_SIZE
         q.set(1503, 1496, l.regs as u64);
+        // SHADER_LOCAL_MEMORY_CRS_SIZE: where the warp's reconvergence stack
+        // spills past its on-chip entries (deep SSY/PBK nesting).
+        q.set(1527, 1504, crate::slm::CRS_BYTES_PER_WARP as u64);
         q.set(1535, 1528, 0x30); // SASS_VERSION
         q
     }

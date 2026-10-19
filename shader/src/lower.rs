@@ -130,6 +130,12 @@ pub fn compile(p: &Program) -> Result<Compiled, Error> {
     })
 }
 
+/// Bytes per warp of the reconvergence stack's spill area (SSY / PBK
+/// entries past the on-chip ones), in the program header and the compute
+/// launch; the `gpu` service reserves it per warp. Without it a deeply
+/// nested branch reconverges wrong on the console (not in the simulator).
+pub const CRS_BYTES_PER_WARP: u32 = 0x800;
+
 // Program header (SPH version 3), fields as `gfx.rs` and NAK's `sph.rs`.
 
 fn setf(h: &mut [u32; SPH_WORDS], lo: usize, v: u32) {
@@ -155,6 +161,7 @@ fn common_flags(h: &mut [u32; SPH_WORDS], info: &Info) {
     if info.discards {
         setf(h, KILLS_PIXELS, 1);
     }
+    setf(h, 96, CRS_BYTES_PER_WARP); // SHADER_LOCAL_MEMORY_CRS_SIZE
 }
 
 fn vertex_header(info: &Info) -> [u32; SPH_WORDS] {
