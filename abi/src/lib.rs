@@ -1055,6 +1055,14 @@ pub mod bootfs {
 /// Service protocols; replies carry the error code in the label.
 /// 0 = success, positive errno otherwise.
 pub mod proto {
+    /// Sleep, answered by every service with hardware to power down
+    /// (labels clear of the services' own). `display` sends SUSPEND going
+    /// to sleep (reply once the hardware is off) and RESUME on the wake
+    /// (reply may come before a slow part, a radio, is back). Both are
+    /// idempotent; a service without them answers EINVAL.
+    pub const SUSPEND: u32 = 0x5300;
+    pub const RESUME: u32 = 0x5301;
+
     pub mod console {
         /// Write: word 0 = byte count, bytes from word 1 on.
         pub const WRITE: u32 = 1;
@@ -1814,7 +1822,9 @@ pub mod proto {
         /// started by `display`, or the screen is taken already.
         pub const SCANOUT: u32 = 4;
         /// Show image word 0 from the next vertical blank; the reply
-        /// comes once it is on display. Sent on `SCANOUT`'s handle 3 only.
+        /// comes once it is on display (word 0: ns the console slept since
+        /// `SCANOUT`, which a game's clock leaves out; asleep, the reply
+        /// waits for the wake). Sent on `SCANOUT`'s handle 3 only.
         pub const FLIP: u32 = 5;
         /// The game is done: the UI comes back (also when it exits).
         pub const RELEASE: u32 = 6;

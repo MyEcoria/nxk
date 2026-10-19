@@ -141,6 +141,13 @@ static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
 static AUDIO: Service = Service::optional("audio");
 static BT: Service = Service::optional("bt");
+static JOYCON: Service = Service::optional("joycon");
+
+/// What each service powers down asleep, in the order it goes; the wake
+/// brings them back in reverse, after the picture and the game.
+static SLEEPERS: [&Service; 6] = [&JOYCON, &FAN, &INPUT, &AUDIO, &BT, &WIFI];
+/// A service's SUSPEND or RESUME that takes longer is left behind.
+const SLEEP_CALL_NS: u64 = 2_000_000_000;
 
 fn wr(dc: &Mmio, reg: usize, v: u32) {
     dc.w32(reg * 4, v);
@@ -208,7 +215,9 @@ enum Job {
     Profile(users::Profile),
     /// A user's directory, or a game's saves, to erase.
     RemoveTree(String),
-    SleepCpu(u64),
+    /// The console goes to sleep (true) or wakes (false) at the time
+    /// given: `sleep_steps`.
+    Sleep(bool, u64),
 }
 
 /// Outcome of an action run by the worker.
@@ -420,7 +429,104 @@ fn scan() -> Result<Vec<ScanNet>, i64> {
 /// Runs the actions that may take seconds (Wi-Fi scan, chip recovery, a
 /// fan busy measuring its speed, a GPU running a batch) one at a time,
 /// off the drawing loop.
-fn work(w: &Worker, notif: u32) -> ! {
+/// The clocks set before the sleep: CPU step (MHz, `cpufreq::BOOT`: the
+/// loader's), GPU step (kHz) if it was on.
+struct Saved {
+    cpu: Option<u64>,
+    gpu: Option<u64>,
+}
+
+/// Window A's fetch on or off (the panel shows the background), under
+/// the link lock like every register sequence.
+fn window_a(dc: &Mmio, link: &Mutex<Link>, on: bool) {
+    let _l = link.lock();
+    wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
+    wr(dc, WIN_OPTIONS, if on { 1 << 30 } else { 0 });
+    wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
+    wr(dc, CMD_STATE_CONTROL, 1 | 2);
+}
+
+/// A GPU step the power source allows, `khz` or the highest below it.
+fn gpu_clock_back(khz: u64) {
+    for &k in gpuproto::STEPS_KHZ.iter().rev().filter(|&&k| k <= khz) {
+        if GPU.call(&Msg::from_words(gpuproto::CLOCK, &[k, 0])).is_ok() {
+            return;
+        }
+    }
+}
+
+/// Every sleeper's SUSPEND or RESUME, in turn.
+fn tell_sleepers(label: u32, order: impl Iterator<Item = &'static &'static Service>) {
+    for s in order {
+        let _ = s.call_timeout(&Msg::new(label, 0, 0), SLEEP_CALL_NS);
+    }
+}
+
+/// Sleep's steps, off the UI loop. Asleep: the services' hardware off,
+/// window A stops fetching, CPU and GPU at their lowest step (an idle GPU
+/// at 768 MHz drew 1.8 W, at 76.8 MHz 0.3 W). Awake: the picture and the
+/// game's held FLIP first, the services after.
+fn sleep_steps(
+    on: bool,
+    at: u64,
+    saved: &mut Option<Saved>,
+    dc: &Mmio,
+    link: &Mutex<Link>,
+    awake: &Condvar,
+) {
+    if on {
+        if saved.is_some() {
+            return;
+        }
+        tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
+        window_a(dc, link, false);
+        let cpu = CPUFREQ
+            .call(&Msg::new(cpufreq::STATUS, 0, 0))
+            .ok()
+            .map(|r| r.mr[5]);
+        let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[cpufreq::STEPS_MHZ[0]]));
+        let gpu_on = GPU
+            .call(&Msg::new(gpuproto::STATUS, 0, 0))
+            .is_ok_and(|r| r.mr[0] & 0xFF == gpuproto::ON);
+        let gpu = gpu_on
+            .then(|| GPU.call(&Msg::from_words(gpuproto::CLOCK, &[0, 0])).ok())
+            .flatten()
+            .map(|r| r.mr[0]);
+        if gpu.is_some() {
+            let _ = GPU.call(&Msg::from_words(
+                gpuproto::CLOCK,
+                &[gpuproto::STEPS_KHZ[0], 0],
+            ));
+        }
+        *saved = Some(Saved { cpu, gpu });
+        return;
+    }
+    window_a(dc, link, true);
+    if let Some(sv) = saved.take() {
+        if let Some(khz) = sv.gpu {
+            gpu_clock_back(khz);
+        }
+        if let Some(mhz) = sv.cpu {
+            let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
+        }
+    }
+    {
+        let mut l = link.lock();
+        l.asleep = false;
+        l.slept += time::now_ns().saturating_sub(l.asleep_since);
+    }
+    awake.notify_all();
+    let back = time::now_ns();
+    tell_sleepers(libnx::abi::proto::RESUME, SLEEPERS.iter().rev());
+    println!(
+        "[display] awake: picture in {} ms, services in {} ms",
+        back.saturating_sub(at) / 1_000_000,
+        time::now_ns().saturating_sub(at) / 1_000_000
+    );
+}
+
+fn work(w: &Worker, notif: u32, dc: Mmio, link: &Mutex<Link>, awake: &Condvar) -> ! {
+    let mut saved: Option<Saved> = None;
     loop {
         let mut q = w.jobs.lock();
         let job = loop {
@@ -448,8 +554,8 @@ fn work(w: &Worker, notif: u32) -> ! {
                 let _ = users::remove_tree(&path);
                 continue;
             }
-            Job::SleepCpu(mhz) => {
-                let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
+            Job::Sleep(on, at) => {
+                sleep_steps(on, at, &mut saved, &dc, link, awake);
                 continue;
             }
         };
@@ -753,6 +859,10 @@ struct Link {
     late: u64,
     /// The console sleeps: the game's next `FLIP` waits for the wake.
     asleep: bool,
+    /// Since when, and the time slept while this game had the screen
+    /// (`FLIP`'s reply: the game's clock leaves it out).
+    asleep_since: u64,
+    slept: u64,
 }
 
 /// Above the UI's threads: a frame asked while the UI draws is not late.
@@ -813,7 +923,7 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>, awake: &Condvar) -> ! {
                 s.late += (t - s.last > 25_000_000) as u64;
             }
             (s.flips, s.last) = (s.flips + 1, t);
-            Msg::new(0, 0, 0)
+            Msg::from_words(0, &[s.slept])
         } else {
             Msg::error(-EINVAL)
         };
@@ -1025,15 +1135,6 @@ fn main() -> i32 {
         })
         .expect("display: touch thread");
     }
-    let worker = Arc::new(Worker {
-        jobs: Mutex::new(VecDeque::new()),
-        wake: Condvar::new(),
-        done: Mutex::new(VecDeque::new()),
-    });
-    {
-        let w2 = worker.clone();
-        thread::spawn(move || work(&w2, notif)).expect("display: worker thread");
-    }
     let link = Arc::new(Mutex::new(Link {
         pas: Vec::new(),
         shown: 0,
@@ -1045,8 +1146,19 @@ fn main() -> i32 {
         gap: 0,
         late: 0,
         asleep: false,
+        asleep_since: 0,
+        slept: 0,
     }));
     let awake = Arc::new(Condvar::new());
+    let worker = Arc::new(Worker {
+        jobs: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+        done: Mutex::new(VecDeque::new()),
+    });
+    {
+        let (w2, l2, a2) = (worker.clone(), link.clone(), awake.clone());
+        thread::spawn(move || work(&w2, notif, dc, &l2, &a2)).expect("display: worker thread");
+    }
     let game_ep = sys::endpoint_create().expect("display: game endpoint");
     {
         let (s2, a2) = (link.clone(), awake.clone());
@@ -1067,7 +1179,6 @@ fn main() -> i32 {
     let mut play_loaded = false;
     let mut save_at: u64 = 0;
     let mut sleeping = false;
-    let mut pre_sleep_cpu: Option<u64> = None;
     let mut last_input = time::now_ns();
 
     let mut term = term::Term::new();
@@ -1140,18 +1251,18 @@ fn main() -> i32 {
         () => {{
             if !sleeping {
                 sleeping = true;
-                link.lock().asleep = true;
+                {
+                    let mut l = link.lock();
+                    (l.asleep, l.asleep_since) = (true, time::now_ns());
+                }
                 if let Some(b) = &bl {
                     b.off();
                 }
-                pre_sleep_cpu = match &data.cpu {
-                    stats::Seen::Value(c) => Some(c.step),
-                    _ => None,
-                };
+                println!("[display] sleep");
                 worker
                     .jobs
                     .lock()
-                    .push_back(Job::SleepCpu(cpufreq::STEPS_MHZ[0] as u64));
+                    .push_back(Job::Sleep(true, time::now_ns()));
                 worker.wake.notify_one();
             }
         }};
@@ -1160,14 +1271,15 @@ fn main() -> i32 {
         ($now:expr) => {{
             if sleeping {
                 sleeping = false;
-                link.lock().asleep = false;
-                awake.notify_all();
+                let since = link.lock().asleep_since;
+                println!(
+                    "[display] wake after {} s",
+                    $now.saturating_sub(since) / 1_000_000_000
+                );
+                worker.jobs.lock().push_back(Job::Sleep(false, $now));
+                worker.wake.notify_one();
                 if let Some(b) = &bl {
                     b.set(ui.cfg.brightness);
-                }
-                if let Some(mhz) = pre_sleep_cpu.take() {
-                    worker.jobs.lock().push_back(Job::SleepCpu(mhz));
-                    worker.wake.notify_one();
                 }
                 scr.forget();
                 dirty = true;
@@ -1884,6 +1996,7 @@ fn main() -> i32 {
                     Ok((mut g, pas)) => {
                         (s.pas, s.shown, s.badge) = (pas, 0, link_gen);
                         (s.waiter, s.events) = (None, VecDeque::new());
+                        s.slept = 0;
                         drop(s);
                         g.owner = rx.pid;
                         next_live = time::now_ns() + LIVE_NS;
