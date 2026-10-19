@@ -1218,6 +1218,40 @@ within 5 s.
     jumps by the sleep. Not proven yet: that C stays usable after a reboot
     with the vertical-blank activation (it should, nothing uses C now).
 
+48. 20/10/2026, Erista, same boot (services `--reload`ed), battery 29 %,
+    USB-C cable in: **a low-power sleep**. `power` `MEASURE` cuts the
+    charger's input (BQ24193 HIZ, its 40 s watchdog kicked every second)
+    so the gauge reads the system's own draw, at 1 Hz for 60 s after 15 s
+    (`/bin/powertest`); every row is a mean of 60 samples, the cell at
+    3.54-3.62 V, Lumen running unless said, usbcon up (the cable's PHY
+    and PLLU count in every row), Power to sleep and to wake:
+
+    | state | draw |
+    |---|---|
+    | library awake, backlight on | 3.11 W |
+    | old sleep (backlight off, CPU 612 MHz), game held | 4.18 W, 4.17 W |
+    | old sleep, no game (GPU off) | 2.43 W |
+    | same, fan off / and `wifi radio off` (WLC_DOWN) | 2.40 W / 2.41 W |
+    | no game, GPU on at 76.8 MHz (rail 868 mV) | 2.75 W |
+    | sleep 1: CPU and GPU lowest, window A off | 2.61 W, 2.61 W |
+    | sleep 2: + services `SUSPEND` | 1.86 W, 1.81 W |
+
+    An idle GPU at 768 MHz (987 mV) cost 1.76 W asleep: no clock gating;
+    at 76.8 MHz 0.31 W. Sleep now lowers both clocks, stops window A's
+    fetch, holds the game in its next `FLIP` and sends `proto::SUSPEND`
+    to `joycon`, `fan`, `input`, `audio`, `bt` and `wlan`: 4.18 W ->
+    1.84 W (-56 %). The wake: the picture 38 ms after the press, the
+    services 145 ms, Bluetooth and Wi-Fi bring-ups (firmware, patch)
+    after; the left Joy-Con handshakes again, the game goes on where it
+    stopped (two captures 4 s apart asleep identical, its clock without
+    the sleep). The audio codec NAKed its reset 75 ms after its LDO came
+    back: the LDO stays on asleep. Touch comes back, but its interrupt
+    then reads stuck low (polled). Not done yet: the panel, DSI and DC
+    (no panel init of ours yet), the GPU rail (0.31 W, needs its state
+    restored), LDO1 (`SUSPEND_RAIL_OFF`, might drop the USB console), the
+    CPU cores 1-3 (no CPU_OFF), EMC and DRAM at full speed (SC7 or EMC
+    scaling).
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
