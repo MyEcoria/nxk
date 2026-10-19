@@ -49,11 +49,10 @@ fn main() {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(10.0);
-    let t0 = now_ns();
-    let mut last = t0;
+    let mut last = now_ns();
     let mut frames = 0u64;
     loop {
-        let t = (now_ns() - t0) as f32 / 1e9;
+        let t = g.seconds();
         if t > secs {
             break;
         }

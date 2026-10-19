@@ -373,6 +373,8 @@ pub struct Graphics {
     /// Frames presented.
     pub frames: u64,
     started: u64,
+    /// Time the console slept since `open` (`display::FLIP`'s reply).
+    slept: u64,
     open: bool,
 }
 
@@ -466,6 +468,7 @@ impl Graphics {
             words: Vec::with_capacity(4096),
             frames: 0,
             started: now_ns(),
+            slept: 0,
             open: true,
         })
     }
@@ -693,9 +696,11 @@ impl Graphics {
         })
     }
 
-    /// Seconds since the program started.
+    /// Seconds since the program started, the console's sleep left out:
+    /// a game resumes where it stopped.
     pub fn seconds(&self) -> f32 {
-        (now_ns() - self.started) as f32 / 1e9
+        let ns = (now_ns() - self.started).saturating_sub(self.slept);
+        ns as f32 / 1e9
     }
 
     /// A new frame, drawing on the image that is not on display.
@@ -996,8 +1001,10 @@ impl Frame<'_> {
         g.cmd.write_words(0, &g.words);
         g.gpu
             .call(&Msg::from_words(gpu::RENDER, &[g.cmd_id, 0, n as u64]))?;
-        g.link
+        let r = g
+            .link
             .call(&Msg::from_words(display::FLIP, &[self.back as u64]))?;
+        g.slept = word(&r, 0);
         g.shown = self.back;
         g.frames += 1;
         Ok(())
