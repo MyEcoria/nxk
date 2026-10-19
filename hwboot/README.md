@@ -1103,6 +1103,21 @@ within 5 s.
     fell from 31% to 15% in an hour on the PC's USB: use a charger.
     The Lab's ray room together with the shadows runs at 30 fps (33 ms
     frames; 59 fps before the shadows): both together exceed a frame.
+44. 19/10/2026, Erista, **shadows without strays or trails**: walking, the
+    player's shadow came out as a checker with a trail of dots, and without
+    jitter whole 8 x 4 groups went dark. `gpu test` now runs the shadow
+    kernel on the console against the reference machine (80 x 60 texels,
+    positions in an RGBA32F texture): 24 of 4800 texels wrong, varying from
+    run to run, while the simulator agreed. Two compiler/service fixes: a
+    read scoreboard on every variable-latency instruction (MUFU and the
+    conversions read their sources late too, trap 10) and a CRS spill area
+    in QMDs, headers and local memory (trap 11); then 0 of 4800, twice,
+    17/17, ray rates unchanged. The trail came from the checkerboard being
+    the screen's: a point moving an odd number of texels a frame kept the
+    same parity and never traced. A texel now also traces when its point did
+    not trace last frame (a fourth word per texel), and the figure's boxes
+    are tested every frame outside the history. Walking by day and night:
+    no trail, soft tree shadows, 58-59 fps, GPU 69-76% busy (as before).
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

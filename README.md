@@ -141,12 +141,17 @@ camera, A to jump, R to run), a sun and sky that follow the time of day,
 are ray traced**: a pre-pass draws the world positions of what the camera
 sees at a quarter of the resolution into an RGBA32F target, an 8 x 4
 compute kernel (`nxk_shader::rt::shadow`) shoots one any-hit ray per texel
-toward the sun over the valley's BVH (built once at load) and over the six
-boxes of the moving figure, and the lit shader filters the mask per pixel
-with a joint bilateral upsample (distance weights that follow the slope).
-The mask accumulates over frames (history reprojected with the last
-camera, a sun disc of 1.5 degrees jittered per texel and frame, half the
-texels tracing each frame), which gives the edges penumbrae. At 1280 x 720
+toward the sun over the valley's BVH (built once at load), and the lit
+shader filters the mask per pixel with a joint bilateral upsample
+(distance weights that follow the slope). The valley's share accumulates
+over frames (history reprojected with the last camera, a sun disc of 1.5
+degrees jittered per texel and frame), which gives the edges penumbrae;
+half the texels trace each frame, plus every texel whose point did not
+trace the frame before (the checkerboard is the screen's, so a point
+moving an odd number of texels a frame would otherwise never trace and
+drag its old shadow along). The six boxes of the moving figure keep no
+history: four rays across the sun's disc test them every frame near its
+bounding sphere, so its shadow follows it without trail. At 1280 x 720
 it holds 60 fps; the GPU is busy 52% without the shadows and about 76% with
 them (pre-pass 1 ms, rays about 1.2 ms with half the texels, mask lookup
 0.8 ms). The
@@ -590,6 +595,17 @@ program that vanished without closing them (crash) are reclaimed.
     to wait on), 33,480 of 65,536 rays came out wrong. Loads, local loads and
     atomics signal a read scoreboard, and a write to their sources waits on it;
     the simulator keeps their sources in use until the result is waited on.
+    The multi-function unit and the conversions (`F2I`, `I2F`) do the same
+    when their unit is busy: every variable-latency instruction now signals
+    a read scoreboard (before, a 4-cycle window let the shadow kernel lose a
+    few texels now and then, and a select feeding a conversion looked wrong).
+
+11. The reconvergence stack (SSY / PBK entries) spills to local memory past
+    its on-chip entries: a QMD or program header with no CRS size, and no
+    room for it in the local memory area, let deeply nested branches go
+    wrong. QMDs and IR headers declare 0x800 bytes per warp (as NVK and
+    nouveau) and `gpu` reserves it per warp; `gpu test` runs the shadow
+    kernel against the reference machine to catch the like.
 
 ## L4T comparison
 
