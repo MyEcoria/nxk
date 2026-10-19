@@ -1,10 +1,13 @@
 //! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
 //! PCIe and touchscreen rails, the charger's input status, the fuel gauge.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
+//! `MEASURE` cuts the charger's input to read the battery's own load.
 //! The TMP451 is started again as hekate's `tmp451_init` does.
 
 #![no_std]
 #![no_main]
+
+mod measure;
 
 use libnx::abi::err::EINVAL;
 use libnx::abi::proto::power as proto;
@@ -186,9 +189,14 @@ fn gauge_mah(i2c: &I2c, reg: u8) -> Result<u64, i64> {
     Ok(gauge(i2c, reg)? as u64 / 2)
 }
 
+/// Cell voltage, in mV (78.125 uV steps in bits 15:3).
+fn cell_mv(i2c: &I2c) -> Result<u64, i64> {
+    Ok((gauge(i2c, MAX_VCELL)? >> 3) as u64 * 625 / 1000)
+}
+
 fn battery(i2c: &I2c) -> Result<Msg, i64> {
     let soc = gauge(i2c, MAX_REPSOC)? as u64;
-    let mv = (gauge(i2c, MAX_VCELL)? >> 3) as u64 * 625 / 1000;
+    let mv = cell_mv(i2c)?;
     let avg = gauge_current(i2c, MAX_AVGCURRENT)?;
     let temp = (gauge(i2c, MAX_TEMP)? as i16 as i64 * 1000 / 256) as u64;
     let caps = gauge_mah(i2c, MAX_REPCAP)? | gauge_mah(i2c, MAX_FULLCAP)? << 32;
@@ -233,6 +241,10 @@ fn main() -> i32 {
             );
         }
         Err(e) => println!("[power] RTC unreadable ({})", libnx::abi::err::name(e)),
+    }
+    // A previous instance may have died mid-measurement.
+    if let Ok(true) = measure::clear_hiz(&i2c) {
+        println!("[power] charger input was cut, restored");
     }
     let ep = drv::publish("power").expect("power: publish");
     drv::serve(ep, |rx| {
@@ -293,6 +305,8 @@ fn main() -> i32 {
             },
             proto::BATTERY => battery(&i2c).unwrap_or_else(Msg::error),
             proto::BATTERY_HEALTH => battery_health(&i2c).unwrap_or_else(Msg::error),
+            proto::MEASURE => measure::start(rx.msg.mr[0], rx.msg.mr[1]),
+            proto::MEASURE_RESULT => measure::result(),
             _ => Msg::error(-EINVAL),
         })
     })

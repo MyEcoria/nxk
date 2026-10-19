@@ -1279,6 +1279,30 @@ pub mod proto {
         /// cycles (1/100 cycle), word 2 = design capacity (mAh), word 3 =
         /// instantaneous current (µA, signed).
         pub const BATTERY_HEALTH: u32 = 10;
+        /// Measure the power drawn from the battery. word 0 = seconds to
+        /// sample (1..=600), word 1 = settle seconds before sampling
+        /// (0..=120). Disconnects the charger's input (BQ24193 HIZ) for the
+        /// run, so the system runs from the battery, and replies at once;
+        /// the run goes on in the background (`MEASURE_RESULT`). EBUSY: one
+        /// is running; EINVAL: bad arguments. Safety net: the charger's I2C
+        /// watchdog (40 s) is kicked every second, so if `power` dies it
+        /// resets the charger and the input comes back.
+        pub const MEASURE: u32 = 11;
+        /// Reply: word 0 = `MEAS_*`, word 1 = samples taken, word 2 = mean
+        /// current (µA, i64, negative: discharging), word 3 = lowest
+        /// current (µA, i32 in bits 31:0) | highest current (µA, i32 in
+        /// bits 63:32), word 4 = mean cell voltage (mV), word 5 = mean
+        /// power drawn (µW, i64, positive: discharging). Words 1..5 cover
+        /// the samples so far while `MEAS_RUNNING`, and those taken before
+        /// an abort.
+        pub const MEASURE_RESULT: u32 = 12;
+        /// No measurement since `power` started.
+        pub const MEAS_NONE: u64 = 0;
+        pub const MEAS_RUNNING: u64 = 1;
+        pub const MEAS_DONE: u64 = 2;
+        /// Stopped early: battery too low (cell under 3.5 V or charge
+        /// under 10 %) or the gauge did not answer. Input restored.
+        pub const MEAS_ABORTED: u64 = 3;
         /// The charger's state (BQ24193 REG08 CHRG_STAT bits 5:4).
         pub const CHARGE_NONE: u64 = 0;
         pub const CHARGE_PRE: u64 = 1;
