@@ -64,14 +64,22 @@ impl Chip {
     }
 }
 
-/// HCI Reset, retried: the chip takes a moment after power-on.
+/// HCI Reset, retried: the chip takes a moment after power-on. A
+/// Hardware Error ends it: only a power cycle clears that.
 fn reset(hci: &mut Hci, tries: u32) -> Result<(), String> {
     let mut last = String::new();
+    let errors = hci.hw_errors;
     for _ in 0..tries {
         hci.flush();
         match hci.call(hci::OP_RESET, &[], 500) {
             Ok(_) => return Ok(()),
             Err(e) => last = e,
+        }
+        if hci.hw_errors > errors {
+            return Err(format!(
+                "HCI reset: controller hardware error at {} baud",
+                hci.uart.baud
+            ));
         }
     }
     Err(format!("HCI reset: {}", last))
@@ -166,7 +174,12 @@ fn download(hci: &mut Hci, data: &[u8]) -> Result<usize, String> {
 /// Power-cycled chip to a configured adapter at `addr`.
 pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, String> {
     hci.uart.set_baud(BAUD_INIT);
+    let errors = hci.hw_errors;
     if let Err(e) = reset(hci, 6) {
+        // Events read whole: the speed is right, the core needs a power cycle.
+        if hci.hw_errors > errors {
+            return Err(e);
+        }
         // A chip left at another speed: the 48 MHz divisors.
         let found = PROBE.iter().copied().find(|&b| {
             hci.uart.set_baud(b);

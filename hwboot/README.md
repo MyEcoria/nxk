@@ -391,7 +391,10 @@ When `bt status` says no adapter, its line names the step (no answer
 to the reset, a patch record refused, no answer after the patch at any
 speed or BT_WAKE level) and dumps what to look at: the RX / CTS pad
 levels, the PMIC's 32 kHz output, the UART registers and the first bytes
-received, the pads' pinmux and GPIO H. `bt retry` power-cycles the core and starts again;
+received, the pads' pinmux and GPIO H. A Hardware Error from the core
+(at boot or later) power-cycles it again after 1 s, then up to 30 s
+apart for two minutes; `bt status` says when (run 45).
+`bt retry` power-cycles the core and starts again;
 after a change, `./tools/usbterm.py --reload bluetooth -c "bt status"`.
 
 ## Fan
@@ -1148,6 +1151,29 @@ within 5 s.
     so a point of the leg lies inside it). Seen from four sides, the lit
     faces stay lit. On the PC, 30 walking frames leave 22 of 1200 texels off
     the truth with the four-texel history as with the nearest texel.
+
+45. 19/10/2026, Erista, boot image of `da8aebe` (`--put` of `bl33.bin`
+    with its `bl31.bin`): after the reboot `bt status` said no adapter, the
+    core answering each HCI Reset at 115200 baud with a Hardware Error
+    (`04 10 01 00`) for the whole bring-up (about 3 s after its 50 ms power
+    cycle). Minutes later `bt retry`, the same 50 ms cycle, brought it up
+    (patch, 3 Mbaud), Wi-Fi staying up. Wi-Fi's bring-up overlapping a BT
+    power cycle (`--reload wlan -c "bt retry"`, twice) did not reproduce
+    it: time after the cold boot clears it, not the cycle itself.
+    `bluetooth` now does what Linux `hci_error_reset` does, spread over
+    two minutes: a Hardware Error during the reset ends the speed probe,
+    the core stays off and is brought up again after 1, 2, 4, 8, 16 then
+    30 s (500 ms off), the service answering meanwhile; one at runtime
+    starts the same series instead of leaving the adapter "ready" and
+    dead. `bt status` tells the series (`next in N s`, `up at bring-up N,
+    S s after the first`): the console has no boot log to replay.
+    `nxtest.py --bt --bt-hw-errors 3`: up at bring-up 4, then a pairing.
+    On the console, `--reload bluetooth` came up at the first bring-up:
+    the normal path still works, the recovery has not run on hardware yet
+    (next boot image). Separately, `wlan`, `bluetooth` and `joycon`
+    read-modify-write GPIO port H's plain registers from separate
+    processes: no lost update showed here (the failure's dump has EN, RST
+    and BT_RST right), but the masked registers would make it safe.
 
 46. 19/10/2026, Erista, `--reload gpu` and `display`, games `--put`:
     **the volume indicator and the drawer over a game**. Window C (window

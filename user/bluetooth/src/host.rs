@@ -269,6 +269,8 @@ pub struct Host {
     pub events: Vec<[u64; input::WORDS]>,
     /// Paired during the current window: address, name.
     pub paired: Vec<(Addr, String)>,
+    /// Hardware Error code: the core is dead until a power cycle.
+    pub hw_error: Option<u8>,
 }
 
 impl Host {
@@ -288,6 +290,7 @@ impl Host {
             naming: None,
             events: Vec::new(),
             paired: Vec::new(),
+            hw_error: None,
         }
     }
 
@@ -656,10 +659,9 @@ impl Host {
                 println!("[bt] {}: pairing failed ({:#04x})", addr_str(&a), p[0]);
             }
             hci::EV_HW_ERROR => {
-                println!(
-                    "[bt] controller hardware error {:#04x}",
-                    p.first().copied().unwrap_or(0)
-                );
+                let code = p.first().copied().unwrap_or(0);
+                println!("[bt] controller hardware error {:#04x}, restarting", code);
+                self.hw_error = Some(code);
             }
             hci::EV_ROLE_CHANGE | hci::EV_MODE_CHANGE | hci::EV_IO_CAP_RESPONSE => {}
             _ => {}

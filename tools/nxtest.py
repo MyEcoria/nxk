@@ -227,6 +227,8 @@ def main():
                     help="touch the screen at landscape (X, Y) after the commands, then capture it")
     ap.add_argument("--bt", action="store_true",
                     help="emulated BCM4356 on UART-D with a Pro Controller in pairing mode (btfake.py)")
+    ap.add_argument("--bt-hw-errors", type=int, default=0, metavar="N",
+                    help="with --bt: the first N HCI resets answer with a Hardware Error")
     a = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
@@ -265,7 +267,7 @@ def main():
     ok = True
     fake = None
     if a.bt:
-        fake = btfake.Fake(bt)
+        fake = btfake.Fake(bt, hw_errors=a.bt_hw_errors)
         fake.start()
     try:
         s = socket.socket(socket.AF_UNIX)

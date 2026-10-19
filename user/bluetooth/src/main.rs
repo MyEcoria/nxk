@@ -69,6 +69,11 @@ const fn port(reg: usize, p: usize) -> usize {
 /// its ROM (Linux `hci_bcm` waits on the same order).
 const POWER_OFF_MS: u64 = 50;
 const POWER_ON_MS: u64 = 200;
+/// After a Hardware Error the core is power-cycled and brought up again
+/// (Linux `hci_error_reset`), after these delays: on Erista the first
+/// bring-up after a cold boot gets one for seconds, a later one works.
+const RETRY_DELAYS_S: [u64; 8] = [1, 2, 4, 8, 16, 30, 30, 30];
+const RETRY_OFF_MS: u64 = 500;
 /// The firmware is on the card: wait for `fs` (mounted after `sd`).
 const FS_WAIT_NS: u64 = 30_000_000_000;
 /// Checks while something is under way (pairing, a controller being
@@ -158,15 +163,61 @@ enum Adapter {
     Up(Box<Host>),
 }
 
-/// Power cycle and bring-up; on failure the core is left off.
-fn start(mut hci: Hci, mut store: Store, pads: &Pads) -> Adapter {
+/// Bring-ups since the last start, retry or runtime Hardware Error.
+struct Recovery {
+    tries: u32,
+    first_ns: u64,
+    /// When the next one runs: the last one got a Hardware Error.
+    next_ns: Option<u64>,
+}
+
+impl Recovery {
+    const fn new() -> Self {
+        Recovery {
+            tries: 0,
+            first_ns: 0,
+            next_ns: None,
+        }
+    }
+
+    /// For `bt status`: hardware runs have no boot log to read.
+    fn note(&self, up: bool) -> String {
+        let now = time::now_ns();
+        let since = now.saturating_sub(self.first_ns) / 1_000_000_000;
+        match (up, self.next_ns) {
+            (true, _) if self.tries > 1 => {
+                alloc::format!(
+                    "; up at bring-up {}, {} s after the first",
+                    self.tries,
+                    since
+                )
+            }
+            (false, Some(t)) => alloc::format!(
+                " (bring-up {} got a hardware error, next in {} s)",
+                self.tries,
+                t.saturating_sub(now).div_ceil(1_000_000_000)
+            ),
+            (false, None) if self.tries > 1 => {
+                alloc::format!(" (gave up after {} bring-ups over {} s)", self.tries, since)
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// Power cycle and one bring-up; on failure the core is left off. True
+/// as well: the core sent a Hardware Error meanwhile.
+fn start(mut hci: Hci, mut store: Store, pads: &Pads, off_ms: u64) -> (Adapter, bool) {
     hci.uart.irq_off();
+    let addr = store.local_addr();
     pads.power(false);
-    time::sleep_ms(POWER_OFF_MS);
+    time::sleep_ms(off_ms);
     pads.power(true);
     time::sleep_ms(POWER_ON_MS);
-    let addr = store.local_addr();
-    match bcm::bring_up(&mut hci, addr, &|on| pads.set(GPIO_OUT, AP_WAKE_BT, on)) {
+    let errors = hci.hw_errors;
+    let result = bcm::bring_up(&mut hci, addr, &|on| pads.set(GPIO_OUT, AP_WAKE_BT, on));
+    let hw_error = hci.hw_errors > errors;
+    let adapter = match result {
         Ok(chip) => {
             println!("[bt] ready: {}", chip.describe());
             hci.uart.irq_on();
@@ -186,7 +237,7 @@ fn start(mut hci: Hci, mut store: Store, pads: &Pads) -> Adapter {
                 })
                 .unwrap_or_default();
             let why = alloc::format!(
-                "{} [port I in {:#x} (RX bit 5, CTS bit 7); pmic 32k/ame/gpio4 {:x?}; uart lcr/mcr/lsr/msr/ier/irda {:x?}, rx bytes {} (first {:02x?}), resyncs {}, tx stalls {}, errors {}; pinmux tx/rx/rts/cts/wake/rst/hostwake {:x?}; gpio H cnf/oe/out/in {:x?}]",
+                "{} [port I in {:#x} (RX bit 5, CTS bit 7); pmic 32k/ame/gpio4 {:x?}; uart lcr/mcr/lsr/msr/ier/irda {:x?}, rx bytes {} (first {:02x?}), resyncs {}, tx stalls {}, errors {}, hardware errors {}; pinmux tx/rx/rts/cts/wake/rst/hostwake {:x?}; gpio H cnf/oe/out/in {:x?}]",
                 why,
                 lines,
                 pmic,
@@ -196,29 +247,88 @@ fn start(mut hci: Hci, mut store: Store, pads: &Pads) -> Adapter {
                 hci.resyncs,
                 hci.tx_stalls,
                 hci.uart.errors,
+                hci.hw_errors,
                 pm,
                 g
             );
-            println!("[bt] no adapter: {}", why);
             pads.power(false);
             Adapter::Down(Box::new(hci), store, why)
         }
-    }
+    };
+    (adapter, hw_error)
 }
 
-fn restart(a: Adapter, pads: &Pads) -> Adapter {
-    match a {
-        Adapter::Down(hci, store, _) => start(*hci, store, pads),
+/// One more bring-up of the adapter held in place (`spare` stands in
+/// meanwhile), the next one planned if the core sent a Hardware Error.
+/// A `PAIR` caller still waiting gets a timeout.
+fn bring_up(
+    adapter: &mut Adapter,
+    rec: &mut Recovery,
+    waiter: &mut Option<u64>,
+    spare: Hci,
+    pads: &Pads,
+) {
+    if let Some(t) = waiter.take() {
+        let _ = ipc::reply_to(t, &Msg::error(-ETIMEDOUT));
+    }
+    let placeholder = Adapter::Down(Box::new(spare), Store::default(), String::new());
+    let (hci, store) = match core::mem::replace(adapter, placeholder) {
+        Adapter::Down(hci, store, _) => (*hci, store),
         Adapter::Up(h) => {
             let h = *h;
-            start(h.hci, h.store, pads)
+            (h.hci, h.store)
         }
+    };
+    rec.tries += 1;
+    let off_ms = if rec.tries == 1 {
+        POWER_OFF_MS
+    } else {
+        RETRY_OFF_MS
+    };
+    let (a, hw_error) = start(hci, store, pads, off_ms);
+    let delay = RETRY_DELAYS_S.get(rec.tries as usize - 1);
+    rec.next_ns = match (&a, delay) {
+        (Adapter::Down(..), Some(&d)) if hw_error => Some(time::now_ns() + d * 1_000_000_000),
+        _ => None,
+    };
+    *adapter = a;
+    match (&*adapter, rec.next_ns) {
+        (Adapter::Down(..), Some(_)) => println!(
+            "[bt] bring-up {}: hardware error{}",
+            rec.tries,
+            rec.note(false)
+        ),
+        (Adapter::Down(_, _, why), None) => println!("[bt] no adapter: {}{}", why, rec.note(false)),
+        (Adapter::Up(_), _) if rec.tries > 1 => println!("[bt] up at bring-up {}", rec.tries),
+        _ => {}
     }
 }
 
-fn status(a: &Adapter) -> Msg {
+/// A new series of bring-ups: start, `bt retry`, Hardware Error at runtime.
+fn bring_up_anew(
+    adapter: &mut Adapter,
+    rec: &mut Recovery,
+    waiter: &mut Option<u64>,
+    spare: Hci,
+    pads: &Pads,
+) {
+    *rec = Recovery {
+        tries: 0,
+        first_ns: time::now_ns(),
+        next_ns: None,
+    };
+    bring_up(adapter, rec, waiter, spare, pads);
+}
+
+fn status(a: &Adapter, rec: &Recovery) -> Msg {
     let (st, conn, paired, addr, text) = match a {
-        Adapter::Down(_, s, why) => (bt::ST_DOWN, 0, s.pads.len(), 0, why.clone()),
+        Adapter::Down(_, s, why) => (
+            bt::ST_DOWN,
+            0,
+            s.pads.len(),
+            0,
+            alloc::format!("{}{}", why, rec.note(false)),
+        ),
         Adapter::Up(h) => (
             if h.pairing.is_some() {
                 bt::ST_PAIRING
@@ -228,7 +338,7 @@ fn status(a: &Adapter) -> Msg {
             h.connected(),
             h.store.pads.len(),
             addr_word(&h.chip.addr),
-            h.describe(),
+            alloc::format!("{}{}", h.describe(), rec.note(true)),
         ),
     };
     ipc::pack_at(0, &[st, conn as u64, paired as u64, addr], text.as_bytes())
@@ -297,11 +407,12 @@ fn main() -> i32 {
         let _ = sys::notify_bind(i.notification());
     }
     let _ = ns::wait_for_timeout("fs", FS_WAIT_NS);
-    let hci = Hci::new(Uart::new(uarts.offset(UARTD)));
-    let mut adapter = start(hci, Store::load(), &pads);
-
+    let spare = || Hci::new(Uart::new(uarts.offset(UARTD)));
+    let mut adapter = Adapter::Down(Box::new(spare()), Store::load(), String::new());
+    let mut rec = Recovery::new();
     // `PAIR` caller waiting for the first controller paired.
     let mut waiter: Option<u64> = None;
+    bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
     loop {
         let mut wait = IDLE_NS;
         if let Adapter::Up(h) = &mut adapter {
@@ -320,6 +431,18 @@ fn main() -> i32 {
                 wait = BUSY_NS;
             }
         }
+        if matches!(&adapter, Adapter::Up(h) if h.hw_error.is_some()) {
+            bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+            continue;
+        }
+        if let Some(t) = rec.next_ns {
+            let now = time::now_ns();
+            if now >= t {
+                bring_up(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+                continue;
+            }
+            wait = wait.min(t - now);
+        }
         let rx = match ipc::recv_timeout(ep, wait) {
             Ok(rx) => rx,
             Err(_) => continue,
@@ -336,22 +459,11 @@ fn main() -> i32 {
         }
         let word = |k: usize| if rx.msg.words() > k { rx.msg.mr[k] } else { 0 };
         let reply = match (rx.msg.label(), &mut adapter) {
-            (bt::STATUS, a) => Some(status(a)),
+            (bt::STATUS, a) => Some(status(a, &rec)),
             (bt::LIST, a) => Some(list(a)),
             (bt::RETRY, _) => {
-                if let Some(t) = waiter.take() {
-                    let _ = ipc::reply_to(t, &Msg::error(-ETIMEDOUT));
-                }
-                let a = core::mem::replace(
-                    &mut adapter,
-                    Adapter::Down(
-                        Box::new(Hci::new(Uart::new(uarts.offset(UARTD)))),
-                        Store::default(),
-                        String::new(),
-                    ),
-                );
-                adapter = restart(a, &pads);
-                Some(status(&adapter))
+                bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+                Some(status(&adapter, &rec))
             }
             (bt::FORGET, Adapter::Up(h)) => {
                 let w = word(0);

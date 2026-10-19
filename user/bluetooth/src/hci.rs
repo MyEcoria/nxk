@@ -105,6 +105,8 @@ pub struct Hci {
     pub rx_seen: u64,
     /// The first bytes received, for a failure report.
     pub rx_log: Vec<u8>,
+    /// Hardware Error events received: the core wants a power cycle.
+    pub hw_errors: u64,
 }
 
 const RX_LOG: usize = 24;
@@ -121,6 +123,7 @@ impl Hci {
             tx_stalls: 0,
             rx_seen: 0,
             rx_log: Vec::new(),
+            hw_errors: 0,
         }
     }
 
@@ -155,6 +158,9 @@ impl Hci {
                 break;
             }
             let pkt = if t == H4_EVT {
+                if self.raw[1] == EV_HW_ERROR {
+                    self.hw_errors += 1;
+                }
                 Packet::Event(self.raw[1], self.raw[3..need].to_vec())
             } else {
                 Packet::Acl(le16(&self.raw[1..3]), self.raw[5..need].to_vec())

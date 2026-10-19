@@ -8,7 +8,9 @@ pairs (Secure Simple Pairing, Just Works), opens the HID channels and
 gets full input reports every 15 ms, with A pressed and the left stick
 pushed right for a moment. Then the controller drops the link and pages
 the host again, as a paired pad does on a button press: the link key
-is checked and the pad opens the channels itself.
+is checked and the pad opens the channels itself. `hw_errors` resets
+answer with a Hardware Error first, as the Erista's core does after a
+cold boot.
 """
 import queue, select, socket, struct, threading, time
 
@@ -25,8 +27,9 @@ def le16(b, i=0):
 
 
 class Fake:
-    def __init__(self, path, log=print, reconnect=True):
+    def __init__(self, path, log=print, reconnect=True, hw_errors=0):
         self.path, self.log, self.reconnect = path, log, reconnect
+        self.hw_errors = hw_errors
         self.sock = None
         self.addr = bytes(6)
         self.stop = threading.Event()
@@ -37,7 +40,7 @@ class Fake:
         self.out = queue.Queue()
         self.reset_state()
         self.stats = {"commands": 0, "patch": 0, "reports": 0, "subcmds": [], "pairs": 0,
-                      "reconnects": 0, "key_ok": None}
+                      "reconnects": 0, "key_ok": None, "hw_errors": 0}
 
     def reset_state(self):
         self.connected = False
@@ -155,7 +158,11 @@ class Fake:
         self.stats["commands"] += 1
         if op == 0xFC4C:
             self.stats["patch"] += 1
-        if op == 0x1001:     # local version: Broadcom
+        if op == 0x0C03 and self.hw_errors > 0:   # reset: Hardware Error 0x00
+            self.hw_errors -= 1
+            self.stats["hw_errors"] += 1
+            self.event(0x10, b"\x00")
+        elif op == 0x1001:   # local version: Broadcom
             self.complete(op, struct.pack("<BBHBHH", 0, 6, 0x1000, 6, 0x000F, 0x230F))
         elif op == 0x0C14:   # local name
             self.complete(op, b"\x00" + CHIP_NAME.ljust(248, b"\x00"))
@@ -349,4 +356,4 @@ class Fake:
         s = self.stats
         return (f"bytes {s.get('bytes', 0)}, commands {s['commands']}, patch records {s['patch']}, paired {s['pairs']}, "
                 f"reports {s['reports']}, subcommands {[hex(x) for x in s['subcmds']]}, "
-                f"reconnects {s['reconnects']}, sniff {s.get('sniff', 0)}, link key {'checked' if s['key_ok'] else s['key_ok']}")
+                f"reconnects {s['reconnects']}, hardware errors {s['hw_errors']}, sniff {s.get('sniff', 0)}, link key {'checked' if s['key_ok'] else s['key_ok']}")
