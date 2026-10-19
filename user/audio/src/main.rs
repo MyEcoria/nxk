@@ -19,7 +19,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use libnx::abi::proto::{audio as proto, clk};
+use libnx::abi::err::EBUSY;
+use libnx::abi::proto::{audio as proto, clk, RESUME, SUSPEND};
 use libnx::abi::{prot, shm};
 use libnx::drv::{self, Mmio};
 use libnx::i2c::I2c;
@@ -343,6 +344,44 @@ impl Audio {
         );
     }
 
+    /// Stream stopped, as Linux's tegra_admaif_stop: speakers muted, ADMA
+    /// off, ADMAIF1 disabled and reset, I2S1 RX off.
+    fn stop(&self, adma: &Mmio) {
+        let _ = self.codec_write(RT_SPK_VOL, SPK_MUTED);
+        adma.w32(ADMA_CH_CMD, 0);
+        time::poll(10_000, || adma.r32(ADMA_CH_STATUS) & 1 == 0);
+        let a = &self.ahub;
+        a.w32(ADMAIF_TX1 + ADMAIF_TX_ENABLE, 0);
+        time::poll(10_000, || a.r32(ADMAIF_TX1 + 0x0C) & 1 == 0);
+        a.w32(ADMAIF_TX1 + 0x04, 1);
+        time::poll(10_000, || a.r32(ADMAIF_TX1 + 0x04) & 1 == 0);
+        a.w32(I2S1 + I2S_RX_ENABLE, 0);
+    }
+
+    /// Sleep, after `stop`: the codec's blocks off (rt5640 bias level
+    /// OFF; the amplifier first), its LDO off with the pads released so
+    /// nothing drives into it, then the audio clocks. `up` redoes it all.
+    fn down(&self, adma: &Mmio) {
+        for r in [RT_PWR_DIG1, RT_PWR_VOL, RT_PWR_MIXER, RT_PWR_ANLG1] {
+            let _ = self.codec_write(r, 0);
+        }
+        // The blocks answer only with their clocks running (a failed
+        // `up` leaves them off).
+        if libnx::clk::ready(clk::AUDIO) {
+            adma.w32(ADMA_GLOBAL + ADMA_GLOBAL_CMD, 0);
+            self.ahub.w32(I2S1 + I2S_ENABLE, 0);
+        }
+        let pm = &self.pinmux;
+        for p in [PM_AUD_MCLK, PM_DAP1_FS, PM_DAP1_DOUT, PM_DAP1_SCLK] {
+            pm.w32(p, PM_PULL_DOWN | PM_TRISTATE);
+        }
+        // The codec's LDO stays on: cut, the codec NAKed its reset 75 ms
+        // after it came back (Erista); its blocks are off above.
+        if let Err(e) = libnx::clk::disable(clk::AUDIO) {
+            println!("[audio] clk AUDIO off: {}", e);
+        }
+    }
+
     /// Hub, pads and codec, once.
     fn up(&self) -> Result<(), i64> {
         libnx::clk::enable(clk::AUDIO).inspect_err(|e| println!("[audio] clk AUDIO: {}", e))?;
@@ -382,8 +421,18 @@ const PERIOD_BYTES: u32 = PERIOD_FRAMES * 4;
 const ADMA_CONFIG: u32 = (PERIODS - 1) << 28 | 5 << 20 | 1;
 /// ADMA FIFO size 3, the transmit field (ADMAIF channel 1).
 const ADMA_FIFO_CTRL: u32 = 3 << 8;
+/// The pump's nap while suspended.
+const ASLEEP_NAP_US: u64 = 50_000;
 /// Silent for this long, the DMA stops until something plays.
 const IDLE_NS: u64 = 3_000_000_000;
+
+/// ADMA reset and enabled (its clock must run).
+fn adma_init(d: &Mmio) {
+    d.w32(ADMA_GLOBAL + ADMA_GLOBAL_INT_CLEAR, 1);
+    d.w32(ADMA_GLOBAL + ADMA_GLOBAL_SOFT_RESET, 1);
+    time::poll(10_000, || d.r32(ADMA_GLOBAL + ADMA_GLOBAL_SOFT_RESET) == 0);
+    d.w32(ADMA_GLOBAL + ADMA_GLOBAL_CMD, 1);
+}
 
 /// Parabolic sine approximation: `phase` in 0..65536 -> `-32768..=32768`.
 fn sin16(phase: u32) -> i32 {
@@ -590,6 +639,8 @@ struct Shared {
     music: Option<Music>,
     volume: u8,
     ready: bool,
+    /// Asleep: the codec and clocks are off (`Audio::down`).
+    suspended: bool,
     playing: bool,
     underruns: u32,
     periods: u32,
@@ -607,6 +658,7 @@ impl Default for Shared {
             music: None,
             volume: proto::DEFAULT_VOL,
             ready: false,
+            suspended: false,
             playing: false,
             underruns: 0,
             periods: 0,
@@ -723,17 +775,7 @@ impl Pump {
     }
 
     fn end(&mut self, sh: &mut Shared) {
-        let _ = self.hw.codec_write(RT_SPK_VOL, SPK_MUTED);
-        let d = &self.adma;
-        d.w32(ADMA_CH_CMD, 0);
-        time::poll(10_000, || d.r32(ADMA_CH_STATUS) & 1 == 0);
-        // ADMAIF stop as Linux's tegra_admaif_stop: disable, wait, reset.
-        let a = &self.ahub;
-        a.w32(ADMAIF_TX1 + ADMAIF_TX_ENABLE, 0);
-        time::poll(10_000, || a.r32(ADMAIF_TX1 + 0x0C) & 1 == 0);
-        a.w32(ADMAIF_TX1 + 0x04, 1);
-        time::poll(10_000, || a.r32(ADMAIF_TX1 + 0x04) & 1 == 0);
-        a.w32(I2S1 + I2S_RX_ENABLE, 0);
+        self.hw.stop(&self.adma);
         sh.playing = false;
         println!("[audio] idle: stopped after {} periods", self.played);
     }
@@ -744,7 +786,8 @@ impl Pump {
             || sh.tone.is_some()
             || sh.client.as_ref().is_some_and(|c| c.pending());
         if !sh.playing {
-            if active {
+            // Asleep: the clocks are off, the ADMA must not be touched.
+            if active && !sh.suspended {
                 self.begin(sh);
             }
             return;
@@ -771,6 +814,45 @@ impl Pump {
             self.end(sh);
         }
     }
+}
+
+/// Sleep: stream stopped, codec and clocks off. A hardware never brought
+/// up stays so. Idempotent.
+fn suspend(hw: &Audio, adma: &Mmio, sh: &mut Shared) -> Msg {
+    if sh.suspended {
+        return Msg::new(0, 0, 0);
+    }
+    sh.suspended = true;
+    // A chime or melody does not resume; a client's ring does.
+    sh.tone = None;
+    sh.music = None;
+    if sh.ready {
+        if sh.playing {
+            hw.stop(adma);
+            sh.playing = false;
+        }
+        hw.down(adma);
+    }
+    Msg::new(0, 0, 0)
+}
+
+/// Wake: the boot bring-up again (clocks, pads, codec, hub, ADMA), the
+/// volume kept; the pump restarts the stream when a client has frames.
+/// On failure the hardware is put back to sleep and a later RESUME retries.
+fn resume(hw: &Audio, adma: &Mmio, sh: &mut Shared) -> Msg {
+    if !sh.suspended {
+        return Msg::new(0, 0, 0);
+    }
+    if sh.ready {
+        if let Err(e) = hw.up() {
+            println!("[audio] resume failed: error {}", e);
+            hw.down(adma);
+            return Msg::error(e);
+        }
+        adma_init(adma);
+    }
+    sh.suspended = false;
+    Msg::new(0, 0, 0)
 }
 
 libnx::entry!(main);
@@ -807,7 +889,14 @@ fn main() -> i32 {
         if m.label() == proto::VOLUME && m.mr[0] == proto::VOL_GET {
             return Some(Msg::from_words(0, &[sh.volume as u64]));
         }
-        if !sh.ready {
+        match m.label() {
+            SUSPEND => return Some(suspend(&hw, &adma, &mut sh)),
+            RESUME => return Some(resume(&hw, &adma, &mut sh)),
+            // Asleep: nothing plays, and the hardware stays off.
+            proto::TONE | proto::MUSIC if sh.suspended => return Some(Msg::error(-EBUSY)),
+            _ => {}
+        }
+        if !sh.ready && !sh.suspended {
             let r = hw.up().and_then(|_| {
                 // The DMA ring (a few frames, below 4 GiB, uncached) and
                 // the ADMA, reset and enabled.
@@ -815,11 +904,7 @@ fn main() -> i32 {
                     (PERIODS * PERIOD_BYTES) as usize,
                     shm::CONTIGUOUS | shm::UNCACHED | shm::DMA32,
                 )?;
-                let d = &adma;
-                d.w32(ADMA_GLOBAL + ADMA_GLOBAL_INT_CLEAR, 1);
-                d.w32(ADMA_GLOBAL + ADMA_GLOBAL_SOFT_RESET, 1);
-                time::poll(10_000, || d.r32(ADMA_GLOBAL + ADMA_GLOBAL_SOFT_RESET) == 0);
-                d.w32(ADMA_GLOBAL + ADMA_GLOBAL_CMD, 1);
+                adma_init(&adma);
                 let mut pump = Pump {
                     hw,
                     ahub,
@@ -832,7 +917,10 @@ fn main() -> i32 {
                 };
                 let sh2 = shared.clone();
                 thread::spawn_on(None, 6, move || loop {
-                    time::sleep_us(1000);
+                    // Asleep nothing plays: wake rarely, a stream restarts
+                    // within one nap of the RESUME.
+                    let asleep = sh2.lock().suspended;
+                    time::sleep_us(if asleep { ASLEEP_NAP_US } else { 1000 });
                     let mut s = sh2.lock();
                     pump.tick(&mut s);
                 })
@@ -913,11 +1001,15 @@ fn main() -> i32 {
                     sh.max_step,
                     sh.laps
                 );
-                hw.dump(&adma, "status");
+                let up = sh.ready && !sh.suspended;
+                if up {
+                    hw.dump(&adma, "status");
+                }
                 Some(Msg::from_words(
                     0,
                     &[
-                        proto::ST_READY | if sh.playing { proto::ST_PLAYING } else { 0 },
+                        if up { proto::ST_READY } else { 0 }
+                            | if sh.playing { proto::ST_PLAYING } else { 0 },
                         sh.underruns as u64,
                         sh.periods as u64,
                         sh.volume as u64,
