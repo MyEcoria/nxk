@@ -17,13 +17,15 @@ mod store;
 mod uart;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use libnx::abi::err::{self, EBUSY, EINVAL, ENETDOWN, ETIMEDOUT};
-use libnx::abi::proto::{bt, clk, input};
+use libnx::abi::proto::{bt, clk, input, RESUME, SUSPEND};
 use libnx::drv::{self, Irq, Mmio};
-use libnx::ipc::{self, Msg};
+use libnx::ipc::{self, Msg, Received};
 use libnx::ns::Service;
 use libnx::{ns, println, sys, time};
 
@@ -76,6 +78,10 @@ const RETRY_DELAYS_S: [u64; 8] = [1, 2, 4, 8, 16, 30, 30, 30];
 const RETRY_OFF_MS: u64 = 500;
 /// The firmware is on the card: wait for `fs` (mounted after `sd`).
 const FS_WAIT_NS: u64 = 30_000_000_000;
+/// Sleep: controllers get this long to answer the hang-up, and a failed
+/// clock bring-up is tried again this often.
+const HANGUP_NS: u64 = 1_000_000_000;
+const WAKE_RETRY_NS: u64 = 2_000_000_000;
 /// Checks while something is under way (pairing, a controller being
 /// set up), and the safety net otherwise: reports come by interrupt.
 const BUSY_NS: u64 = 20_000_000;
@@ -207,21 +213,43 @@ impl Recovery {
 
 /// Power cycle and one bring-up; on failure the core is left off. True
 /// as well: the core sent a Hardware Error meanwhile.
-fn start(mut hci: Hci, mut store: Store, pads: &Pads, off_ms: u64) -> (Adapter, bool) {
+fn start(
+    mut hci: Hci,
+    mut store: Store,
+    pads: &Pads,
+    off_ms: u64,
+    stop: &dyn Fn() -> bool,
+) -> (Adapter, bool) {
     hci.uart.irq_off();
+    if stop() {
+        return (
+            Adapter::Down(Box::new(hci), store, String::from(bcm::STOPPED)),
+            false,
+        );
+    }
     let addr = store.local_addr();
     pads.power(false);
     time::sleep_ms(off_ms);
     pads.power(true);
     time::sleep_ms(POWER_ON_MS);
     let errors = hci.hw_errors;
-    let result = bcm::bring_up(&mut hci, addr, &|on| pads.set(GPIO_OUT, AP_WAKE_BT, on));
+    let result = bcm::bring_up(
+        &mut hci,
+        addr,
+        &|on| pads.set(GPIO_OUT, AP_WAKE_BT, on),
+        stop,
+    );
     let hw_error = hci.hw_errors > errors;
     let adapter = match result {
         Ok(chip) => {
             println!("[bt] ready: {}", chip.describe());
             hci.uart.irq_on();
             Adapter::Up(Box::new(Host::new(hci, chip, store)))
+        }
+        // Cut short for the sleep: nothing to diagnose.
+        Err(why) if why == bcm::STOPPED => {
+            pads.power(false);
+            Adapter::Down(Box::new(hci), store, why)
         }
         Err(why) => {
             // What the pins and the UART look like, for a run on hardware.
@@ -258,6 +286,132 @@ fn start(mut hci: Hci, mut store: Store, pads: &Pads, off_ms: u64) -> (Adapter, 
     (adapter, hw_error)
 }
 
+/// The transport and the link keys out of the adapter (`spare` stands in
+/// meanwhile).
+fn take_parts(adapter: &mut Adapter, spare: Hci) -> (Hci, Store) {
+    let placeholder = Adapter::Down(Box::new(spare), Store::default(), String::new());
+    match core::mem::replace(adapter, placeholder) {
+        Adapter::Down(hci, store, _) => (*hci, store),
+        Adapter::Up(h) => {
+            let h = *h;
+            (h.hci, h.store)
+        }
+    }
+}
+
+/// What arrived while a bring-up held the loop, kept in order for the
+/// loop; a SUSPEND in it ends the bring-up.
+struct Stash {
+    ep: u32,
+    queue: RefCell<VecDeque<Received>>,
+}
+
+impl Stash {
+    fn queued_suspend(&self) -> bool {
+        let q = self.queue.borrow();
+        q.iter()
+            .any(|rx| !rx.msg.is_notify() && rx.msg.label() == SUSPEND)
+    }
+
+    /// Takes in what is waiting, without blocking (every item, UART
+    /// notifications too: the loop acknowledges them). True once a
+    /// SUSPEND is in.
+    fn stop(&self) -> bool {
+        // 1 ns is "now" to the kernel; 0 would be forever.
+        while !self.queued_suspend() {
+            let Ok(rx) = ipc::recv_timeout(self.ep, 1) else {
+                break;
+            };
+            self.queue.borrow_mut().push_back(rx);
+        }
+        self.queued_suspend()
+    }
+
+    fn next(&self) -> Option<Received> {
+        self.queue.borrow_mut().pop_front()
+    }
+}
+
+/// Where the sleep stands: UART-D's clock must be on whenever its
+/// registers are touched (a gated block hangs the bus).
+struct Sleep {
+    suspended: bool,
+    clock_on: bool,
+    /// When the bring-up after a RESUME runs.
+    wake_at: Option<u64>,
+}
+
+impl Sleep {
+    /// RESUME: the bring-up runs in the loop, after the reply.
+    fn resume(&mut self) {
+        if self.suspended {
+            println!("[bt] resume");
+            self.suspended = false;
+            self.wake_at = Some(0);
+        }
+    }
+
+    /// Clock and pads back, ready for a bring-up.
+    fn power_up(&mut self, pads: &Pads) -> bool {
+        if !self.clock_on {
+            if let Err(e) = libnx::clk::enable(clk::UARTD) {
+                println!("[bt] UART-D clock: error {}", err::name(e));
+                return false;
+            }
+            self.clock_on = true;
+        }
+        pads.setup();
+        true
+    }
+}
+
+/// Controllers disconnected, as far as they answer, their buttons released.
+fn hang_up(h: &mut Host) {
+    h.hang_up();
+    let end = time::now_ns() + HANGUP_NS;
+    while h.linked() && time::now_ns() < end {
+        h.poll();
+        flush(&mut h.events);
+        time::sleep_ms(2);
+    }
+    h.drop_links();
+    flush(&mut h.events);
+}
+
+/// SUSPEND: controllers off, pairing and retries ended, the core held in
+/// reset and its UART clock gated. Link keys stay in the adapter.
+fn suspend(
+    adapter: &mut Adapter,
+    rec: &mut Recovery,
+    waiter: &mut Option<u64>,
+    sleep: &mut Sleep,
+    spare: Hci,
+    pads: &Pads,
+) {
+    sleep.suspended = true;
+    sleep.wake_at = None;
+    *rec = Recovery::new();
+    if !sleep.clock_on {
+        return;
+    }
+    println!("[bt] suspend");
+    if let Some(t) = waiter.take() {
+        let _ = ipc::reply_to(t, &Msg::error(-ENETDOWN));
+    }
+    if let Adapter::Up(h) = adapter {
+        hang_up(h);
+    }
+    let (mut hci, store) = take_parts(adapter, spare);
+    hci.uart.irq_off();
+    pads.power(false);
+    hci.flush();
+    *adapter = Adapter::Down(Box::new(hci), store, String::from("suspended"));
+    match libnx::clk::disable(clk::UARTD) {
+        Ok(()) => sleep.clock_on = false,
+        Err(e) => println!("[bt] UART-D clock off: error {}", err::name(e)),
+    }
+}
+
 /// One more bring-up of the adapter held in place (`spare` stands in
 /// meanwhile), the next one planned if the core sent a Hardware Error.
 /// A `PAIR` caller still waiting gets a timeout.
@@ -267,25 +421,19 @@ fn bring_up(
     waiter: &mut Option<u64>,
     spare: Hci,
     pads: &Pads,
+    stash: &Stash,
 ) {
     if let Some(t) = waiter.take() {
         let _ = ipc::reply_to(t, &Msg::error(-ETIMEDOUT));
     }
-    let placeholder = Adapter::Down(Box::new(spare), Store::default(), String::new());
-    let (hci, store) = match core::mem::replace(adapter, placeholder) {
-        Adapter::Down(hci, store, _) => (*hci, store),
-        Adapter::Up(h) => {
-            let h = *h;
-            (h.hci, h.store)
-        }
-    };
+    let (hci, store) = take_parts(adapter, spare);
     rec.tries += 1;
     let off_ms = if rec.tries == 1 {
         POWER_OFF_MS
     } else {
         RETRY_OFF_MS
     };
-    let (a, hw_error) = start(hci, store, pads, off_ms);
+    let (a, hw_error) = start(hci, store, pads, off_ms, &|| stash.stop());
     let delay = RETRY_DELAYS_S.get(rec.tries as usize - 1);
     rec.next_ns = match (&a, delay) {
         (Adapter::Down(..), Some(&d)) if hw_error => Some(time::now_ns() + d * 1_000_000_000),
@@ -311,13 +459,14 @@ fn bring_up_anew(
     waiter: &mut Option<u64>,
     spare: Hci,
     pads: &Pads,
+    stash: &Stash,
 ) {
     *rec = Recovery {
         tries: 0,
         first_ns: time::now_ns(),
         next_ns: None,
     };
-    bring_up(adapter, rec, waiter, spare, pads);
+    bring_up(adapter, rec, waiter, spare, pads, stash);
 }
 
 fn status(a: &Adapter, rec: &Recovery) -> Msg {
@@ -412,7 +561,16 @@ fn main() -> i32 {
     let mut rec = Recovery::new();
     // `PAIR` caller waiting for the first controller paired.
     let mut waiter: Option<u64> = None;
-    bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+    let stash = Stash {
+        ep,
+        queue: RefCell::new(VecDeque::new()),
+    };
+    let mut sleep = Sleep {
+        suspended: false,
+        clock_on: true,
+        wake_at: None,
+    };
+    bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads, &stash);
     loop {
         let mut wait = IDLE_NS;
         if let Adapter::Up(h) = &mut adapter {
@@ -432,20 +590,37 @@ fn main() -> i32 {
             }
         }
         if matches!(&adapter, Adapter::Up(h) if h.hw_error.is_some()) {
-            bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+            bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads, &stash);
             continue;
         }
         if let Some(t) = rec.next_ns {
             let now = time::now_ns();
             if now >= t {
-                bring_up(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+                bring_up(&mut adapter, &mut rec, &mut waiter, spare(), &pads, &stash);
                 continue;
             }
             wait = wait.min(t - now);
         }
-        let rx = match ipc::recv_timeout(ep, wait) {
-            Ok(rx) => rx,
-            Err(_) => continue,
+        // After a RESUME: the slow part, once the reply is out.
+        if let Some(t) = sleep.wake_at {
+            let now = time::now_ns();
+            if now >= t {
+                sleep.wake_at = None;
+                if sleep.power_up(&pads) {
+                    bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads, &stash);
+                } else {
+                    sleep.wake_at = Some(now + WAKE_RETRY_NS);
+                }
+                continue;
+            }
+            wait = wait.min(t - now);
+        }
+        let rx = match stash.next() {
+            Some(rx) => rx,
+            None => match ipc::recv_timeout(ep, wait) {
+                Ok(rx) => rx,
+                Err(_) => continue,
+            },
         };
         if rx.msg.is_notify() {
             if let Adapter::Up(h) = &mut adapter {
@@ -461,9 +636,26 @@ fn main() -> i32 {
         let reply = match (rx.msg.label(), &mut adapter) {
             (bt::STATUS, a) => Some(status(a, &rec)),
             (bt::LIST, a) => Some(list(a)),
+            // Nothing powers the core on while the UART's clock is off.
+            (bt::RETRY, _) if sleep.suspended || !sleep.clock_on => Some(status(&adapter, &rec)),
             (bt::RETRY, _) => {
-                bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads);
+                bring_up_anew(&mut adapter, &mut rec, &mut waiter, spare(), &pads, &stash);
                 Some(status(&adapter, &rec))
+            }
+            (SUSPEND, _) => {
+                suspend(
+                    &mut adapter,
+                    &mut rec,
+                    &mut waiter,
+                    &mut sleep,
+                    spare(),
+                    &pads,
+                );
+                Some(Msg::new(0, 0, 0))
+            }
+            (RESUME, _) => {
+                sleep.resume();
+                Some(Msg::new(0, 0, 0))
             }
             (bt::FORGET, Adapter::Up(h)) => {
                 let w = word(0);

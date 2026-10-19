@@ -40,6 +40,18 @@ const ACCEPT_TIMEOUT: u16 = 0x7D00;
 /// Page scan only: paired controllers reconnect, nobody finds us.
 pub const SCAN_PAGE: u8 = 0x02;
 
+/// Error of a bring-up the host cut short (the console goes to sleep).
+pub const STOPPED: &str = "stopped for sleep";
+
+/// The host's `stop` asked to end the bring-up.
+fn halted(stop: &dyn Fn() -> bool) -> Result<(), String> {
+    if stop() {
+        Err(String::from(STOPPED))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct Chip {
     pub name: String,
     pub lmp_subver: u16,
@@ -66,10 +78,11 @@ impl Chip {
 
 /// HCI Reset, retried: the chip takes a moment after power-on. A
 /// Hardware Error ends it: only a power cycle clears that.
-fn reset(hci: &mut Hci, tries: u32) -> Result<(), String> {
+fn reset(hci: &mut Hci, tries: u32, stop: &dyn Fn() -> bool) -> Result<(), String> {
     let mut last = String::new();
     let errors = hci.hw_errors;
     for _ in 0..tries {
+        halted(stop)?;
         hci.flush();
         match hci.call(hci::OP_RESET, &[], 500) {
             Ok(_) => return Ok(()),
@@ -152,11 +165,12 @@ fn firmware_file(chip_name: &str) -> Option<(String, Vec<u8>)> {
 
 /// `btbcm_patchram`: the file is a list of HCI commands (opcode, length,
 /// parameters), sent one after the other.
-fn download(hci: &mut Hci, data: &[u8]) -> Result<usize, String> {
+fn download(hci: &mut Hci, data: &[u8], stop: &dyn Fn() -> bool) -> Result<usize, String> {
     hci.call(hci::OP_BCM_DOWNLOAD_MINIDRIVER, &[], 1000)?;
     time::sleep_ms(MINIDRIVER_MS);
     let (mut at, mut n) = (0, 0);
     while at + 3 <= data.len() {
+        halted(stop)?;
         let op = le16(&data[at..at + 2]);
         let len = data[at + 2] as usize;
         let p = data
@@ -172,10 +186,19 @@ fn download(hci: &mut Hci, data: &[u8]) -> Result<usize, String> {
 }
 
 /// Power-cycled chip to a configured adapter at `addr`.
-pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, String> {
+pub fn bring_up(
+    hci: &mut Hci,
+    addr: Addr,
+    wake: &dyn Fn(bool),
+    stop: &dyn Fn() -> bool,
+) -> Result<Chip, String> {
+    halted(stop)?;
     hci.uart.set_baud(BAUD_INIT);
     let errors = hci.hw_errors;
-    if let Err(e) = reset(hci, 6) {
+    if let Err(e) = reset(hci, 6, stop) {
+        if e == STOPPED {
+            return Err(e);
+        }
         // Events read whole: the speed is right, the core needs a power cycle.
         if hci.hw_errors > errors {
             return Err(e);
@@ -183,8 +206,9 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
         // A chip left at another speed: the 48 MHz divisors.
         let found = PROBE.iter().copied().find(|&b| {
             hci.uart.set_baud(b);
-            reset(hci, 2).is_ok()
+            reset(hci, 2, stop).is_ok()
         });
+        halted(stop)?;
         match found {
             Some(b) => println!("[bt] no answer at 115200, the chip answers at {} baud", b),
             None => {
@@ -193,6 +217,7 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
             }
         }
     }
+    halted(stop)?;
     let (_, subver) = version(hci)?;
     let name = local_name(hci);
     println!("[bt] {} answers, LMP subversion {:#06x}", name, subver);
@@ -200,7 +225,7 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
 
     let firmware = match firmware_file(&name) {
         Some((file, data)) => {
-            let n = download(hci, &data)?;
+            let n = download(hci, &data, stop)?;
             // The patch restarts the chip at its default speed, or at
             // one the file sets: each is tried.
             let _ = fast;
@@ -211,12 +236,13 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
                 time::sleep_ms(20);
                 for b in speeds {
                     hci.uart.set_baud(b);
-                    if reset(hci, 2).is_ok() {
+                    if reset(hci, 2, stop).is_ok() {
                         at = Some((b, level));
                         break 'found;
                     }
                 }
             }
+            halted(stop)?;
             match at {
                 Some((b, w)) => println!(
                     "[bt] patched firmware answers at {} baud, BT_WAKE {}",
@@ -241,6 +267,7 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
     if hci.uart.baud != BAUD_FAST {
         go_fast(hci);
     }
+    halted(stop)?;
     let (manufacturer, lmp_subver) = version(hci)?;
     if manufacturer != BROADCOM {
         println!("[bt] manufacturer {:#06x}, not Broadcom", manufacturer);
@@ -249,6 +276,7 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
     // without its low-power support).
     let _ = hci.call(hci::OP_BCM_SLEEP_MODE, &[0; 12], 500);
 
+    halted(stop)?;
     let mut wire = addr;
     hci.call(hci::OP_BCM_WRITE_BDADDR, &wire, 500)?;
     let got = hci.call(hci::OP_READ_BDADDR, &[], 500)?;
@@ -261,6 +289,7 @@ pub fn bring_up(hci: &mut Hci, addr: Addr, wake: &dyn Fn(bool)) -> Result<Chip, 
     }
     let (acl_mtu, acl_pkts) = (le16(&b[0..2]), le16(&b[3..5]));
 
+    halted(stop)?;
     hci.call(hci::OP_SET_EVENT_MASK, &EVENT_MASK, 500)?;
     hci.call(hci::OP_WRITE_SSP_MODE, &[1], 500)?;
     // Extended results carry names; older controllers refuse it.

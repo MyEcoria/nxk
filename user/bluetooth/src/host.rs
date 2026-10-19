@@ -27,6 +27,9 @@ const IO_NO_INPUT_NO_OUTPUT: u8 = 0x03;
 /// General bonding, no MITM protection (Just Works).
 const AUTH_GENERAL_BONDING: u8 = 0x04;
 const REASON_USER: u8 = 0x13;
+/// Remote device terminated the connection due to power off (Linux
+/// `HCI_ERROR_REMOTE_POWER_OFF`, what it sends on suspend).
+const REASON_POWER_OFF: u8 = 0x15;
 const REASON_AUTH_FAILURE: u8 = 0x05;
 const REASON_UNACCEPTABLE: u8 = 0x0F;
 /// Link key types an unauthenticated (Just Works) pairing gives.
@@ -95,6 +98,7 @@ const OPEN_FALLBACK_NS: u64 = 1_500_000_000;
 const INQUIRY_PAUSE_NS: u64 = 200_000_000;
 /// Inquiry scan and page scan while pairing.
 const SCAN_INQUIRY_PAGE: u8 = 0x03;
+const SCAN_NONE: u8 = 0x00;
 /// Connection attempts to one controller per pairing window.
 const PAGE_TRIES: usize = 4;
 
@@ -361,6 +365,35 @@ impl Host {
         if self.inquiring {
             self.hci.command(hci::OP_INQUIRY_CANCEL, &[]);
             self.inquiring = false;
+        }
+    }
+
+    /// Sleep: pairing and inquiry ended, nobody can page us, every link
+    /// asked to end (`poll` until `linked` is false).
+    pub fn hang_up(&mut self) {
+        self.pairing = None;
+        if self.inquiring {
+            self.hci.command(hci::OP_INQUIRY_CANCEL, &[]);
+            self.inquiring = false;
+        }
+        self.hci.command(hci::OP_WRITE_SCAN_ENABLE, &[SCAN_NONE]);
+        let handles: Vec<u16> = self.conns.iter().map(|c| c.handle).collect();
+        for h in handles {
+            self.disconnect(h, REASON_POWER_OFF);
+        }
+    }
+
+    /// Links still open, set up or not.
+    pub fn linked(&self) -> bool {
+        !self.conns.is_empty()
+    }
+
+    /// The links that did not answer a hang-up: gone with the power
+    /// (buttons released).
+    pub fn drop_links(&mut self) {
+        let handles: Vec<u16> = self.conns.iter().map(|c| c.handle).collect();
+        for h in handles {
+            self.gone(h, REASON_POWER_OFF);
         }
     }
 
