@@ -1268,6 +1268,7 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
     use nxk_shader::rt::{shadow, shadow_demo as sd};
     const W: usize = 80;
     const H: usize = 60;
+    const LAUNCHES: usize = 8;
     let c = match lower::compile(&shadow::kernel(shadow::Slots::default())) {
         Ok(c) => c,
         Err(err) => {
@@ -1302,20 +1303,30 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
         let hist = hist.map_or(&zeros, |k: usize| &kept[k]).clone();
         let un = sd::uniforms(&sc, W, H, &f);
         let want = sd::reference(&sc, pos, &hist, &un);
-        let Some((got, t)) = shadow_frame(g, &c, pos, &hist, &un, &sc.bvh)? else {
-            return Ok((false, ns));
-        };
-        ns += t;
-        let mut wrong = Vec::new();
-        for i in 0..W * H {
-            let word = |m: &[u32], k: usize| f32::from_bits(m[TW * i + k]);
-            let (gd, wd) = (word(&got, 0), word(&want, 0));
-            let off = fmath::abs(gd - wd) > 1e-3 * wd.max(1.0)
-                || (1..TW).any(|k| !(fmath::abs(word(&got, k) - word(&want, k)) <= 0.05));
-            if off {
-                wrong.push(i);
+        // Several launches on the same inputs: a timing hazard shows in
+        // some of them only. `wrong` gathers the texels any launch got wrong.
+        let (mut wrong, mut bad_launches, mut t) = (Vec::new(), 0, 0);
+        let mut got = Vec::new();
+        for _ in 0..LAUNCHES {
+            let Some((g1, t1)) = shadow_frame(g, &c, pos, &hist, &un, &sc.bvh)? else {
+                return Ok((false, ns));
+            };
+            ns += t1;
+            t = t1;
+            let before = wrong.len();
+            for i in 0..W * H {
+                let word = |m: &[u32], k: usize| f32::from_bits(m[TW * i + k]);
+                let (gd, wd) = (word(&g1, 0), word(&want, 0));
+                let off = fmath::abs(gd - wd) > 1e-3 * wd.max(1.0)
+                    || (1..TW).any(|k| !(fmath::abs(word(&g1, k) - word(&want, k)) <= 0.05));
+                if off && !wrong.contains(&i) {
+                    wrong.push(i);
+                    got.push((i, g1[TW * i..TW * i + TW].to_vec()));
+                }
             }
+            bad_launches += (wrong.len() > before) as usize;
         }
+        wrong.sort_unstable();
         // Whole groups of 8 x 4 texels gone wrong together.
         let (gw, gh) = (shadow::GROUP[0] as usize, shadow::GROUP[1] as usize);
         let mut groups = 0;
@@ -1327,23 +1338,26 @@ pub fn shadows(g: &mut Gpu) -> Res<(bool, u64)> {
                 groups += (all && (0..gw * gh).any(bad)) as usize;
             }
         }
-        // A ray grazing an edge may fall either way: a few in a hundred.
-        let pass = wrong.len() * 50 <= W * H && groups == 0;
+        // A ray grazing an edge may fall either way: a few in a thousand.
+        let pass = wrong.len() * 500 <= W * H && groups == 0;
         println!(
-            "[gpu] IR shadows ({}): {} of {} texels differ, {} whole groups; {} us ({} registers)",
+            "[gpu] IR shadows ({}): {} of {} texels differ in {} of {} launches, {} whole groups; {} us ({} registers)",
             name,
             wrong.len(),
             W * H,
+            bad_launches,
+            LAUNCHES,
             groups,
             t / 1000,
             c.gprs
         );
-        for &i in wrong.iter().take(4) {
+        for (i, words) in got.iter().take(4) {
+            let i = *i;
             println!(
                 "[gpu]   texel ({}, {}): {:?}, expected {:?}",
                 i % W,
                 i / W,
-                got[TW * i..TW * i + TW].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
+                words.iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
                 want[TW * i..TW * i + TW].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>()
             );
         }
