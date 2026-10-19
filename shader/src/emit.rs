@@ -12,9 +12,6 @@ const NONE: u8 = 0xFF;
 /// Cycles until a fixed-latency GPR result / predicate is readable.
 const GPR_LATENCY: u32 = 6;
 const PRED_LATENCY: u32 = 13;
-/// Cycles in which a variable-latency instruction may still read its
-/// sources.
-const READ_WINDOW: u32 = 4;
 /// Stall after a control-flow instruction.
 const CTL_STALL: u8 = 15;
 
@@ -37,9 +34,9 @@ pub struct Eff<'a> {
     pub w: &'a [u8],
     pub pr: &'a [u8],
     pub pw: &'a [u8],
-    /// A `Var` instruction that also signals when it has read its
-    /// sources: a load queues behind the others, and the scratch registers
-    /// of its address must not be rewritten before it has taken them.
+    /// Kept for the callers: every `Var` instruction now signals when it
+    /// has read its sources (loads, MUFU and conversions queue on the
+    /// console and take their sources late).
     pub rd_bar: bool,
 }
 
@@ -216,16 +213,14 @@ impl Emitter {
                     for &r in e.w.iter().filter(|&&r| r != RZ) {
                         self.pend_w[r as usize] = bar;
                     }
-                    if e.rd_bar {
+                    // Its sources may be read late (a busy unit queues it):
+                    // a second scoreboard says when they are free again.
+                    if e.r.iter().any(|&r| r != RZ) {
                         let rbar = self.next_bar;
                         self.next_bar = (self.next_bar + 1) % 6;
                         s = s.rd(rbar);
                         for &r in e.r.iter().filter(|&&r| r != RZ) {
                             self.pend_r[r as usize] = rbar;
-                        }
-                    } else {
-                        for &r in e.r.iter().filter(|&&r| r != RZ) {
-                            self.war[r as usize] = self.war[r as usize].max(issue + READ_WINDOW);
                         }
                     }
                 } else {

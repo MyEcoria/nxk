@@ -15,7 +15,6 @@ use crate::interp::Sampler;
 const VAR_LATENCY: u64 = 30;
 const GPR_LATENCY: u64 = 6;
 const PRED_LATENCY: u64 = 13;
-const READ_WINDOW: u64 = 4;
 
 pub struct Sim<'a> {
     pub code: &'a [u64],
@@ -60,7 +59,6 @@ struct Timing {
     pready: [u64; 8],
     pend_w: [Option<u8>; 256],
     pend_r: [Option<u8>; 256],
-    read_until: [u64; 256],
     bar_done: [u64; 6],
 }
 
@@ -120,7 +118,6 @@ impl<'a> Sim<'a> {
             pready: [0; 8],
             pend_w: [None; 256],
             pend_r: [None; 256],
-            read_until: [0; 256],
             bar_done: [0; 6],
         };
         loop {
@@ -188,9 +185,6 @@ impl<'a> Sim<'a> {
                 if t.pend_w[r].is_some() || t.pend_r[r].is_some() {
                     return Err(at(&format!("R{r} written while a load or store uses it")));
                 }
-                if t.read_until[r] > t.cycle {
-                    return Err(at(&format!("R{r} written while still being read")));
-                }
             }
             for &p in preads.iter().filter(|&&p| p != 7) {
                 if t.pready[p] > t.cycle {
@@ -213,19 +207,13 @@ impl<'a> Sim<'a> {
                         for &r in reads.iter().filter(|&&r| r != 255) {
                             t.pend_r[r] = Some(br);
                         }
-                    } else if matches!(family(op), Op::Ldg | Op::Ldl | Op::Atom | Op::Ldc | Op::Tex)
-                    {
-                        // A load queues behind the others and takes its
-                        // address registers when it gets its turn: they stay
-                        // in use until its result is waited on (the console
-                        // gave wrong rays when scratch address registers
-                        // were rewritten earlier).
+                    } else {
+                        // A load, MUFU or conversion queues behind the others
+                        // and takes its sources when it gets its turn: they
+                        // stay in use until its result is waited on (the
+                        // console gave wrong rays and shadows otherwise).
                         for &r in reads.iter().filter(|&&r| r != 255) {
                             t.pend_r[r] = Some(bw);
-                        }
-                    } else {
-                        for &r in &reads {
-                            t.read_until[r] = t.cycle + READ_WINDOW;
                         }
                     }
                 } else if let Some(br) = bar_for(rd) {
