@@ -54,7 +54,7 @@ fn texels(pos: &[[f32; 4]]) -> Positions {
 
 fn hits_box(b: &[f32; 18], o: [f32; 3], d: [f32; 3], t_min: f32, t_max: f32) -> bool {
     let rel = [o[0] - b[9], o[1] - b[10], o[2] - b[11]];
-    let (mut tn, mut tf) = (t_min, t_max);
+    let (mut tn, mut tf) = (-1.0e30f32, t_max);
     for a in 0..3 {
         let ax = [b[3 * a], b[3 * a + 1], b[3 * a + 2]];
         let lp = rel[0] * ax[0] + rel[1] * ax[1] + rel[2] * ax[2];
@@ -64,7 +64,7 @@ fn hits_box(b: &[f32; 18], o: [f32; 3], d: [f32; 3], t_min: f32, t_max: f32) -> 
         tn = tn.max(t1.min(t2));
         tf = tf.min(t1.max(t2));
     }
-    tn <= tf
+    tn <= tf && tn >= t_min
 }
 
 /// What each texel should say without jitter: (distance, 1 lit or 0
@@ -306,6 +306,101 @@ fn a_box_just_above_a_surface_shades_it() {
     std::println!("box just above: share {share}, scene {scene}");
     assert!(scene > 0.0 && figure < 0.01, "share {share}, scene {scene}");
 }
+
+/// A point on a face of a mesh whose box is 5 cm larger than the face
+/// (the leg's box takes in the shoe) stays lit when the sun is on it.
+#[test]
+fn a_point_inside_its_own_box_stays_lit() {
+    use super::shadow_demo as sd;
+    let mut sc = scene();
+    let p = [0.0f32, 20.0, 10.0];
+    let (_, packed) = sd::quantize([0.0, 1.0, 0.0]);
+    // The point is the top face of a mesh; the box goes 5 cm above it.
+    sc.boxes = vec![[
+        1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, p[0], p[1], p[2], -0.3, -0.3, -0.3, 0.3, 0.05,
+        0.3,
+    ]];
+    while sc.boxes.len() < shadow::BOXES {
+        sc.boxes.push([
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 900.0, 900.0, 900.0, 0.0, 0.0, 0.0, 0.1,
+            0.1, 0.1,
+        ]);
+    }
+    let (w, h) = (8, 4);
+    let mut pos = Positions {
+        w,
+        h,
+        texels: vec![[p[0], p[1], p[2], packed]; w * h],
+    };
+    let eye = [0.0, 23.0, 0.0];
+    let f = sd::Frame {
+        eye,
+        prev: (eye, PITCH),
+        number: 0,
+        jitter: 0.0,
+        reset: true,
+    };
+    let mut un = sd::uniforms(&sc, w, h, &f);
+    for (k, v) in [p[0], p[1], p[2], 2.0].iter().enumerate() {
+        un[u::SPHERE as usize + k] = v.to_bits();
+    }
+    let out = sd::reference(&sc, &mut pos, &vec![0; TW * w * h], &un);
+    let share = f32::from_bits(out[1]);
+    std::println!("inside its own box: share {share}");
+    assert!(share > 0.99, "share {share}");
+}
+
+/// Walking: the camera moves about half a texel a frame for 30 frames,
+/// each frame's mask the next one's history (no jitter, so the truth is 0
+/// or 1). Resampling the history must not blur the valley's shadows
+/// frame after frame: texels whose share is off by more than 0.3.
+#[test]
+fn walking_keeps_the_history_sharp() {
+    let sc = scene();
+    let mut hist = vec![0u32; TW * W * H];
+    let mut prev = EYE;
+    let mut off = 0;
+    for k in 0..30u32 {
+        let eye = [EYE[0] + 0.3 * k as f32, EYE[1], EYE[2]];
+        let (pos, normals) = positions(&sc, eye, PITCH);
+        let un = uniforms(&sc, eye, (prev, PITCH), k, 0.0, k == 0);
+        hist = frame(&sc, &pos, &hist, &un);
+        prev = eye;
+        // The valley's share against its truth (the boxes left out).
+        off = (0..W * H)
+            .filter(|&i| {
+                let p = pos[i];
+                if p[3] <= 0.0 {
+                    return false;
+                }
+                let n = normals[i];
+                let lit_n =
+                    (n[0] * sc.sun[0] + n[1] * sc.sun[1] + n[2] * sc.sun[2]).clamp(0.0, 1.0);
+                let bias = shadow::BIAS + shadow::BIAS_SLOPE * (1.0 - lit_n);
+                let o = [p[0] + n[0] * bias, p[1] + n[1] * bias, p[2] + n[2] * bias];
+                let ray = Ray {
+                    origin: o,
+                    t_min: shadow::T_MIN,
+                    dir: sc.sun,
+                    t_max: 80.0,
+                };
+                let truth = if trace::occluded(&sc.bvh, &ray) {
+                    0.0
+                } else {
+                    1.0
+                };
+                (f32::from_bits(hist[TW * i + 2]) - truth).abs() > 0.3
+            })
+            .count();
+    }
+    std::println!("walking 30 frames: {off} of {} texels off", W * H);
+    assert!(off <= WALK_OFF, "{off} texels off");
+}
+
+/// What `walking_keeps_the_history_sharp` allows: 22 measured with the
+/// four-texel history (22 with the nearest texel too, 23 against 35 at
+/// half the speed): resampling does not pile blur up.
+const WALK_OFF: usize = 26;
 
 #[test]
 fn the_jitter_makes_penumbrae() {

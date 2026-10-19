@@ -119,9 +119,10 @@ fn uni3(b: &mut Builder, at: u16) -> [Reg; 3] {
     ]
 }
 
-/// Whether the ray from `o` along `d` (distances from `t_min`, up to
-/// `t_max`) goes through the box whose words start at `base` (a U32
-/// register, words from `u::BOXES`).
+/// Whether the ray from `o` along `d` enters the box whose words start at
+/// `base` (a U32 register, words from `u::BOXES`) between `t_min` and
+/// `t_max`. A box that holds `o` does not count: the boxes are a little
+/// larger than the meshes, and a point of a mesh may lie inside its own.
 fn hits_box(b: &mut Builder, base: Reg, o: [Reg; 3], d: [Reg; 3], t_min: Reg, t_max: Reg) -> Reg {
     let word = |b: &mut Builder, k: u16| b.uniform_idx(u::BOXES + k, base, Ty::F32);
     let v3 = |b: &mut Builder, at: u16| [word(b, at), word(b, at + 1), word(b, at + 2)];
@@ -134,7 +135,7 @@ fn hits_box(b: &mut Builder, base: Reg, o: [Reg; 3], d: [Reg; 3], t_min: Reg, t_
         b.fsub(o[2], origin[2]),
     ];
     let tiny = b.f32(1e-20);
-    let (mut tn, mut tf) = (t_min, t_max);
+    let (mut tn, mut tf) = (b.f32(-1.0e30), t_max);
     for a in 0..3 {
         let lp = dot(b, rel, axes[a]);
         let ld = dot(b, d, axes[a]);
@@ -149,7 +150,9 @@ fn hits_box(b: &mut Builder, base: Reg, o: [Reg; 3], d: [Reg; 3], t_min: Reg, t_
         tn = b.fmax(tn, near);
         tf = b.fmin(tf, far);
     }
-    b.cmp(CmpOp::Le, tn, tf)
+    let through = b.cmp(CmpOp::Le, tn, tf);
+    let ahead = b.cmp(CmpOp::Ge, tn, t_min);
+    b.band(through, ahead)
 }
 
 /// Whether the ray from `o` along unit `d` goes near the sphere (centre
@@ -458,7 +461,7 @@ pub fn kernel(s: Slots) -> Program {
                 let mask = b.u32(1023);
                 let fm = b.and(frame, mask);
                 let fmf = b.u2f(fm);
-                let (g1, g2) = (b.f32(0.754_877_67), b.f32(0.569_840_3));
+                let (g1, g2) = (b.f32(0.754_877_7), b.f32(0.569_840_3));
                 let (a0, b0) = (b.fma(fmf, g1, ja), b.fma(fmf, g2, jb));
                 let (a1, b1) = (fract(b, a0), fract(b, b0));
                 let (two_f, minus) = (b.f32(2.0), b.f32(-1.0));
