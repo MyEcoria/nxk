@@ -1170,6 +1170,28 @@ within 5 s.
     old for one frame where it changes. The boot image's `display` still
     speaks the old protocol: after a reboot, games need `--reload display`.
 
+47. 19/10/2026, Erista, same boot, `--reload display`: **run 46 was
+    wrong on the panel**. Its pictures came from `SNAPSHOT`, which blends
+    the overlay in software; on the screen, `+` showed nothing and the
+    game seemed frozen (the invisible drawer took the input). The output
+    CRC (`COM_CRC_CONTROL`, game held by the link lock) was the same with
+    window C on or off; white and black patches gave the same CRC: C no
+    longer fetched, its registers set like B's and D's. In the boot of
+    run 46's first tries B was the one stuck, C fine; a reboot freed B.
+    hekate leaves `CMD_REG_ACT_CONTROL` at 0x454: windows A to D take
+    their registers at the next line, not the next frame; hekate clears
+    D's bit before drawing its log on D. `display` now clears A's, B's and
+    D's, checks at start that D (then B) fetches (16x4 patch, two CRCs)
+    and draws the overlay on it. Window A's flips now latch at the
+    vertical blank: waiting on its own request bit gives 59 flips/s (71/s
+    before, flips taken mid-frame, so tearing). Seen on the panel: the
+    volume pill and the drawer over Lumen. Underflow counters (0x80A)
+    replace `CMD_INT_STATUS`, which read 0. Sleep Mode is in the drawer
+    over a game, and a short Power press sleeps there too: the game waits
+    in its next `FLIP` (picture held, GPU idle) until the wake; its clock
+    jumps by the sleep. Not proven yet: that C stays usable after a reboot
+    with the vertical-blank activation (it should, nothing uses C now).
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
