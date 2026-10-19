@@ -1,6 +1,6 @@
 //! The drawer on the right, as the Switch's quick settings: Sleep Mode,
 //! brightness, volume, Flight Mode, System Settings. Over a game (`+`),
-//! without Sleep Mode and System Settings: the game keeps the screen.
+//! without System Settings: the game keeps the screen.
 
 use crate::backlight::MIN_PCT;
 use crate::font::Face;
@@ -31,14 +31,12 @@ impl Ui {
         self.status(s, d, W - 32, 40, p.surface);
 
         // Sleep Mode.
-        if !self.in_game {
-            let (y, h) = (95, 76);
-            let bg = press(p.raised, self.pressed == Some(Id::QSleep));
-            s.fill_round(L, y, R - L, h, 6, bg);
-            icon(s, Icon::Power, IX, y + h / 2, p.text, bg);
-            s.label(SX, y + h / 2, "Sleep Mode", Face::Body, p.text);
-            self.zone(Id::QSleep, L, y, R - L, h, 6);
-        }
+        let (y, h) = (95, 76);
+        let bg = press(p.raised, self.pressed == Some(Id::QSleep));
+        s.fill_round(L, y, R - L, h, 6, bg);
+        icon(s, Icon::Power, IX, y + h / 2, p.text, bg);
+        s.label(SX, y + h / 2, "Sleep Mode", Face::Body, p.text);
+        self.zone(Id::QSleep, L, y, R - L, h, 6);
 
         // No light sensor read yet: brightness is set by hand.
         s.label(TX, 213, "Automatic Brightness", Face::Body, p.text);

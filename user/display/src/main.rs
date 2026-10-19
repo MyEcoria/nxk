@@ -2,8 +2,9 @@
 //! the Switch-style touch UI of `ui`: home row of games and app tiles,
 //! quick settings drawer, settings, system, network, USB-C terminal and
 //! logs. Redrawn every second and on input. Counts the time played in
-//! the games it starts. Over a game (window A on its images), window C
-//! blends the volume indicator, toasts and the drawer (`+`) on top.
+//! the games it starts. Over a game (window A on its images), window D
+//! (B if D does not fetch) blends the volume indicator, toasts and the
+//! drawer (`+`) on top; Sleep holds the game in its next `FLIP`.
 //! Panel init is left to the bootloader; only the window is changed. A
 //! portrait panel (Switch) is drawn turned.
 
@@ -110,21 +111,16 @@ const WINBUF_SURFACE_KIND: usize = 0x80B;
 const WIN_BLEND_LAYER_CONTROL: usize = 0x716;
 const WIN_BLEND_MATCH_SELECT: usize = 0x717;
 const WIN_BLEND_NOMATCH_SELECT: usize = 0x718;
-const CMD_INT_STATUS: usize = 0x37;
-/// `CMD_INT_STATUS`: window A / C underflow (write 1 to clear).
-const WIN_A_UF: u32 = 1 << 8;
-const WIN_C_UF: u32 = 1 << 10;
-/// `CMD_DISPLAY_WINDOW_HEADER`: which window the `WIN*` registers address.
-/// The overlay is window C: on the Erista, window B scans out black and
-/// underflows whatever its image (its memory client is not served).
+/// Underflows of the selected window (a count).
+const WINBUF_UFLOW_STATUS: usize = 0x80A;
+const CMD_REG_ACT_CONTROL: usize = 0x43;
+const COM_CRC_CONTROL: usize = 0x300;
+const COM_CRC_CHECKSUM_LATCHED: usize = 0x329;
+/// `CMD_DISPLAY_WINDOW_HEADER`: window A's registers addressed.
 const SELECT_A: u32 = 1 << 4;
-const SELECT_C: u32 = 1 << 6;
-/// `CMD_STATE_CONTROL`: window C's update and activation requests.
-const WIN_C_UPDATE: u32 = 1 << 11;
-const WIN_C_ACT_REQ: u32 = 1 << 3;
 /// `WIN_BLEND_LAYER_CONTROL`: blending off, the bottom layer.
 const BLEND_BYPASS: u32 = 1 << 24;
-/// Window C's layer on top (depth 0) with K1 = K2 = 255, per-pixel
+/// The overlay's layer on top (depth 0) with K1 = K2 = 255, per-pixel
 /// premultiplied alpha: color = src + dst * (1 - K1 * src alpha).
 const BLEND_TOP: u32 = 255 << 16 | 255 << 8;
 const BLEND_PREMULT: u32 = 2 | 6 << 4 | 2 << 8;
@@ -251,6 +247,8 @@ struct Game {
 struct Frames {
     since: u64,
     flips: u64,
+    /// Underflows of window A and the overlay's when it opened.
+    uf: [u32; 2],
     draws: u64,
     draw_ns: u64,
     draw_max: u64,
@@ -258,10 +256,11 @@ struct Frames {
 }
 
 impl Frames {
-    fn new(now: u64, flips: u64) -> Self {
+    fn new(now: u64, flips: u64, uf: [u32; 2]) -> Self {
         Self {
             since: now,
             flips,
+            uf,
             draws: 0,
             draw_ns: 0,
             draw_max: 0,
@@ -278,13 +277,14 @@ impl Frames {
         }
     }
 
-    /// One log line; `scan`'s flips since, `uf`: window A / C underflowed.
-    fn report(&self, now: u64, scan: &Link, uf: (bool, bool)) {
+    /// One log line; `scan`'s flips since, `uf`: window A's and the
+    /// overlay's underflows now.
+    fn report(&self, now: u64, scan: &Link, uf: [u32; 2]) {
         let ms = ((now - self.since) / 1_000_000).max(1);
         let n = self.draws.max(1);
         let flips = scan.flips - self.flips;
         println!(
-            "[display] drawer over the game {} ms: {} flips ({}/s), longest gap {} ms, {} late; {} redraws, {} us mean (draw {} present {} ink {}), {} us longest; underflow A {} C {}",
+            "[display] drawer over the game {} ms: {} flips ({}/s), longest gap {} ms, {} late; {} redraws, {} us mean (draw {} present {} ink {}), {} us longest; underflows A {} overlay {}",
             ms,
             flips,
             flips * 1000 / ms,
@@ -296,8 +296,8 @@ impl Frames {
             self.split[1] / n / 1000,
             self.split[2] / n / 1000,
             self.draw_max / 1000,
-            uf.0,
-            uf.1
+            uf[0].wrapping_sub(self.uf[0]),
+            uf[1].wrapping_sub(self.uf[1])
         );
     }
 }
@@ -619,6 +619,104 @@ fn flip(dc: &Mmio, pa: u32) {
     wait_shown(dc);
 }
 
+/// A window of the display controller: A (0) to D (3).
+#[derive(Clone, Copy, PartialEq)]
+struct Win(u32);
+
+/// The overlay's candidates, the first that fetches its image: D (hekate
+/// draws its log on it), then B. A window activated mid-frame stopped
+/// fetching for good on the Erista (B, then C, until a reboot).
+const OVERLAY_WINS: [Win; 2] = [Win(3), Win(1)];
+
+impl Win {
+    /// `CMD_DISPLAY_WINDOW_HEADER`: its registers addressed.
+    fn select(self) -> u32 {
+        1 << (4 + self.0)
+    }
+
+    /// `CMD_STATE_CONTROL`: its update, then its activation request.
+    fn update(self) -> u32 {
+        1 << (9 + self.0)
+    }
+
+    fn act(self) -> u32 {
+        1 << (1 + self.0)
+    }
+
+    /// `CMD_REG_ACT_CONTROL`: taken at the next line, not the next frame.
+    fn hcntr(self) -> u32 {
+        1 << [2, 4, 6, 10][self.0 as usize]
+    }
+
+    fn name(self) -> char {
+        (b'A' + self.0 as u8) as char
+    }
+
+    /// Its underflows so far.
+    fn underflows(self, dc: &Mmio) -> u32 {
+        wr(dc, CMD_DISPLAY_WINDOW_HEADER, self.select());
+        let n = dc.r32(WINBUF_UFLOW_STATUS * 4);
+        wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
+        n
+    }
+}
+
+/// The display's output CRC over a frame, taken twice; `None` if the two
+/// differ.
+fn out_crc(dc: &Mmio) -> Option<u32> {
+    wr(dc, COM_CRC_CONTROL, 0);
+    wr(dc, COM_CRC_CONTROL, (1 << 3) | (1 << 2) | 1); // always, active data, on
+    time::sleep_ms(60);
+    let a = dc.r32(COM_CRC_CHECKSUM_LATCHED * 4);
+    time::sleep_ms(40);
+    let b = dc.r32(COM_CRC_CHECKSUM_LATCHED * 4);
+    wr(dc, COM_CRC_CONTROL, 0);
+    (a == b).then_some(b)
+}
+
+/// Whether `win` fetches: a 16x4 white then black patch in the corner
+/// (opaque, `buf` rows 0-3 and 4-7, 64 bytes each) give two output CRCs.
+fn fetches(dc: &Mmio, win: Win, buf: u32) -> bool {
+    let patch = |dc: &Mmio, row: Option<u32>| {
+        wr(dc, CMD_DISPLAY_WINDOW_HEADER, win.select());
+        if let Some(r) = row {
+            wr(dc, WIN_BUFFER_CONTROL, 0);
+            wr(dc, WIN_COLOR_DEPTH, R8G8B8A8);
+            wr(dc, WIN_POSITION, 0);
+            wr(dc, WIN_SIZE, 4 << 16 | 16);
+            wr(dc, WIN_PRESCALED_SIZE, 4 << 16 | 64);
+            wr(dc, WIN_H_INITIAL_DDA, 0);
+            wr(dc, WIN_V_INITIAL_DDA, 0);
+            wr(dc, WIN_DDA_INCREMENT, 0x1000_1000);
+            wr(dc, WIN_LINE_STRIDE, 64);
+            wr(dc, WINBUF_START_ADDR, buf);
+            wr(dc, WINBUF_ADDR_H_OFFSET, 0);
+            wr(dc, WINBUF_ADDR_V_OFFSET, r);
+            wr(dc, WINBUF_SURFACE_KIND, 0);
+            wr(dc, WIN_BLEND_LAYER_CONTROL, BLEND_BYPASS);
+            wr(dc, WIN_OPTIONS, 1 << 30);
+        } else {
+            wr(dc, WIN_OPTIONS, 0);
+        }
+        wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
+        wr(dc, CMD_STATE_CONTROL, (1 << 8) | win.update());
+        wr(dc, CMD_STATE_CONTROL, 1 | win.act());
+        time::sleep_ms(40);
+        out_crc(dc)
+    };
+    let white = patch(dc, Some(0));
+    let black = patch(dc, Some(4));
+    let off = patch(dc, None);
+    println!(
+        "[display] window {}: output CRC {:x?} white, {:x?} black, {:x?} off",
+        win.name(),
+        white,
+        black,
+        off
+    );
+    white.is_some() && white != black
+}
+
 /// Window A asked to read `pa` from the next vertical blank.
 fn show(dc: &Mmio, pa: u32) {
     wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
@@ -627,11 +725,11 @@ fn show(dc: &Mmio, pa: u32) {
     wr(dc, CMD_STATE_CONTROL, 1 | 2);
 }
 
-/// Until window A took its update. Its own request bit only: window C's
-/// asked meanwhile sets the general one again.
+/// Until window A took its update (at the vertical blank). Its own request
+/// bit only: the overlay's asked meanwhile sets the general one again.
 fn wait_shown(dc: &Mmio) {
     for _ in 0..400 {
-        if dc.r32(CMD_STATE_CONTROL * 4) & 3 == 0 {
+        if dc.r32(CMD_STATE_CONTROL * 4) & 2 == 0 {
             return;
         }
         time::sleep_us(100);
@@ -653,6 +751,8 @@ struct Link {
     last: u64,
     gap: u64,
     late: u64,
+    /// The console sleeps: the game's next `FLIP` waits for the wake.
+    asleep: bool,
 }
 
 /// Above the UI's threads: a frame asked while the UI draws is not late.
@@ -660,7 +760,7 @@ const GAME_PRIO: u8 = 8;
 
 /// The game's `FLIP` and `EVENT`, on their own endpoint (`SCANOUT`'s
 /// handle 3): never behind a redraw of the overlay.
-fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>) -> ! {
+fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>, awake: &Condvar) -> ! {
     let _ = thread::set_current_priority(GAME_PRIO);
     loop {
         let wait = match link.lock().waiter.map_or(0, |w| w.1) {
@@ -693,7 +793,11 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>) -> ! {
         }
         let k = rx.msg.mr[0] as usize;
         let ok = rx.msg.label() == proto::FLIP && {
-            let s = link.lock();
+            let mut s = link.lock();
+            // Asleep, the game waits in its FLIP: its GPU and CPU idle.
+            while s.asleep && s.badge == rx.badge {
+                s = awake.wait(s);
+            }
             let pa = s.pas.get(k).copied().filter(|_| s.badge == rx.badge);
             pa.inspect(|&pa| show(&dc, pa)).is_some()
         };
@@ -717,11 +821,11 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>) -> ! {
     }
 }
 
-/// Window C: the part `rect` (x, y, w, h, image pixels) of the UI's image
-/// `pa` (`w` wide, premultiplied alpha) over the game, or off. Taken at
-/// the next vertical blank; window A's registers addressed again after.
-fn overlay(dc: &Mmio, pa: u32, w: usize, rect: Option<(usize, usize, usize, usize)>) {
-    wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_C);
+/// The overlay window `win`: the part `rect` (x, y, w, h, image pixels)
+/// of the UI's image `pa` (`w` wide, premultiplied alpha) over the game,
+/// or off. Taken at the next vertical blank; window A addressed after.
+fn overlay(dc: &Mmio, win: Win, pa: u32, w: usize, rect: Option<(usize, usize, usize, usize)>) {
+    wr(dc, CMD_DISPLAY_WINDOW_HEADER, win.select());
     match rect {
         Some((x, y, rw, rh)) => {
             let (x, y, rw, rh) = (x as u32, y as u32, rw as u32, rh as u32);
@@ -747,8 +851,29 @@ fn overlay(dc: &Mmio, pa: u32, w: usize, rect: Option<(usize, usize, usize, usiz
         None => wr(dc, WIN_OPTIONS, 0),
     }
     wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
-    wr(dc, CMD_STATE_CONTROL, (1 << 8) | WIN_C_UPDATE);
-    wr(dc, CMD_STATE_CONTROL, 1 | WIN_C_ACT_REQ);
+    wr(dc, CMD_STATE_CONTROL, (1 << 8) | win.update());
+    wr(dc, CMD_STATE_CONTROL, 1 | win.act());
+}
+
+/// Underflows so far of window A and the overlay window.
+fn underflows(dc: &Mmio, ov: Option<Win>) -> [u32; 2] {
+    [Win(0).underflows(dc), ov.map_or(0, |v| v.underflows(dc))]
+}
+
+/// The overlay window: the first candidate that fetches, left off
+/// (a display started again finds it as left).
+fn pick_overlay(dc: &Mmio) -> Option<Win> {
+    let buf = SharedMemory::new(4096, CONTIGUOUS | DMA32 | UNCACHED).ok()?;
+    let px = unsafe { core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u32, 128) };
+    px[..64].fill(0xFFFF_FFFF);
+    px[64..].fill(0xFF00_0000);
+    let pa = buf.paddr(0).ok()? as u32;
+    let win = OVERLAY_WINS.into_iter().find(|&v| fetches(dc, v, pa));
+    match win {
+        Some(v) => println!("[display] overlay on window {}", v.name()),
+        None => println!("[display] no window fetches (or no output CRC): no overlay over games"),
+    }
+    win
 }
 
 /// The overlay's drawn area widened to 16-pixel columns (64-byte reads).
@@ -763,7 +888,7 @@ fn ov_rect(
 }
 
 /// The overlay as shown (`rect` of the UI's image) blended over a game's
-/// block-linear copy, as window C does: for `SNAPSHOT`.
+/// block-linear copy, as the overlay window does: for `SNAPSHOT`.
 fn blend_over(snap: &SharedMemory, scr: &Screen, rect: (usize, usize, usize, usize)) {
     let (iw, _) = scr.image_size();
     let (x0, y0, rw, rh) = rect;
@@ -852,10 +977,17 @@ fn main() -> i32 {
     wr(&dc, WIN_BLEND_LAYER_CONTROL, BLEND_BYPASS | 255);
     wr(&dc, DISP_BLEND_BACKGROUND_COLOR, 0);
     wr(&dc, CMD_DISPLAY_COMMAND, 1 << 5); // continuous display
+
+    // Window A and the overlay's candidates take their registers at the
+    // vertical blank (hekate leaves them at the next line).
+    let hcntr = OVERLAY_WINS
+        .iter()
+        .fold(Win(0).hcntr(), |m, v| m | v.hcntr());
+    let act = dc.r32(CMD_REG_ACT_CONTROL * 4);
+    wr(&dc, CMD_REG_ACT_CONTROL, act & !hcntr);
     wr(&dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(&dc, CMD_STATE_CONTROL, 1 | 2);
-    // Window C (the overlay) off: a display started again finds it as left.
-    overlay(&dc, pa, w, None);
+    let ov_win = pick_overlay(&dc);
 
     let mut msgs = Messages {
         lines: VecDeque::new(),
@@ -912,11 +1044,13 @@ fn main() -> i32 {
         last: 0,
         gap: 0,
         late: 0,
+        asleep: false,
     }));
+    let awake = Arc::new(Condvar::new());
     let game_ep = sys::endpoint_create().expect("display: game endpoint");
     {
-        let s2 = link.clone();
-        thread::spawn(move || game_thread(dc, game_ep, &s2)).expect("display: game thread");
+        let (s2, a2) = (link.clone(), awake.clone());
+        thread::spawn(move || game_thread(dc, game_ep, &s2, &a2)).expect("display: game thread");
     }
     // Each game's endpoint has its own badge: an old one is refused.
     let mut link_gen = 0u64;
@@ -954,7 +1088,7 @@ fn main() -> i32 {
         notif,
     };
     let (mut next_scan, mut next_live) = (0u64, 0u64);
-    // Over a game: window C's area of the UI's image (None: off), the
+    // Over a game: the overlay window's area of the UI's image (None: off), the
     // finger the overlay follows, and the frames counted while the drawer
     // is open (since, flips, longest gap, last flip, longest redraw).
     let mut ov_shown: Option<(usize, usize, usize, usize)> = None;
@@ -968,7 +1102,10 @@ fn main() -> i32 {
                 let mut s = link.lock();
                 (s.pas, s.badge, s.waiter) = (Vec::new(), 0, None);
                 s.events.clear();
-                overlay(&dc, pa, w, None);
+                awake.notify_all();
+                if let Some(v) = ov_win {
+                    overlay(&dc, v, pa, w, None);
+                }
             }
             ov_shown = None;
             ov_finger = None;
@@ -1003,6 +1140,7 @@ fn main() -> i32 {
         () => {{
             if !sleeping {
                 sleeping = true;
+                link.lock().asleep = true;
                 if let Some(b) = &bl {
                     b.off();
                 }
@@ -1022,6 +1160,8 @@ fn main() -> i32 {
         ($now:expr) => {{
             if sleeping {
                 sleeping = false;
+                link.lock().asleep = false;
+                awake.notify_all();
                 if let Some(b) = &bl {
                     b.set(ui.cfg.brightness);
                 }
@@ -1329,10 +1469,10 @@ fn main() -> i32 {
                 let t1 = time::now_ns();
                 scr.present();
                 let t2 = time::now_ns();
-                let rect = ov_rect(scr.ink(), w);
-                if rect != ov_shown {
+                let rect = ov_rect(scr.ink(), w).filter(|_| ov_win.is_some());
+                if let Some(v) = ov_win.filter(|_| rect != ov_shown) {
                     let _s = link.lock();
-                    overlay(&dc, pa, w, rect);
+                    overlay(&dc, v, pa, w, rect);
                     ov_shown = rect;
                 }
                 if let Some(st) = ov_stats.as_mut() {
@@ -1399,8 +1539,8 @@ fn main() -> i32 {
                     dirty = true;
                 }
                 // The Power button is the console's too: a short press
-                // sleeps, a long one opens the Power sheet. A game or a
-                // program owning the screen keeps the screen to itself.
+                // sleeps (a game too, held in its FLIP), a long one opens
+                // the Power sheet. A program owning the screen keeps it.
                 let power: Vec<u64> = batch
                     .iter()
                     .filter(|e| {
@@ -1414,12 +1554,13 @@ fn main() -> i32 {
                     !(e.0 == input::KIND_BUTTON
                         && matches!(e.1, input::BTN_POWER | input::BTN_POWER_LONG))
                 });
-                if game.is_none() && !owned {
+                if !owned {
                     for code in power {
-                        if code == input::BTN_POWER_LONG {
-                            ui.power_menu();
-                        } else {
+                        if code != input::BTN_POWER_LONG {
+                            ui.quick = false;
                             enter_sleep!();
+                        } else if game.is_none() {
+                            ui.power_menu();
                         }
                         dirty = true;
                     }
@@ -1440,7 +1581,8 @@ fn main() -> i32 {
                             data.refresh();
                             let mut s = link.lock();
                             (s.gap, s.late) = (0, 0);
-                            ov_stats = Some(Frames::new(now, s.flips));
+                            let uf = underflows(&dc, ov_win);
+                            ov_stats = Some(Frames::new(now, s.flips, uf));
                         }
                     }
                     batch.retain(|e| !plus(e));
@@ -1491,9 +1633,7 @@ fn main() -> i32 {
                     if !ui.quick {
                         if let Some(st) = ov_stats.take() {
                             let s = link.lock();
-                            let uf = dc.r32(CMD_INT_STATUS * 4) & (WIN_A_UF | WIN_C_UF);
-                            wr(&dc, CMD_INT_STATUS, uf);
-                            st.report(now, &s, (uf & WIN_A_UF != 0, uf & WIN_C_UF != 0));
+                            st.report(now, &s, underflows(&dc, ov_win));
                         }
                     }
                     let mut s = link.lock();
@@ -1700,7 +1840,7 @@ fn main() -> i32 {
                 let (mem, layout, block) = match game.as_mut() {
                     Some(g) => match still(g, held.shown) {
                         Some(m) => {
-                            // With the overlay window C adds on top.
+                            // With the overlay window adds on top.
                             if let Some(r) = ov_shown {
                                 blend_over(m, &scr, r);
                             }

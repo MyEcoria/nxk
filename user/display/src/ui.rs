@@ -734,12 +734,7 @@ impl Ui {
 
     pub fn toggle_quick(&mut self) {
         self.quick = !self.quick;
-        let first = if self.in_game {
-            Id::QBright
-        } else {
-            Id::QSleep
-        };
-        self.focus = self.quick.then_some(first);
+        self.focus = self.quick.then_some(Id::QSleep);
     }
 
     /// Whether a touch at (x, y) lands on the overlay drawn over a game
