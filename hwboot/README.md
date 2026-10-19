@@ -1143,7 +1143,11 @@ within 5 s.
     weighted by nearness and distance agreement: soft edges while walking,
     for about 0.7 ms of GPU (72-81% busy in the Lab walk, 69-76% before).
     The figure's boxes were tested from the scene's offset (10-25 cm), wider
-    than an arm is from the body; their rays now start 2 cm off.
+    than an arm is from the body; their rays now start 2 cm off, and a box
+    that holds the ray's start is skipped (the leg's box takes in the shoe,
+    so a point of the leg lies inside it). Seen from four sides, the lit
+    faces stay lit. On the PC, 30 walking frames leave 22 of 1200 texels off
+    the truth with the four-texel history as with the nearest texel.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
