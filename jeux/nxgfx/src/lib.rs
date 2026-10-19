@@ -75,6 +75,7 @@ pub enum Button {
     R,
     Zl,
     Zr,
+    /// Never sent to a game: display keeps it for its drawer.
     Plus,
     Minus,
     Up,
@@ -355,6 +356,8 @@ struct Target {
 
 pub struct Graphics {
     display: Service,
+    /// The screen's side for this game: `display::FLIP` and `EVENT`.
+    link: Service,
     gpu: Service,
     /// Images on the panel, scanned out in turn; the one on display.
     images: Vec<Target>,
@@ -406,6 +409,7 @@ impl Graphics {
         }
         let r = at("screen", display.call(&Msg::new(display::SCANOUT, 0, 0)))?;
         let handles: Vec<u32> = (0..display::SCANOUT_BUFFERS).map(received_handle).collect();
+        let link = Service::from_handle(received_handle(display::SCANOUT_BUFFERS));
         let (w, h, bl) = (word(&r, 0) as u32, word(&r, 1) as u32, word(&r, 3));
         let mut images = Vec::new();
         let mut failed = None;
@@ -449,6 +453,7 @@ impl Graphics {
         let cid = word(&at("canvas buffer", gpu_s.call_with(m, cvs.handle()))?, 0);
         Ok(Self {
             display,
+            link,
             gpu: gpu_s,
             images,
             shown: 0,
@@ -707,7 +712,7 @@ impl Graphics {
     /// The next input event, waiting at most `timeout_ns` (0: for good).
     pub fn poll(&self, timeout_ns: u64) -> Option<Event> {
         let r = self
-            .display
+            .link
             .call(&Msg::from_words(display::EVENT, &[timeout_ns]))
             .ok()?;
         let (kind, code, value, x, y) = (
@@ -991,7 +996,7 @@ impl Frame<'_> {
         g.cmd.write_words(0, &g.words);
         g.gpu
             .call(&Msg::from_words(gpu::RENDER, &[g.cmd_id, 0, n as u64]))?;
-        g.display
+        g.link
             .call(&Msg::from_words(display::FLIP, &[self.back as u64]))?;
         g.shown = self.back;
         g.frames += 1;

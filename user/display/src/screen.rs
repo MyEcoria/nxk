@@ -61,6 +61,11 @@ fn expand(p: u16) -> u32 {
     0xFF00_0000 | (b << 3 | b >> 2) << 16 | (g << 2 | g >> 4) << 8 | (r << 3 | r >> 2)
 }
 
+/// Coverage `a` over coverage `d` (premultiplied over).
+fn over_a(d: u8, a: u32) -> u8 {
+    (a + (d as u32 * (255 - a) + 127) / 255) as u8
+}
+
 /// `c` (A B G R) over `d`, `a` of 255 opaque.
 fn blend(d: u16, c: u32, a: u32) -> u16 {
     let (r, g, b) = ((d >> 11) as u32 & 31, (d >> 5) as u32 & 63, d as u32 & 31);
@@ -110,6 +115,10 @@ pub struct Screen {
     pub dx: i32,
     /// Portrait panel: landscape view turned 90 degrees counterclockwise.
     rot: bool,
+    /// Overlay mode (over a game): each pixel's coverage, drawn and
+    /// displayed; the colors are then premultiplied. Empty otherwise.
+    alpha: Vec<u8>,
+    ashown: Vec<u8>,
 }
 
 impl Screen {
@@ -123,7 +132,61 @@ impl Screen {
             h,
             dx: 0,
             rot: h > w,
+            alpha: Vec::new(),
+            ashown: Vec::new(),
         }
+    }
+
+    /// Overlay mode on (pixels carry their coverage, the frame starts
+    /// transparent) or off (opaque, as the UI); the next frame is copied whole.
+    pub fn set_overlay(&mut self, on: bool) {
+        if on == !self.alpha.is_empty() {
+            return;
+        }
+        let n = self.w * self.h;
+        (self.alpha, self.ashown) = if on {
+            (vec![0; n], vec![0; n])
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.all = true;
+    }
+
+    /// Nothing drawn: every pixel transparent (overlay mode).
+    pub fn clear_clear(&mut self) {
+        self.back.fill(0);
+        self.alpha.fill(0);
+    }
+
+    /// The image rectangle (x, y, w, h, panel scan order) holding every
+    /// pixel not transparent; `None` if there is none or not in overlay mode.
+    pub fn ink(&self) -> Option<(usize, usize, usize, usize)> {
+        if self.alpha.is_empty() {
+            return None;
+        }
+        let (mut x0, mut x1, mut y0, mut y1) = (self.w, 0, self.h, 0);
+        for (r, row) in self.alpha.chunks_exact(self.w).enumerate() {
+            let Some(f) = row.iter().position(|&a| a != 0) else {
+                continue;
+            };
+            let l = row.iter().rposition(|&a| a != 0).unwrap_or(f);
+            (x0, x1) = (x0.min(f), x1.max(l));
+            (y0, y1) = (y0.min(r), r);
+        }
+        (y0 <= y1 && y0 < self.h).then(|| (x0, y0, x1 + 1 - x0, y1 + 1 - y0))
+    }
+
+    /// Image size, panel scan order.
+    pub fn image_size(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+
+    /// The displayed pixel at image (x, y): R8G8B8A8, premultiplied in
+    /// overlay mode.
+    pub fn shown_at(&self, x: usize, y: usize) -> u32 {
+        let i = y * self.w + x;
+        let a = self.ashown.get(i).map_or(255, |&a| a as u32);
+        expand(self.shown[i]) & 0x00FF_FFFF | a << 24
     }
 
     /// Landscape size.
@@ -154,20 +217,28 @@ impl Screen {
             return;
         }
         let (iw, ih, c) = (self.w, self.h, c565(c));
+        let ov = !self.alpha.is_empty();
         if self.rot {
             // Landscape (x, y) is image pixel (row ih-1-x, column y).
             for r in ih - x - w..ih - x {
                 self.back[r * iw + y..r * iw + y + h].fill(c);
+                if ov {
+                    self.alpha[r * iw + y..r * iw + y + h].fill(255);
+                }
             }
         } else {
             for r in y..y + h {
                 self.back[r * iw + x..r * iw + x + w].fill(c);
+                if ov {
+                    self.alpha[r * iw + x..r * iw + x + w].fill(255);
+                }
             }
         }
     }
 
     pub fn clear(&mut self, c: u32) {
         self.back.fill(c565(c));
+        self.alpha.fill(255);
     }
 
     /// One pixel at landscape (x, y) (the shift `dx` applied), `c` over
@@ -188,6 +259,9 @@ impl Screen {
         } else {
             blend(self.back[i], c, a)
         };
+        if let Some(d) = self.alpha.get_mut(i) {
+            *d = over_a(*d, a.min(255));
+        }
     }
 
     /// `c` over what is there, `a` of 255 opaque.
@@ -205,18 +279,32 @@ impl Screen {
         let (w, h) = (w.min(sw.saturating_sub(x)), h.min(sh.saturating_sub(y)));
         let (iw, ih) = (self.w, self.h);
         let a = a as u32;
-        if self.rot {
-            for lx in x..x + w {
-                let row = (ih - 1 - lx) * iw;
-                for p in &mut self.back[row + y..row + y + h] {
+        let ov = !self.alpha.is_empty();
+        // Over a transparent pixel (the overlay's scrim): no blending.
+        let (clear_c, clear_a) = (blend(0, c, a), a as u8);
+        let run = |s: &mut Self, from: usize, n: usize| {
+            if !ov {
+                for p in &mut s.back[from..from + n] {
                     *p = blend(*p, c, a);
                 }
+                return;
+            }
+            let (b, al) = (&mut s.back[from..from + n], &mut s.alpha[from..from + n]);
+            for (p, d) in b.iter_mut().zip(al.iter_mut()) {
+                if *d == 0 {
+                    (*p, *d) = (clear_c, clear_a);
+                } else {
+                    (*p, *d) = (blend(*p, c, a), over_a(*d, a));
+                }
+            }
+        };
+        if self.rot {
+            for lx in x..x + w {
+                run(self, (ih - 1 - lx) * iw + y, h);
             }
         } else {
             for ly in y..y + h {
-                for p in &mut self.back[ly * iw + x..ly * iw + x + w] {
-                    *p = blend(*p, c, a);
-                }
+                run(self, ly * iw + x, w);
             }
         }
     }
@@ -499,6 +587,9 @@ impl Screen {
             core::slice::from_raw_parts_mut(self.fb.as_ptr() as *mut u32, self.w * self.h)
         };
         let all = core::mem::take(&mut self.all);
+        if !self.alpha.is_empty() {
+            return self.present_overlay(fb, all);
+        }
         for r in 0..self.h {
             let row = r * self.w..(r + 1) * self.w;
             let (b, s) = (&self.back[row.clone()], &mut self.shown[row.clone()]);
@@ -521,6 +612,44 @@ impl Screen {
                 .zip(&b[first..=last])
             {
                 *d = expand(p);
+            }
+        }
+    }
+
+    /// `present` with each pixel's coverage as its alpha: a pixel changed
+    /// if its color or its coverage did. Rows compared 8 bytes at a time
+    /// (`memcmp` is bytewise here), pixels stored 4 at a time: the image
+    /// is uncached.
+    fn present_overlay(&mut self, fb: &mut [u32], all: bool) {
+        for r in 0..self.h {
+            let row = r * self.w..(r + 1) * self.w;
+            let (b, s) = (&self.back[row.clone()], &mut self.shown[row.clone()]);
+            let (a, sa) = (&self.alpha[row.clone()], &mut self.ashown[row.clone()]);
+            let (first, last) = if all {
+                (0, self.w - 1)
+            } else {
+                let (b8, s8) = (bytes(b), bytes(s));
+                let Some(f) = min_opt(first_diff(b8, s8).map(|k| k / 2), first_diff(a, sa)) else {
+                    continue;
+                };
+                let l = max_opt(last_diff(b8, s8).map(|k| k / 2), last_diff(a, sa)).unwrap_or(f);
+                (f, l)
+            };
+            s[first..=last].copy_from_slice(&b[first..=last]);
+            sa[first..=last].copy_from_slice(&a[first..=last]);
+            let px = |k: usize| expand(b[k]) & 0x00FF_FFFF | (a[k] as u32) << 24;
+            let out = &mut fb[row.start + first..=row.start + last];
+            let mut k = first;
+            let (quads, rest) = out.as_chunks_mut::<4>();
+            for q in quads {
+                let v = [px(k), px(k + 1), px(k + 2), px(k + 3)];
+                // One 16-byte store: the write buffer sends whole bursts.
+                unsafe { (q as *mut [u32; 4]).write_unaligned(v) };
+                k += 4;
+            }
+            for d in rest {
+                *d = px(k);
+                k += 1;
             }
         }
     }
@@ -584,6 +713,48 @@ impl fmt::Display for Hms {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let s = self.0;
         write!(f, "{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    }
+}
+
+/// A row of pixels as bytes.
+fn bytes(v: &[u16]) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+fn word(v: &[u8], i: usize) -> u64 {
+    u64::from_ne_bytes(v[i..i + 8].try_into().unwrap_or([0; 8]))
+}
+
+/// The first byte where `a` and `b` (as long) differ.
+fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n && word(a, i) == word(b, i) {
+        i += 8;
+    }
+    (i..n).find(|&k| a[k] != b[k])
+}
+
+/// The last byte where `a` and `b` (as long) differ.
+fn last_diff(a: &[u8], b: &[u8]) -> Option<usize> {
+    let mut n = a.len().min(b.len());
+    while n >= 8 && word(a, n - 8) == word(b, n - 8) {
+        n -= 8;
+    }
+    (0..n).rev().find(|&k| a[k] != b[k])
+}
+
+fn min_opt(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+fn max_opt(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
     }
 }
 

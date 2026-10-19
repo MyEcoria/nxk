@@ -116,6 +116,11 @@ impl Service {
         Ok(Self { ep })
     }
 
+    /// An endpoint received in a reply.
+    pub fn from_handle(ep: u32) -> Self {
+        Self { ep }
+    }
+
     pub fn call(&self, m: &Msg) -> Result<Msg> {
         checked(user::call(self.ep, m, 0)?)
     }

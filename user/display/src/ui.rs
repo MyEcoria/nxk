@@ -66,6 +66,9 @@ pub enum Id {
     StatusQuick,
     /// Closes what is on top (the dimmed area).
     Scrim,
+    /// The volume indicator, and the level bar in it (a slider).
+    Hud,
+    HudVolume,
     // The drawer.
     QSleep,
     QBright,
@@ -244,6 +247,9 @@ pub struct Ui {
     pub(crate) sheet: Option<Sheet>,
     /// The drawer on the right (`+`, `-` or the status).
     pub quick: bool,
+    /// A game holds the screen: only the overlay is drawn (`draw_over`),
+    /// the drawer without the entries that leave the game.
+    pub in_game: bool,
     pub(crate) fan: Seen<Fan>,
     fan_sent: usize,
     fan_last: u64,
@@ -307,6 +313,7 @@ impl Ui {
             bt_pads: Vec::new(),
             sheet: None,
             quick: false,
+            in_game: false,
             fan: Seen::Unknown,
             fan_sent: 0,
             fan_last: fan::AUTO,
@@ -501,10 +508,15 @@ impl Ui {
             .map(|z| z.id)
     }
 
+    /// What the gamepad's selection can land on.
+    fn focusable(id: Id) -> bool {
+        !matches!(id, Id::Scrim | Id::Hud | Id::HudVolume)
+    }
+
     fn nearest(&self, cx: usize, cy: usize) -> Option<Id> {
         self.zones
             .iter()
-            .filter(|z| z.id != Id::Scrim)
+            .filter(|z| Self::focusable(z.id))
             .min_by_key(|z| {
                 let dx = (z.x + z.w / 2) as i64 - cx as i64;
                 let dy = (z.y + z.h / 2) as i64 - cy as i64;
@@ -526,14 +538,18 @@ impl Ui {
             .focus
             .and_then(|f| self.zones.iter().find(|z| z.id == f));
         let Some(cur) = cur else {
-            self.focus = self.zones.iter().find(|z| z.id != Id::Scrim).map(|z| z.id);
+            self.focus = self
+                .zones
+                .iter()
+                .find(|z| Self::focusable(z.id))
+                .map(|z| z.id);
             return;
         };
         let (cx, cy) = ((cur.x + cur.w / 2) as i64, (cur.y + cur.h / 2) as i64);
         let next = self
             .zones
             .iter()
-            .filter(|z| z.id != cur.id && z.id != Id::Scrim)
+            .filter(|z| z.id != cur.id && Self::focusable(z.id))
             .filter_map(|z| {
                 let (zx, zy) = ((z.x + z.w / 2) as i64 - cx, (z.y + z.h / 2) as i64 - cy);
                 let along = zx * dx + zy * dy;
@@ -548,11 +564,14 @@ impl Ui {
     }
 
     fn is_slider(id: Id) -> bool {
-        matches!(id, Id::QBright | Id::Bright | Id::QVolume | Id::Volume)
+        matches!(
+            id,
+            Id::QBright | Id::Bright | Id::QVolume | Id::Volume | Id::HudVolume
+        )
     }
 
     fn is_volume(id: Id) -> bool {
-        matches!(id, Id::QVolume | Id::Volume)
+        matches!(id, Id::QVolume | Id::Volume | Id::HudVolume)
     }
 
     fn set_brightness(&mut self, pct: u8) -> Option<Action> {
@@ -575,6 +594,10 @@ impl Ui {
 
     fn slide(&mut self, id: Id, x: usize, sx: usize, sw: usize) -> Option<Action> {
         let rel = x.saturating_sub(sx).min(sw);
+        if id == Id::HudVolume {
+            // The indicator stays while a finger moves its level.
+            self.vol_hud = libnx::time::now_ns() + VOL_HUD_NS;
+        }
         if Self::is_volume(id) {
             self.set_volume((100 * rel / sw.max(1)) as u8)
         } else {
@@ -612,7 +635,10 @@ impl Ui {
                 None
             }
             input::TOUCH_UP => {
-                if self.drag.take().is_some() {
+                if let Some((id, _, _)) = self.drag.take() {
+                    if id == Id::HudVolume {
+                        self.vol_hud = libnx::time::now_ns() + VOL_HUD_NS;
+                    }
                     self.pressed = None;
                     return Some(Action::Save);
                 }
@@ -706,9 +732,20 @@ impl Ui {
         None
     }
 
-    fn toggle_quick(&mut self) {
+    pub fn toggle_quick(&mut self) {
         self.quick = !self.quick;
-        self.focus = self.quick.then_some(Id::QSleep);
+        let first = if self.in_game {
+            Id::QBright
+        } else {
+            Id::QSleep
+        };
+        self.focus = self.quick.then_some(first);
+    }
+
+    /// Whether a touch at (x, y) lands on the overlay drawn over a game
+    /// (the drawer takes them all).
+    pub fn over_hit(&self, x: usize, y: usize) -> bool {
+        self.quick || self.hit(x, y).is_some()
     }
 
     pub(crate) fn go(&mut self, page: usize) {
@@ -780,7 +817,7 @@ impl Ui {
                 self.quick = false;
                 self.go(SETTINGS);
             }
-            Id::QBright | Id::Bright | Id::QVolume | Id::Volume => {}
+            Id::QBright | Id::Bright | Id::QVolume | Id::Volume | Id::Hud | Id::HudVolume => {}
             Id::Mute => {
                 let next = if self.cfg.volume == 0 {
                     libnx::abi::proto::audio::DEFAULT_VOL
@@ -991,13 +1028,7 @@ impl Ui {
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
         }
-        if let Some((t, _)) = &self.toast {
-            let w = font::width(Face::Body, t) + 56;
-            let (x, y) = ((W - w) / 2, RULE_Y - 64);
-            s.shadow(x, y, w, 48, 24, theme::BLACK);
-            s.fill_round(x, y, w, 48, 24, p.text);
-            s.label_c(W / 2, y + 24, t, Face::Body, p.bg);
-        }
+        self.draw_toast(s);
         if self.quick {
             self.zones.clear();
             self.quick_panel(s, d);
@@ -1015,17 +1046,66 @@ impl Ui {
             self.zones.clear();
             self.modal(s);
         }
-        if self.vol_hud != 0 {
-            if now >= self.vol_hud {
-                self.vol_hud = 0;
-            } else {
-                volume_hud(s, HEADER_RULE_Y + 16, self.cfg.volume);
-            }
-        }
+        self.draw_hud(s, now);
         // The home row shows its own selection; a sliding step has no zones yet.
         if (self.page == LIBRARY && self.flow.is_none() && !self.overlay()) || self.sliding {
             return;
         }
+        self.focus_ring(s);
+    }
+
+    /// What shows over a game, on a transparent frame: toasts, the
+    /// drawer, the volume indicator.
+    pub fn draw_over(&mut self, s: &mut Screen, d: &Data, now: u64) {
+        self.zones.clear();
+        self.wall = libnx::time::realtime_ns();
+        s.clear_clear();
+        if matches!(&self.toast, Some((_, end)) if now >= *end) {
+            self.toast = None;
+        }
+        self.draw_toast(s);
+        if self.quick {
+            self.zones.clear();
+            self.quick_panel(s, d);
+        }
+        self.draw_hud(s, now);
+        if self.quick {
+            self.focus_ring(s);
+        }
+    }
+
+    fn draw_toast(&self, s: &mut Screen) {
+        let p = pal();
+        if let Some((t, _)) = &self.toast {
+            let w = font::width(Face::Body, t) + 56;
+            let (x, y) = ((W - w) / 2, RULE_Y - 64);
+            s.shadow(x, y, w, 48, 24, theme::BLACK);
+            s.fill_round(x, y, w, 48, 24, p.text);
+            s.label_c(W / 2, y + 24, t, Face::Body, p.bg);
+        }
+    }
+
+    /// The volume indicator while it shows; touching its bar sets the level.
+    fn draw_hud(&mut self, s: &mut Screen, now: u64) {
+        if self.vol_hud == 0 {
+            return;
+        }
+        if now >= self.vol_hud {
+            if self.drag.is_none_or(|d| d.0 != Id::HudVolume) {
+                self.vol_hud = 0;
+                return;
+            }
+            self.vol_hud = now + VOL_HUD_NS;
+        }
+        let y = HEADER_RULE_Y + 16;
+        let (x, w, h, bx, bw) = volume_hud(s, y, self.cfg.volume);
+        self.zone(Id::Hud, x, y, w, h, h / 2);
+        self.zone(Id::HudVolume, bx - 20, y, bw + 40, h, 8);
+    }
+
+    /// The gamepad's selection, as a ring around its zone.
+    fn focus_ring(&mut self, s: &mut Screen) {
+        let p = pal();
         if self
             .focus
             .is_some_and(|f| self.zones.iter().all(|z| z.id != f))

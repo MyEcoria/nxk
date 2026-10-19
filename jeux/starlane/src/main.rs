@@ -461,7 +461,7 @@ fn main() {
                 Event::Button { button, down } => match button {
                     Button::Left | Button::L | Button::Zl => left = down,
                     Button::Right | Button::R | Button::Zr => right = down,
-                    Button::A | Button::Plus if down => go = true,
+                    Button::A if down => go = true,
                     Button::B if down && game.state != State::Playing => quit = true,
                     Button::Home if down => quit = true,
                     _ => {}

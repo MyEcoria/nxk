@@ -1781,21 +1781,23 @@ pub mod proto {
         pub const SNAPSHOT: u32 = 3;
         /// A game takes the screen (the UI stops): `SCANOUT_BUFFERS`
         /// block-linear images for the GPU to draw on, `CONTIGUOUS |
-        /// DMA32 | UNCACHED`, handles 0-2 with the `DMA` and `MAP` rights.
-        /// Reply: words = width, height (of the panel as it scans out),
+        /// DMA32 | UNCACHED`, handles 0-2 with the `DMA` and `MAP` rights;
+        /// handle 3: the endpoint `FLIP` and `EVENT` go to (served by their
+        /// own thread: a frame never waits behind the UI drawing over the
+        /// game). Reply: words = width, height (of the panel as it scans out),
         /// format (`FORMAT_RGBA8888`), block height (log2 of GOBs),
         /// bytes per image; the first image is on display. `ENODEV`: not
         /// started by `display`, or the screen is taken already.
         pub const SCANOUT: u32 = 4;
         /// Show image word 0 from the next vertical blank; the reply
-        /// comes once it is on display.
+        /// comes once it is on display. Sent on `SCANOUT`'s handle 3 only.
         pub const FLIP: u32 = 5;
         /// The game is done: the UI comes back (also when it exits).
         pub const RELEASE: u32 = 6;
         /// The next input event routed to the game (`input::READ`'s
         /// reply: kind, code, value, x, y, source; raw touch coordinates), waiting
         /// up to word 0 ns (0: no limit). While a game has the screen the
-        /// UI reads none.
+        /// UI reads none. Sent on `SCANOUT`'s handle 3 only.
         pub const EVENT: u32 = 7;
         pub const SCANOUT_BUFFERS: usize = 3;
         pub const FORMAT_RGBA8888: u64 = 1;

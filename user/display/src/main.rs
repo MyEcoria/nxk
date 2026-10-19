@@ -2,7 +2,8 @@
 //! the Switch-style touch UI of `ui`: home row of games and app tiles,
 //! quick settings drawer, settings, system, network, USB-C terminal and
 //! logs. Redrawn every second and on input. Counts the time played in
-//! the games it starts.
+//! the games it starts. Over a game (window A on its images), window C
+//! blends the volume indicator, toasts and the drawer (`+`) on top.
 //! Panel init is left to the bootloader; only the window is changed. A
 //! portrait panel (Switch) is drawn turned.
 
@@ -46,7 +47,7 @@ use libnx::abi::proto::gpu as gpuproto;
 use libnx::abi::proto::{
     audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, wifi,
 };
-use libnx::abi::rights::{DMA, DUP, GRANT, MAP, WRITE};
+use libnx::abi::rights::{DMA, DUP, GRANT, MAP, SEND, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
 use libnx::abi::slots;
 use libnx::drv::{self, Mmio};
@@ -93,6 +94,7 @@ const CMD_DISPLAY_WINDOW_HEADER: usize = 0x42;
 const DISP_DISP_ACTIVE: usize = 0x409;
 const DISP_BLEND_BACKGROUND_COLOR: usize = 0x4E4;
 const WIN_OPTIONS: usize = 0x700;
+const WIN_BUFFER_CONTROL: usize = 0x702;
 const WIN_COLOR_DEPTH: usize = 0x703;
 const WIN_POSITION: usize = 0x704;
 const WIN_SIZE: usize = 0x705;
@@ -105,9 +107,30 @@ const WINBUF_START_ADDR: usize = 0x800;
 const WINBUF_ADDR_H_OFFSET: usize = 0x806;
 const WINBUF_ADDR_V_OFFSET: usize = 0x808;
 const WINBUF_SURFACE_KIND: usize = 0x80B;
+const WIN_BLEND_LAYER_CONTROL: usize = 0x716;
+const WIN_BLEND_MATCH_SELECT: usize = 0x717;
+const WIN_BLEND_NOMATCH_SELECT: usize = 0x718;
+const CMD_INT_STATUS: usize = 0x37;
+/// `CMD_INT_STATUS`: window A / C underflow (write 1 to clear).
+const WIN_A_UF: u32 = 1 << 8;
+const WIN_C_UF: u32 = 1 << 10;
+/// `CMD_DISPLAY_WINDOW_HEADER`: which window the `WIN*` registers address.
+/// The overlay is window C: on the Erista, window B scans out black and
+/// underflows whatever its image (its memory client is not served).
+const SELECT_A: u32 = 1 << 4;
+const SELECT_C: u32 = 1 << 6;
+/// `CMD_STATE_CONTROL`: window C's update and activation requests.
+const WIN_C_UPDATE: u32 = 1 << 11;
+const WIN_C_ACT_REQ: u32 = 1 << 3;
+/// `WIN_BLEND_LAYER_CONTROL`: blending off, the bottom layer.
+const BLEND_BYPASS: u32 = 1 << 24;
+/// Window C's layer on top (depth 0) with K1 = K2 = 255, per-pixel
+/// premultiplied alpha: color = src + dst * (1 - K1 * src alpha).
+const BLEND_TOP: u32 = 255 << 16 | 255 << 8;
+const BLEND_PREMULT: u32 = 2 | 6 << 4 | 2 << 8;
 /// `WINBUF_SURFACE_KIND`: block-linear, block height in bits 6-4.
 const KIND_BLOCK: u32 = 2;
-/// Block height of the scanout images (log2 of GOBs): 16 GOBs.
+/// Block height of the link images (log2 of GOBs): 16 GOBs.
 const SCANOUT_BLOCK_LOG2: u32 = 4;
 /// Events kept for a game that does not read them.
 const GAME_EVENTS: usize = 256;
@@ -216,16 +239,67 @@ enum Done {
 /// waiting for the next one (reply token, deadline).
 struct Game {
     images: Vec<SharedMemory>,
-    /// The one on display.
-    shown: usize,
     /// The process that took the screen.
     owner: u32,
     /// A copy of it for `SNAPSHOT`: the GPU is drawing on the others, and
     /// a capture takes longer than a frame.
     snap: Option<SharedMemory>,
-    pas: Vec<u32>,
-    events: VecDeque<Event>,
-    waiter: Option<(u64, u64)>,
+}
+
+/// The overlay's redraws while the drawer is open over a game (count,
+/// total, longest, split); the game's flips are counted by `Link`.
+struct Frames {
+    since: u64,
+    flips: u64,
+    draws: u64,
+    draw_ns: u64,
+    draw_max: u64,
+    split: [u64; 3],
+}
+
+impl Frames {
+    fn new(now: u64, flips: u64) -> Self {
+        Self {
+            since: now,
+            flips,
+            draws: 0,
+            draw_ns: 0,
+            draw_max: 0,
+            split: [0; 3],
+        }
+    }
+
+    fn drawn(&mut self, t: [u64; 4]) {
+        let ns = t[3] - t[0];
+        (self.draws, self.draw_ns, self.draw_max) =
+            (self.draws + 1, self.draw_ns + ns, self.draw_max.max(ns));
+        for k in 0..3 {
+            self.split[k] += t[k + 1] - t[k];
+        }
+    }
+
+    /// One log line; `scan`'s flips since, `uf`: window A / C underflowed.
+    fn report(&self, now: u64, scan: &Link, uf: (bool, bool)) {
+        let ms = ((now - self.since) / 1_000_000).max(1);
+        let n = self.draws.max(1);
+        let flips = scan.flips - self.flips;
+        println!(
+            "[display] drawer over the game {} ms: {} flips ({}/s), longest gap {} ms, {} late; {} redraws, {} us mean (draw {} present {} ink {}), {} us longest; underflow A {} C {}",
+            ms,
+            flips,
+            flips * 1000 / ms,
+            scan.gap / 1_000_000,
+            scan.late,
+            self.draws,
+            self.draw_ns / n / 1000,
+            self.split[0] / n / 1000,
+            self.split[1] / n / 1000,
+            self.split[2] / n / 1000,
+            self.draw_max / 1000,
+            uf.0,
+            uf.1
+        );
+    }
 }
 
 /// The game the library started: its play time counts from `since`.
@@ -491,19 +565,24 @@ fn touch_xy(x: u64, y: u64, sw: usize, sh: usize) -> (usize, usize) {
 
 /// The image on display, copied (cached memory, allocated on the first
 /// capture).
-fn still(g: &mut Game) -> Option<&SharedMemory> {
-    let n = g.images[g.shown].len();
+fn still(g: &mut Game, shown: usize) -> Option<&SharedMemory> {
+    let n = g.images[shown].len();
     if g.snap.is_none() {
         g.snap = Some(SharedMemory::new(n, 0).ok()?);
     }
     let snap = g.snap.as_ref()?;
-    snap.as_mut_slice()[..n].copy_from_slice(&g.images[g.shown].as_slice()[..n]);
+    snap.as_mut_slice()[..n].copy_from_slice(&g.images[shown].as_slice()[..n]);
     Some(snap)
 }
 
 /// The images of a game, black, the first on display, block-linear:
-/// handles queued in `sent` for the reply.
-fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Game, i64> {
+/// handles queued in `sent` for the reply; their addresses.
+fn take_screen(
+    dc: &Mmio,
+    w: usize,
+    h: usize,
+    sent: &mut Vec<u32>,
+) -> Result<(Game, Vec<u32>), i64> {
     let bytes = gpuproto::tiled_bytes(w as u32, h as u32, SCANOUT_BLOCK_LOG2);
     let mut images = Vec::new();
     let mut pas = Vec::new();
@@ -526,28 +605,182 @@ fn take_screen(dc: &Mmio, w: usize, h: usize, sent: &mut Vec<u32>) -> Result<Gam
     wr(dc, WIN_LINE_STRIDE, w as u32 * 4);
     flip(dc, pas[0]);
     let _ = h;
-    Ok(Game {
+    let g = Game {
         images,
-        shown: 0,
         owner: 0,
         snap: None,
-        pas,
-        events: VecDeque::new(),
-        waiter: None,
-    })
+    };
+    Ok((g, pas))
 }
 
 /// Window A reads `pa` from the next vertical blank; returns once it does.
 fn flip(dc: &Mmio, pa: u32) {
+    show(dc, pa);
+    wait_shown(dc);
+}
+
+/// Window A asked to read `pa` from the next vertical blank.
+fn show(dc: &Mmio, pa: u32) {
+    wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
     wr(dc, WINBUF_START_ADDR, pa);
     wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(dc, CMD_STATE_CONTROL, 1 | 2);
-    // The request bits clear when the controller takes the update.
+}
+
+/// Until window A took its update. Its own request bit only: window C's
+/// asked meanwhile sets the general one again.
+fn wait_shown(dc: &Mmio) {
     for _ in 0..400 {
         if dc.r32(CMD_STATE_CONTROL * 4) & 3 == 0 {
             return;
         }
         time::sleep_us(100);
+    }
+}
+
+/// What the game's thread shares with the UI's loop, locked around every
+/// register sequence too: the game's images, the one on display, its
+/// endpoint's badge, the input routed to it and its waiting `EVENT`
+/// (reply token, deadline), the flips, the longest gap and the gaps over
+/// 25 ms (a frame missed).
+struct Link {
+    pas: Vec<u32>,
+    shown: usize,
+    badge: u64,
+    events: VecDeque<Event>,
+    waiter: Option<(u64, u64)>,
+    flips: u64,
+    last: u64,
+    gap: u64,
+    late: u64,
+}
+
+/// Above the UI's threads: a frame asked while the UI draws is not late.
+const GAME_PRIO: u8 = 8;
+
+/// The game's `FLIP` and `EVENT`, on their own endpoint (`SCANOUT`'s
+/// handle 3): never behind a redraw of the overlay.
+fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>) -> ! {
+    let _ = thread::set_current_priority(GAME_PRIO);
+    loop {
+        let wait = match link.lock().waiter.map_or(0, |w| w.1) {
+            0 => 0,
+            d => d.saturating_sub(time::now_ns()).max(1),
+        };
+        let Ok(rx) = ipc::recv_timeout(ep, wait) else {
+            let mut s = link.lock();
+            if let Some((tok, _)) = s.waiter.filter(|w| w.1 != 0 && time::now_ns() >= w.1) {
+                s.waiter = None;
+                let _ = ipc::reply_to(tok, &Msg::error(-libnx::abi::err::ETIMEDOUT));
+            }
+            continue;
+        };
+        if rx.msg.label() == proto::EVENT {
+            let mut s = link.lock();
+            let reply = if s.badge != rx.badge {
+                Msg::error(-ENODEV)
+            } else if let Some(e) = s.events.pop_front() {
+                Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4, e.5])
+            } else {
+                let t = rx.msg.mr[0];
+                let d = if t == 0 { 0 } else { time::now_ns() + t };
+                s.waiter = Some((rx.token, d));
+                continue;
+            };
+            drop(s);
+            let _ = ipc::reply(&reply);
+            continue;
+        }
+        let k = rx.msg.mr[0] as usize;
+        let ok = rx.msg.label() == proto::FLIP && {
+            let s = link.lock();
+            let pa = s.pas.get(k).copied().filter(|_| s.badge == rx.badge);
+            pa.inspect(|&pa| show(&dc, pa)).is_some()
+        };
+        let reply = if ok {
+            wait_shown(&dc);
+            let t = time::now_ns();
+            let mut s = link.lock();
+            if s.badge == rx.badge {
+                s.shown = k;
+            }
+            if s.flips > 0 {
+                s.gap = s.gap.max(t - s.last);
+                s.late += (t - s.last > 25_000_000) as u64;
+            }
+            (s.flips, s.last) = (s.flips + 1, t);
+            Msg::new(0, 0, 0)
+        } else {
+            Msg::error(-EINVAL)
+        };
+        let _ = ipc::reply(&reply);
+    }
+}
+
+/// Window C: the part `rect` (x, y, w, h, image pixels) of the UI's image
+/// `pa` (`w` wide, premultiplied alpha) over the game, or off. Taken at
+/// the next vertical blank; window A's registers addressed again after.
+fn overlay(dc: &Mmio, pa: u32, w: usize, rect: Option<(usize, usize, usize, usize)>) {
+    wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_C);
+    match rect {
+        Some((x, y, rw, rh)) => {
+            let (x, y, rw, rh) = (x as u32, y as u32, rw as u32, rh as u32);
+            wr(dc, WIN_BUFFER_CONTROL, 0); // the host's memory (not VI or SB2D)
+            wr(dc, WIN_COLOR_DEPTH, R8G8B8A8);
+            wr(dc, WIN_POSITION, y << 16 | x);
+            wr(dc, WIN_SIZE, rh << 16 | rw);
+            wr(dc, WIN_PRESCALED_SIZE, (rh << 16) | (rw * 4));
+            wr(dc, WIN_H_INITIAL_DDA, 0);
+            wr(dc, WIN_V_INITIAL_DDA, 0);
+            wr(dc, WIN_DDA_INCREMENT, 0x1000_1000);
+            wr(dc, WIN_LINE_STRIDE, w as u32 * 4);
+            wr(dc, WINBUF_START_ADDR, pa);
+            wr(dc, WINBUF_ADDR_H_OFFSET, x * 4);
+            wr(dc, WINBUF_ADDR_V_OFFSET, y);
+            wr(dc, WINBUF_SURFACE_KIND, 0);
+            wr(dc, WIN_BLEND_LAYER_CONTROL, BLEND_TOP);
+            // No color key: the "no match" factors apply; both set alike.
+            wr(dc, WIN_BLEND_MATCH_SELECT, BLEND_PREMULT);
+            wr(dc, WIN_BLEND_NOMATCH_SELECT, BLEND_PREMULT);
+            wr(dc, WIN_OPTIONS, 1 << 30);
+        }
+        None => wr(dc, WIN_OPTIONS, 0),
+    }
+    wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
+    wr(dc, CMD_STATE_CONTROL, (1 << 8) | WIN_C_UPDATE);
+    wr(dc, CMD_STATE_CONTROL, 1 | WIN_C_ACT_REQ);
+}
+
+/// The overlay's drawn area widened to 16-pixel columns (64-byte reads).
+fn ov_rect(
+    r: Option<(usize, usize, usize, usize)>,
+    w: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    r.map(|(x, y, rw, rh)| {
+        let (x0, x1) = (x & !15, ((x + rw + 15) & !15).min(w));
+        (x0, y, x1 - x0, rh)
+    })
+}
+
+/// The overlay as shown (`rect` of the UI's image) blended over a game's
+/// block-linear copy, as window C does: for `SNAPSHOT`.
+fn blend_over(snap: &SharedMemory, scr: &Screen, rect: (usize, usize, usize, usize)) {
+    let (iw, _) = scr.image_size();
+    let (x0, y0, rw, rh) = rect;
+    let px = snap.as_mut_slice();
+    for y in y0..y0 + rh {
+        for x in x0..x0 + rw {
+            let o = scr.shown_at(x, y);
+            let a = o >> 24;
+            if a == 0 {
+                continue;
+            }
+            let at = gpuproto::tiled_offset(iw as u32, x as u32, y as u32, 4, SCANOUT_BLOCK_LOG2);
+            for c in 0..3 {
+                let s = (o >> (8 * c) & 0xFF) + (px[at + c] as u32 * (255 - a) + 127) / 255;
+                px[at + c] = s.min(255) as u8;
+            }
+        }
     }
 }
 
@@ -615,10 +848,14 @@ fn main() -> i32 {
     wr(&dc, WINBUF_ADDR_H_OFFSET, 0);
     wr(&dc, WINBUF_ADDR_V_OFFSET, 0);
     wr(&dc, WIN_OPTIONS, 1 << 30);
+    // Window A is the bottom layer, opaque whatever its alpha (a game's).
+    wr(&dc, WIN_BLEND_LAYER_CONTROL, BLEND_BYPASS | 255);
     wr(&dc, DISP_BLEND_BACKGROUND_COLOR, 0);
     wr(&dc, CMD_DISPLAY_COMMAND, 1 << 5); // continuous display
     wr(&dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(&dc, CMD_STATE_CONTROL, 1 | 2);
+    // Window C (the overlay) off: a display started again finds it as left.
+    overlay(&dc, pa, w, None);
 
     let mut msgs = Messages {
         lines: VecDeque::new(),
@@ -665,6 +902,24 @@ fn main() -> i32 {
         let w2 = worker.clone();
         thread::spawn(move || work(&w2, notif)).expect("display: worker thread");
     }
+    let link = Arc::new(Mutex::new(Link {
+        pas: Vec::new(),
+        shown: 0,
+        badge: 0,
+        events: VecDeque::new(),
+        waiter: None,
+        flips: 0,
+        last: 0,
+        gap: 0,
+        late: 0,
+    }));
+    let game_ep = sys::endpoint_create().expect("display: game endpoint");
+    {
+        let s2 = link.clone();
+        thread::spawn(move || game_thread(dc, game_ep, &s2)).expect("display: game thread");
+    }
+    // Each game's endpoint has its own badge: an old one is refused.
+    let mut link_gen = 0u64;
 
     let ep = drv::publish("display").expect("display: publish");
     let mut data = stats::Data::new();
@@ -699,14 +954,33 @@ fn main() -> i32 {
         notif,
     };
     let (mut next_scan, mut next_live) = (0u64, 0u64);
+    // Over a game: window C's area of the UI's image (None: off), the
+    // finger the overlay follows, and the frames counted while the drawer
+    // is open (since, flips, longest gap, last flip, longest redraw).
+    let mut ov_shown: Option<(usize, usize, usize, usize)> = None;
+    let mut ov_finger: Option<u64> = None;
+    let mut ov_stats: Option<Frames> = None;
     // The game goes: the UI comes back, the GPU forgets its buffers.
     macro_rules! release_game {
         () => {{
             game = None;
+            {
+                let mut s = link.lock();
+                (s.pas, s.badge, s.waiter) = (Vec::new(), 0, None);
+                s.events.clear();
+                overlay(&dc, pa, w, None);
+            }
+            ov_shown = None;
+            ov_finger = None;
+            ov_stats = None;
+            ui.in_game = false;
+            ui.quick = false;
+            scr.set_overlay(false);
             // Nothing runs on the GPU any more: it goes off (the clock asked
             // for is kept for the next game).
             let _ = GPU.call(&Msg::new(gpuproto::RESET, 0, 0));
             let _ = GPU.call(&Msg::from_words(gpuproto::POWER, &[0]));
+            // No game thread write after: the game's images are gone.
             give_back(&dc, w, pa);
             scr.forget();
             dirty = true;
@@ -1031,8 +1305,43 @@ fn main() -> i32 {
                 }
             }
         }
-        if let Some((_, d)) = game.as_ref().and_then(|g| g.waiter).filter(|w| w.1 != 0) {
-            wake = wake.min(d);
+        // Over a game, only the overlay is drawn: on a change, and when
+        // a toast or the volume indicator ends.
+        if game.is_some() && !sleeping {
+            if ui.deadline().is_some_and(|d| now >= d) {
+                dirty = true;
+            }
+            if ui.quick {
+                if let Some(b) = ui.stick_repeat(now) {
+                    touches
+                        .lock()
+                        .push_back((input::KIND_BUTTON, b, 1, 0, 0, input::SRC_NONE));
+                    let _ = sys::notify_signal(notif, EV_TOUCH);
+                }
+                if let Some(d) = ui.stick_due() {
+                    wake = wake.min(d);
+                }
+            }
+            if dirty {
+                dirty = false;
+                let t0 = time::now_ns();
+                ui.draw_over(&mut scr, &data, t0);
+                let t1 = time::now_ns();
+                scr.present();
+                let t2 = time::now_ns();
+                let rect = ov_rect(scr.ink(), w);
+                if rect != ov_shown {
+                    let _s = link.lock();
+                    overlay(&dc, pa, w, rect);
+                    ov_shown = rect;
+                }
+                if let Some(st) = ov_stats.as_mut() {
+                    st.drawn([t0, t1, t2, time::now_ns()]);
+                }
+            }
+            if let Some(d) = ui.deadline() {
+                wake = wake.min(d);
+            }
         }
         let wait = if wake == u64::MAX {
             0
@@ -1040,14 +1349,6 @@ fn main() -> i32 {
             wake.saturating_sub(time::now_ns()).max(1)
         };
         let Ok(rx) = ipc::recv_timeout(ep, wait) else {
-            if let Some(g) = game.as_mut() {
-                if let Some((tok, d)) = g.waiter {
-                    if d != 0 && time::now_ns() >= d {
-                        g.waiter = None;
-                        let _ = ipc::reply_to(tok, &Msg::error(-libnx::abi::err::ETIMEDOUT));
-                    }
-                }
-            }
             continue;
         };
         if rx.msg.is_notify() {
@@ -1123,18 +1424,90 @@ fn main() -> i32 {
                         dirty = true;
                     }
                 }
-                if let Some(g) = game.as_mut() {
+                if game.is_some() {
+                    // PLUS is the console's in a game: it opens or closes
+                    // the drawer; the game never sees it.
+                    let plus = |e: &Event| e.0 == input::KIND_BUTTON && e.1 == input::BTN_PLUS;
+                    let mut to_game: Vec<Event> = Vec::new();
+                    if batch.iter().any(|e| plus(e) && e.2 == 1) {
+                        ui.toggle_quick();
+                        dirty = true;
+                        if ui.quick {
+                            // Nothing stays held in the game: sticks centered.
+                            for st in [input::STICK_L, input::STICK_R] {
+                                to_game.push((input::KIND_STICK, st, 0, 0, 0, input::SRC_NONE));
+                            }
+                            data.refresh();
+                            let mut s = link.lock();
+                            (s.gap, s.late) = (0, 0);
+                            ov_stats = Some(Frames::new(now, s.flips));
+                        }
+                    }
+                    batch.retain(|e| !plus(e));
                     for e in batch {
+                        let (kind, code, id, x, y, _) = e;
+                        // A finger belongs to what it went down on: the
+                        // overlay (the drawer takes them all) or the game.
+                        let action = if kind == input::KIND_TOUCH {
+                            let own = match code {
+                                input::TOUCH_DOWN if ov_finger.is_none() => {
+                                    let (tx, ty) = touch_xy(x, y, sw, sh);
+                                    ui.over_hit(tx, ty)
+                                }
+                                _ => ov_finger == Some(id),
+                            };
+                            if !own {
+                                to_game.push(e);
+                                continue;
+                            }
+                            let (tx, ty) = match (code, finger) {
+                                (input::TOUCH_UP, Some((f, fx, fy))) if f == id => (fx, fy),
+                                _ => touch_xy(x, y, sw, sh),
+                            };
+                            let up = code == input::TOUCH_UP;
+                            ov_finger = (!up).then_some(id);
+                            finger = (!up).then_some((id, tx, ty));
+                            ui.touch(code, tx, ty)
+                        } else if !ui.quick {
+                            to_game.push(e);
+                            continue;
+                        } else if kind == input::KIND_BUTTON && id == 0 {
+                            // Releases still reach the game (its presses did).
+                            to_game.push(e);
+                            continue;
+                        } else if kind == input::KIND_BUTTON {
+                            ui.pad(code)
+                        } else if kind == input::KIND_STICK {
+                            match ui.stick_nav(code, x, y, now) {
+                                Some(b) => ui.pad(b),
+                                None => continue,
+                            }
+                        } else {
+                            continue;
+                        };
+                        run_action!(action, now);
+                        dirty = true;
+                    }
+                    if !ui.quick {
+                        if let Some(st) = ov_stats.take() {
+                            let s = link.lock();
+                            let uf = dc.r32(CMD_INT_STATUS * 4) & (WIN_A_UF | WIN_C_UF);
+                            wr(&dc, CMD_INT_STATUS, uf);
+                            st.report(now, &s, (uf & WIN_A_UF != 0, uf & WIN_C_UF != 0));
+                        }
+                    }
+                    let mut s = link.lock();
+                    for e in to_game {
                         let m = Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4, e.5]);
-                        match g.waiter.take() {
+                        match s.waiter.take() {
                             Some((tok, _)) => {
                                 let _ = ipc::reply_to(tok, &m);
                             }
                             None => {
-                                if g.events.len() == GAME_EVENTS {
-                                    g.events.pop_front();
+                                if s.events.len() == GAME_EVENTS {
+                                    s.events.pop_front();
                                 }
-                                g.events.push_back(e);
+                                s.events.push_back(e);
                             }
                         }
                     }
@@ -1321,10 +1694,18 @@ fn main() -> i32 {
             },
             // The image as it is, read-only: the UI goes on.
             proto::SNAPSHOT => {
-                // What is on display: the UI's image, or a game's.
+                // What is on display: the UI's image, or a game's, copied
+                // with no flip meanwhile (the game draws on it two later).
+                let held = link.lock();
                 let (mem, layout, block) = match game.as_mut() {
-                    Some(g) => match still(g) {
-                        Some(m) => (m, 1, SCANOUT_BLOCK_LOG2 as u64),
+                    Some(g) => match still(g, held.shown) {
+                        Some(m) => {
+                            // With the overlay window C adds on top.
+                            if let Some(r) = ov_shown {
+                                blend_over(m, &scr, r);
+                            }
+                            (m, 1, SCANOUT_BLOCK_LOG2 as u64)
+                        }
                         None => (&scr.fb, 0, 0),
                     },
                     None => (&scr.fb, 0, 0),
@@ -1351,11 +1732,26 @@ fn main() -> i32 {
             }
             proto::SCANOUT if game.is_none() && !owned => {
                 wake_sleep!(now);
-                match take_screen(&dc, w, h, &mut sent) {
-                    Ok(mut g) => {
+                let mut s = link.lock();
+                link_gen += 1;
+                let taken = take_screen(&dc, w, h, &mut sent).and_then(|t| {
+                    let fh = sys::handle_dup(game_ep, SEND | GRANT, link_gen)?;
+                    ipc::set_send_handle(proto::SCANOUT_BUFFERS, fh);
+                    sent.push(fh);
+                    Ok(t)
+                });
+                match taken {
+                    Ok((mut g, pas)) => {
+                        (s.pas, s.shown, s.badge) = (pas, 0, link_gen);
+                        (s.waiter, s.events) = (None, VecDeque::new());
+                        drop(s);
                         g.owner = rx.pid;
                         next_live = time::now_ns() + LIVE_NS;
                         game = Some(g);
+                        ui.in_game = true;
+                        ui.quick = false;
+                        scr.set_overlay(true);
+                        dirty = true;
                         Msg::from_words(
                             0,
                             &[
@@ -1367,36 +1763,16 @@ fn main() -> i32 {
                                     as u64,
                             ],
                         )
-                        .with_handles(proto::SCANOUT_BUFFERS)
+                        .with_handles(proto::SCANOUT_BUFFERS + 1)
                     }
                     Err(e) => Msg::error(e),
                 }
             }
             proto::SCANOUT => Msg::error(-ENODEV),
-            proto::FLIP => match game.as_mut() {
-                Some(g) if (rx.msg.mr[0] as usize) < g.pas.len() => {
-                    g.shown = rx.msg.mr[0] as usize;
-                    flip(&dc, g.pas[g.shown]);
-                    Msg::new(0, 0, 0)
-                }
-                _ => Msg::error(-EINVAL),
-            },
             proto::RELEASE if game.is_some() => {
                 release_game!();
                 Msg::new(0, 0, 0)
             }
-            proto::EVENT => match game.as_mut() {
-                None => Msg::error(-ENODEV),
-                Some(g) => match g.events.pop_front() {
-                    Some(e) => Msg::from_words(0, &[e.0, e.1, e.2, e.3, e.4, e.5]),
-                    None => {
-                        let t = rx.msg.mr[0];
-                        let deadline = if t == 0 { 0 } else { time::now_ns() + t };
-                        g.waiter = Some((rx.token, deadline));
-                        continue;
-                    }
-                },
-            },
             proto::WRITE => {
                 let n = ipc::unpack(&rx.msg, &mut buf);
                 let lines = msgs.write(&buf[..n]);

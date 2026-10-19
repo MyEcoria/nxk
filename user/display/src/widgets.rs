@@ -304,8 +304,9 @@ pub fn press(c: u32, pressed: bool) -> u32 {
 }
 
 /// The volume indicator: a pill at the top center with the speaker, the
-/// level bar and the percentage.
-pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) {
+/// level bar and the percentage. Returns the pill's x, width and height,
+/// the bar's x and width.
+pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) -> (usize, usize, usize, usize, usize) {
     let p = pal();
     // Sized for "100%" so the bar does not move with the level.
     let tw = font::width(Face::Body, "100%");
@@ -326,4 +327,5 @@ pub fn volume_hud(s: &mut Screen, y: usize, pct: u8) {
         s.fill_round(bx, cy - 3, fw.max(7), 7, 3, p.bg);
     }
     s.label_r(x + w - 28, cy, &format!("{}%", pct), Face::Body, p.bg);
+    (x, w, h, bx, bw)
 }

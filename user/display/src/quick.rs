@@ -1,5 +1,6 @@
 //! The drawer on the right, as the Switch's quick settings: Sleep Mode,
-//! brightness, volume, Flight Mode, System Settings.
+//! brightness, volume, Flight Mode, System Settings. Over a game (`+`),
+//! without Sleep Mode and System Settings: the game keeps the screen.
 
 use crate::backlight::MIN_PCT;
 use crate::font::Face;
@@ -30,12 +31,14 @@ impl Ui {
         self.status(s, d, W - 32, 40, p.surface);
 
         // Sleep Mode.
-        let (y, h) = (95, 76);
-        let bg = press(p.raised, self.pressed == Some(Id::QSleep));
-        s.fill_round(L, y, R - L, h, 6, bg);
-        icon(s, Icon::Power, IX, y + h / 2, p.text, bg);
-        s.label(SX, y + h / 2, "Sleep Mode", Face::Body, p.text);
-        self.zone(Id::QSleep, L, y, R - L, h, 6);
+        if !self.in_game {
+            let (y, h) = (95, 76);
+            let bg = press(p.raised, self.pressed == Some(Id::QSleep));
+            s.fill_round(L, y, R - L, h, 6, bg);
+            icon(s, Icon::Power, IX, y + h / 2, p.text, bg);
+            s.label(SX, y + h / 2, "Sleep Mode", Face::Body, p.text);
+            self.zone(Id::QSleep, L, y, R - L, h, 6);
+        }
 
         // No light sensor read yet: brightness is set by hand.
         s.label(TX, 213, "Automatic Brightness", Face::Body, p.text);
@@ -76,12 +79,14 @@ impl Ui {
         self.zone(Id::QFlight, L, fy - 30, R - L, 126, 6);
 
         let sy = 584;
-        if self.pressed == Some(Id::QSettings) {
-            s.fill_round(L, sy - 26, R - L, 52, 6, p.raised);
+        if !self.in_game {
+            if self.pressed == Some(Id::QSettings) {
+                s.fill_round(L, sy - 26, R - L, 52, 6, p.raised);
+            }
+            icon(s, Icon::Sliders, IX, sy, p.text, p.surface);
+            s.label(SX, sy, "System Settings", Face::Body, p.text);
+            self.zone(Id::QSettings, L, sy - 26, R - L, 52, 6);
         }
-        icon(s, Icon::Sliders, IX, sy, p.text, p.surface);
-        s.label(SX, sy, "System Settings", Face::Body, p.text);
-        self.zone(Id::QSettings, L, sy - 26, R - L, 52, 6);
 
         self.hints(s, L - 1, R, p.surface, &[("B", "Back"), ("A", "OK")]);
     }
