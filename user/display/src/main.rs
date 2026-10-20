@@ -651,10 +651,20 @@ fn work(w: &Worker, notif: u32, hw: Screens, link: &Mutex<Link>, awake: &Condvar
                 )
             }
             // Silent on failure: also replayed at boot, and `audio` logs its own errors.
-            Action::Volume(pct) => Done::Audio(Ok(AUDIO
-                .call(&Msg::from_words(audio::VOLUME, &[pct as u64]))
-                .ok()
-                .and(None))),
+            Action::Volume(pct) => {
+                // At boot `audio` may not be published yet: the saved level
+                // must still land, its default is loud.
+                let m = Msg::from_words(audio::VOLUME, &[pct as u64]);
+                let mut r = AUDIO.call(&m);
+                for _ in 0..40 {
+                    if r.is_ok() {
+                        break;
+                    }
+                    time::sleep_ms(250);
+                    r = AUDIO.call(&m);
+                }
+                Done::Audio(Ok(r.ok().and(None)))
+            }
             Action::Music => Done::Audio(
                 AUDIO
                     .call(&Msg::new(audio::MUSIC, 0, 0))
