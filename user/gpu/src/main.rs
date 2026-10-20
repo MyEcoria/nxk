@@ -568,7 +568,8 @@ impl Gpu {
             for (_, h) in d.surfaces.iter().flatten() {
                 let _ = sys::handle_close(*h);
             }
-            if hw {
+            // A resume that failed early has no clock yet: no register.
+            if hw && self.stage >= proto::STAGE_PLL {
                 d.chan.unschedule(&r);
             }
         }

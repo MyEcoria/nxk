@@ -1307,9 +1307,10 @@ within 5 s.
     Checks: `gpu test` now ends with a suspend, a resume and the 2D,
     compute and 3D tests again on the same device: 17/17, 10/10 after
     (resume 21 ms, the cold start 236 ms with the card's firmware
-    read); Lumen asleep and awake seven times, rendering identical (two
-    shots), 60 fps, GPU back at 768 MHz 57 ms after the wake: the
-    picture still 223 ms after the press. A/B in one boot, Lumen held,
+    read); Lumen through six sleeps with the GPU suspended, rendering
+    right after the wake (a shot before and one after: the same scene,
+    the time of day moved on), 60 fps, GPU back at 768 MHz 57 ms after
+    the wake: the picture still 223 ms after the press. A/B in one boot, Lumen held,
     cell 3.85 V, USB-C cable in, `powertest start 60 15`, Power pressed
     at once (cores 1-3 off in all):
 
@@ -1320,7 +1321,8 @@ within 5 s.
     | same, `display` reloaded | 1.311 W |
 
     **-0.32 W (-20 %)**, more than the 0.31 W run 48 estimated for the
-    rail. The emulator cannot test it (its GPU model runs the first
+    rail. (The `display` measured also called the `emc` service's sleep
+    hook, which was not running: a no-op.) The emulator cannot test it (its GPU model runs the first
     power-up only: a second one, with or without this change, times out
     at the first batch); the console did. Not done: SC7 itself (the
     GPU comes back from reset the same way), the late request that

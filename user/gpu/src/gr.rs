@@ -545,6 +545,7 @@ fn bind_ctx(inst: &Dma, va: u64) {
 
 /// Golden context image (`gf100_grctx_generate` + `gm20b_grctx_generate_main`):
 /// FECS builds it on `inst`'s channel from the netlists, then saves it.
+#[allow(clippy::too_many_arguments)]
 pub fn golden(
     r: &Regs,
     vm: &mut Vm,
