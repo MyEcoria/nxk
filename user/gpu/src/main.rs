@@ -224,7 +224,11 @@ impl Gpu {
 
     fn power_on(&mut self) -> Result<()> {
         if self.state == proto::ON {
-            return if self.suspended { self.resume() } else { Ok(()) };
+            return if self.suspended {
+                self.resume()
+            } else {
+                Ok(())
+            };
         }
         let t0 = time::now_ns();
         self.err = 0;

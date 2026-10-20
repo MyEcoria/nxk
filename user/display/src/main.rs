@@ -495,11 +495,8 @@ fn gpu_suspend(link: &Mutex<Link>) -> bool {
     {
         time::sleep_us(1000);
     }
-    GPU.call_timeout(
-        &Msg::new(libnx::abi::proto::SUSPEND, 0, 0),
-        SLEEP_CALL_NS,
-    )
-    .is_ok()
+    GPU.call_timeout(&Msg::new(libnx::abi::proto::SUSPEND, 0, 0), SLEEP_CALL_NS)
+        .is_ok()
 }
 
 /// A GPU step the power source allows, `khz` or the highest below it.
