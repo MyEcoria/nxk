@@ -540,6 +540,19 @@ fn t_hotplug() -> R {
         sl.store(time::now_ns() - t0, Ordering::Release);
     })
     .map_err(|e| format!("thread {}", e))?;
+    // Unpinned spinners: running on the cores that go off, they must go on.
+    let spins: Arc<[AtomicU64; 3]> = Arc::new(core::array::from_fn(|_| AtomicU64::new(0)));
+    let spinners: Vec<_> = (0..3)
+        .map(|k| {
+            let (s, n) = (stop.clone(), spins.clone());
+            // Below the test's own priority (16): it keeps its core.
+            thread::spawn_on(None, 24, move || {
+                while !s.load(Ordering::Acquire) {
+                    n[k].fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
     time::sleep_ms(10);
     let res = (|| {
         let r = set_cores(power, 0b0011);
@@ -547,6 +560,13 @@ fn t_hotplug() -> R {
             return Err(format!("CORES 3: {}", err::name(r)));
         }
         time::sleep_ms(20);
+        let before: [u64; 3] = core::array::from_fn(|k| spins[k].load(Ordering::Relaxed));
+        time::sleep_ms(30);
+        for k in 0..3 {
+            if spins[k].load(Ordering::Relaxed) == before[k] {
+                return Err(format!("spinner {} stopped once cores 2-3 went off", k));
+            }
+        }
         let on = cores_online();
         if on != [true, true, false, false] {
             return Err(format!("cores on after CORES 3: {:?}", on));
@@ -584,6 +604,9 @@ fn t_hotplug() -> R {
     let _ = set_cores(power, 0b1111);
     stop.store(true, Ordering::Release);
     pinned.join();
+    for h in spinners.into_iter().flatten() {
+        h.join();
+    }
     let _ = sys::handle_close(power);
     res
 }
@@ -699,6 +722,14 @@ fn t_breathe() -> R {
 }
 
 fn t_round_robin() -> R {
+    // Off core 3: its prio-0 spinners would starve this thread there.
+    let _ = thread::set_current_affinity(Some(0));
+    let r = round_robin();
+    let _ = thread::set_current_affinity(None);
+    r
+}
+
+fn round_robin() -> R {
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let mut hs = Vec::new();
