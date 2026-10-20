@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
-use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo, ThreadInfo};
+use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo, SocInfo, ThreadInfo};
 use libnx::abi::proto::{audio, cpufreq, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
@@ -153,6 +153,7 @@ fn command(line: &str) {
         "echo" => echo(&argv[1..]),
         "ps" => ps(),
         "threads" => threads(),
+        "soc" => soc(),
         "jobs" => jobs(),
         "kill" => kill(argv.get(1).copied().unwrap_or("")),
         "mem" => mem(),
@@ -234,6 +235,7 @@ fn help() {
     println!("  mem             physical memory");
     println!("  cpu             per-core statistics");
     println!("  threads         every thread: state, core, pin, deadline");
+    println!("  soc             BPMP and EMC state the deep sleep depends on");
     println!("  cores MASK      CPU cores kept on (hex mask), the others off");
     println!("  uptime          time since boot");
     println!("  echo TEXT       print TEXT");
@@ -567,6 +569,24 @@ fn as_bytes_mut<T>(v: &mut [T]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, core::mem::size_of_val(v)) }
 }
 
+/// BPMP and EMC registers the deep sleep depends on, read now.
+fn soc() {
+    let mut si = [SocInfo::default()];
+    if let Err(e) = sys::sysinfo(info::SOC, as_bytes_mut(&mut si)) {
+        println!("soc: {}", err::name(e));
+        return fail(e);
+    }
+    let s = &si[0];
+    println!(
+        "BPMP: HALT_COP_EVENTS {:#x}, in reset {}, reset vector {:#x}",
+        s.halt_cop_events, s.cop_reset, s.cop_reset_vector
+    );
+    println!(
+        "EMC: CLK_SOURCE_EMC {:#x}, PLLM_BASE {:#x}",
+        s.clk_source_emc, s.pllm_base
+    );
+}
+
 /// Every thread: its state, home core, pin and pending deadline.
 fn threads() {
     let mut ts = Vec::new();
@@ -641,7 +661,7 @@ fn mem() {
 fn cpu() {
     let mut cpus = [CpuInfo::default(); 4];
     let n = sys::sysinfo(info::CPUS, as_bytes_mut(&mut cpus)).unwrap_or(0) as usize;
-    println!("  CORE   SWITCHES     SYSCALLS    IRQ      IDLE  DEADLINE  TIMER(ms)");
+    println!("  CORE   SWITCHES     SYSCALLS    IRQ      IDLE  DEADLINE  TIMER(ms)  MISSED");
     let ms = |ns: i64| match ns {
         i64::MAX => alloc::format!("-"),
         v => alloc::format!("{}", v / 1_000_000),
@@ -649,7 +669,7 @@ fn cpu() {
     for (i, c) in cpus[..n.min(4)].iter().enumerate() {
         let total = (c.idle_ns + c.busy_ns).max(1);
         println!(
-            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%  {:>8}  {:>9}{}",
+            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%  {:>8}  {:>9}  {:>6}{}",
             i,
             c.switches,
             c.syscalls,
@@ -657,6 +677,7 @@ fn cpu() {
             c.idle_ns * 100 / total,
             ms(c.deadline_in_ns),
             ms(c.timer_in_ns),
+            c.catch_ups,
             if c.online == 0 { "  off" } else { "" }
         );
     }
