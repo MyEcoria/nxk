@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
-use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo};
+use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo, ThreadInfo};
 use libnx::abi::proto::{audio, cpufreq, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
@@ -152,6 +152,7 @@ fn command(line: &str) {
         "help" => help(),
         "echo" => echo(&argv[1..]),
         "ps" => ps(),
+        "threads" => threads(),
         "jobs" => jobs(),
         "kill" => kill(argv.get(1).copied().unwrap_or("")),
         "mem" => mem(),
@@ -232,6 +233,7 @@ fn help() {
     println!("  ps              processes");
     println!("  mem             physical memory");
     println!("  cpu             per-core statistics");
+    println!("  threads         every thread: state, core, pin, deadline");
     println!("  cores MASK      CPU cores kept on (hex mask), the others off");
     println!("  uptime          time since boot");
     println!("  echo TEXT       print TEXT");
@@ -565,6 +567,36 @@ fn as_bytes_mut<T>(v: &mut [T]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, core::mem::size_of_val(v)) }
 }
 
+/// Every thread: its state, home core, pin and pending deadline.
+fn threads() {
+    let mut ts = Vec::new();
+    ts.resize(256, ThreadInfo::default());
+    let n = sys::sysinfo(info::THREADS, as_bytes_mut(&mut ts)).unwrap_or(0) as usize;
+    println!("  PID    TID  STATE    CORE  PIN  PRIO  WAKE(ms)  CPU(ms)");
+    for t in &ts[..n.min(ts.len())] {
+        let state = info::THREAD_STATES.get(t.state as usize).unwrap_or(&"?");
+        let pin = match t.affinity {
+            0xFF => alloc::format!("-"),
+            k => alloc::format!("{}", k),
+        };
+        let wake = match t.timed {
+            0 => alloc::format!("-"),
+            _ => alloc::format!("{}", t.wake_in_ns / 1_000_000),
+        };
+        println!(
+            "  {:>3}  {:>5}  {:<7}  {:>4}  {:>3}  {:>4}  {:>8}  {:>7}",
+            t.pid,
+            t.tid,
+            state,
+            t.home,
+            pin,
+            t.prio,
+            wake,
+            t.cpu_ns / 1_000_000
+        );
+    }
+}
+
 fn ps() {
     let mut procs = [ProcInfo::default(); 64];
     let n = sys::sysinfo(info::PROCESSES, as_bytes_mut(&mut procs)).unwrap_or(0) as usize;
@@ -609,16 +641,22 @@ fn mem() {
 fn cpu() {
     let mut cpus = [CpuInfo::default(); 4];
     let n = sys::sysinfo(info::CPUS, as_bytes_mut(&mut cpus)).unwrap_or(0) as usize;
-    println!("  CORE   SWITCHES     SYSCALLS    IRQ      IDLE");
+    println!("  CORE   SWITCHES     SYSCALLS    IRQ      IDLE  DEADLINE  TIMER(ms)");
+    let ms = |ns: i64| match ns {
+        i64::MAX => alloc::format!("-"),
+        v => alloc::format!("{}", v / 1_000_000),
+    };
     for (i, c) in cpus[..n.min(4)].iter().enumerate() {
         let total = (c.idle_ns + c.busy_ns).max(1);
         println!(
-            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%{}",
+            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%  {:>8}  {:>9}{}",
             i,
             c.switches,
             c.syscalls,
             c.irqs,
             c.idle_ns * 100 / total,
+            ms(c.deadline_in_ns),
+            ms(c.timer_in_ns),
             if c.online == 0 { "  off" } else { "" }
         );
     }
