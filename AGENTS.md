@@ -65,7 +65,9 @@ device mode behind chardev `usbotg`, needed by `nxtest.py --usb-cmd`;
 `tegra_qemu-touch-irq.patch`, applied after it: the touch panel's
 interrupt on GPIO X1, needed by `nxtest.py --tap`;
 `tegra_qemu-gpu.patch`: GM20B's unit counts and FE power mode in the
-GPU model, needed for `gpu on` to reach its channel).
+GPU model, needed for `gpu on` to reach its channel;
+`tegra_qemu-mc-tz.patch`: the TX1 offsets of `MC_SECURITY_CFG0/1`, needed
+for PSCI calls after boot under `nxk-bl31`).
 
 ## 3. Mandatory workflow: build, run, test
 

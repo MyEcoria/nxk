@@ -1,0 +1,26 @@
+--- a/hw/arm/tegra2/axi/mc/mc.c
++++ b/hw/arm/tegra2/axi/mc/mc.c
+@@ -607,6 +607,11 @@
+     tegra_mc *s = opaque;
+     uint64_t ret = 0;
+ 
++    /* TX1: MC_SECURITY_CFG0/1 (TZ base, size in MB) are at 0x70/0x74. */
++    if (tegra_board >= TEGRAX1_BOARD && (offset == 0x70 || offset == 0x74)) {
++        return s->regs[offset >> 2];
++    }
++
+     switch (offset) {
+     case ERR_STATUS_OFFSET:
+         ret = s->err_status.reg32;
+@@ -996,6 +1001,11 @@
+ {
+     tegra_mc *s = opaque;
+ 
++    if (tegra_board >= TEGRAX1_BOARD && (offset == 0x70 || offset == 0x74)) {
++        s->regs[offset >> 2] = value;
++        return;
++    }
++
+     switch (offset) {
+     case ERR_STATUS_OFFSET:
+         TRACE_WRITE(s->iomem.addr, offset, s->err_status.reg32, value);
