@@ -243,6 +243,8 @@ global_asm!(
 .section .text.boot, "ax"
 .globl _start
 _start:
+    // A core reset without a power cycle keeps CPU_OFF's OS double lock.
+    msr     osdlr_el1, xzr
     // Per-core EL3 setup (ATF/exosphere values; UNKNOWN reset on silicon): CNTFRQ_EL0,
     // CPUECTLR_EL1.SMPEN, CPUACTLR_EL1[0] (Spectre-v2 IALLU, as in nxk boot.rs).
     movz    x0, #0xF800

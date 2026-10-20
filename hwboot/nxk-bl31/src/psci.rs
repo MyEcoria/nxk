@@ -14,6 +14,9 @@ const CPU_OFF: u32 = 0x8400_0002;
 const CPU_ON_64: u32 = 0xC400_0003;
 const AFFINITY_INFO_64: u32 = 0xC400_0004;
 const SYSTEM_RESET: u32 = 0x8400_0009;
+/// nxk SiP call (SMC64, SiP range): x1 = core; returns the `DIAG` words of
+/// its last CPU_OFF and CPU_ON in x0-x3.
+const NXK_DIAG: u32 = 0xC200_0001;
 
 const SUCCESS: i64 = 0;
 const NOT_SUPPORTED: i64 = -1;
@@ -36,6 +39,7 @@ const SB_AA64_RST_AARCH64_MODE_EN: u32 = 1;
 const PMC_CNTRL: usize = PMC_BASE;
 const PMC_CNTRL_MAIN_RST: u32 = 1 << 4;
 const PMC_PWRGATE_TOGGLE: usize = PMC_BASE + 0x30;
+const PMC_REMOVE_CLAMPING: usize = PMC_BASE + 0x34;
 const PMC_PWRGATE_STATUS: usize = PMC_BASE + 0x38;
 const PWRGATE_TOGGLE_START: u32 = 1 << 8;
 /// PMC partition per core: CE0, then CE1..CE3.
@@ -63,6 +67,23 @@ const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 static mut STATE: [u32; NR_CPUS] = [OFF; NR_CPUS];
 static mut ENTRY: [u64; NR_CPUS] = [0; NR_CPUS];
 static mut CTX: [u64; NR_CPUS] = [0; NR_CPUS];
+/// Per core: [0] CPU_ON outcome (step that brought it up, 0: none; bit 8:
+/// partition on at entry; bit 9: still on after the gate wait), [1] at
+/// CPU_OFF: PWRGATE_STATUS << 32 | CPUn_CSR, [2] at CPU_ON: the same,
+/// [3] at CPU_ON: HALT_CPUn << 32 | PWRGATE_STATUS after the gate wait.
+static mut DIAG: [[u64; 4]; NR_CPUS] = [[0; 4]; NR_CPUS];
+
+fn diag_set(cpu: usize, i: usize, v: u64) {
+    unsafe { write_volatile((addr_of_mut!(DIAG) as *mut u64).add(cpu * 4 + i), v) };
+}
+
+fn diag(cpu: usize, i: usize) -> u64 {
+    unsafe { read_volatile((addr_of!(DIAG) as *const u64).add(cpu * 4 + i)) }
+}
+
+fn pwr_csr(cpu: usize) -> u64 {
+    (rd(PMC_PWRGATE_STATUS) as u64) << 32 | rd(FLOW_CTLR + FLOW_CPU_CSR[cpu]) as u64
+}
 
 fn state(cpu: usize) -> u32 {
     unsafe { read_volatile((addr_of!(STATE) as *const u32).add(cpu)) }
@@ -115,6 +136,13 @@ pub fn smc(regs: &mut [u64; 31]) {
         CPU_OFF => cpu_off(),
         AFFINITY_INFO_64 => affinity_info(regs[1], regs[2]),
         SYSTEM_RESET => system_reset(),
+        NXK_DIAG if (regs[1] as usize) < NR_CPUS => {
+            let cpu = regs[1] as usize;
+            for i in 1..4 {
+                regs[i] = diag(cpu, i);
+            }
+            diag(cpu, 0) as i64
+        }
         _ => NOT_SUPPORTED,
     };
     regs[0] = r as u64;
@@ -127,7 +155,10 @@ fn features(fid: u32) -> i64 {
     }
 }
 
-/// Callers serialize CPU_ON for a given core (nxk: boot core only).
+/// Callers serialize CPU_ON for a given core (nxk: boot core only). Returns
+/// once the core reached `bl31_secondary`, trying in turn: the flow
+/// controller's own power-up of a core it gated (HALT_CPUn cleared), a PMC
+/// toggle, then a full PMC off/on cycle. `DIAG` keeps what happened.
 fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
     if mpidr >= NR_CPUS as u64 {
         return INVALID_PARAMETERS;
@@ -141,9 +172,17 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
         PENDING => return ON_PENDING,
         _ => {}
     }
-    // Just turned off: the reset must not hit its cache flush. On silicon the
-    // gate follows its `wfi` within microseconds; the emulator never gates.
-    wait_for(5000, || !partition_on(CPU_PARTITION[cpu]));
+    let part = CPU_PARTITION[cpu];
+    let on_at_entry = partition_on(part);
+    diag_set(cpu, 2, pwr_csr(cpu));
+    // Just turned off: the reset must not hit its cache flush.
+    wait_for(5000, || !partition_on(part));
+    let on_after_wait = partition_on(part);
+    diag_set(
+        cpu,
+        3,
+        (rd(FLOW_CTLR + FLOW_HALT_CPU[cpu]) as u64) << 32 | rd(PMC_PWRGATE_STATUS) as u64,
+    );
     unsafe {
         write_volatile((addr_of_mut!(ENTRY) as *mut u64).add(cpu), entry);
         write_volatile((addr_of_mut!(CTX) as *mut u64).add(cpu), ctx);
@@ -151,13 +190,59 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
     set_state(cpu, PENDING);
 
     let reset = 1 << cpu | 1 << (16 + cpu); // CPURESETn | CORERESETn
+    let arrived = || wait_for(10_000, || state(cpu) == ON);
     wr(RST_CPUG_CMPLX_SET, reset);
-    if !power_on(CPU_PARTITION[cpu]) {
+    // 1: a core the flow controller gated comes back when un-halted.
+    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], 0);
+    let mut step = if wait_for(10_000, || partition_on(part)) {
+        1
+    } else {
+        2
+    };
+    // 2: cold core (or the flow controller did not act): PMC toggle.
+    let powered = step == 1 || power_on(part);
+    if powered {
+        wr(PMC_REMOVE_CLAMPING, 1 << part);
+        wr(RST_CPUG_CMPLX_CLR, reset);
+    }
+    if !powered || !arrived() {
+        // 3: full cycle, nothing armed in the flow controller.
+        step = 3;
+        wr(RST_CPUG_CMPLX_SET, reset);
+        flow_reset(cpu);
+        if partition_on(part) {
+            toggle(part);
+            wait_for(5000, || !partition_on(part));
+        }
+        let up = power_on(part) && {
+            wr(PMC_REMOVE_CLAMPING, 1 << part);
+            wr(RST_CPUG_CMPLX_CLR, reset);
+            arrived()
+        };
+        if !up {
+            step = 0;
+        }
+    }
+    diag_set(
+        cpu,
+        0,
+        step | (on_at_entry as u64) << 8 | (on_after_wait as u64) << 9,
+    );
+    if step == 0 {
+        wr(RST_CPUG_CMPLX_SET, reset);
         set_state(cpu, OFF);
         return INTERNAL_FAILURE;
     }
-    wr(RST_CPUG_CMPLX_CLR, reset);
     SUCCESS
+}
+
+/// Start a PMC power toggle of `partition` (on <-> off).
+fn toggle(partition: u32) -> bool {
+    if !wait_for(5000, || rd(PMC_PWRGATE_TOGGLE) & PWRGATE_TOGGLE_START == 0) {
+        return false;
+    }
+    wr(PMC_PWRGATE_TOGGLE, partition | PWRGATE_TOGGLE_START);
+    true
 }
 
 fn partition_on(partition: u32) -> bool {
@@ -167,14 +252,7 @@ fn partition_on(partition: u32) -> bool {
 /// Ungate a CPU partition; 5 ms per step as exosphere.
 fn power_on(partition: u32) -> bool {
     let on = || partition_on(partition);
-    if on() {
-        return true;
-    }
-    if !wait_for(5000, || rd(PMC_PWRGATE_TOGGLE) & PWRGATE_TOGGLE_START == 0) {
-        return false;
-    }
-    wr(PMC_PWRGATE_TOGGLE, partition | PWRGATE_TOGGLE_START);
-    wait_for(5000, on)
+    on() || toggle(partition) && wait_for(5000, on)
 }
 
 /// OFF only once the partition is gated (PSCI: not while still running).
@@ -201,6 +279,7 @@ fn cpu_off() -> i64 {
     if cpu == 0 || cpu >= NR_CPUS {
         return DENIED;
     }
+    diag_set(cpu, 1, pwr_csr(cpu));
     wr(
         FLOW_CTLR + FLOW_CPU_CSR[cpu],
         CSR_FLAGS | (1 << cpu) << CSR_WFI_SHIFT | CSR_ENABLE,
