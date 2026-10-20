@@ -99,6 +99,15 @@ pub fn reprogram(c: &mut PerCpu) {
     }
 }
 
+/// Deadlines already due but not expired (their timer edge was lost): handle
+/// them as the timer interrupt would.
+pub fn catch_up() {
+    let c = percpu::this();
+    if c.tmo_head != NIL && thread::get(c.tmo_head).wake_at <= counter() {
+        on_irq();
+    }
+}
+
 /// Timer interrupt: quantum end and/or reached deadlines.
 pub fn on_irq() {
     let c = percpu::this();

@@ -880,12 +880,29 @@ pub fn core_up(k: usize, entry: usize) -> Result<(), i64> {
     if c.going_down {
         return Err(-nxk_abi::err::EAGAIN);
     }
-    match psci::cpu_on(k as u64, entry as u64) {
-        0 => Ok(()),
+    let r = psci::cpu_on(k as u64, entry as u64);
+    let diag = psci::nxk_diag(k as u64).unwrap_or_default();
+    match r {
+        0 => {}
         // ALREADY_ON: between its hand-over and its CPU_OFF.
-        -4 | -5 => Err(-nxk_abi::err::EAGAIN),
-        _ => Err(-nxk_abi::err::EIO),
+        -4 | -5 => return Err(-nxk_abi::err::EAGAIN),
+        _ => {
+            crate::kprintln!("[smp] core {}: CPU_ON {}, monitor {:x?}", k, r, diag);
+            return Err(-nxk_abi::err::EIO);
+        }
     }
+    // It sets `online` before taking the global lock (as at boot).
+    let end = timer::counter() + timer::ns_to_ticks(50_000_000);
+    let online = || unsafe { core::ptr::read_volatile(&percpu::get(k).online) };
+    while !online() && timer::counter() < end {
+        core::hint::spin_loop();
+    }
+    if !online() {
+        crate::kprintln!("[smp] core {} did not rejoin, monitor {:x?}", k, diag);
+        return Err(-nxk_abi::err::ETIMEDOUT);
+    }
+    crate::kprintln!("[smp] core {} on, monitor {:x?}", k, diag);
+    Ok(())
 }
 
 /// This core leaves: threads (running, ready, parked, with deadlines), FP
@@ -899,13 +916,16 @@ fn go_offline(c: &mut PerCpu) -> ! {
     }
     fpu::save_owner(c);
     c.going_down = false;
+    let mut moved = [0u32; 12];
     for i in 0..thread::capacity() as u16 {
-        if thread::get(i).home as usize == c.id {
+        let t = thread::get(i);
+        if t.home as usize == c.id && t.state != State::Free {
+            moved[t.state as usize] += 1;
             migrate_now(i, 0);
         }
     }
     c.current = NIL;
-    irq::retarget(c.id, 0);
+    let lines = irq::retarget(c.id, 0);
     if c.acct_thread != NIL {
         account(c, NIL);
     }
@@ -919,7 +939,12 @@ fn go_offline(c: &mut PerCpu) -> ! {
     c.fp_enabled = false;
     c.ss_enabled = false;
     smp::mark_offline();
-    crate::kprintln!("[smp] core {} off", c.id);
+    crate::kprintln!(
+        "[smp] core {} off: threads moved by state {:?}, {} IRQ lines",
+        c.id,
+        moved,
+        lines
+    );
     bkl::release();
     arch::irq_disable();
     psci::cpu_off();

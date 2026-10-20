@@ -48,6 +48,27 @@ pub fn cpu_on(mpidr: u64, entry: u64) -> i64 {
     smc(CPU_ON_64, mpidr, entry, 0) as i64
 }
 
+/// nxk-bl31's record of `cpu`'s last CPU_OFF and CPU_ON (hwboot/nxk-bl31
+/// `DIAG`); `None` from another monitor.
+pub fn nxk_diag(cpu: u64) -> Option<[u64; 4]> {
+    let (r0, r1, r2, r3): (u64, u64, u64, u64);
+    unsafe {
+        core::arch::asm!("smc #0",
+            inlateout("x0") 0xC200_0001u64 => r0,
+            inlateout("x1") cpu => r1,
+            out("x2") r2, out("x3") r3,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _,
+            options(nostack))
+    };
+    if r0 as i64 == -1 {
+        return None;
+    }
+    Some([r0, r1, r2, r3])
+}
+
 /// Power off the calling core; returns only if the monitor refuses.
 pub fn cpu_off() -> i64 {
     smc(CPU_OFF, 0, 0, 0) as i64

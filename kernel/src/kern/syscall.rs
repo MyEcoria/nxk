@@ -2,7 +2,7 @@
 //! Parking calls complete later via the waker's Frame write.
 
 use nxk_abi::err::*;
-use nxk_abi::info::{self, CpuInfo, MemInfo, ProcInfo};
+use nxk_abi::info::{self, CpuInfo, MemInfo, ProcInfo, ThreadInfo};
 use nxk_abi::layout::*;
 use nxk_abi::spawn::{HandleGrant, SpawnArgs};
 use nxk_abi::{clock, prot, rights, sys};
@@ -325,6 +325,16 @@ fn set_cores(mask: u64) -> SysResult {
         Err(-EAGAIN)
     } else {
         val(0)
+    }
+}
+
+/// Signed distance from now to counter value `t`, in ns.
+fn ns_from_now(t: u64) -> i64 {
+    let now = timer::counter();
+    if t >= now {
+        timer::ticks_to_ns(t - now) as i64
+    } else {
+        -(timer::ticks_to_ns(now - t) as i64)
     }
 }
 
@@ -729,6 +739,38 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
             }
             val(n)
         }
+        info::THREADS => {
+            let sz = core::mem::size_of::<ThreadInfo>() as u64;
+            let now = timer::counter();
+            let mut n = 0u64;
+            for i in 0..thread::capacity() as u16 {
+                let t = thread::get(i);
+                if t.state == thread::State::Free {
+                    continue;
+                }
+                if (n + 1) * sz <= len {
+                    let ti = ThreadInfo {
+                        pid: process::get(t.proc_idx).pid,
+                        tid: t.tid,
+                        state: t.state as u8,
+                        home: t.home,
+                        affinity: t.affinity,
+                        prio: t.prio,
+                        timed: t.timed as u8,
+                        pad: [0; 3],
+                        wake_in_ns: if t.timed {
+                            timer::ticks_to_ns(t.wake_at.saturating_sub(now))
+                        } else {
+                            0
+                        },
+                        cpu_ns: timer::ticks_to_ns(t.cpu_time),
+                    };
+                    uaccess::write(buf + n * sz, &ti)?;
+                }
+                n += 1;
+            }
+            val(n)
+        }
         info::MEMORY => {
             let (total, free, kernel) = pmm::stats();
             let m = MemInfo {
@@ -768,6 +810,14 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
                     busy_ns: timer::ticks_to_ns(busy),
                     timer_late_ns: timer::ticks_to_ns(pc.stats.timer_late),
                     empty_wakeups: pc.stats.empty_wakeups,
+                    deadline_in_ns: match pc.tmo_head {
+                        thread::NIL => i64::MAX,
+                        h => ns_from_now(thread::get(h).wake_at),
+                    },
+                    timer_in_ns: match pc.timer_cval {
+                        u64::MAX => i64::MAX,
+                        v => ns_from_now(v),
+                    },
                 };
                 uaccess::write(buf + c as u64 * sz, &ci)?;
             }

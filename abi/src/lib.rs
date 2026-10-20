@@ -965,6 +965,14 @@ pub mod info {
     pub const PROCESSES: u64 = 0;
     pub const MEMORY: u64 = 1;
     pub const CPUS: u64 = 2;
+    /// Every live thread (`ThreadInfo`), for the shell's `threads`.
+    pub const THREADS: u64 = 3;
+
+    /// `ThreadInfo::state` names, by value.
+    pub const THREAD_STATES: [&str; 12] = [
+        "free", "ready", "running", "send", "recv", "reply", "notify", "wait", "futex", "sleep",
+        "stopped", "zombie",
+    ];
 
     pub const PSTATE_ALIVE: u32 = 1;
     pub const PSTATE_ZOMBIE: u32 = 2;
@@ -979,6 +987,26 @@ pub mod info {
         pub state: u32,
         pub parent: u32,
         /// CPU time consumed (ns).
+        pub cpu_ns: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct ThreadInfo {
+        pub pid: u32,
+        pub tid: u32,
+        /// Index in `THREAD_STATES`.
+        pub state: u8,
+        /// Core it lives on (its run queue and deadline).
+        pub home: u8,
+        /// Pinned core, 0xFF: any.
+        pub affinity: u8,
+        pub prio: u8,
+        /// 1: a deadline is armed.
+        pub timed: u8,
+        pub pad: [u8; 3],
+        /// Deadline in ns from now (0: none or past).
+        pub wake_in_ns: u64,
         pub cpu_ns: u64,
     }
 
@@ -1005,6 +1033,11 @@ pub mod info {
         /// Timer or IPI interrupts that found the core idle and left it
         /// idle: wake-ups for nothing (a periodic tick shows here).
         pub empty_wakeups: u64,
+        /// Nearest deadline in the core's queue, ns from now (negative:
+        /// past; `i64::MAX`: none).
+        pub deadline_in_ns: i64,
+        /// Where the core's timer is set, ns from now (`i64::MAX`: off).
+        pub timer_in_ns: i64,
     }
 }
 
