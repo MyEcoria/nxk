@@ -803,6 +803,9 @@ pub fn exit_to_user() -> ! {
             }
             request_work(c.id);
             let top = c.kstack_top;
+            if core::mem::take(&mut c.suspend_req) {
+                suspend_idle(c);
+            }
             bkl::release();
             unsafe { nxk_enter_idle(top) }
         }
@@ -949,6 +952,43 @@ fn go_offline(c: &mut PerCpu) -> ! {
     arch::irq_disable();
     psci::cpu_off();
     arch::park()
+}
+
+/// Idle core powers down (CPU_SUSPEND) until an interrupt; the FP registers
+/// and the core's timer die with it. Returns only if the monitor refuses.
+fn suspend_idle(c: &mut PerCpu) {
+    extern "C" {
+        fn _start();
+    }
+    fpu::save_owner(c);
+    sysreg_write!("cntp_ctl_el0", 0);
+    c.suspended_at = timer::counter();
+    c.suspended = true;
+    bkl::release();
+    arch::irq_disable();
+    let r = psci::cpu_suspend(_start as *const () as usize as u64);
+    bkl::acquire();
+    c.suspended = false;
+    crate::kprintln!("[smp] core {}: CPU_SUSPEND refused ({})", c.id, r);
+    c.timer_cval = u64::MAX;
+    c.timer_dirty = true;
+}
+
+/// Kernel side of a core back from CPU_SUSPEND (`kresume`): what the
+/// hardware lost is reloaded at the next exit.
+pub fn resumed() {
+    let c = percpu::this();
+    c.suspended = false;
+    c.last_run = NIL;
+    c.fp_enabled = false;
+    c.ss_enabled = false;
+    c.timer_cval = u64::MAX;
+    c.timer_dirty = true;
+    crate::kprintln!(
+        "[smp] core {} back from CPU_SUSPEND after {} us",
+        c.id,
+        timer::ticks_to_ns(timer::counter() - c.suspended_at) / 1000
+    );
 }
 
 /// A core back on: threads pinned to it, moved off meanwhile, return.

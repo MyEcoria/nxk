@@ -37,6 +37,9 @@ pub fn claim(intid: u32, proc_idx: u16) -> Result<(), i64> {
     if intid < 32 || intid as usize >= MAX_IRQ || intid >= gic::num_irqs() {
         return Err(-EINVAL);
     }
+    if intid == timer::IRQ_WAKE_TMR || intid == timer::IRQ_WAKE_CHECK {
+        return Err(-EBUSY);
+    }
     let l = &mut LINES.get()[intid as usize];
     if l.owned {
         return Err(-EBUSY);
@@ -122,6 +125,8 @@ pub fn handle() -> bool {
         }
         match id {
             gic::IRQ_TIMER => timer::on_irq(),
+            timer::IRQ_WAKE_TMR => timer::wake_irq(),
+            timer::IRQ_WAKE_CHECK => timer::wake_check_irq(),
             gic::SGI_RESCHEDULE => percpu::this().need_resched = true,
             32.. => {
                 device = true;

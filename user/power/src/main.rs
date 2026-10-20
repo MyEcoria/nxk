@@ -319,6 +319,10 @@ fn main() -> i32 {
             proto::BATTERY_HEALTH => battery_health(&i2c).unwrap_or_else(Msg::error),
             proto::MEASURE => measure::start(rx.msg.mr[0], rx.msg.mr[1]),
             proto::MEASURE_RESULT => measure::result(),
+            proto::SUSPEND_TEST => match sys::suspend_test(sysctl, rx.msg.mr[0]) {
+                Ok(()) => Msg::new(0, 0, 0),
+                Err(e) => Msg::error(e),
+            },
             proto::CORES => match cores(sysctl, rx.msg.mr[0]) {
                 Ok(n) => Msg::from_words(0, &[n]),
                 Err(e) => Msg::error(e),

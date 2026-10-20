@@ -209,6 +209,21 @@ pub extern "C" fn ksecondary(core: usize) -> ! {
     sched::exit_to_user()
 }
 
+/// A core back from CPU_SUSPEND: its EL1/EL2 state and caches were lost,
+/// the kernel's (threads, queues, deadlines) is all in memory.
+#[no_mangle]
+pub extern "C" fn kresume(core: usize) -> ! {
+    unsafe { mmu::enable() };
+    percpu::init(core, kstack_top(core), mmu::kernel_ttbr());
+    arch::cpu_init();
+    arch::exceptions::init();
+    gic::init_cpu();
+    bkl::acquire();
+    timer::init_cpu();
+    sched::resumed();
+    sched::exit_to_user()
+}
+
 /// First process: read-only boot image plus root IRQ/MMIO/sysctl caps.
 fn start_init() {
     let elf_image = bootfs::find("init").expect("boot image without 'init'");

@@ -276,6 +276,7 @@ fn system_power(cmd: u64, arg: u64) -> SysResult {
     use crate::arch::psci;
     match cmd {
         nxk_abi::power::CORES => set_cores(arg),
+        nxk_abi::power::SUSPEND_TEST => suspend_test(arg),
         nxk_abi::power::REBOOT => {
             crate::kprintln!("[nxk] reboot");
             if psci::present() {
@@ -294,6 +295,27 @@ fn system_power(cmd: u64, arg: u64) -> SysResult {
         }
         _ => Err(-EINVAL),
     }
+}
+
+/// Core 0 suspends at its next idle; TMR8 wakes it `us` later.
+fn suspend_test(us: u64) -> SysResult {
+    if !crate::arch::psci::present() || !crate::arch::mmu::monitor_reserved() {
+        return Err(-ENOSYS);
+    }
+    if us == 0 || us > 60_000_000 {
+        return Err(-EINVAL);
+    }
+    // The safety net (a missed wake interrupt) needs another core awake.
+    if !(1..percpu::NR_CPUS).any(|k| percpu::get(k).online) {
+        return Err(-EBUSY);
+    }
+    timer::arm_wake(0, us as u32);
+    let c = percpu::get(0);
+    c.suspend_req = true;
+    if percpu::this().id != 0 {
+        crate::kern::sched::kick(0);
+    }
+    val(0)
 }
 
 /// Cores in `mask` on, the others off (core 0 always on). EAGAIN: a core

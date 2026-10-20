@@ -207,6 +207,7 @@ fn command(line: &str) {
             println!("{}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
         }
         "cores" => cores_cmd(argv.get(1).copied()),
+        "coresleep" => coresleep(argv.get(1).copied()),
         "poweroff" => power_cmd(power::OFF),
         "reboot" => power_cmd(power::REBOOT),
         "recv" if argv.len() == 4 => recv(argv[1], argv[2], argv[3]),
@@ -237,6 +238,7 @@ fn help() {
     println!("  threads         every thread: state, core, pin, deadline");
     println!("  soc             BPMP and EMC state the deep sleep depends on");
     println!("  cores MASK      CPU cores kept on (hex mask), the others off");
+    println!("  coresleep MS    core 0 powered down until a timer wakes it");
     println!("  uptime          time since boot");
     println!("  echo TEXT       print TEXT");
     println!("  date            wall-clock time (RTC)");
@@ -1275,6 +1277,27 @@ fn power_cmd(label: u32) {
             fail(e);
         }
         _ => {}
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `coresleep MS`: core 0 powered down at its next idle for MS ms.
+fn coresleep(arg: Option<&str>) {
+    let Some(ms) = arg.and_then(|a| a.parse::<u64>().ok()) else {
+        println!("usage: coresleep MS (core 0 powered down, woken by a timer)");
+        return fail(-err::EINVAL);
+    };
+    let Some(h) = power_service() else { return };
+    match ipc::call(h, &Msg::from_words(power::SUSPEND_TEST, &[ms * 1000])) {
+        Ok(m) if m.label() != 0 => {
+            println!("coresleep: {}", err::name(-(m.label() as i64)));
+            fail(-(m.label() as i64));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            println!("coresleep: {}", err::name(e));
+            fail(e);
+        }
     }
     let _ = sys::handle_close(h);
 }

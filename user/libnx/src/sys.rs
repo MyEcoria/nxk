@@ -72,6 +72,13 @@ pub fn set_cores(sysctl: u32, mask: u64) -> Result<()> {
     check(r).map(|_| ())
 }
 
+/// Core 0 powers down at its next idle, woken `us` later by a Tegra timer
+/// (SysControl capability; deep sleep rehearsal).
+pub fn suspend_test(sysctl: u32, us: u64) -> Result<()> {
+    let r = unsafe { syscall3(SYSTEM_POWER, sysctl as u64, nxk_abi::power::SUSPEND_TEST, us) };
+    check(r).map(|_| ())
+}
+
 /// Set the wall clock (SysControl capability).
 pub fn clock_set_realtime(sysctl: u32, ns: u64) -> Result<()> {
     check(unsafe { syscall3(CLOCK_SET, sysctl as u64, nxk_abi::clock::REALTIME, ns) }).map(|_| ())

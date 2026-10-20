@@ -149,6 +149,12 @@ pub mod power {
     /// power off (PSCI CPU_OFF). Needs a monitor (ENOSYS without), EAGAIN
     /// while a core is still on its way off.
     pub const CORES: u64 = 2;
+    /// Rehearsal of the deep sleep's warm entry: core 0 powers down (PSCI
+    /// CPU_SUSPEND) the next time it is idle, and a Tegra timer wakes it
+    /// after the third argument's microseconds. Needs nxk-bl31 (ENOSYS)
+    /// and another core on (EBUSY): it wakes core 0 if the interrupt does
+    /// not.
+    pub const SUSPEND_TEST: u64 = 3;
 }
 
 /// Clocks for `clock`.
@@ -1378,6 +1384,10 @@ pub mod proto {
         /// Waits up to 100 ms for a core still going off. ENOSYS without a
         /// monitor. Reply: word 0 = the number of cores in the mask.
         pub const CORES: u32 = 13;
+        /// word 0 = microseconds: core 0 powers down at its next idle and
+        /// a Tegra timer wakes it (`power::SUSPEND_TEST`, deep sleep
+        /// rehearsal). ENOSYS without nxk-bl31.
+        pub const SUSPEND_TEST: u32 = 14;
     }
     /// Fan: speed from the SoC temperature, or set by hand.
     pub mod fan {

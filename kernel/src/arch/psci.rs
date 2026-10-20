@@ -3,7 +3,10 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 const VERSION: u64 = 0x8400_0000;
+const CPU_SUSPEND_64: u64 = 0xC400_0001;
 const CPU_OFF: u64 = 0x8400_0002;
+/// x0 at `_start` when a core comes back from CPU_SUSPEND ("NXKRESUS").
+pub const RESUME_MAGIC: u64 = 0x4E58_4B52_4552_5355;
 const CPU_ON_64: u64 = 0xC400_0003;
 const SYSTEM_OFF: u64 = 0x8400_0008;
 const SYSTEM_RESET: u64 = 0x8400_0009;
@@ -67,6 +70,17 @@ pub fn nxk_diag(cpu: u64) -> Option<[u64; 4]> {
         return None;
     }
     Some([r0, r1, r2, r3])
+}
+
+/// Power the calling core down until an interrupt; it comes back at the
+/// kernel's `_start` (then `kresume`). Returns only if the monitor refuses.
+pub fn cpu_suspend(entry: u64) -> i64 {
+    smc(CPU_SUSPEND_64, 1 << 16, entry, RESUME_MAGIC) as i64
+}
+
+/// nxk-bl31: power up `cpu`, suspended and not woken by its interrupt.
+pub fn nxk_wake(cpu: u64) -> i64 {
+    smc(0xC200_0002, cpu, 0, 0) as i64
 }
 
 /// Power off the calling core; returns only if the monitor refuses.

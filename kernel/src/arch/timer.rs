@@ -99,6 +99,74 @@ pub fn reprogram(c: &mut PerCpu) {
     }
 }
 
+/// Tegra TMR8 (hekate bdk/soc/timer.h, its SPI 154): wakes a core powered
+/// down by CPU_SUSPEND, whose own timer is gone. 1 us ticks.
+const TMR8_PTV: usize = 0x6000_5078;
+const TMR8_PCR: usize = 0x6000_507C;
+const TMR_EN: u32 = 1 << 31;
+const TMR_INTR_CLR: u32 = 1 << 30;
+pub const IRQ_WAKE_TMR: u32 = 32 + 154;
+/// TMR9 (SPI 155) on core 1: checks the suspended core came back.
+const TMR9_PTV: usize = 0x6000_5080;
+const TMR9_PCR: usize = 0x6000_5084;
+pub const IRQ_WAKE_CHECK: u32 = 32 + 155;
+/// After the wake timer, how long a missing wake is waited for (us).
+const WAKE_MARGIN_US: u32 = 50_000;
+
+/// One-shot wake interrupt for `core` in `us` microseconds.
+pub fn arm_wake(core: usize, us: u32) {
+    unsafe {
+        crate::mmio::write32(TMR8_PCR, TMR_INTR_CLR);
+        crate::mmio::write32(TMR8_PTV, TMR_EN | us.clamp(1, 0x1FFF_FFFF));
+    }
+    gic::set_target(IRQ_WAKE_TMR, 1 << core);
+    gic::set_priority(IRQ_WAKE_TMR, 0xA0);
+    gic::enable_irq(IRQ_WAKE_TMR);
+    // Safety net on another core: no wake interrupt, no core back.
+    let checker = (0..percpu::NR_CPUS)
+        .find(|&k| k != core && percpu::get(k).online)
+        .unwrap_or(core);
+    unsafe {
+        crate::mmio::write32(TMR9_PCR, TMR_INTR_CLR);
+        crate::mmio::write32(
+            TMR9_PTV,
+            TMR_EN | (us.clamp(1, 0x1FFF_0000) + WAKE_MARGIN_US),
+        );
+    }
+    WAKE_CORE.store(core as u64, Ordering::Relaxed);
+    gic::set_target(IRQ_WAKE_CHECK, 1 << checker);
+    gic::set_priority(IRQ_WAKE_CHECK, 0xA0);
+    gic::enable_irq(IRQ_WAKE_CHECK);
+}
+
+static WAKE_CORE: AtomicU64 = AtomicU64::new(0);
+
+/// The safety-net timer fired: a core still suspended is powered up by the
+/// monitor (the flow controller), and that is logged.
+pub fn wake_check_irq() {
+    unsafe {
+        crate::mmio::write32(TMR9_PTV, 0);
+        crate::mmio::write32(TMR9_PCR, TMR_INTR_CLR);
+    }
+    let core = WAKE_CORE.load(Ordering::Relaxed) as usize;
+    if percpu::get(core).suspended {
+        let r = crate::arch::psci::nxk_wake(core as u64);
+        crate::kprintln!(
+            "[smp] core {}: no wake interrupt, monitor wakes it ({})",
+            core,
+            r
+        );
+    }
+}
+
+/// The wake timer fired: stop and clear it.
+pub fn wake_irq() {
+    unsafe {
+        crate::mmio::write32(TMR8_PTV, 0);
+        crate::mmio::write32(TMR8_PCR, TMR_INTR_CLR);
+    }
+}
+
 /// Deadlines already due but not expired (their timer edge was lost): handle
 /// them as the timer interrupt would.
 pub fn catch_up() {

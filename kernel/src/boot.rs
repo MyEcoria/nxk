@@ -119,6 +119,15 @@ _start:
     msub    x0, x1, x19, x0              // sp = __stack_top - core_id * STACK_SIZE
     mov     sp, x0
 
+    // Back from CPU_SUSPEND (x0 = RESUME_MAGIC): the kernel is live, no
+    // `.bss` clearing, no boot.
+    movz    x0, #0x5355
+    movk    x0, #0x4552, lsl #16
+    movk    x0, #0x4B52, lsl #32
+    movk    x0, #0x4E58, lsl #48
+    cmp     x21, x0
+    b.eq    .Lresume
+
     cbnz    x19, .Lsecondary
 
     // ---- core 0: zero .bss ----
@@ -141,6 +150,10 @@ _start:
 .Lsecondary:
     mov     x0, x19
     bl      ksecondary
+
+.Lresume:
+    mov     x0, x19
+    bl      kresume
 
 .Lpark:
     msr     daifset, #0xF
