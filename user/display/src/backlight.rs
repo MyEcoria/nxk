@@ -11,6 +11,7 @@ const EN: u32 = 1 << 31;
 /// Lowest brightness the slider gives: the screen stays readable.
 pub const MIN_PCT: u8 = 10;
 
+#[derive(Clone, Copy)]
 pub struct Backlight {
     pwm: Mmio,
 }

@@ -216,8 +216,8 @@ enum Job {
     /// A user's directory, or a game's saves, to erase.
     RemoveTree(String),
     /// The console goes to sleep (true) or wakes (false) at the time
-    /// given: `sleep_steps`.
-    Sleep(bool, u64),
+    /// given, the brightness to come back to: `sleep_steps`.
+    Sleep(bool, u64, u8),
 }
 
 /// Outcome of an action run by the worker.
@@ -436,6 +436,31 @@ struct Saved {
     gpu: Option<u64>,
 }
 
+/// DSI A (hekate bdk/display/di.h): host packets inside the video stream,
+/// the packet's header word; MIPI DCS commands.
+const DSI_BASE: u64 = 0x5430_0000;
+const DSI_WR_DATA: usize = 0x0A;
+const DSI_VIDEO_MODE_CONTROL: usize = 0x4E;
+const DSI_CMD_PKT_VID_ENABLE: u32 = 1;
+const DCS_SHORT_WRITE: u32 = 0x05;
+const DCS_SLEEP_IN: u32 = 0x10;
+const DCS_SLEEP_OUT: u32 = 0x11;
+const DCS_DISPLAY_OFF: u32 = 0x28;
+const DCS_DISPLAY_ON: u32 = 0x29;
+/// A frame and the packet's transmission (hekate `display_end`).
+const DCS_FRAME_US: u64 = 16_666 + 230;
+/// Sleep out to display on: 180 ms, the longest of hekate's panels.
+const SLEEP_OUT_MS: u64 = 180;
+
+/// A DCS short write while the panel takes video: host packets on for
+/// one frame, sent in its blanking as hekate's `display_end` does.
+fn dcs(dsi: &Mmio, cmd: u32) {
+    dsi.w32(DSI_VIDEO_MODE_CONTROL * 4, DSI_CMD_PKT_VID_ENABLE);
+    dsi.w32(DSI_WR_DATA * 4, cmd << 8 | DCS_SHORT_WRITE);
+    time::sleep_us(DCS_FRAME_US);
+    dsi.w32(DSI_VIDEO_MODE_CONTROL * 4, 0);
+}
+
 /// Window A's fetch on or off (the panel shows the background), under
 /// the link lock like every register sequence.
 fn window_a(dc: &Mmio, link: &Mutex<Link>, on: bool) {
@@ -470,21 +495,27 @@ fn tell_sleepers(label: u32, order: impl Iterator<Item = &'static &'static Servi
 fn sleep_steps(
     on: bool,
     at: u64,
+    pct: u8,
     saved: &mut Option<Saved>,
-    dc: &Mmio,
-    ov: Option<Win>,
+    hw: &Screens,
     link: &Mutex<Link>,
     awake: &Condvar,
 ) {
+    let dc = &hw.dc;
     if on {
         if saved.is_some() {
             return;
         }
         tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
         window_a(dc, link, false);
-        if let Some(v) = ov {
+        if let Some(v) = hw.ov {
             let _l = link.lock();
             overlay(dc, v, 0, 0, None);
+        }
+        // The backlight is off already: the panel blanks, then sleeps.
+        if let Some(d) = &hw.dsi {
+            dcs(d, DCS_DISPLAY_OFF);
+            dcs(d, DCS_SLEEP_IN);
         }
         let cpu = CPUFREQ
             .call(&Msg::new(cpufreq::STATUS, 0, 0))
@@ -507,13 +538,26 @@ fn sleep_steps(
         *saved = Some(Saved { cpu, gpu });
         return;
     }
-    window_a(dc, link, true);
+    // The clocks come back while the panel leaves its sleep.
+    let woke = time::now_ns();
+    if let Some(d) = &hw.dsi {
+        dcs(d, DCS_SLEEP_OUT);
+    }
     if let Some(sv) = saved.take() {
         if let Some(khz) = sv.gpu {
             gpu_clock_back(khz);
         }
         if let Some(mhz) = sv.cpu {
             let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
+        }
+    }
+    window_a(dc, link, true);
+    if let Some(d) = &hw.dsi {
+        let left = (SLEEP_OUT_MS * 1_000_000).saturating_sub(time::now_ns() - woke);
+        time::sleep_us(left / 1000);
+        dcs(d, DCS_DISPLAY_ON);
+        if let Some(b) = &hw.bl {
+            b.set(pct);
         }
     }
     {
@@ -531,14 +575,17 @@ fn sleep_steps(
     );
 }
 
-fn work(
-    w: &Worker,
-    notif: u32,
+/// What the sleep steps drive: the display controller, the overlay
+/// window, DSI A (`None`: no grant, the panel stays on) and the backlight.
+#[derive(Clone, Copy)]
+struct Screens {
     dc: Mmio,
     ov: Option<Win>,
-    link: &Mutex<Link>,
-    awake: &Condvar,
-) -> ! {
+    dsi: Option<Mmio>,
+    bl: Option<backlight::Backlight>,
+}
+
+fn work(w: &Worker, notif: u32, hw: Screens, link: &Mutex<Link>, awake: &Condvar) -> ! {
     let mut saved: Option<Saved> = None;
     loop {
         let mut q = w.jobs.lock();
@@ -567,8 +614,8 @@ fn work(
                 let _ = users::remove_tree(&path);
                 continue;
             }
-            Job::Sleep(on, at) => {
-                sleep_steps(on, at, &mut saved, &dc, ov, link, awake);
+            Job::Sleep(on, at, pct) => {
+                sleep_steps(on, at, pct, &mut saved, &hw, link, awake);
                 continue;
             }
         };
@@ -1069,6 +1116,8 @@ libnx::entry!(main);
 fn main() -> i32 {
     let dc = Mmio::map(drv::dev_slot(0), DC, 0x40000).expect("display: registers");
     let bl = backlight::Backlight::open();
+    // Granted by a newer init only: without it the panel stays on asleep.
+    let dsi_regs = Mmio::map(drv::dev_slot(2), DSI_BASE, 0x1000).ok();
     let active = dc.r32(DISP_DISP_ACTIVE * 4);
     let (mut w, mut h) = (
         (active & 0x1FFF) as usize,
@@ -1170,8 +1219,13 @@ fn main() -> i32 {
     });
     {
         let (w2, l2, a2) = (worker.clone(), link.clone(), awake.clone());
-        thread::spawn(move || work(&w2, notif, dc, ov_win, &l2, &a2))
-            .expect("display: worker thread");
+        let hw = Screens {
+            dc,
+            ov: ov_win,
+            dsi: dsi_regs,
+            bl,
+        };
+        thread::spawn(move || work(&w2, notif, hw, &l2, &a2)).expect("display: worker thread");
     }
     let game_ep = sys::endpoint_create().expect("display: game endpoint");
     {
@@ -1276,7 +1330,7 @@ fn main() -> i32 {
                 worker
                     .jobs
                     .lock()
-                    .push_back(Job::Sleep(true, time::now_ns()));
+                    .push_back(Job::Sleep(true, time::now_ns(), ui.cfg.brightness));
                 worker.wake.notify_one();
             }
         }};
@@ -1290,11 +1344,13 @@ fn main() -> i32 {
                     "[display] wake after {} s",
                     $now.saturating_sub(since) / 1_000_000_000
                 );
-                worker.jobs.lock().push_back(Job::Sleep(false, $now));
+                let pct = ui.cfg.brightness;
+                worker.jobs.lock().push_back(Job::Sleep(false, $now, pct));
                 ov_shown = None;
                 worker.wake.notify_one();
-                if let Some(b) = &bl {
-                    b.set(ui.cfg.brightness);
+                // With DSI the worker lights it once the panel is on.
+                if let (Some(b), None) = (&bl, dsi_regs) {
+                    b.set(pct);
                 }
                 scr.forget();
                 dirty = true;
