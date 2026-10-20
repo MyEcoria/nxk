@@ -1,5 +1,6 @@
-//! PSCI 1.0 subset: VERSION, FEATURES, CPU_ON, AFFINITY_INFO, SYSTEM_RESET.
+//! PSCI 1.0 subset: VERSION, FEATURES, CPU_ON, CPU_OFF, AFFINITY_INFO, SYSTEM_RESET.
 //! CPU_ON as exosphere: assert CPU/CORE reset, power the CPU partition, release reset; the core restarts at our `_start` (SB reset vector) and is sent to the caller's entry in EL2.
+//! CPU_OFF as exosphere's `PowerOffCpuImpl`: the flow controller power-gates the core at its next WFI.
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
@@ -9,12 +10,14 @@ pub const NR_CPUS: usize = 4;
 
 const VERSION: u32 = 0x8400_0000;
 const FEATURES: u32 = 0x8400_000A;
+const CPU_OFF: u32 = 0x8400_0002;
 const CPU_ON_64: u32 = 0xC400_0003;
 const AFFINITY_INFO_64: u32 = 0xC400_0004;
 const SYSTEM_RESET: u32 = 0x8400_0009;
 
 const SUCCESS: i64 = 0;
 const NOT_SUPPORTED: i64 = -1;
+const DENIED: i64 = -3;
 const INVALID_PARAMETERS: i64 = -2;
 const ALREADY_ON: i64 = -4;
 const ON_PENDING: i64 = -5;
@@ -39,6 +42,20 @@ const PWRGATE_TOGGLE_START: u32 = 1 << 8;
 const CPU_PARTITION: [u32; NR_CPUS] = [14, 9, 10, 11];
 
 const RST_CPUG_CMPLX_SET: usize = CAR_BASE + 0x450;
+
+/// Flow controller (libvapours tegra_flow_ctlr.hpp): per-core offsets are
+/// not a stride.
+const FLOW_CTLR: usize = 0x6000_7000;
+const FLOW_CPU_CSR: [usize; NR_CPUS] = [0x08, 0x18, 0x20, 0x28];
+const FLOW_HALT_CPU: [usize; NR_CPUS] = [0x00, 0x14, 0x1C, 0x24];
+const FLOW_CC4_CORE_CTRL: [usize; NR_CPUS] = [0x6C, 0x70, 0x74, 0x78];
+/// CPUn_CSR: ENABLE, WAIT_WFI_BITMAP (11:8), ENABLE_EXT (13:12) = 0
+/// (power-gate the CPU only), EVENT_FLAG and INTR_FLAG (write 1 to clear).
+const CSR_ENABLE: u32 = 1 << 0;
+const CSR_WFI_SHIFT: u32 = 8;
+const CSR_FLAGS: u32 = 1 << 14 | 1 << 15;
+/// HALT_CPUn_EVENTS.FLOW_MODE (31:29) = WAITEVENT, no wake source.
+const HALT_WAITEVENT: u32 = 2 << 29;
 const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 
 /// EL3 runs with caches off: volatile accesses are coherent between cores.
@@ -77,6 +94,8 @@ fn wait_for(us: u64, cond: impl Fn() -> bool) -> bool {
 
 extern "C" {
     fn _start();
+    /// Caches off, L1 flushed, SMPEN off, GIC CPU interface off, `wfi`.
+    fn cpu_power_down() -> !;
 }
 
 /// Boot core: mark itself on, point the AArch64 reset vector at our `_start`
@@ -93,6 +112,7 @@ pub fn smc(regs: &mut [u64; 31]) {
         VERSION => 0x0001_0000,
         FEATURES => features(regs[1] as u32),
         CPU_ON_64 => cpu_on(regs[1], regs[2], regs[3]),
+        CPU_OFF => cpu_off(),
         AFFINITY_INFO_64 => affinity_info(regs[1], regs[2]),
         SYSTEM_RESET => system_reset(),
         _ => NOT_SUPPORTED,
@@ -102,7 +122,7 @@ pub fn smc(regs: &mut [u64; 31]) {
 
 fn features(fid: u32) -> i64 {
     match fid {
-        VERSION | FEATURES | CPU_ON_64 | AFFINITY_INFO_64 | SYSTEM_RESET => SUCCESS,
+        VERSION | FEATURES | CPU_ON_64 | CPU_OFF | AFFINITY_INFO_64 | SYSTEM_RESET => SUCCESS,
         _ => NOT_SUPPORTED,
     }
 }
@@ -121,6 +141,9 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
         PENDING => return ON_PENDING,
         _ => {}
     }
+    // Just turned off: the reset must not hit its cache flush. On silicon the
+    // gate follows its `wfi` within microseconds; the emulator never gates.
+    wait_for(5000, || !partition_on(CPU_PARTITION[cpu]));
     unsafe {
         write_volatile((addr_of_mut!(ENTRY) as *mut u64).add(cpu), entry);
         write_volatile((addr_of_mut!(CTX) as *mut u64).add(cpu), ctx);
@@ -137,9 +160,13 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
     SUCCESS
 }
 
+fn partition_on(partition: u32) -> bool {
+    rd(PMC_PWRGATE_STATUS) & (1 << partition) != 0
+}
+
 /// Ungate a CPU partition; 5 ms per step as exosphere.
 fn power_on(partition: u32) -> bool {
-    let on = || rd(PMC_PWRGATE_STATUS) & (1 << partition) != 0;
+    let on = || partition_on(partition);
     if on() {
         return true;
     }
@@ -150,11 +177,44 @@ fn power_on(partition: u32) -> bool {
     wait_for(5000, on)
 }
 
+/// OFF only once the partition is gated (PSCI: not while still running).
 fn affinity_info(mpidr: u64, level: u64) -> i64 {
     if level != 0 || mpidr >= NR_CPUS as u64 {
         return INVALID_PARAMETERS;
     }
-    state(mpidr as usize) as i64
+    let cpu = mpidr as usize;
+    match state(cpu) {
+        OFF if partition_on(CPU_PARTITION[cpu]) => ON as i64,
+        s => s as i64,
+    }
+}
+
+fn this_cpu() -> usize {
+    let mpidr: u64;
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack)) };
+    (mpidr & 0xFF) as usize
+}
+
+/// Core 0 stays up (it alone serves SYSTEM_RESET and, later, the suspend).
+fn cpu_off() -> i64 {
+    let cpu = this_cpu();
+    if cpu == 0 || cpu >= NR_CPUS {
+        return DENIED;
+    }
+    wr(
+        FLOW_CTLR + FLOW_CPU_CSR[cpu],
+        CSR_FLAGS | (1 << cpu) << CSR_WFI_SHIFT | CSR_ENABLE,
+    );
+    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], HALT_WAITEVENT);
+    wr(FLOW_CTLR + FLOW_CC4_CORE_CTRL[cpu], 0);
+    set_state(cpu, OFF);
+    unsafe { cpu_power_down() }
+}
+
+/// A powered-up core: no power-gate armed for its next `wfi`.
+fn flow_reset(cpu: usize) {
+    wr(FLOW_CTLR + FLOW_CPU_CSR[cpu], CSR_FLAGS);
+    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], 0);
 }
 
 fn system_reset() -> i64 {
@@ -168,6 +228,7 @@ extern "C" fn bl31_secondary(cpu: usize) -> ! {
     if cpu >= NR_CPUS || state(cpu) != PENDING {
         crate::park();
     }
+    flow_reset(cpu);
     crate::gic_secure_init_cpu();
     let (entry, ctx) = unsafe {
         (

@@ -125,13 +125,18 @@ Chosen chain (validated in the emulator, and on hardware up to the
   `0xAA000000` to `0x80000000`, and jumps to EL2 (SCTLR_EL2,
   MDCR_EL2... in a known state) with x0 = 0 (no DTB: DRAM via
   `MC_EMEM_CFG` + probing). It then serves PSCI 1.0 (`psci.rs`:
-  VERSION, FEATURES, CPU_ON, AFFINITY_INFO, SYSTEM_RESET; no
+  VERSION, FEATURES, CPU_ON, CPU_OFF, AFFINITY_INFO, SYSTEM_RESET; no
   SYSTEM_OFF, which needs the PMIC). CPU_ON follows exosphere: assert
   the core's CPU/CORE reset, ungate its PMC partition (CE1-CE3), release
   the reset; the core restarts at the monitor's `_start` (SB AA64 reset
   vector, set by hekate and rewritten by the monitor: hekate's lock only
   blocks non-secure writes, which is why nxk in EL2 cannot wake cores
   itself), gets its EL3 and banked GIC setup, then enters nxk in EL2.
+  CPU_OFF too (`PowerOffCpuImpl`): the flow controller's `CPUn_CSR` arms
+  a power-gate of the core at its next WFI, then L1 flushed by set/way,
+  SMPEN off, GIC CPU interface muted, `wfi`; CPU_ON first waits for that
+  gate, and a woken core clears its flow-controller registers. The deep
+  sleep plan built on it: `SC7.md`.
 - `nxk/bl33.bin`: byte-identical copy of `build/nxk.bin`.
 - `bootloader/sys/l4t/` + `libsys_*.bso`: BPMP/SC7/Minerva firmware from
   the Nyx pack (DRAM init by hekate); installed by `mksd-hw.sh` if missing.

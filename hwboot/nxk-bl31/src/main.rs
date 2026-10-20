@@ -328,6 +328,66 @@ drop_to_el2:
     isb
     eret
 
+// cpu_power_down() -> ! : exosphere's FinalizePowerOff. The flow controller
+// is armed: the core's partition is gated at the `wfi`.
+.globl cpu_power_down
+cpu_power_down:
+    mrs     x0, sctlr_el1
+    bic     x0, x0, #(1 << 2)
+    msr     sctlr_el1, x0
+    isb
+    mrs     x0, sctlr_el3
+    bic     x0, x0, #(1 << 2)
+    msr     sctlr_el3, x0
+    isb
+    // CPUECTLR: no table-walk descriptor prefetch, no instruction or data
+    // prefetch, before the flush.
+    mrs     x0, S3_1_C15_C2_1
+    orr     x0, x0, #(1 << 38)
+    bic     x0, x0, #(3 << 35)
+    bic     x0, x0, #(3 << 32)
+    msr     S3_1_C15_C2_1, x0
+    isb
+    dsb     sy
+    // Clean and invalidate L1 data by set/way (L2 stays: the cluster is on).
+    msr     csselr_el1, xzr
+    isb
+    mrs     x1, ccsidr_el1
+    and     x2, x1, #7
+    add     x2, x2, #4                 // set shift: log2(line bytes)
+    ubfx    x3, x1, #3, #10            // ways - 1
+    ubfx    x4, x1, #13, #15           // sets - 1
+    clz     w5, w3                     // way shift
+.Lway:
+    mov     x6, x4
+.Lset:
+    lsl     x7, x3, x5
+    lsl     x8, x6, x2
+    orr     x7, x7, x8
+    dc      cisw, x7
+    subs    x6, x6, #1
+    b.ge    .Lset
+    subs    x3, x3, #1
+    b.ge    .Lway
+    dsb     sy
+    // Leave coherency (no more broadcast maintenance), then mute the GIC
+    // CPU interface (bypass disabled both groups) and lock the OS double lock.
+    mrs     x0, S3_1_C15_C2_1
+    bic     x0, x0, #(1 << 6)
+    msr     S3_1_C15_C2_1, x0
+    movz    x1, #0x2000
+    movk    x1, #0x5004, lsl #16
+    mov     w0, #0x1E0
+    str     w0, [x1]
+    mrs     x0, osdlr_el1
+    orr     x0, x0, #1
+    msr     osdlr_el1, x0
+    isb
+    dsb     sy
+.Loff:
+    wfi
+    b       .Loff
+
 .macro SAVE
     sub     sp, sp, #256
     stp     x0, x1, [sp, #0]
