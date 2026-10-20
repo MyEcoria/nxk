@@ -169,6 +169,11 @@ today's software sleep stays the default:
    gate, the woken core clears its flow-controller registers. Kernel: the
    dying core moves its threads, deadlines, FP state and interrupt lines to
    core 0, then calls CPU_OFF; `power` asks for it, `display` at sleep.
+   **Done** (`README.md` run 50): on silicon a core the flow controller
+   gated comes back by itself once `HALT_CPUn_EVENTS` is cleared (exosphere's
+   PMC toggle does not bring it back); asleep with Lumen held, -65 mW
+   (1.561 W -> 1.496 W). Still open from section 5: the boot line with the
+   BPMP and EMC state scrolled out of `display`'s log before it was read.
 2. **Core 0 power-down rehearsal** with the CPU rail on, woken by a Tegra
    timer (the arch timer dies with the core): warm entry, EL2/EL1 and GIC
    distributor restore, no DRAM or PMIC risk.

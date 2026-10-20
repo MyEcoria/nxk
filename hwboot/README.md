@@ -1271,6 +1271,25 @@ within 5 s.
     before `audio` was published, so audio kept its loud default (70 %);
     it now retries for up to 10 s.
 
+50. 20/10/2026, Erista, two boot images (the first SC7 stage,
+    `SC7.md`): **cores 1-3 powered off while asleep** (PSCI CPU_OFF in
+    `nxk-bl31`, kernel hotplug, `cores MASK` in the shell). First image
+    (85f6c8f): the cores went off, but CPU_ON (PMC toggle, as exosphere)
+    never brought them back; `display` and `joycon` stopped too. Second
+    image (de0ed8f): CPU_ON tries in turn the flow controller's own
+    power-up, a PMC toggle and a full PMC cycle, and records which one
+    worked: always the first. Clearing `HALT_CPUn_EVENTS` is enough for
+    a core the flow controller gated to power itself back up; the monitor
+    saw each core's partition gated (CE1-3 clear in `PWRGATE_STATUS`).
+    Five off/on cycles, `display` and `joycon` running throughout, ktest
+    0 failed (its hotplug case included), stdtest 17/17. Same boot, Lumen
+    held asleep, battery 13-14 % (cell 3.65 V), USB-C cable in, A/B
+    within one sleep: cores 1-3 off 1.506 W, all four on 1.561 W, off
+    again 1.486 W: **-65 mW** (4 %). The wake: the picture back, the four
+    cores back, the game going on where it stopped. CPU_OFF on its own
+    saves little; it is the first step towards SC7, which needs cores
+    1-3 off anyway.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
