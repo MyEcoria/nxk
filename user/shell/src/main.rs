@@ -247,7 +247,7 @@ fn help() {
     println!("  temp            chip and package temperatures");
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
-    println!("  emc [MHZ|sleep on|off]  DRAM clock, trained rates; MHZ: switch; sleep: drop asleep");
+    println!("  emc [MHZ|bench|sleep on|off]  DRAM clock, trained rates; MHZ: switch; bench: DRAM MB/s");
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
     println!(
         "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
@@ -814,6 +814,18 @@ fn fan_cmd(arg: Option<&str>) {
 fn emc_cmd(argv: &[&str]) {
     let req = match (argv.get(1).copied(), argv.get(2).copied()) {
         (None, _) => Msg::new(emc::STATUS, 0, 0),
+        (Some("bench"), None) => {
+            let Some(h) = service("emc") else { return };
+            match ipc::call(h, &Msg::new(emc::BENCH, 0, 0)).and_then(ipc::checked) {
+                Ok(m) => println!("dram copy {} MB/s, read {} MB/s", m.mr[0], m.mr[1]),
+                Err(e) => {
+                    println!("emc: {}", err::name(e));
+                    fail(e);
+                }
+            }
+            let _ = sys::handle_close(h);
+            return;
+        }
         (Some("sleep"), Some(m @ ("on" | "off"))) => {
             Msg::from_words(emc::SLEEP_MODE, &[(m == "on") as u64])
         }
@@ -835,7 +847,7 @@ fn emc_cmd(argv: &[&str]) {
             Msg::from_words(emc::SET, &[khz])
         }
         _ => {
-            println!("usage: emc [MHZ | sleep on|off]");
+            println!("usage: emc [MHZ | bench | sleep on|off]");
             fail(-err::EINVAL);
             return;
         }

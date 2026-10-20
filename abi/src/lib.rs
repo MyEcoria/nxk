@@ -1474,6 +1474,9 @@ pub mod proto {
         pub const SLEEP: u32 = 4;
         /// word 0 = 1 to let `SLEEP` change the rate (default 0).
         pub const SLEEP_MODE: u32 = 5;
+        /// DRAM throughput as seen from the service: word 0 = copy of 16
+        /// MiB (MB/s), word 1 = sequential read (MB/s).
+        pub const BENCH: u32 = 6;
         /// The table was read and has an entry for the current rate.
         pub const ST_READY: u64 = 1;
         /// `SLEEP` acts.

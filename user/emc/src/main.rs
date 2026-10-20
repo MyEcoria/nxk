@@ -144,10 +144,10 @@ impl Emc {
         let n = nxk_emc::mc_mismatches(&mut self.bus, t, &mut out);
         self.mc_diff = n as u32;
         println!(
-            "[emc] {}: MC matches the {} MHz entry in {}/33 registers",
+            "[emc] {}: MC matches the {} MHz entry in {}/24 compared registers",
             what,
             rate / 1000,
-            33 - n
+            24 - n
         );
         for &(o, have, want) in &out[..n.min(8)] {
             println!("[emc]   MC {:#x}: {:#x}, table {:#x}", o, have, want);
@@ -205,6 +205,9 @@ impl Emc {
         match self.switch(to_khz as u32) {
             Ok(()) => {
                 self.last_err = 0;
+                // A manual switch shows what the DRAM gives now.
+                let m = bench();
+                println!("[emc] dram copy {} MB/s, read {} MB/s", m.mr[0], m.mr[1]);
             }
             Err(e) => {
                 self.last_err = e;
@@ -267,6 +270,30 @@ fn load_tables(win: &Mmio) -> Vec<[u32; TABLE_WORDS]> {
     out
 }
 
+/// 16 MiB copied and read back-to-back (far larger than the caches): MB/s.
+fn bench() -> Msg {
+    const N: usize = 16 << 20;
+    let a = alloc::vec![1u8; N];
+    let mut b = alloc::vec![0u8; N];
+    let mb_s = |bytes: u64, t0: u64| bytes / (time::ticks_to_ns(time::ticks() - t0) / 1000).max(1);
+    let t0 = time::ticks();
+    for _ in 0..4 {
+        b.copy_from_slice(core::hint::black_box(&a));
+        core::hint::black_box(&b);
+    }
+    let copy = mb_s(4 * N as u64, t0);
+    let t0 = time::ticks();
+    let mut sum = 0u64;
+    for _ in 0..4 {
+        sum += core::hint::black_box(&b)
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .fold(0u64, |x, y| x.wrapping_add(y));
+    }
+    core::hint::black_box(sum);
+    Msg::from_words(0, &[copy, mb_s(4 * N as u64, t0)])
+}
+
 libnx::entry!(main);
 
 fn main() -> i32 {
@@ -305,6 +332,7 @@ fn main() -> i32 {
             proto::SET => svc.set(rx.msg.mr[0]),
             proto::ENTRY => svc.entry(rx.msg.mr[0]),
             proto::SLEEP => svc.sleep(rx.msg.mr[0] != 0),
+            proto::BENCH => bench(),
             proto::SLEEP_MODE => {
                 svc.sleep_mode = rx.msg.mr[0] != 0;
                 svc.status()

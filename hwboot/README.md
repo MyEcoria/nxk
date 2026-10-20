@@ -467,10 +467,12 @@ alone). The sequence is a Rust port of Minerva's `OP_SWITCH` (`emc/`);
 the DRAM voltage is never touched. Expected in the boot log:
 
 ```text
-[emc] at start: MC matches the 800 MHz entry in 33/33 registers
+[emc] at start: MC matches the 800 MHz entry in 24/24 compared registers
 [emc] 800 MHz now, tables for [204, 408, 800, 1331, 1600] MHz
 ```
 
+The arbiter hysteresis group (MC 0xBCC-0xBEC, nine registers) never reads
+back as written and is not compared; MC 0x94's bits 16-18 move by themselves.
 A few differing MC registers are logged with their values (up to 3 are
 tolerated); more, or no entry for the running rate (`[emc] ... no table
 entry`), and every SET is refused (ENODEV): the table does not describe
@@ -478,13 +480,13 @@ the DRAM that is running. At the shell:
 
 ```text
 emc               rate, entries (periodic-training ones are refused), switches
-emc 204           switch: [emc] 800 -> 204 MHz in NNN us, MC matches 33/33 after
+emc 204           switch: [emc] 800 -> 204 MHz in NNN us, MC matches after, DRAM MB/s
 emc 800           back
 emc sleep on      let display's sleep drop to 204 MHz (off by default)
 ```
 
 First trial, one change at a time, no game running, cable in: (1) the
-boot log above; (2) `emc 204`, `emc`, `emc 800`, then a few cycles with
+boot log above (`emc bench` needs a shell newer than the image's); (2) `emc 204`, `emc`, `emc 800`, then a few cycles with
 `bench`/`gpu test` between them; (3) sleep and wake with the drop off;
 (4) `emc sleep on`, Lumen held, sleep, wake: the log shows `[emc] 800 ->
 204 MHz` after the cores went off and `204 -> 800` first at the wake.

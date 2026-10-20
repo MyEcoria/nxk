@@ -509,9 +509,11 @@ fn mc_check_compares_the_burst_registers() {
     assert_eq!(nxk_emc::mc_mismatches(&mut m, &t, &mut out), 0);
     let mut init = init;
     init[5].2 ^= 0x10;
-    init[30].2 ^= 1;
+    init[20].2 ^= 1;
+    // The hysteresis group (indexes 24..33) is not compared.
+    init[26].2 ^= 0x80_0000;
     let mut m = Model::new(1, &init);
     assert_eq!(nxk_emc::mc_mismatches(&mut m, &t, &mut out), 2);
     assert_eq!(out[0].0, regs::BURST_MC_REGS_ADDR_TABLE[5]);
-    assert_eq!(out[1].0, regs::BURST_MC_REGS_ADDR_TABLE[30]);
+    assert_eq!(out[1].0, regs::BURST_MC_REGS_ADDR_TABLE[20]);
 }

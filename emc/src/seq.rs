@@ -991,12 +991,18 @@ pub fn check_lpddr4<H: Hw>(h: &mut H) -> Result<(), Error> {
 }
 
 /// Memory controller registers the entry would write that read differently
-/// now: (offset, live, table). The switch writes all of them verbatim, so a
+/// now (but for the arbiter hysteresis group, which never reads back as written): (offset, live, table). The switch writes all of them verbatim, so a
 /// table that describes the running DRAM leaves (almost) none. Returns the
 /// count; `out` holds the first ones.
 pub fn mc_mismatches<H: Hw>(h: &mut H, t: &Table, out: &mut [(u32, u32, u32); 33]) -> usize {
     let mut n = 0;
     for (i, &addr) in BURST_MC_REGS_ADDR_TABLE.iter().enumerate() {
+        // The arbiter hysteresis group reads back differently from what the
+        // table (and Minerva) wrote on a Switch (measured, run 51: bit 23
+        // gone in all nine, CTRL 0x2 for 0x80001a); the other 24 match.
+        if (MC_EMEM_ARB_DHYST_CTRL..=MC_EMEM_ARB_DHYST_TIMEOUT_UTIL_7).contains(&addr) {
+            continue;
+        }
         let (have, want) = (m_rd(h, addr), t.w(L::BURST_MC_REGS + i));
         if have != want {
             out[n] = (addr, have, want);
