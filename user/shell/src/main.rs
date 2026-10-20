@@ -250,6 +250,7 @@ fn help() {
     println!(
         "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
     );
+    println!("  gpu suspend     GPU rail off, its state kept; gpu resume: back as it was");
     println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels, 3D clear and triangle");
     println!("  gpu bench [MS]  GPU FFMA throughput for MS milliseconds (1000)");
     println!(
@@ -1164,6 +1165,8 @@ fn gpu_cmd(argv: &[&str]) {
         (None, _) => Msg::new(gpu::STATUS, 0, 0),
         (Some("on"), None) => Msg::from_words(gpu::POWER, &[1]),
         (Some("off"), None) => Msg::from_words(gpu::POWER, &[0]),
+        (Some("suspend"), None) => Msg::new(libnx::abi::proto::SUSPEND, 0, 0),
+        (Some("resume"), None) => Msg::new(libnx::abi::proto::RESUME, 0, 0),
         (Some("test"), None) => Msg::new(gpu::TEST, 0, 0),
         (Some("irtest"), None) => Msg::new(gpu::TEST_IR, 0, 0),
         (Some("bench"), None) => Msg::from_words(gpu::BENCH, &[1000]),
@@ -1172,7 +1175,7 @@ fn gpu_cmd(argv: &[&str]) {
         }
         _ => {
             println!(
-                "usage: gpu [on|off|test|irtest|bench [MS]|clock [MHZ] [force]|sweep [force]|load [MS]]"
+                "usage: gpu [on|off|suspend|resume|test|irtest|bench [MS]|clock [MHZ] [force]|sweep [force]|load [MS]]"
             );
             fail(-err::EINVAL);
             return;
@@ -1217,6 +1220,8 @@ fn gpu_cmd(argv: &[&str]) {
                 fail(-err::EIO);
             }
         }
+        Ok(_) if req.label() == libnx::abi::proto::SUSPEND => println!("gpu suspend: ok"),
+        Ok(_) if req.label() == libnx::abi::proto::RESUME => println!("gpu resume: ok"),
         Ok(m) if req.label() == gpu::BENCH => {
             let (flops, ns) = (m.mr[0], m.mr[1].max(1));
             let mflops = flops * 1000 / ns;

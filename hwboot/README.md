@@ -497,6 +497,7 @@ gpu sweep       gpu bench at each step up to the cap, ~77.5% of peak each
 bench full      CPU burn and GPU FFMA together, 30 s
 gpu load        gpu load: N% over 1000 ms (NNN ms busy since the service started)
 gpu off         clamps, reset, clocks and rail off
+gpu suspend     rail off, its state kept; gpu resume: programmed again over it
 ```
 
 `gpu clock` takes sys-clk's steps (76, 153, ... 921) while the GPU runs,
@@ -1289,6 +1290,41 @@ within 5 s.
     cores back, the game going on where it stopped. CPU_OFF on its own
     saves little; it is the first step towards SC7, which needs cores
     1-3 off anyway.
+
+51. 20/10/2026, Erista, same boot, `--reload gpu` and `display`, battery
+    65 %: **the GPU rail off asleep, its state kept** (`SC7.md`'s GPU
+    cold restore). `gpu` answers `proto::SUSPEND`: L2 flushed, channel
+    off the runlist, GPCPLL, clocks, rail off; `dev` (page tables,
+    channel, context, buffers, the clients' mappings, shaders and
+    pipelines, firmware files) all stay in DRAM and RAM. `RESUME` runs
+    the cold power-up over them (same addresses): rail, clocks, PLL, FB
+    and BAR1 registers, ACR boot (PMU), GR init (FECS, GPCCS), a new
+    golden image, RAMFC / USERD reset, the class state pushed again. Any
+    request that needs the GPU while it is off resumes it ("resumed on
+    demand") and it goes off again after 1 s idle while the console
+    sleeps. `display` sends it once the game waits in its held `FLIP`
+    and resumes it after the panel's sleep out, inside its 180 ms wait.
+    Checks: `gpu test` now ends with a suspend, a resume and the 2D,
+    compute and 3D tests again on the same device: 17/17, 10/10 after
+    (resume 21 ms, the cold start 236 ms with the card's firmware
+    read); Lumen asleep and awake seven times, rendering identical (two
+    shots), 60 fps, GPU back at 768 MHz 57 ms after the wake: the
+    picture still 223 ms after the press. A/B in one boot, Lumen held,
+    cell 3.85 V, USB-C cable in, `powertest start 60 15`, Power pressed
+    at once (cores 1-3 off in all):
+
+    | sleep | draw |
+    |---|---|
+    | GPU at 76.8 MHz, rail on (run 48's) | 1.646 W |
+    | GPU suspended, rail 0 mV | 1.327 W |
+    | same, `display` reloaded | 1.311 W |
+
+    **-0.32 W (-20 %)**, more than the 0.31 W run 48 estimated for the
+    rail. The emulator cannot test it (its GPU model runs the first
+    power-up only: a second one, with or without this change, times out
+    at the first batch); the console did. Not done: SC7 itself (the
+    GPU comes back from reset the same way), the late request that
+    finds the GPU off while a batch is half-built.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.

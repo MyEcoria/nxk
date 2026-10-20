@@ -79,7 +79,7 @@ fn bad(e: &'static str) -> (i64, &'static str) {
 }
 
 /// Run the loader. Afterwards FECS holds its firmware from the WPR.
-pub fn boot(r: &Regs, vm: &mut Vm, f: &Files) -> Result<Wpr> {
+pub fn boot(r: &Regs, vm: &mut Vm, f: &Files, slot: &mut mmu::Slot) -> Result<Wpr> {
     let w = wpr(r);
     let ls = fw::ls(&f.fecs_bl, &f.fecs_inst, &f.fecs_data, &f.fecs_sig).map_err(bad)?;
     let image = fw::wpr(&ls, fw::FALCON_FECS, w.start);
@@ -105,7 +105,7 @@ pub fn boot(r: &Regs, vm: &mut Vm, f: &Files) -> Result<Wpr> {
     hs.set_blob(blob.pa, image.len() as u32);
     let img = Dma::new(hs.img.len())?;
     img.write(0, &hs.img);
-    let va = vm.map(&img, false)?;
+    let va = vm.map_in(slot, &img)?;
     let inst = Dma::new(4096)?;
     vm.join(&inst, mmu::LIMIT);
     mmu::invalidate(r, vm)?;

@@ -553,6 +553,7 @@ pub fn golden(
     g: &Global,
     n: &Nets,
     size: u32,
+    slot: &mut mmu::Slot,
 ) -> Result<Vec<u8>> {
     // FE power forced on while the context-switch units reset.
     r.wr(0x404170, 0x12);
@@ -567,7 +568,7 @@ pub fn golden(
     r.wr(0x40802C, 1);
 
     let data = Dma::new(CB_RESERVED + size as usize)?;
-    let va = vm.map(&data, false)?;
+    let va = vm.map_in(slot, &data)?;
     bind_ctx(inst, va + CB_RESERVED as u64);
     mmu::invalidate(r, vm)?;
     let ptr = 0x8000_0000 | (inst.pa >> 12) as u32;
@@ -643,8 +644,11 @@ pub fn golden(
 /// A channel's context: the golden image, plus the list of registers
 /// FECS applies at its first load (`gf100_gr_chan_new` / `_bind`).
 pub struct ChanCtx {
-    _ctx: Dma,
+    ctx: Dma,
     _list: Dma,
+    ctx_va: u64,
+    list_va: u64,
+    words: usize,
 }
 
 pub fn channel(vm: &mut Vm, inst: &Dma, t: &Topo, g: &Global, golden: &[u8]) -> Result<ChanCtx> {
@@ -652,7 +656,6 @@ pub fn channel(vm: &mut Vm, inst: &Dma, t: &Topo, g: &Global, golden: &[u8]) -> 
         return Err((EINVAL, "no golden context"));
     }
     let ctx = Dma::new(golden.len())?;
-    ctx.write(0, golden);
     let list = Dma::new(4096)?;
     let mut words = 0usize;
     ctx_regs(g, t, &mut |a, v| {
@@ -661,23 +664,37 @@ pub fn channel(vm: &mut Vm, inst: &Dma, t: &Topo, g: &Global, golden: &[u8]) -> 
         words += 2;
     });
     let list_va = vm.map(&list, true)?;
-    for (o, v) in [
-        (0xF4, 0),
-        (0xF8, 0),
-        (0x10, (words / 2) as u32),
-        (0x14, list_va as u32),
-        (0x18, (list_va >> 32) as u32),
-        (0x1C, 1),
-        (0x20, 0),
-        (0x28, 0),
-        (0x2C, 0),
-    ] {
-        ctx.w32(o, v);
-    }
     let ctx_va = vm.map(&ctx, true)?;
-    bind_ctx(inst, ctx_va);
-    Ok(ChanCtx {
-        _ctx: ctx,
+    let c = ChanCtx {
+        ctx,
         _list: list,
-    })
+        ctx_va,
+        list_va,
+        words,
+    };
+    c.restore(inst, golden);
+    Ok(c)
+}
+
+impl ChanCtx {
+    /// The golden image and its header words back in the context, and
+    /// the instance block pointing at it: a fresh context after the GPU
+    /// came back from a power-off.
+    pub fn restore(&self, inst: &Dma, golden: &[u8]) {
+        self.ctx.write(0, golden);
+        for (o, v) in [
+            (0xF4, 0),
+            (0xF8, 0),
+            (0x10, (self.words / 2) as u32),
+            (0x14, self.list_va as u32),
+            (0x18, (self.list_va >> 32) as u32),
+            (0x1C, 1),
+            (0x20, 0),
+            (0x28, 0),
+            (0x2C, 0),
+        ] {
+            self.ctx.w32(o, v);
+        }
+        bind_ctx(inst, self.ctx_va);
+    }
 }

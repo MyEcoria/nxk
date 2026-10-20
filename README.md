@@ -516,6 +516,8 @@ program that vanished without closing them (crash) are reclaimed.
   the ACR loader from linux-firmware runs on the PMU, copies FECS into
   the GPU firmware carveout hekate's L4T entry locks, and starts it;
   GPCCS, the golden context and one channel follow nouveau's GM20B code.
+  Asleep, `display` has it suspended (`proto::SUSPEND`): rail off, its
+  memory and the clients' state kept, programmed again at the wake.
   It runs 2D fills and copies on surfaces clients attach, three
   hand-assembled SM 5.3 kernels (fill, copy, SAXPY) and an FFMA
   benchmark (`gpu test`, `gpu bench`). `gpu clock` moves it among

@@ -71,6 +71,7 @@ pub struct Chan {
     pub inst: Dma,
     userd: Dma,
     gp: Dma,
+    gp_va: u64,
     put: u32,
     pb: Dma,
     pb_va: u64,
@@ -96,32 +97,12 @@ impl Chan {
         let pb_va = vm.map(&pb, false)?;
         let sem = Dma::new(4096)?;
         let sem_va = vm.map(&sem, false)?;
-        let userd_pa = userd.pa + (id * USERD_SIZE) as u64;
-        let limit2 = GPFIFO_ENTRIES.trailing_zeros();
-        for (o, v) in [
-            (0x08, userd_pa as u32),
-            (0x0C, (userd_pa >> 32) as u32),
-            (0x10, 0x0000_FACE),
-            (0x30, 0xFFFF_F902),
-            (0x48, gp_va as u32),
-            (0x4C, (gp_va >> 32) as u32 | limit2 << 16),
-            (0x84, 0x2040_0000),
-            (0x94, 0x3000_0FFF),
-            (0x9C, 0x0000_0100),
-            (0xAC, 0x0000_001F),
-            (0xE4, 0x0000_0020),
-            (0xE8, id),
-            (0xB8, 0xF800_0000),
-            (0xF8, 0x1000_3080),
-            (0xFC, 0x1000_0010),
-        ] {
-            inst.w32(o, v);
-        }
-        Ok(Self {
+        let c = Self {
             id,
             inst,
             userd,
             gp,
+            gp_va,
             put: 0,
             pb,
             pb_va,
@@ -130,7 +111,50 @@ impl Chan {
             sem,
             sem_va,
             seq: 0,
-        })
+        };
+        c.write_ramfc();
+        Ok(c)
+    }
+
+    /// The channel's RAMFC (`gk104_chan_ramfc_write`).
+    fn write_ramfc(&self) {
+        let userd_pa = self.userd.pa + (self.id * USERD_SIZE) as u64;
+        let limit2 = GPFIFO_ENTRIES.trailing_zeros();
+        for (o, v) in [
+            (0x08, userd_pa as u32),
+            (0x0C, (userd_pa >> 32) as u32),
+            (0x10, 0x0000_FACE),
+            (0x30, 0xFFFF_F902),
+            (0x48, self.gp_va as u32),
+            (0x4C, (self.gp_va >> 32) as u32 | limit2 << 16),
+            (0x84, 0x2040_0000),
+            (0x94, 0x3000_0FFF),
+            (0x9C, 0x0000_0100),
+            (0xAC, 0x0000_001F),
+            (0xE4, 0x0000_0020),
+            (0xE8, self.id),
+            (0xB8, 0xF800_0000),
+            (0xF8, 0x1000_3080),
+            (0xFC, 0x1000_0010),
+        ] {
+            self.inst.w32(o, v);
+        }
+    }
+
+    /// Back to a new channel's state after a power cycle: the PBDMA's
+    /// copy in RAMFC, USERD's GP_GET / GP_PUT and the ring's position
+    /// are all from before it. Everything the channel maps stays.
+    pub fn reset(&mut self, runl: u32) {
+        for o in (0..0x200).step_by(4) {
+            self.inst.w32(o, 0);
+        }
+        let u = (self.id * USERD_SIZE) as usize;
+        for o in (0..USERD_SIZE as usize).step_by(4) {
+            self.userd.w32(u + o, 0);
+        }
+        self.put = 0;
+        self.runl = runl;
+        self.write_ramfc();
     }
 
     /// Bound, enabled and put on its runlist (`gk104_chan_bind`,

@@ -36,6 +36,14 @@ pub const KIND_ZF32: u8 = 0x7B;
 const PDE_SPT_VIDMEM: u64 = 1 << 32;
 const PDE_SPT_VOL: u64 = 1 << 34;
 
+/// A GPU address range kept for a scratch buffer of the same size
+/// mapped again each time (the VA allocator never gives addresses back).
+#[derive(Default)]
+pub struct Slot {
+    va: u64,
+    len: u64,
+}
+
 pub struct Vm {
     pub pd: Dma,
     pts: Vec<Option<Dma>>,
@@ -131,6 +139,22 @@ impl Vm {
     /// Map contiguous DMA memory somewhere; its GPU address.
     pub fn map(&mut self, m: &Dma, privileged: bool) -> Result<u64> {
         self.map_kind(m, privileged, KIND_PITCH, PAGE)
+    }
+
+    /// `map` at the range `slot` keeps (reserved on first use).
+    pub fn map_in(&mut self, slot: &mut Slot, m: &Dma) -> Result<u64> {
+        if slot.va == 0 {
+            slot.va = self.alloc(m.len() as u64, PAGE)?;
+            slot.len = m.len() as u64;
+        }
+        if m.len() as u64 > slot.len {
+            return Err((EINVAL, "scratch buffer grew"));
+        }
+        let pages: Vec<u64> = (0..m.len() as u64 / PAGE)
+            .map(|k| m.pa + k * PAGE)
+            .collect();
+        self.map_at(slot.va, &pages, false)?;
+        Ok(slot.va)
     }
 
     /// Like `map`, cached in L2 (`map_at_cached`).

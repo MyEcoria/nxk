@@ -73,24 +73,52 @@ const BATCH_TIMEOUT_US: u64 = 2_000_000;
 /// SoC temperature and power source, checked this often while above the
 /// lowest step.
 const CHECK_NS: u64 = 2_000_000_000;
+/// A GPU woken by a request while the console sleeps goes off again
+/// after this long without one.
+const IDLE_SUSPEND_NS: u64 = 1_000_000_000;
 /// Farthest a measured clock may be from its step (1/20: 5%).
 const MEASURE_TOLERANCE: u32 = 20;
 static POWER: Service = Service::optional("power");
 
-/// Everything that exists while the GPU is on.
+/// The firmware files, read once and kept with the device: a resume
+/// (and the deep sleep's, with the card off) does not read them again.
+struct Firmware {
+    acr: acr::Files,
+    gpccs_inst: Vec<u8>,
+    gpccs_data: Vec<u8>,
+    nets: gr::Nets,
+}
+
+/// Everything that exists while the GPU is on. It is all DRAM: a
+/// suspend powers the chip off and keeps this, a resume programs the
+/// chip again over it (same addresses, so the clients' mappings, shaders
+/// and pipelines stay as they are).
 struct Dev {
     vm: Vm,
-    _bar1_inst: Dma,
-    _fb_pages: [Dma; 3],
+    bar1_inst: Dma,
+    fb_pages: [Dma; 3],
+    fw: Firmware,
+    /// Ranges of the scratch buffers of the ACR boot and the golden
+    /// context, mapped again at each power-up.
+    acr_slot: mmu::Slot,
+    golden_slot: mmu::Slot,
     chan: Chan,
-    _global: gr::Global,
-    _ctx: gr::ChanCtx,
+    global: gr::Global,
+    ctx: gr::ChanCtx,
     compute: Compute,
     gfx: Gfx,
-    _slm: slm::Slm,
+    slm: slm::Slm,
     client: client::Client,
     topo: gr::Topo,
     surfaces: Vec<Option<(Surface, u32)>>,
+}
+
+/// What the engines' bring-up found: topology, context image size,
+/// graphics runlist.
+struct Engines {
+    topo: gr::Topo,
+    image: u32,
+    runl: u32,
 }
 
 struct Gpu {
@@ -122,6 +150,14 @@ struct Gpu {
     stats: Stats,
     /// Handle sent with the last reply, closed once it went.
     sent: u32,
+    /// Powered off with its state kept (`SUSPEND`): `dev` stays, the
+    /// chip, its clocks and its rail are off, no register is touched.
+    suspended: bool,
+    /// `display` asked for the suspend and has not resumed yet: a request
+    /// that woke the GPU puts it back to sleep once idle.
+    sleeping: bool,
+    /// When the last request was handled (ns).
+    last_use: u64,
 }
 
 fn read(name: &str) -> Result<Vec<u8>> {
@@ -188,7 +224,7 @@ impl Gpu {
 
     fn power_on(&mut self) -> Result<()> {
         if self.state == proto::ON {
-            return Ok(());
+            return if self.suspended { self.resume() } else { Ok(()) };
         }
         let t0 = time::now_ns();
         self.err = 0;
@@ -199,37 +235,47 @@ impl Gpu {
                 self.stage = proto::STAGE_READY;
                 println!("[gpu] ready in {} ms", (time::now_ns() - t0) / 1_000_000);
                 self.share();
-                // Up at the lowest step, then the one asked for.
-                let (cap, _) = self.cap();
-                if !self.forced && self.target > cap {
-                    self.target = cap;
-                }
-                if self.target != pll::GPC_KHZ {
-                    let _ = self.change(self.target);
-                }
+                self.clock_up();
             }
-            Err((e, what)) => {
-                drv::report(
-                    "gpu",
-                    &alloc::format!(
-                        "power-up failed at stage {}: {} ({})",
-                        self.stage,
-                        what,
-                        libnx::abi::err::name(-e)
-                    ),
-                );
-                let stage = self.stage;
-                self.power_down();
-                self.state = proto::FAILED;
-                self.stage = stage;
-                self.err = -e;
-                self.share();
-            }
+            Err((e, what)) => self.failed(e, what),
         }
         r
     }
 
-    fn bring_up(&mut self) -> Result<()> {
+    /// Up at the lowest step, then the one asked for (within the cap).
+    fn clock_up(&mut self) {
+        let (cap, _) = self.cap();
+        if !self.forced && self.target > cap {
+            self.target = cap;
+        }
+        if self.target != pll::GPC_KHZ {
+            let _ = self.change(self.target);
+        }
+    }
+
+    /// A power-up or resume that did not get to the end.
+    fn failed(&mut self, e: i64, what: &'static str) {
+        drv::report(
+            "gpu",
+            &alloc::format!(
+                "power-up failed at stage {}: {} ({})",
+                self.stage,
+                what,
+                libnx::abi::err::name(-e)
+            ),
+        );
+        let stage = self.stage;
+        self.suspended = false;
+        self.power_down();
+        self.state = proto::FAILED;
+        self.stage = stage;
+        self.err = -e;
+        self.share();
+    }
+
+    /// Rail, clocks, units and the GPCPLL at the lowest step: the chip
+    /// answers and can be programmed (a cold start, or a resume).
+    fn power_stage(&mut self) -> Result<()> {
         let r = self.regs;
         self.at(proto::STAGE_RAIL);
         // T210B01 (Mariko) has its GPU rail on a MAX77812 phase instead.
@@ -277,14 +323,39 @@ impl Gpu {
         r.wr(0x128328, 0x800);
         r.wr(0x124320, 0x800);
         self.clock = power::clock(&r, &self.chip, self.rail)?;
-
         self.at(proto::STAGE_MMU);
-        let mut vm = Vm::new(FIRST_VA)?;
-        // FB: system memory flush page, MMU debug buffers, big page size
-        // per instance (`gf100_fb_sysmem_flush_page_init`, `gm200_fb_init`).
-        let flush = Dma::new(4096)?;
-        let dbg_wr = Dma::new(128 << 10)?;
-        let dbg_rd = Dma::new(128 << 10)?;
+        Ok(())
+    }
+
+    /// The firmware files, from the card.
+    fn load_firmware(&mut self) -> Result<Firmware> {
+        self.at(proto::STAGE_FIRMWARE);
+        Ok(Firmware {
+            acr: acr::Files {
+                load: read("acr/ucode_load.bin")?,
+                bl: read("acr/bl.bin")?,
+                fecs_bl: read("gr/fecs_bl.bin")?,
+                fecs_inst: read("gr/fecs_inst.bin")?,
+                fecs_data: read("gr/fecs_data.bin")?,
+                fecs_sig: read("gr/fecs_sig.bin")?,
+            },
+            gpccs_inst: read("gr/gpccs_inst.bin")?,
+            gpccs_data: read("gr/gpccs_data.bin")?,
+            nets: gr::Nets {
+                nonctx: read("gr/sw_nonctx.bin")?,
+                ctx: read("gr/sw_ctx.bin")?,
+                bundle: read("gr/sw_bundle_init.bin")?,
+                method: read("gr/sw_method_init.bin")?,
+            },
+        })
+    }
+
+    /// The memory controller side of the chip over the pages it uses: FB
+    /// flush page and MMU debug buffers, big page size, L2, BAR1 on the
+    /// address space (`gf100_fb_sysmem_flush_page_init`, `gm200_fb_init`).
+    fn mmu_regs(&self, fb: &[Dma; 3], bar1_inst: &Dma) -> Result<()> {
+        let r = self.regs;
+        let [flush, dbg_wr, dbg_rd] = fb;
         r.wr(0x100C10, (flush.pa >> 8) as u32);
         r.wr(0x100CC8, (dbg_wr.pa >> 8) as u32);
         r.wr(0x100CCC, (dbg_rd.pa >> 8) as u32);
@@ -293,33 +364,18 @@ impl Gpu {
         // L2: no compression tags without video memory (`gm200_ltc_init`).
         r.wr(0x17E278, 0);
         // BAR1: the same address space, limited to its 16 MiB window.
-        let bar1_inst = Dma::new(4096)?;
-        vm.join(&bar1_inst, fifo::BAR1_SIZE);
         r.l2_invalidate()?;
         r.wr(0x1704, 0x8000_0000 | (bar1_inst.pa >> 12) as u32);
         r.wr(0x70000, 1);
-        r.wait(0x70000, 2, 0, 2_000_000, "BAR flush")?;
+        r.wait(0x70000, 2, 0, 2_000_000, "BAR flush")
+    }
 
-        self.at(proto::STAGE_FIRMWARE);
-        let files = acr::Files {
-            load: read("acr/ucode_load.bin")?,
-            bl: read("acr/bl.bin")?,
-            fecs_bl: read("gr/fecs_bl.bin")?,
-            fecs_inst: read("gr/fecs_inst.bin")?,
-            fecs_data: read("gr/fecs_data.bin")?,
-            fecs_sig: read("gr/fecs_sig.bin")?,
-        };
-        let gpccs_inst = read("gr/gpccs_inst.bin")?;
-        let gpccs_data = read("gr/gpccs_data.bin")?;
-        let nets = gr::Nets {
-            nonctx: read("gr/sw_nonctx.bin")?,
-            ctx: read("gr/sw_ctx.bin")?,
-            bundle: read("gr/sw_bundle_init.bin")?,
-            method: read("gr/sw_method_init.bin")?,
-        };
-
+    /// Secure boot of FECS, GR init with GPCCS, the FIFO: the engines
+    /// run and say what they are.
+    fn engines(&mut self, vm: &mut Vm, fw: &Firmware, acr_slot: &mut mmu::Slot) -> Result<Engines> {
+        let r = self.regs;
         self.at(proto::STAGE_ACR);
-        acr::boot(&r, &mut vm, &files)?;
+        acr::boot(&r, vm, &fw.acr, acr_slot)?;
 
         self.at(proto::STAGE_FECS);
         let topo = gr::topology(&r)?;
@@ -329,85 +385,219 @@ impl Gpu {
             topo.tpc_total,
             r.rd(0x12006C)
         );
-        let sizes = gr::init(&r, &topo, &gpccs_inst, &gpccs_data, &nets)?;
-
-        self.at(proto::STAGE_CONTEXT);
+        let sizes = gr::init(&r, &topo, &fw.gpccs_inst, &fw.gpccs_data, &fw.nets)?;
         let pbdmas = fifo::init(&r);
         let runl = fifo::gr_runlist(&r);
-        let mut chan = Chan::new(&mut vm, 0, runl)?;
-        let global = gr::global(&mut vm, &topo)?;
+        println!("[gpu] {} PBDMA, runlist {}", pbdmas, runl);
+        Ok(Engines {
+            topo,
+            image: sizes.image.max(4),
+            runl,
+        })
+    }
+
+    /// Golden context image of the channel (FECS builds it from the
+    /// netlists), copied into its context.
+    fn golden(&mut self, d: &mut Dev, e: &Engines) -> Result<Vec<u8>> {
+        self.at(proto::STAGE_CONTEXT);
+        let golden = gr::golden(
+            &self.regs,
+            &mut d.vm,
+            &d.chan.inst,
+            &e.topo,
+            &d.global,
+            &d.fw.nets,
+            e.image,
+            &mut d.golden_slot,
+        )?;
+        println!("[gpu] golden context {} bytes", golden.len());
+        Ok(golden)
+    }
+
+    /// The channel scheduled and its class state set: the first fenced
+    /// batch (the state that stays across batches is this push alone).
+    fn start_channel(&mut self, d: &mut Dev) -> Result<()> {
+        let r = self.regs;
+        self.at(proto::STAGE_CHANNEL);
+        mmu::invalidate(&r, &d.vm)?;
+        d.chan.schedule(&r)?;
+        let mut p = Push::default();
+        d.compute.setup(&mut p, d.gfx.pools());
+        d.gfx.setup(&mut p);
+        d.slm.setup(&mut p);
+        d.chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US, false)
+    }
+
+    fn bring_up(&mut self) -> Result<()> {
+        let r = self.regs;
+        self.power_stage()?;
+
+        let mut vm = Vm::new(FIRST_VA)?;
+        let fb_pages = [Dma::new(4096)?, Dma::new(128 << 10)?, Dma::new(128 << 10)?];
+        let bar1_inst = Dma::new(4096)?;
+        vm.join(&bar1_inst, fifo::BAR1_SIZE);
+        self.mmu_regs(&fb_pages, &bar1_inst)?;
+
+        let fw = self.load_firmware()?;
+        let mut acr_slot = mmu::Slot::default();
+        let e = self.engines(&mut vm, &fw, &mut acr_slot)?;
+
+        let chan = Chan::new(&mut vm, 0, e.runl)?;
+        let global = gr::global(&mut vm, &e.topo)?;
+        let compute = Compute::new(&mut vm)?;
+        let gfx = Gfx::new(&mut vm)?;
+        let slm = slm::Slm::new(&mut vm, e.topo.tpc_total as u64)?;
+        let mut golden_slot = mmu::Slot::default();
+        self.at(proto::STAGE_CONTEXT);
         let golden = gr::golden(
             &r,
             &mut vm,
             &chan.inst,
-            &topo,
+            &e.topo,
             &global,
-            &nets,
-            sizes.image.max(4),
+            &fw.nets,
+            e.image,
+            &mut golden_slot,
         )?;
-        let ctx = gr::channel(&mut vm, &chan.inst, &topo, &global, &golden)?;
-        mmu::invalidate(&r, &vm)?;
-        println!(
-            "[gpu] golden context {} bytes, {} PBDMA, runlist {}",
-            golden.len(),
-            pbdmas,
-            runl
-        );
-
-        self.at(proto::STAGE_CHANNEL);
-        let compute = Compute::new(&mut vm)?;
-        let gfx = Gfx::new(&mut vm)?;
-        let slm = slm::Slm::new(&mut vm, topo.tpc_total as u64)?;
-        mmu::invalidate(&r, &vm)?;
-        chan.schedule(&r)?;
-        let mut p = Push::default();
-        compute.setup(&mut p, gfx.pools());
-        gfx.setup(&mut p);
-        slm.setup(&mut p);
-        chan.run(&r, &self.bar1, p, BATCH_TIMEOUT_US, false)?;
-        self.dev = Some(Dev {
+        println!("[gpu] golden context {} bytes", golden.len());
+        let ctx = gr::channel(&mut vm, &chan.inst, &e.topo, &global, &golden)?;
+        let mut d = Dev {
             vm,
-            _bar1_inst: bar1_inst,
-            _fb_pages: [flush, dbg_wr, dbg_rd],
+            bar1_inst,
+            fb_pages,
+            fw,
+            acr_slot,
+            golden_slot,
             chan,
-            _global: global,
-            _ctx: ctx,
+            global,
+            ctx,
             compute,
             gfx,
-            _slm: slm,
+            slm,
             client: client::Client::default(),
-            topo,
+            topo: e.topo,
             surfaces: Vec::new(),
-        });
+        };
+        self.start_channel(&mut d)?;
+        self.dev = Some(d);
         Ok(())
+    }
+
+    /// `SUSPEND`: the chip off, its state kept. The service answers one
+    /// request at a time, so no batch is in flight: L2's dirty lines
+    /// (the clients' data is cached there) go to memory, the channel
+    /// leaves the runlist, then clocks and rail go. Nothing touches the
+    /// chip's registers until `resume`.
+    fn suspend(&mut self) {
+        self.sleeping = true;
+        if self.state != proto::ON || self.suspended {
+            return;
+        }
+        let r = self.regs;
+        let t0 = time::now_ns();
+        let _ = r.l2_flush();
+        if let Some(d) = &self.dev {
+            d.chan.unschedule(&r);
+        }
+        if let Some(c) = self.clock.take() {
+            power::clock_off(&r, &c);
+        }
+        let _ = libnx::clk::disable(clk::GPU);
+        power::rail_off(&self.i2c);
+        self.suspended = true;
+        self.share();
+        println!(
+            "[gpu] suspended in {} ms: rail off, state kept",
+            (time::now_ns() - t0) / 1_000_000
+        );
+    }
+
+    /// `RESUME`: the chip programmed again over the state `suspend`
+    /// kept, as at a cold start (a power cycle resets all of it): the
+    /// firmware comes from RAM, the context from a new golden image, the
+    /// channel starts empty and the class state is set again.
+    fn resume(&mut self) -> Result<()> {
+        if !self.suspended {
+            return Ok(());
+        }
+        let t0 = time::now_ns();
+        self.err = 0;
+        let Some(mut d) = self.dev.take() else {
+            return Err((ENODEV, "no device to resume"));
+        };
+        let r = (|| -> Result<()> {
+            self.power_stage()?;
+            self.mmu_regs(&d.fb_pages, &d.bar1_inst)?;
+            let e = self.engines(&mut d.vm, &d.fw, &mut d.acr_slot)?;
+            if e.topo.tpc_total != d.topo.tpc_total {
+                return Err((EIO, "GPU changed across the power cycle"));
+            }
+            d.chan.reset(e.runl);
+            let golden = self.golden(&mut d, &e)?;
+            d.ctx.restore(&d.chan.inst, &golden);
+            self.start_channel(&mut d)
+        })();
+        // Kept either way: a failure closes the clients' handles in
+        // `power_down`.
+        self.dev = Some(d);
+        match r {
+            Ok(()) => {
+                self.suspended = false;
+                self.stage = proto::STAGE_READY;
+                println!("[gpu] resumed in {} ms", (time::now_ns() - t0) / 1_000_000);
+                self.share();
+                self.clock_up();
+                Ok(())
+            }
+            Err((e, what)) => {
+                self.failed(e, what);
+                Err((e, what))
+            }
+        }
     }
 
     fn power_down(&mut self) {
         let r = self.regs;
+        // Suspended, the chip is off already: no register is touched.
+        let hw = !self.suspended;
         if let Some(d) = self.dev.take() {
             for (_, h) in d.surfaces.iter().flatten() {
                 let _ = sys::handle_close(*h);
             }
-            d.chan.unschedule(&r);
+            if hw {
+                d.chan.unschedule(&r);
+            }
         }
-        if self.stage >= proto::STAGE_PLL {
+        if hw && self.stage >= proto::STAGE_PLL {
             if let Some(c) = self.clock.take() {
                 power::clock_off(&r, &c);
             }
         }
-        if self.stage >= proto::STAGE_CLOCKS {
+        if hw && self.stage >= proto::STAGE_CLOCKS {
             let _ = libnx::clk::disable(clk::GPU);
         }
         power::rail_off(&self.i2c);
         self.clock = None;
+        self.suspended = false;
         self.state = proto::OFF;
         self.stage = 0;
         self.share();
         println!("[gpu] off");
     }
 
+    /// The chip's registers, unless it is powered off.
+    fn live(&self) -> Option<Regs> {
+        (!self.suspended).then_some(self.regs)
+    }
+
     /// The device, powered up first unless the request says `IF_ON`.
     fn dev(&mut self, flags: u64) -> core::result::Result<&mut Dev, i64> {
+        // A request for a suspended GPU wakes it, `IF_ON` too: the client
+        // holds buffers on it.
+        if self.suspended {
+            println!("[gpu] resumed on demand");
+            self.resume().map_err(|(e, _)| -e)?;
+        }
         if self.state != proto::ON {
             if flags & proto::IF_ON != 0 {
                 return Err(-EAGAIN);
@@ -477,7 +667,7 @@ impl Gpu {
         self.target = khz;
         self.forced = force;
         self.ck = if force { proto::CK_FORCED } else { 0 };
-        if self.state == proto::ON {
+        if self.state == proto::ON && !self.suspended {
             self.change(khz)?;
         }
         Ok(())
@@ -561,7 +751,15 @@ impl Gpu {
     /// Above the lowest step: back to it at `HOT_MC`, down to the cap if
     /// the power source changed (unless forced).
     fn check(&mut self) {
-        if self.state != proto::ON || self.target == pll::GPC_KHZ {
+        // Asleep and woken by a late request: off again once idle.
+        if self.sleeping
+            && self.state == proto::ON
+            && !self.suspended
+            && time::now_ns().saturating_sub(self.last_use) > IDLE_SUSPEND_NS
+        {
+            self.suspend();
+        }
+        if self.state != proto::ON || self.suspended || self.target == pll::GPC_KHZ {
             return;
         }
         if let Ok(m) = POWER.call(&Msg::new(psu::TEMPERATURE, 0, 0)) {
@@ -1287,6 +1485,23 @@ fn test3d(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     Ok((pass, all, ns))
 }
 
+/// The 2D, compute and 3D tests again after the GPU went off and came
+/// back (`suspend`, `resume`): what passed before must pass on the same
+/// device. Returns the bits that passed (all of them when it did not run).
+fn test_cycle(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
+    let was = g.sleeping;
+    g.suspend();
+    g.sleeping = was;
+    g.resume().map_err(|(e, _)| -e)?;
+    let (a, b) = (test(g)?, test3d(g)?);
+    println!(
+        "[gpu] after suspend and resume: {}/{} tests passed",
+        (a.0 | b.0).count_ones(),
+        (a.1 | b.1).count_ones()
+    );
+    Ok((a.0 | b.0 | !(a.1 | b.1), a.1 | b.1, a.2 + b.2))
+}
+
 /// The shader compiler on the GPU: random compute programs, and a draw.
 fn test_ir(g: &mut Gpu) -> core::result::Result<(u64, u64, u64), i64> {
     type Case = fn(&mut Gpu) -> core::result::Result<(bool, u64), i64>;
@@ -1398,6 +1613,9 @@ fn main() -> i32 {
         steps: 0,
         stats: Stats::new().expect("gpu: stats page"),
         sent: 0,
+        suspended: false,
+        sleeping: false,
+        last_use: time::now_ns(),
     };
     // Left on by an instance replaced in place (`usbterm.py --reload`):
     // clamped, reset, stopped and its rail off, like power-down.
@@ -1418,6 +1636,7 @@ fn main() -> i32 {
                 if g.sent != 0 {
                     let _ = sys::handle_close(core::mem::take(&mut g.sent));
                 }
+                g.last_use = time::now_ns();
                 g.share();
             }
             Err(e) if e != -ETIMEDOUT => time::sleep_ms(10),
@@ -1449,14 +1668,28 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
             }
             g.status()
         }
+        // `display` puts the console to sleep and wakes it.
+        libnx::abi::proto::SUSPEND => {
+            g.suspend();
+            Msg::new(0, 0, 0)
+        }
+        libnx::abi::proto::RESUME => {
+            g.sleeping = false;
+            match g.resume() {
+                Ok(()) => Msg::new(0, 0, 0),
+                Err((e, _)) => Msg::error(-e),
+            }
+        }
         proto::ATTACH if m.handles() == 1 => reply(attach(g, m)),
         proto::DETACH => {
-            let regs = g.regs;
+            let regs = g.live();
             reply(match g.dev.as_mut() {
                 Some(d) => match d.surfaces.get_mut(m.mr[0] as usize).and_then(|s| s.take()) {
                     Some((s, h)) => {
                         let _ = d.vm.unmap(s.va, s.bytes());
-                        let _ = mmu::invalidate(&regs, &d.vm);
+                        if let Some(regs) = regs {
+                            let _ = mmu::invalidate(&regs, &d.vm);
+                        }
                         let _ = sys::handle_close(h);
                         Ok(0)
                     }
@@ -1472,6 +1705,7 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
             match test(g)
                 .and_then(|a| test3d(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2)))
                 .and_then(|a| test_ir(g).map(|b| (a.0 | b.0, a.1 | b.1, a.2 + b.2)))
+                .and_then(|a| test_cycle(g).map(|b| (a.0 & b.0, a.1, a.2 + b.2)))
             {
                 Ok((pass, run, ns)) => Msg::from_words(0, &[pass, run, ns]),
                 Err(e) => Msg::error(e),
@@ -1481,7 +1715,7 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
         proto::TARGET_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, true, false)),
         proto::TEXTURE_ATTACH if m.handles() == 1 => reply(attach_shared(g, m, false, true)),
         proto::BUFFER_DETACH | proto::TARGET_DETACH | proto::TEXTURE_DETACH => {
-            let regs = g.regs;
+            let regs = g.live();
             reply(match g.dev.as_mut() {
                 Some(d) => {
                     let r = if m.label() == proto::BUFFER_DETACH {
@@ -1491,7 +1725,9 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
                     } else {
                         d.client.detach_target(&mut d.vm, m.mr[0])
                     };
-                    let _ = mmu::invalidate(&regs, &d.vm);
+                    if let Some(regs) = regs {
+                        let _ = mmu::invalidate(&regs, &d.vm);
+                    }
                     r.map(|_| 0)
                 }
                 None => Err(-EINVAL),
@@ -1521,10 +1757,12 @@ fn handle(g: &mut Gpu, rx: &Received) -> Msg {
         }),
         proto::RENDER => reply(render(g, m)),
         proto::RESET => {
-            let regs = g.regs;
+            let regs = g.live();
             if let Some(d) = g.dev.as_mut() {
                 d.client.clear(&mut d.vm, &mut d.gfx, &mut d.compute);
-                let _ = mmu::invalidate(&regs, &d.vm);
+                if let Some(regs) = regs {
+                    let _ = mmu::invalidate(&regs, &d.vm);
+                }
             }
             Msg::new(0, 0, 0)
         }

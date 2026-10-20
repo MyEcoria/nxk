@@ -434,6 +434,9 @@ fn scan() -> Result<Vec<ScanNet>, i64> {
 struct Saved {
     cpu: Option<u64>,
     gpu: Option<u64>,
+    /// The GPU was suspended (`proto::SUSPEND`): `RESUME` brings it back
+    /// at its own clock, `gpu` is then `None`.
+    gpu_off: bool,
 }
 
 /// CPU cores on asleep (core 0 only) and awake (all four).
@@ -473,6 +476,30 @@ fn window_a(dc: &Mmio, link: &Mutex<Link>, on: bool) {
     wr(dc, WIN_OPTIONS, if on { 1 << 30 } else { 0 });
     wr(dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(dc, CMD_STATE_CONTROL, 1 | 2);
+}
+
+/// How long the GPU's suspend waits for a game to stop at its held
+/// `FLIP`: a frame still in flight would wake the GPU again.
+const PARK_WAIT_NS: u64 = 50_000_000;
+/// The GPU's `RESUME` runs a full bring-up (secure boot, golden context).
+const GPU_RESUME_NS: u64 = 5_000_000_000;
+
+/// The GPU powered off with its state kept, once the game (if any) waits
+/// in its `FLIP`. False: the service is older than the call, or absent.
+fn gpu_suspend(link: &Mutex<Link>) -> bool {
+    let t0 = time::now_ns();
+    while {
+        let l = link.lock();
+        l.badge != 0 && !l.parked
+    } && time::now_ns() - t0 < PARK_WAIT_NS
+    {
+        time::sleep_us(1000);
+    }
+    GPU.call_timeout(
+        &Msg::new(libnx::abi::proto::SUSPEND, 0, 0),
+        SLEEP_CALL_NS,
+    )
+    .is_ok()
 }
 
 /// A GPU step the power source allows, `khz` or the highest below it.
@@ -526,9 +553,12 @@ fn sleep_steps(
             .ok()
             .map(|r| r.mr[5]);
         let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[cpufreq::STEPS_MHZ[0]]));
-        let gpu_on = GPU
-            .call(&Msg::new(gpuproto::STATUS, 0, 0))
-            .is_ok_and(|r| r.mr[0] & 0xFF == gpuproto::ON);
+        // The GPU off (its state kept); an older service lowers its clock.
+        let gpu_off = gpu_suspend(link);
+        let gpu_on = !gpu_off
+            && GPU
+                .call(&Msg::new(gpuproto::STATUS, 0, 0))
+                .is_ok_and(|r| r.mr[0] & 0xFF == gpuproto::ON);
         let gpu = gpu_on
             .then(|| GPU.call(&Msg::from_words(gpuproto::CLOCK, &[0, 0])).ok())
             .flatten()
@@ -541,7 +571,7 @@ fn sleep_steps(
         }
         // Cores 1-3 off (PSCI CPU_OFF); no monitor: ENOSYS, they stay.
         let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_ASLEEP]));
-        *saved = Some(Saved { cpu, gpu });
+        *saved = Some(Saved { cpu, gpu, gpu_off });
         return;
     }
     // The clocks come back while the panel leaves its sleep.
@@ -551,11 +581,21 @@ fn sleep_steps(
     }
     let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_AWAKE]));
     if let Some(sv) = saved.take() {
-        if let Some(khz) = sv.gpu {
-            gpu_clock_back(khz);
-        }
         if let Some(mhz) = sv.cpu {
             let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
+        }
+        // The GPU's bring-up fits in the panel's sleep-out wait below.
+        if sv.gpu_off {
+            let t = time::now_ns();
+            let r = GPU.call_timeout(&Msg::new(libnx::abi::proto::RESUME, 0, 0), GPU_RESUME_NS);
+            println!(
+                "[display] gpu resumed in {} ms ({})",
+                (time::now_ns() - t) / 1_000_000,
+                if r.is_ok() { "ok" } else { "failed" }
+            );
+        }
+        if let Some(khz) = sv.gpu {
+            gpu_clock_back(khz);
         }
     }
     window_a(dc, link, true);
@@ -940,6 +980,9 @@ struct Link {
     /// (`FLIP`'s reply: the game's clock leaves it out).
     asleep_since: u64,
     slept: u64,
+    /// The game's `FLIP` waits for the wake (`asleep`): it has stopped
+    /// using the GPU.
+    parked: bool,
 }
 
 /// Above the UI's threads: a frame asked while the UI draws is not late.
@@ -983,8 +1026,10 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>, awake: &Condvar) -> ! {
             let mut s = link.lock();
             // Asleep, the game waits in its FLIP: its GPU and CPU idle.
             while s.asleep && s.badge == rx.badge {
+                s.parked = true;
                 s = awake.wait(s);
             }
+            s.parked = false;
             let pa = s.pas.get(k).copied().filter(|_| s.badge == rx.badge);
             pa.inspect(|&pa| show(&dc, pa)).is_some()
         };
@@ -1227,6 +1272,7 @@ fn main() -> i32 {
         asleep: false,
         asleep_since: 0,
         slept: 0,
+        parked: false,
     }));
     let awake = Arc::new(Condvar::new());
     let worker = Arc::new(Worker {
