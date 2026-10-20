@@ -204,6 +204,7 @@ fn command(line: &str) {
             let n = ns::services(&mut buf);
             println!("{}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
         }
+        "cores" => cores_cmd(argv.get(1).copied()),
         "poweroff" => power_cmd(power::OFF),
         "reboot" => power_cmd(power::REBOOT),
         "recv" if argv.len() == 4 => recv(argv[1], argv[2], argv[3]),
@@ -231,6 +232,7 @@ fn help() {
     println!("  ps              processes");
     println!("  mem             physical memory");
     println!("  cpu             per-core statistics");
+    println!("  cores MASK      CPU cores kept on (hex mask), the others off");
     println!("  uptime          time since boot");
     println!("  echo TEXT       print TEXT");
     println!("  date            wall-clock time (RTC)");
@@ -611,12 +613,13 @@ fn cpu() {
     for (i, c) in cpus[..n.min(4)].iter().enumerate() {
         let total = (c.idle_ns + c.busy_ns).max(1);
         println!(
-            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%",
+            "  {:>5}  {:>12}  {:>10}  {:>7}  {:>4}%{}",
             i,
             c.switches,
             c.syscalls,
             c.irqs,
-            c.idle_ns * 100 / total
+            c.idle_ns * 100 / total,
+            if c.online == 0 { "  off" } else { "" }
         );
     }
 }
@@ -1213,6 +1216,28 @@ fn power_cmd(label: u32) {
             fail(e);
         }
         _ => {}
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `cores MASK`: CPU cores to keep on (hex, bit 0 = core 0, kept).
+fn cores_cmd(arg: Option<&str>) {
+    let Some(mask) = arg.and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+    else {
+        println!("usage: cores MASK (hex, e.g. 1 = core 0 only, f = all four)");
+        return fail(-err::EINVAL);
+    };
+    let Some(h) = power_service() else { return };
+    match ipc::call(h, &Msg::from_words(power::CORES, &[mask])) {
+        Ok(m) if m.label() != 0 => {
+            println!("cores: {}", err::name(-(m.label() as i64)));
+            fail(-(m.label() as i64));
+        }
+        Ok(m) => println!("cores: {} on", m.mr[0]),
+        Err(e) => {
+            println!("cores: {}", err::name(e));
+            fail(e);
+        }
     }
     let _ = sys::handle_close(h);
 }
