@@ -138,6 +138,7 @@ static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
 static FAN: Service = Service::optional("fan");
 static CPUFREQ: Service = Service::optional("cpufreq");
+static EMC: Service = Service::optional("emc");
 static GPU: Service = Service::optional("gpu");
 static AUDIO: Service = Service::optional("audio");
 static BT: Service = Service::optional("bt");
@@ -508,6 +509,14 @@ fn gpu_clock_back(khz: u64) {
     }
 }
 
+/// The DRAM clock's sleep drop (`on`) or its restore.
+fn emc_sleep(on: bool) {
+    let _ = EMC.call_timeout(
+        &Msg::from_words(libnx::abi::proto::emc::SLEEP, &[on as u64]),
+        SLEEP_CALL_NS,
+    );
+}
+
 /// Every sleeper's SUSPEND or RESUME, in turn.
 fn tell_sleepers(label: u32, order: impl Iterator<Item = &'static &'static Service>) {
     for s in order {
@@ -568,11 +577,16 @@ fn sleep_steps(
         }
         // Cores 1-3 off (PSCI CPU_OFF); no monitor: ENOSYS, they stay.
         let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_ASLEEP]));
+        // Last: the DRAM at its lowest trained rate (a no-op until the
+        // `emc` service's sleep mode is on; it restores the rate on wake).
+        emc_sleep(true);
         *saved = Some(Saved { cpu, gpu, gpu_off });
         return;
     }
     // The clocks come back while the panel leaves its sleep.
     let woke = time::now_ns();
+    // First: nothing runs at the sleep rate once awake.
+    emc_sleep(false);
     if let Some(d) = &hw.dsi {
         dcs(d, DCS_SLEEP_OUT);
     }

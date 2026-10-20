@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libnx::abi::err::{EINVAL, ENOENT, ENOSYS, EPERM};
-use libnx::abi::proto::{console as con, pm};
+use libnx::abi::proto::{console as con, emc, pm};
 use libnx::abi::rights::{DUP, GRANT, MAP, SEND};
 use libnx::abi::spawn::{self, HandleGrant};
 use libnx::abi::{layout, slots, startup};
@@ -96,6 +96,22 @@ const DRIVERS: &[Driver] = &[
     // CAR (the CPU clock and PLLX registers only; clk never touches
     // them); APB_MISC (chip revision) and fuses (SKU, CPU speedo)
     // read-only. The CPU regulator goes through the i2c service.
+    // DRAM clock: CAR (CLK_SOURCE_EMC, PLLM/PLLMB), MC and the EMC with its
+    // two channels; hekate's trained tables, read-only, from the SECFW
+    // carveout.
+    Driver {
+        name: "emc",
+        mmio: &[
+            (0x6000_6000, 0x1000),
+            (0x7001_9000, 0x1000),
+            (0x7001_B000, 0x5000),
+        ],
+        ro_mmio: &[(emc::TABLE_BASE, emc::TABLE_LEN)],
+        irqs: &[],
+        sysctl: false,
+        console: 0,
+        prio: 6,
+    },
     Driver {
         name: "cpufreq",
         mmio: &[(0x6000_6000, 0x1000)],
@@ -439,7 +455,13 @@ fn start_driver(st: &State, d: &Driver, elf: &[u8]) -> Result<u32, i64> {
         }
         for &(base, len) in d.ro_mmio {
             // No WRITE right: mapped read-only.
-            let h = sys::mmio_derive(slots::INIT_MMIO_ROOT, base, len)?;
+            // DRAM (hekate's tables) is outside the MMIO root.
+            let root = if base >= 0x8000_0000 {
+                slots::INIT_FW_TABLES
+            } else {
+                slots::INIT_MMIO_ROOT
+            };
+            let h = sys::mmio_derive(root, base, len)?;
             let ro = sys::handle_dup(h, MAP | GRANT, 0);
             let _ = sys::handle_close(h);
             let ro = ro?;

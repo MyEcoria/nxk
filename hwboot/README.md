@@ -457,6 +457,42 @@ boot clock is back. `./tools/usbterm.py --reload cpufreq` replaces the
 driver in place (it restarts at the boot clock only after `cpufreq
 boot`: the loader's values are read when it starts).
 
+## DRAM clock
+
+`emc` switches the EMC between the rates hekate's Minerva trained
+(`minerva_prep_boot_l4t` leaves it at 800 MHz and copies its tables to
+DRAM at 0xFFE80000: the SECFW carveout + 512 KiB, MC GSC1 lets the
+CCPLEX read it; the kernel hands `init` a read-only window on that range
+alone). The sequence is a Rust port of Minerva's `OP_SWITCH` (`emc/`);
+the DRAM voltage is never touched. Expected in the boot log:
+
+```text
+[emc] at start: MC matches the 800 MHz entry in 33/33 registers
+[emc] 800 MHz now, tables for [204, 408, 800, 1331, 1600] MHz
+```
+
+A few differing MC registers are logged with their values (up to 3 are
+tolerated); more, or no entry for the running rate (`[emc] ... no table
+entry`), and every SET is refused (ENODEV): the table does not describe
+the DRAM that is running. At the shell:
+
+```text
+emc               rate, entries (periodic-training ones are refused), switches
+emc 204           switch: [emc] 800 -> 204 MHz in NNN us, MC matches 33/33 after
+emc 800           back
+emc sleep on      let display's sleep drop to 204 MHz (off by default)
+```
+
+First trial, one change at a time, no game running, cable in: (1) the
+boot log above; (2) `emc 204`, `emc`, `emc 800`, then a few cycles with
+`bench`/`gpu test` between them; (3) sleep and wake with the drop off;
+(4) `emc sleep on`, Lumen held, sleep, wake: the log shows `[emc] 800 ->
+204 MHz` after the cores went off and `204 -> 800` first at the wake.
+A hang during a switch: hold Power 12 s and reboot; nothing persistent is
+written. `./tools/usbterm.py --reload emc` replaces the service (not on
+a boot image older than the `emc` driver entry: init's table is in the
+boot image).
+
 ## GPU
 
 `gpu` leaves the GM20B off until asked (`gpu on`, or a 2D or compute

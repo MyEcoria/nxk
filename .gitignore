@@ -12,3 +12,4 @@ hwboot/fusee-nano/*.o
 hwboot/fusee-nano/src/intermezzo.h
 hwboot/nxk-bl31/target/
 shader/target/
+emc/target/

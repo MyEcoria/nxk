@@ -817,6 +817,9 @@ pub mod slots {
     pub const INIT_SYSCTL: u32 = 3;
     /// Kernel log (`klog_read`, `klog_bind`), passed on to the console.
     pub const INIT_KLOG: u32 = 4;
+    /// Read-only window on hekate's EMC tables (`proto::emc::TABLE_BASE`), outside
+    /// the MMIO root (DRAM): handed to `emc` alone.
+    pub const INIT_FW_TABLES: u32 = 5;
     // init-spawned applications
     /// Standard output (console, or a pipe).
     pub const CONSOLE: u32 = 2;
@@ -1443,6 +1446,47 @@ pub mod proto {
         /// Not an Erista Switch (or fuses unreadable): `BOOT` only.
         pub const ST_UNSUPPORTED: u64 = 2;
         pub const HOT_MC: i64 = 80_000;
+    }
+    /// DRAM clock (`emc`): switches the EMC between the rates hekate's
+    /// Minerva trained (tables at 0xFFE80000, 204 / 408 / 800 MHz ...). LPDDR4
+    /// Switch only; nothing is touched until a SET (or the sleep drop,
+    /// off until `SLEEP_MODE`).
+    pub mod emc {
+        /// Reply: word 0 = EMC rate (kHz, 0: unreadable), word 1 = entries
+        /// found | `ST_*` bits << 8, word 2 = errno of the last failed switch
+        /// (0: none), word 3 = switches made, word 4 = duration of the
+        /// last one (us), word 5 = rate the sleep drop restores (kHz, 0:
+        /// awake).
+        pub const STATUS: u32 = 1;
+        /// word 0 = rate (kHz) of a table entry. ENOENT: no such entry (or
+        /// the current rate is not one), EEXIST: already there, EOPNOTSUPP:
+        /// the entry needs periodic training, EIO: a hardware wait timed
+        /// out (the DRAM state is then unknown), ENODEV: no usable table.
+        /// Reply as `STATUS`.
+        pub const SET: u32 = 2;
+        /// word 0 = entry index. Reply: word 0 = rate (kHz), word 1 =
+        /// clk_src_emc, word 2 = periodic training, word 3 = trained.
+        pub const ENTRY: u32 = 3;
+        /// word 0 = 1: asleep (drop to `SLEEP_KHZ` if the mode is on and
+        /// the current rate is higher), 0: awake (back to the rate it
+        /// left). Reply as `STATUS`; a drop that fails is not an error
+        /// for the sleeper (the rate stays).
+        pub const SLEEP: u32 = 4;
+        /// word 0 = 1 to let `SLEEP` change the rate (default 0).
+        pub const SLEEP_MODE: u32 = 5;
+        /// The table was read and has an entry for the current rate.
+        pub const ST_READY: u64 = 1;
+        /// `SLEEP` acts.
+        pub const ST_SLEEP_MODE: u64 = 2;
+        /// The memory controller's registers match the running entry's table
+        /// (all but a few): without it a SET is refused (ENODEV).
+        pub const ST_MC_OK: u64 = 4;
+        /// Rate the sleep drops to.
+        pub const SLEEP_KHZ: u64 = 204_000;
+        /// Where hekate copies the tables (SECFW carveout + 512 KiB) and
+        /// how much of it `emc` maps.
+        pub const TABLE_BASE: u64 = 0xFFE8_0000;
+        pub const TABLE_LEN: u64 = 0x4_0000;
     }
     /// GM20B GPU (`gpu`): off until POWER or a 2D / compute request
     /// without `IF_ON`. Requests are synchronous: the reply comes once

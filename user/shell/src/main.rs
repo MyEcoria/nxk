@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo, SocInfo, ThreadInfo};
-use libnx::abi::proto::{audio, cpufreq, fan, gpu, pm, power};
+use libnx::abi::proto::{audio, cpufreq, emc, fan, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::seqpage::SeqPage;
@@ -199,6 +199,7 @@ fn command(line: &str) {
         "temp" => temp(),
         "fan" => fan_cmd(argv.get(1).copied()),
         "cpufreq" => cpufreq_cmd(argv.get(1).copied()),
+        "emc" => emc_cmd(&argv),
         "gpu" => gpu_cmd(&argv),
         "audio" => audio_cmd(&argv),
         "services" => {
@@ -246,6 +247,7 @@ fn help() {
     println!("  temp            chip and package temperatures");
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
+    println!("  emc [MHZ|sleep on|off]  DRAM clock, trained rates; MHZ: switch; sleep: drop asleep");
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
     println!(
         "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
@@ -801,6 +803,89 @@ fn fan_cmd(arg: Option<&str>) {
         }
         Err(e) => {
             println!("fan: {}", err::name(e));
+            fail(e);
+        }
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `emc`: DRAM clock and the rates hekate trained; `emc MHZ` switches,
+/// `emc sleep on|off` lets the display's sleep drop it to 204 MHz.
+fn emc_cmd(argv: &[&str]) {
+    let req = match (argv.get(1).copied(), argv.get(2).copied()) {
+        (None, _) => Msg::new(emc::STATUS, 0, 0),
+        (Some("sleep"), Some(m @ ("on" | "off"))) => {
+            Msg::from_words(emc::SLEEP_MODE, &[(m == "on") as u64])
+        }
+        (Some(mhz), None) if mhz.parse::<u64>().is_ok() => {
+            // A rate in MHz names the entry whose kHz rate it rounds to.
+            let want: u64 = mhz.parse().unwrap();
+            let Some(h) = service("emc") else { return };
+            let mut khz = want * 1000;
+            for i in 0..8 {
+                let Ok(e) = ipc::call(h, &Msg::from_words(emc::ENTRY, &[i])).and_then(ipc::checked)
+                else {
+                    break;
+                };
+                if (e.mr[0] + 500) / 1000 == want {
+                    khz = e.mr[0];
+                }
+            }
+            let _ = sys::handle_close(h);
+            Msg::from_words(emc::SET, &[khz])
+        }
+        _ => {
+            println!("usage: emc [MHZ | sleep on|off]");
+            fail(-err::EINVAL);
+            return;
+        }
+    };
+    let Some(h) = service("emc") else { return };
+    match ipc::call(h, &req).and_then(ipc::checked) {
+        Ok(m) => {
+            let (khz, n, st) = (m.mr[0], m.mr[1] & 0xFF, m.mr[1] >> 8);
+            match khz {
+                0 => print!("emc ? MHz"),
+                k => print!("emc {}.{} MHz", k / 1000, k % 1000 / 100),
+            }
+            print!(", {} trained rates", n);
+            if st & emc::ST_READY == 0 {
+                print!(" (current rate not among them)");
+            }
+            println!(
+                ", sleep drop {}, {} switches (last {} us)",
+                if st & emc::ST_SLEEP_MODE != 0 { "on" } else { "off" },
+                m.mr[3],
+                m.mr[4]
+            );
+            if m.mr[2] != 0 {
+                println!("last switch failed: {}", err::name(-(m.mr[2] as i64)));
+            }
+            if m.mr[5] != 0 {
+                println!("asleep: restores {} MHz", m.mr[5] / 1000);
+            }
+            print!("rates (MHz):");
+            for i in 0..8 {
+                match ipc::call(h, &Msg::from_words(emc::ENTRY, &[i])).and_then(ipc::checked) {
+                    Ok(e) => print!(
+                        " {}{}",
+                        e.mr[0] / 1000,
+                        if e.mr[2] != 0 { "(periodic training)" } else { "" }
+                    ),
+                    Err(_) => break,
+                }
+            }
+            println!();
+        }
+        Err(e) => {
+            match -e {
+                err::ENOENT => println!("emc: no table entry for that rate (or the current one)"),
+                err::EEXIST => println!("emc: already running at that rate"),
+                err::EOPNOTSUPP => println!("emc: that rate needs periodic training (not ported)"),
+                err::EIO => println!("emc: a hardware wait timed out, the DRAM state is unknown"),
+                err::ENODEV => println!("emc: no usable tables, or not LPDDR4"),
+                _ => println!("emc: {}", err::name(e)),
+            }
             fail(e);
         }
     }

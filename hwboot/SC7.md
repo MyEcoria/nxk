@@ -185,5 +185,6 @@ today's software sleep stays the default:
 Long poles that do not depend on bl31, each its own piece of work: a native
 DSI and panel init in `display` (hekate `di.c`), a GPU cold restore with a
 game held, an EMC clock change from the trained table (back from the boot
-ROM's 204 MHz to 800 MHz), and every other service re-initialising from reset
+ROM's 204 MHz to 800 MHz; written as the `emc` service, `hwboot/README.md`
+"DRAM clock": it also drops the DRAM to 204 MHz asleep today), and every other service re-initialising from reset
 on `RESUME`.

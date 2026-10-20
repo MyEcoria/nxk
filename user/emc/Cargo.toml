@@ -1,0 +1,9 @@
+[package]
+name = "emc"
+version = "0.1.0"
+edition = "2021"
+description = "DRAM clock: EMC switches between the rates hekate's Minerva trained"
+
+[dependencies]
+libnx = { path = "../libnx" }
+nxk-emc = { path = "../../emc" }

@@ -1,0 +1,10 @@
+[package]
+name = "nxk-emc"
+version = "0.1.0"
+edition = "2021"
+description = "Tegra X1 EMC (LPDDR4) frequency switch from hekate's Minerva tables"
+license = "GPL-2.0-only"
+
+[features]
+# Tests record every register access; nothing else needs std.
+default = []

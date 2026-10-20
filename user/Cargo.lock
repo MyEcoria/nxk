@@ -115,6 +115,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "emc"
+version = "0.1.0"
+dependencies = [
+ "libnx",
+ "nxk-emc",
+]
+
+[[package]]
 name = "fan"
 version = "0.1.0"
 dependencies = [
@@ -241,6 +249,10 @@ dependencies = [
 
 [[package]]
 name = "nxk-abi"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-emc"
 version = "0.1.0"
 
 [[package]]

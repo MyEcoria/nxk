@@ -33,6 +33,10 @@ const KSTACK_SIZE: u64 = 0x4000;
 /// the AFI, all below the APB blocks) up to where DRAM starts.
 const MMIO_ROOT: (u64, u64) = (0x0100_0000, 0x7F00_0000);
 
+/// hekate's trained EMC tables, in the SECFW carveout (DRAM, kept out of
+/// the free memory): a read-only window for the `emc` service.
+const FW_TABLES: (u64, u64) = (nxk_abi::proto::emc::TABLE_BASE, nxk_abi::proto::emc::TABLE_LEN);
+
 extern "C" {
     static __stack_top: u8;
     static __kernel_start: u8;
@@ -258,6 +262,14 @@ fn start_init() {
     let mut m = Cap::new(Kind::Mmio, (MMIO_ROOT.0 >> 12) as u32, 0, rights::ALL);
     m.extra = MMIO_ROOT.1;
     cap::insert_at(pi, slots::INIT_MMIO_ROOT as usize, m).expect("init: MMIO");
+    let mut t = Cap::new(
+        Kind::Mmio,
+        (FW_TABLES.0 >> 12) as u32,
+        0,
+        rights::MAP | rights::DUP | rights::GRANT,
+    );
+    t.extra = FW_TABLES.1;
+    cap::insert_at(pi, slots::INIT_FW_TABLES as usize, t).expect("init: firmware tables");
     cap::insert_at(
         pi,
         slots::INIT_SYSCTL as usize,
