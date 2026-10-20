@@ -242,7 +242,7 @@ global_asm!(
     r#"
 .section .text.boot, "ax"
 .globl _start
-_start:
+.macro CORE_SETUP
     // A core reset without a power cycle keeps CPU_OFF's OS double lock.
     msr     osdlr_el1, xzr
     // Per-core EL3 setup (ATF/exosphere values; UNKNOWN reset on silicon): CNTFRQ_EL0,
@@ -268,6 +268,10 @@ _start:
     add     x0, x0, :lo12:el3_vectors
     msr     vbar_el3, x0
     isb
+.endm
+
+_start:
+    CORE_SETUP
     cbnz    x19, .Lsecondary            // woken by PSCI CPU_ON
     adrp    x0, __bss_start
     add     x0, x0, :lo12:__bss_start
@@ -283,6 +287,14 @@ _start:
 .Lsecondary:
     mov     x0, x19
     bl      bl31_secondary              // does not return
+
+// The reset vector once booted (CPU_ON, a core the flow controller powers
+// back up from CPU_SUSPEND), and where a suspend's `wfi` falls through.
+.globl _start_warm
+_start_warm:
+    CORE_SETUP
+    mov     x0, x19
+    bl      bl31_warm                   // does not return
 
 // drop_to_el2(entry, ctx) -> ! : EL3 -> EL2h, ELR = entry, x0 = ctx.
 .globl drop_to_el2
@@ -330,10 +342,12 @@ drop_to_el2:
     isb
     eret
 
-// cpu_power_down() -> ! : exosphere's FinalizePowerOff. The flow controller
-// is armed: the core's partition is gated at the `wfi`.
+// cpu_power_down(resume) -> ! : exosphere's FinalizePowerOff. The flow
+// controller is armed: the core's partition is gated at the `wfi`. With
+// `resume` set, a `wfi` that returns (not gated) goes the warm way.
 .globl cpu_power_down
 cpu_power_down:
+    mov     x9, x0
     mrs     x0, sctlr_el1
     bic     x0, x0, #(1 << 2)
     msr     sctlr_el1, x0
@@ -388,6 +402,7 @@ cpu_power_down:
     dsb     sy
 .Loff:
     wfi
+    cbnz    x9, _start_warm
     b       .Loff
 
 .macro SAVE

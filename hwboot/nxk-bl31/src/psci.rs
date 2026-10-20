@@ -10,6 +10,7 @@ pub const NR_CPUS: usize = 4;
 
 const VERSION: u32 = 0x8400_0000;
 const FEATURES: u32 = 0x8400_000A;
+const CPU_SUSPEND_64: u32 = 0xC400_0001;
 const CPU_OFF: u32 = 0x8400_0002;
 const CPU_ON_64: u32 = 0xC400_0003;
 const AFFINITY_INFO_64: u32 = 0xC400_0004;
@@ -17,6 +18,9 @@ const SYSTEM_RESET: u32 = 0x8400_0009;
 /// nxk SiP call (SMC64, SiP range): x1 = core; returns the `DIAG` words of
 /// its last CPU_OFF and CPU_ON in x0-x3.
 const NXK_DIAG: u32 = 0xC200_0001;
+/// nxk SiP call: x1 = a core suspended by CPU_SUSPEND that no interrupt
+/// woke: the flow controller powers it up (HALT_CPUn cleared).
+const NXK_WAKE: u32 = 0xC200_0002;
 
 const SUCCESS: i64 = 0;
 const NOT_SUPPORTED: i64 = -1;
@@ -31,6 +35,8 @@ const INVALID_ADDRESS: i64 = -9;
 const ON: u32 = 0;
 const OFF: u32 = 1;
 const PENDING: u32 = 2;
+/// Powered down by CPU_SUSPEND, back on its next interrupt (reported ON).
+const SUSPENDED: u32 = 3;
 
 const SB_AA64_RESET_LOW: usize = 0x6000_C230;
 const SB_AA64_RESET_HIGH: usize = 0x6000_C234;
@@ -60,6 +66,8 @@ const CSR_WFI_SHIFT: u32 = 8;
 const CSR_FLAGS: u32 = 1 << 14 | 1 << 15;
 /// HALT_CPUn_EVENTS.FLOW_MODE (31:29) = WAITEVENT, no wake source.
 const HALT_WAITEVENT: u32 = 2 << 29;
+/// Wake sources: GIC FIQ/IRQ (8, 9), legacy controller IRQ/FIQ (10, 11).
+const HALT_ON_IRQ: u32 = 0xF << 8;
 const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 
 /// EL3 runs with caches off: volatile accesses are coherent between cores.
@@ -115,15 +123,18 @@ fn wait_for(us: u64, cond: impl Fn() -> bool) -> bool {
 
 extern "C" {
     fn _start();
-    /// Caches off, L1 flushed, SMPEN off, GIC CPU interface off, `wfi`.
-    fn cpu_power_down() -> !;
+    fn _start_warm();
+    /// Caches off, L1 flushed, SMPEN off, GIC CPU interface off, `wfi`
+    /// (`resume` != 0: a `wfi` that returns goes to `_start_warm`).
+    fn cpu_power_down(resume: u64) -> !;
 }
 
-/// Boot core: mark itself on, point the AArch64 reset vector at our `_start`
-/// (hekate already does; a secure write is allowed despite its NS lock).
+/// Boot core: mark itself on, point the AArch64 reset vector at our
+/// `_start_warm` (a secure write is allowed despite hekate's NS lock): from
+/// now on a core powering up is never a cold boot.
 pub fn init() {
     set_state(0, ON);
-    let v = _start as *const () as usize as u64;
+    let v = _start_warm as *const () as usize as u64;
     wr(SB_AA64_RESET_LOW, v as u32 | SB_AA64_RST_AARCH64_MODE_EN);
     wr(SB_AA64_RESET_HIGH, (v >> 32) as u32);
 }
@@ -134,6 +145,7 @@ pub fn smc(regs: &mut [u64; 31]) {
         FEATURES => features(regs[1] as u32),
         CPU_ON_64 => cpu_on(regs[1], regs[2], regs[3]),
         CPU_OFF => cpu_off(),
+        CPU_SUSPEND_64 => cpu_suspend(regs[1], regs[2], regs[3]),
         AFFINITY_INFO_64 => affinity_info(regs[1], regs[2]),
         SYSTEM_RESET => system_reset(),
         NXK_DIAG if (regs[1] as usize) < NR_CPUS => {
@@ -143,6 +155,20 @@ pub fn smc(regs: &mut [u64; 31]) {
             }
             diag(cpu, 0) as i64
         }
+        NXK_WAKE if (regs[1] as usize) < NR_CPUS => {
+            let cpu = regs[1] as usize;
+            if state(cpu) != SUSPENDED {
+                INVALID_PARAMETERS
+            } else {
+                let step = power_up(cpu);
+                diag_set(cpu, 0, step | 1 << 16);
+                if step == 0 {
+                    INTERNAL_FAILURE
+                } else {
+                    step as i64
+                }
+            }
+        }
         _ => NOT_SUPPORTED,
     };
     regs[0] = r as u64;
@@ -150,7 +176,8 @@ pub fn smc(regs: &mut [u64; 31]) {
 
 fn features(fid: u32) -> i64 {
     match fid {
-        VERSION | FEATURES | CPU_ON_64 | CPU_OFF | AFFINITY_INFO_64 | SYSTEM_RESET => SUCCESS,
+        VERSION | FEATURES | CPU_ON_64 | CPU_OFF | CPU_SUSPEND_64 | AFFINITY_INFO_64
+        | SYSTEM_RESET => SUCCESS,
         _ => NOT_SUPPORTED,
     }
 }
@@ -168,7 +195,7 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
     }
     let cpu = mpidr as usize;
     match state(cpu) {
-        ON => return ALREADY_ON,
+        ON | SUSPENDED => return ALREADY_ON,
         PENDING => return ON_PENDING,
         _ => {}
     }
@@ -189,6 +216,27 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
     }
     set_state(cpu, PENDING);
 
+    let step = power_up(cpu);
+    diag_set(
+        cpu,
+        0,
+        step | (on_at_entry as u64) << 8 | (on_after_wait as u64) << 9,
+    );
+    let reset = 1 << cpu | 1 << (16 + cpu);
+    if step == 0 {
+        wr(RST_CPUG_CMPLX_SET, reset);
+        set_state(cpu, OFF);
+        return INTERNAL_FAILURE;
+    }
+    SUCCESS
+}
+
+/// Bring `cpu` up from a flow-controller gate or cold, until it reaches
+/// `_start_warm` and sets itself ON: the flow controller's own power-up
+/// (HALT_CPUn cleared), a PMC toggle, then a full PMC cycle. Returns the
+/// step that worked, 0 if none.
+fn power_up(cpu: usize) -> u64 {
+    let part = CPU_PARTITION[cpu];
     let reset = 1 << cpu | 1 << (16 + cpu); // CPURESETn | CORERESETn
     let arrived = || wait_for(10_000, || state(cpu) == ON);
     wr(RST_CPUG_CMPLX_SET, reset);
@@ -223,17 +271,7 @@ fn cpu_on(mpidr: u64, entry: u64, ctx: u64) -> i64 {
             step = 0;
         }
     }
-    diag_set(
-        cpu,
-        0,
-        step | (on_at_entry as u64) << 8 | (on_after_wait as u64) << 9,
-    );
-    if step == 0 {
-        wr(RST_CPUG_CMPLX_SET, reset);
-        set_state(cpu, OFF);
-        return INTERNAL_FAILURE;
-    }
-    SUCCESS
+    step
 }
 
 /// Start a PMC power toggle of `partition` (on <-> off).
@@ -263,6 +301,7 @@ fn affinity_info(mpidr: u64, level: u64) -> i64 {
     let cpu = mpidr as usize;
     match state(cpu) {
         OFF if partition_on(CPU_PARTITION[cpu]) => ON as i64,
+        SUSPENDED => ON as i64,
         s => s as i64,
     }
 }
@@ -287,7 +326,56 @@ fn cpu_off() -> i64 {
     wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], HALT_WAITEVENT);
     wr(FLOW_CTLR + FLOW_CC4_CORE_CTRL[cpu], 0);
     set_state(cpu, OFF);
-    unsafe { cpu_power_down() }
+    unsafe { cpu_power_down(0) }
+}
+
+/// Power-down state only (power_state bit 16): the core is gated at its
+/// `wfi` and comes back on an interrupt, through `_start_warm`, at `entry`
+/// in EL2 with x0 = `ctx`: its EL1/EL2 state is gone.
+fn cpu_suspend(power_state: u64, entry: u64, ctx: u64) -> i64 {
+    let cpu = this_cpu();
+    if cpu >= NR_CPUS || power_state & (1 << 16) == 0 {
+        return INVALID_PARAMETERS;
+    }
+    if !(BL33_DST as u64..MON_BASE as u64).contains(&entry) || !entry.is_multiple_of(4) {
+        return INVALID_ADDRESS;
+    }
+    unsafe {
+        write_volatile((addr_of_mut!(ENTRY) as *mut u64).add(cpu), entry);
+        write_volatile((addr_of_mut!(CTX) as *mut u64).add(cpu), ctx);
+    }
+    wr(
+        FLOW_CTLR + FLOW_CPU_CSR[cpu],
+        CSR_FLAGS | (1 << cpu) << CSR_WFI_SHIFT | CSR_ENABLE,
+    );
+    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], HALT_WAITEVENT | HALT_ON_IRQ);
+    wr(FLOW_CTLR + FLOW_CC4_CORE_CTRL[cpu], 0);
+    set_state(cpu, SUSPENDED);
+    unsafe { cpu_power_down(1) }
+}
+
+/// A core powering up after boot: CPU_ON's, or a suspended one waking.
+#[no_mangle]
+extern "C" fn bl31_warm(cpu: usize) -> ! {
+    if cpu >= NR_CPUS {
+        crate::park();
+    }
+    match state(cpu) {
+        PENDING => bl31_secondary(cpu),
+        SUSPENDED => {
+            flow_reset(cpu);
+            crate::gic_secure_init_cpu();
+            let (entry, ctx) = unsafe {
+                (
+                    read_volatile((addr_of!(ENTRY) as *const u64).add(cpu)),
+                    read_volatile((addr_of!(CTX) as *const u64).add(cpu)),
+                )
+            };
+            set_state(cpu, ON);
+            unsafe { crate::drop_to_el2(entry, ctx) }
+        }
+        _ => crate::park(),
+    }
 }
 
 /// A powered-up core: no power-gate armed for its next `wfi`.
