@@ -5,8 +5,11 @@
 //! the games it starts. Over a game (window A on its images), window D
 //! (B if D does not fetch) blends the volume indicator, toasts and the
 //! drawer (`+`) on top; Sleep holds the game in its next `FLIP`.
-//! Panel init is left to the bootloader; only the window is changed. A
-//! portrait panel (Switch) is drawn turned.
+//! The panel is the bootloader's at start (adopted as it left it, its id
+//! read); asleep the whole display path goes off (`panel`: panel, DSI,
+//! the controller, PLLD, the rails) and comes back from reset at the wake,
+//! the windows replayed (`dcgate`). A portrait panel (Switch) is drawn
+//! turned.
 
 #![no_std]
 #![no_main]
@@ -18,11 +21,13 @@ mod avatar;
 mod backlight;
 mod config;
 mod controllers;
+mod dcgate;
 mod flow;
 mod font;
 mod games;
 mod home;
 mod pages;
+mod panel;
 mod playtime;
 mod quick;
 mod screen;
@@ -42,6 +47,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV};
 use libnx::abi::proto::gpu as gpuproto;
@@ -150,8 +156,14 @@ static SLEEPERS: [&Service; 6] = [&JOYCON, &FAN, &INPUT, &AUDIO, &BT, &WIFI];
 /// A service's SUSPEND or RESUME that takes longer is left behind.
 const SLEEP_CALL_NS: u64 = 2_000_000_000;
 
+/// Controller register access: behind `dcgate` (a stopped controller must
+/// not be touched; its windows are replayed at the wake).
 fn wr(dc: &Mmio, reg: usize, v: u32) {
-    dc.w32(reg * 4, v);
+    dcgate::wr(dc, reg, v);
+}
+
+fn rd(dc: &Mmio, reg: usize) -> u32 {
+    dcgate::rd(dc, reg)
 }
 
 /// Log lines, the latest last.
@@ -438,7 +450,14 @@ struct Saved {
     /// The GPU was suspended (`proto::SUSPEND`): `RESUME` brings it back
     /// at its own clock, `gpu` is then `None`.
     gpu_off: bool,
+    /// The output CRC of the picture before the sleep, when it is checked
+    /// against the one after the wake (the first sleeps with `panel`).
+    crc: Option<Option<u32>>,
 }
+
+/// Sleeps whose picture is compared before and after (a CRC of the output
+/// costs 100 ms at each end).
+static CRC_CHECKS: AtomicU32 = AtomicU32::new(3);
 
 /// CPU cores on asleep (core 0 only) and awake (all four).
 const CORES_ASLEEP: u64 = 0b0001;
@@ -534,7 +553,7 @@ fn sleep_steps(
     at: u64,
     pct: u8,
     saved: &mut Option<Saved>,
-    hw: &Screens,
+    hw: &mut Screens,
     link: &Mutex<Link>,
     awake: &Condvar,
 ) {
@@ -544,13 +563,21 @@ fn sleep_steps(
             return;
         }
         tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
-        window_a(dc, link, false);
         if let Some(v) = hw.ov {
             let _l = link.lock();
             overlay(dc, v, 0, 0, None);
         }
-        // The backlight is off already: the panel blanks, then sleeps.
-        if let Some(d) = &hw.dsi {
+        let check = hw.panel.is_some()
+            && CRC_CHECKS
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok();
+        let crc = check.then(|| out_crc(dc));
+        window_a(dc, link, false);
+        // The backlight is off already: the panel blanks, then sleeps; with
+        // `panel` the whole display path goes off.
+        if let Some(p) = hw.panel.as_mut() {
+            p.power_down();
+        } else if let Some(d) = &hw.dsi {
             dcs(d, DCS_DISPLAY_OFF);
             dcs(d, DCS_SLEEP_IN);
         }
@@ -580,18 +607,30 @@ fn sleep_steps(
         // Last: the DRAM at its lowest trained rate (a no-op until the
         // `emc` service's sleep mode is on; it restores the rate on wake).
         emc_sleep(true);
-        *saved = Some(Saved { cpu, gpu, gpu_off });
+        *saved = Some(Saved {
+            cpu,
+            gpu,
+            gpu_off,
+            crc,
+        });
         return;
     }
     // The clocks come back while the panel leaves its sleep.
     let woke = time::now_ns();
     // First: nothing runs at the sleep rate once awake.
     emc_sleep(false);
-    if let Some(d) = &hw.dsi {
-        dcs(d, DCS_SLEEP_OUT);
-    }
+    let ready = match hw.panel.as_mut() {
+        Some(p) => Some(p.power_up_1()),
+        None => {
+            if let Some(d) = &hw.dsi {
+                dcs(d, DCS_SLEEP_OUT);
+            }
+            None
+        }
+    };
     let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_AWAKE]));
-    if let Some(sv) = saved.take() {
+    let sv = saved.take();
+    if let Some(sv) = &sv {
         if let Some(mhz) = sv.cpu {
             let _ = CPUFREQ.call(&Msg::from_words(cpufreq::SET, &[mhz]));
         }
@@ -609,13 +648,33 @@ fn sleep_steps(
             gpu_clock_back(khz);
         }
     }
-    window_a(dc, link, true);
-    if let Some(d) = &hw.dsi {
-        let left = (SLEEP_OUT_MS * 1_000_000).saturating_sub(time::now_ns() - woke);
-        time::sleep_us(left / 1000);
-        dcs(d, DCS_DISPLAY_ON);
+    if let (Some(p), Some(ready)) = (hw.panel.as_mut(), ready) {
+        // The panel's out of sleep: video back, the windows replayed.
+        p.power_up_2(ready);
+        window_a(dc, link, true);
+        if let Some(Some(before)) = sv.as_ref().and_then(|s| s.crc) {
+            let after = out_crc(dc);
+            println!(
+                "[display] output CRC before sleep {:#x}, after wake {:x?}: {}",
+                before,
+                after,
+                if after == Some(before) { "same" } else { "DIFFERENT" }
+            );
+        } else if sv.as_ref().is_some_and(|s| s.crc.is_some()) {
+            println!("[display] output CRC before sleep: none stable, not compared");
+        }
         if let Some(b) = &hw.bl {
             b.set(pct);
+        }
+    } else {
+        window_a(dc, link, true);
+        if let Some(d) = &hw.dsi {
+            let left = (SLEEP_OUT_MS * 1_000_000).saturating_sub(time::now_ns() - woke);
+            time::sleep_us(left / 1000);
+            dcs(d, DCS_DISPLAY_ON);
+            if let Some(b) = &hw.bl {
+                b.set(pct);
+            }
         }
     }
     {
@@ -641,9 +700,11 @@ struct Screens {
     ov: Option<Win>,
     dsi: Option<Mmio>,
     bl: Option<backlight::Backlight>,
+    /// The display path's own bring-up (`None`: the loader's, left on).
+    panel: Option<panel::Panel>,
 }
 
-fn work(w: &Worker, notif: u32, hw: Screens, link: &Mutex<Link>, awake: &Condvar) -> ! {
+fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Condvar) -> ! {
     let mut saved: Option<Saved> = None;
     loop {
         let mut q = w.jobs.lock();
@@ -673,7 +734,7 @@ fn work(w: &Worker, notif: u32, hw: Screens, link: &Mutex<Link>, awake: &Condvar
                 continue;
             }
             Job::Sleep(on, at, pct) => {
-                sleep_steps(on, at, pct, &mut saved, &hw, link, awake);
+                sleep_steps(on, at, pct, &mut saved, &mut hw, link, awake);
                 continue;
             }
         };
@@ -889,7 +950,7 @@ impl Win {
     /// Its underflows so far.
     fn underflows(self, dc: &Mmio) -> u32 {
         wr(dc, CMD_DISPLAY_WINDOW_HEADER, self.select());
-        let n = dc.r32(WINBUF_UFLOW_STATUS * 4);
+        let n = rd(dc, WINBUF_UFLOW_STATUS);
         wr(dc, CMD_DISPLAY_WINDOW_HEADER, SELECT_A);
         n
     }
@@ -901,9 +962,9 @@ fn out_crc(dc: &Mmio) -> Option<u32> {
     wr(dc, COM_CRC_CONTROL, 0);
     wr(dc, COM_CRC_CONTROL, (1 << 3) | (1 << 2) | 1); // always, active data, on
     time::sleep_ms(60);
-    let a = dc.r32(COM_CRC_CHECKSUM_LATCHED * 4);
+    let a = rd(dc, COM_CRC_CHECKSUM_LATCHED);
     time::sleep_ms(40);
-    let b = dc.r32(COM_CRC_CHECKSUM_LATCHED * 4);
+    let b = rd(dc, COM_CRC_CHECKSUM_LATCHED);
     wr(dc, COM_CRC_CONTROL, 0);
     (a == b).then_some(b)
 }
@@ -963,7 +1024,7 @@ fn show(dc: &Mmio, pa: u32) {
 /// bit only: the overlay's asked meanwhile sets the general one again.
 fn wait_shown(dc: &Mmio) {
     for _ in 0..400 {
-        if dc.r32(CMD_STATE_CONTROL * 4) & 2 == 0 {
+        if rd(dc, CMD_STATE_CONTROL) & 2 == 0 {
             return;
         }
         time::sleep_us(100);
@@ -1191,6 +1252,14 @@ fn main() -> i32 {
     let bl = backlight::Backlight::open();
     // Granted by a newer init only: without it the panel stays on asleep.
     let dsi_regs = Mmio::map(drv::dev_slot(2), DSI_BASE, 0x1000).ok();
+    // Before the first read of the controller: a stopped display path is
+    // brought up here (its picture is then dark until the backlight).
+    let panel = dsi_regs.and_then(|d| panel::Panel::open(dc, d));
+    if let (Some(p), Some(b)) = (&panel, &bl) {
+        if p.cold_started() {
+            b.set(100);
+        }
+    }
     let active = dc.r32(DISP_DISP_ACTIVE * 4);
     let (mut w, mut h) = (
         (active & 0x1FFF) as usize,
@@ -1228,11 +1297,13 @@ fn main() -> i32 {
     let hcntr = OVERLAY_WINS
         .iter()
         .fold(Win(0).hcntr(), |m, v| m | v.hcntr());
-    let act = dc.r32(CMD_REG_ACT_CONTROL * 4);
+    let act = rd(&dc, CMD_REG_ACT_CONTROL);
     wr(&dc, CMD_REG_ACT_CONTROL, act & !hcntr);
     wr(&dc, CMD_STATE_CONTROL, (1 << 8) | (1 << 9));
     wr(&dc, CMD_STATE_CONTROL, 1 | 2);
     let ov_win = pick_overlay(&dc);
+    // What the loader left in the windows is part of the state replayed at a wake.
+    dcgate::adopt(&dc);
 
     let mut msgs = Messages {
         lines: VecDeque::new(),
@@ -1298,6 +1369,7 @@ fn main() -> i32 {
             ov: ov_win,
             dsi: dsi_regs,
             bl,
+            panel,
         };
         thread::spawn(move || work(&w2, notif, hw, &l2, &a2)).expect("display: worker thread");
     }

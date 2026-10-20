@@ -124,13 +124,20 @@ const DRIVERS: &[Driver] = &[
     Driver {
         name: "display",
         // Display controller A, the PWM block (channel 0 dims the
-        // backlight; the fan owns channel 1) and DSI A (the panel's DCS).
+        // backlight; the fan owns channel 1), DSI A (the panel), and for its
+        // own bring-up (PLLD and the display clocks, panel reset and
+        // rails on GPIO I and V through their masked registers and pads,
+        // MIPI CAL); APB_MISC read-only (chip revision).
         mmio: &[
             (0x5420_0000, 0x40000),
             (0x7000_A000, 0x1000),
             (0x5430_0000, 0x40000),
+            (0x6000_6000, 0x1000),
+            (0x6000_D000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x700E_3000, 0x1000),
         ],
-        ro_mmio: &[],
+        ro_mmio: &[(0x7000_0000, 0x1000)],
         irqs: &[105],
         sysctl: false,
         console: con::BADGE_SCREEN,
