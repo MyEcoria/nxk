@@ -35,6 +35,14 @@ pub const DRAM_BASE: usize = 0x8000_0000;
 const MC_EMEM_CFG: usize = 0x7001_9050;
 
 static mut DRAM_END: usize = DRAM_BASE + L1_SIZE;
+/// The MC declares a TZ carveout: a monitor's memory is kept out.
+static MONITOR_HOLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A monitor's memory is protected from the kernel (`detect_holes`): only
+/// then are PSCI calls after boot safe.
+pub fn monitor_reserved() -> bool {
+    MONITOR_HOLE.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 #[repr(C, align(4096))]
 struct Table([u64; ENTRIES]);
@@ -74,6 +82,7 @@ pub fn detect_holes() -> [(u64, u64); MAX_HOLES] {
         ((rd(0x9BC) & 3) << 32) | (rd(0x70) & 0xFFF0_0000),
         (rd(0x74) & 0x3FFF) << 20,
     );
+    MONITOR_HOLE.store(zones[0].1 != 0, core::sync::atomic::Ordering::Relaxed);
     // Secure carveout: MC_SEC_CARVEOUT_BOM / ADR_HI / SIZE_MB.
     zones[1] = (
         ((rd(0x9D4) & 3) << 32) | (rd(0x670) & 0xFFF0_0000),

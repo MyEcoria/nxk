@@ -967,6 +967,8 @@ pub mod info {
     pub const CPUS: u64 = 2;
     /// Every live thread (`ThreadInfo`), for the shell's `threads`.
     pub const THREADS: u64 = 3;
+    /// `SocInfo`, read live.
+    pub const SOC: u64 = 4;
 
     /// `ThreadInfo::state` names, by value.
     pub const THREAD_STATES: [&str; 12] = [
@@ -1038,6 +1040,24 @@ pub mod info {
         pub deadline_in_ns: i64,
         /// Where the core's timer is set, ns from now (`i64::MAX`: off).
         pub timer_in_ns: i64,
+        /// Overdue deadlines another interrupt had to expire: a timer
+        /// interrupt went missing (the emulator's edge-triggered PPIs).
+        pub catch_ups: u64,
+    }
+
+    /// Live SoC state the deep sleep depends on (`SOC`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct SocInfo {
+        /// FLOW_CTLR_HALT_COP_EVENTS: the BPMP's halt mode.
+        pub halt_cop_events: u32,
+        /// 1: the BPMP is held in reset (CAR RST_DEVICES_L bit 1).
+        pub cop_reset: u32,
+        /// EVP_COP_RESET_VECTOR.
+        pub cop_reset_vector: u32,
+        pub clk_source_emc: u32,
+        pub pllm_base: u32,
+        pub pad: u32,
     }
 }
 

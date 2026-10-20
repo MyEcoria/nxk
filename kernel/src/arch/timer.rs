@@ -104,6 +104,7 @@ pub fn reprogram(c: &mut PerCpu) {
 pub fn catch_up() {
     let c = percpu::this();
     if c.tmo_head != NIL && thread::get(c.tmo_head).wake_at <= counter() {
+        c.stats.catch_ups += 1;
         on_irq();
     }
 }

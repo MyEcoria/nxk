@@ -162,7 +162,6 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
             prefetch
         );
     }
-    sleep_state_log();
 
     thread::init();
     process::init();
@@ -193,23 +192,6 @@ pub extern "C" fn kmain(core: usize, entry_el: usize, dtb: u64) -> ! {
     start_init();
     timer::init_cpu();
     sched::exit_to_user()
-}
-
-/// What the deep sleep (hwboot/SC7.md) depends on, as the loader left it:
-/// the BPMP (halt mode, COP reset, reset vector), the EMC clock source and
-/// PLLM. nxk has no other way to read them on the console.
-fn sleep_state_log() {
-    use crate::mmio::read32;
-    let r = |a: usize| unsafe { read32(a) };
-    kprintln!(
-        "[boot] BPMP: HALT_COP_EVENTS {:#x}, COP reset {}, reset vector {:#x}; \
-         CLK_SOURCE_EMC {:#x}, PLLM_BASE {:#x}",
-        r(0x6000_7004),
-        (r(0x6000_6004) >> 1) & 1,
-        r(0x6000_F200),
-        r(0x6000_619C),
-        r(0x6000_6090)
-    );
 }
 
 /// Secondary core entry point.

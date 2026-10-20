@@ -2,7 +2,7 @@
 //! Parking calls complete later via the waker's Frame write.
 
 use nxk_abi::err::*;
-use nxk_abi::info::{self, CpuInfo, MemInfo, ProcInfo, ThreadInfo};
+use nxk_abi::info::{self, CpuInfo, MemInfo, ProcInfo, SocInfo, ThreadInfo};
 use nxk_abi::layout::*;
 use nxk_abi::spawn::{HandleGrant, SpawnArgs};
 use nxk_abi::{clock, prot, rights, sys};
@@ -304,7 +304,8 @@ fn set_cores(mask: u64) -> SysResult {
     extern "C" {
         fn _start();
     }
-    if !crate::arch::psci::present() {
+    // A monitor whose memory the kernel may have reused would be gone.
+    if !crate::arch::psci::present() || !crate::arch::mmu::monitor_reserved() {
         return Err(-ENOSYS);
     }
     if mask & 1 == 0 || mask >> NR_CPUS != 0 {
@@ -771,6 +772,22 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
             }
             val(n)
         }
+        info::SOC => {
+            let r = |a: usize| unsafe { crate::mmio::read32(a) };
+            let si = SocInfo {
+                halt_cop_events: r(0x6000_7004),
+                cop_reset: (r(0x6000_6004) >> 1) & 1,
+                cop_reset_vector: r(0x6000_F200),
+                clk_source_emc: r(0x6000_619C),
+                pllm_base: r(0x6000_6090),
+                pad: 0,
+            };
+            if len < core::mem::size_of::<SocInfo>() as u64 {
+                return Err(-EINVAL);
+            }
+            uaccess::write(buf, &si)?;
+            val(1)
+        }
         info::MEMORY => {
             let (total, free, kernel) = pmm::stats();
             let m = MemInfo {
@@ -818,6 +835,7 @@ fn sysinfo(kind: u64, buf: u64, len: u64) -> SysResult {
                         u64::MAX => i64::MAX,
                         v => ns_from_now(v),
                     },
+                    catch_ups: pc.stats.catch_ups,
                 };
                 uaccess::write(buf + c as u64 * sz, &ci)?;
             }

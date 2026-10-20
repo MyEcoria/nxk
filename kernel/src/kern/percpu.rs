@@ -19,6 +19,8 @@ pub struct CpuStats {
     pub busy_time: u64,
     pub timer_late: u64,
     pub empty_wakeups: u64,
+    /// Overdue deadlines found by another interrupt (`timer::catch_up`).
+    pub catch_ups: u64,
 }
 
 #[repr(C, align(64))]
@@ -98,6 +100,7 @@ impl PerCpu {
                 busy_time: 0,
                 timer_late: 0,
                 empty_wakeups: 0,
+                catch_ups: 0,
             },
             polling: AtomicBool::new(false),
             wake: AtomicBool::new(false),
