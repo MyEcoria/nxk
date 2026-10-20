@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 use libnx::abi::err::{EINVAL, EIO, ENODEV};
 use libnx::abi::proto::gpu as gpuproto;
 use libnx::abi::proto::{
-    audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, wifi,
+    audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, power, wifi,
 };
 use libnx::abi::rights::{DMA, DUP, GRANT, MAP, SEND, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
@@ -436,6 +436,10 @@ struct Saved {
     gpu: Option<u64>,
 }
 
+/// CPU cores on asleep (core 0 only) and awake (all four).
+const CORES_ASLEEP: u64 = 0b0001;
+const CORES_AWAKE: u64 = 0b1111;
+
 /// DSI A (hekate bdk/display/di.h): host packets inside the video stream,
 /// the packet's header word; MIPI DCS commands.
 const DSI_BASE: u64 = 0x5430_0000;
@@ -535,6 +539,8 @@ fn sleep_steps(
                 &[gpuproto::STEPS_KHZ[0], 0],
             ));
         }
+        // Cores 1-3 off (PSCI CPU_OFF); no monitor: ENOSYS, they stay.
+        let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_ASLEEP]));
         *saved = Some(Saved { cpu, gpu });
         return;
     }
@@ -543,6 +549,7 @@ fn sleep_steps(
     if let Some(d) = &hw.dsi {
         dcs(d, DCS_SLEEP_OUT);
     }
+    let _ = POWER.call(&Msg::from_words(power::CORES, &[CORES_AWAKE]));
     if let Some(sv) = saved.take() {
         if let Some(khz) = sv.gpu {
             gpu_clock_back(khz);
