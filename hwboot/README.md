@@ -1366,6 +1366,36 @@ within 5 s.
     GPU comes back from reset the same way), the late request that
     finds the GPU off while a batch is half-built.
 
+52. 20/10/2026, Erista, boot image of `17efa56` (`--put` to `/nxk/bl33.new`
+    and `bl31.new`, then `mv`; the pair before kept as `bl33.pre-emc`,
+    `bl31.pre-emc`; the new `bl31` is the one with the SC7 stage 2 warm
+    entry, which was not exercised): the **`emc` service**, a Rust port of
+    Minerva's switch run from EL0 on the tables hekate left at 0xFFE80000.
+    Boot: 5 entries (204, 408, 800, 1331 and 1600 MHz, the last two need
+    periodic training and are refused), running at 800 MHz, 23-24 of the 24
+    compared MC registers equal to the 800 MHz entry (the nine arbiter
+    hysteresis registers never read back as written; MC 0x94's bits 16-18
+    move by themselves). 11 awake switches among 204 / 408 / 800 MHz with
+    `stdtest` 17/17 between each: 72-74 us to 204, 95-97 us to 408, 104-113
+    us to 800, the MC matching the new entry afterwards, and a DRAM copy of
+    878 MB/s at 204 MHz, 1489 at 408, 2212 at 800 (the clock really moves).
+    A/B asleep in one sleep, Lumen held, `powertest start 60 15`, `emc` run
+    from the shell between the measurements (cores 1-3 off, GPU suspended):
+
+    | DRAM | draw |
+    |---|---|
+    | 800 MHz | 1.305 W |
+    | 204 MHz | 1.125 W |
+    | 800 MHz | 1.277 W |
+    | 204 MHz | 1.102 W |
+
+    **-0.18 W (-14 %)**. With `emc sleep on`, a sleep and wake through the
+    Power button: `display` dropped the DRAM to 204 MHz after the cores went
+    off (the status showed "asleep: restores 800 MHz", 1.103 W measured) and
+    the wake put it back to 800 MHz first, Lumen going on as before. Off by
+    default; `emc sleep on` after each boot. The path SC7 needs after the
+    boot ROM's 204 MHz is the same call (`emc 800`).
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell

@@ -998,7 +998,7 @@ pub fn mc_mismatches<H: Hw>(h: &mut H, t: &Table, out: &mut [(u32, u32, u32); 33
     let mut n = 0;
     for (i, &addr) in BURST_MC_REGS_ADDR_TABLE.iter().enumerate() {
         // The arbiter hysteresis group reads back differently from what the
-        // table (and Minerva) wrote on a Switch (measured, run 51: bit 23
+        // table (and Minerva) wrote on a Switch (measured, run 52: bit 23
         // gone in all nine, CTRL 0x2 for 0x80001a); the other 24 match.
         if (MC_EMEM_ARB_DHYST_CTRL..=MC_EMEM_ARB_DHYST_TIMEOUT_UTIL_7).contains(&addr) {
             continue;
