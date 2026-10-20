@@ -1252,6 +1252,20 @@ within 5 s.
     CPU cores 1-3 (no CPU_OFF), EMC and DRAM at full speed (SC7 or EMC
     scaling).
 
+49. 20/10/2026, Erista, boot image of a3e3208 plus the panel's sleep
+    (`--put` to `/nxk/bl33.new`, the image before kept as `.prev`): init
+    grants DSI A to `display`. Asleep the panel gets DCS display off and
+    sleep in (host packets inside the video stream, one frame each, as
+    hekate's `display_end`), awake sleep out, 180 ms, display on, then
+    the backlight: the picture 196 ms after the Power press (38 ms
+    before). Same boot, same battery (3.57 V), Lumen held, A/B of the
+    two `display` builds: 1.73 W, 1.71 W with the panel on, 1.68 W,
+    1.66 W with it asleep: -50 mW. The rest of the display path (DC
+    scanning, DSI in HS, PLLD, the panel's rails) needs our own panel
+    init to come back from. Also: at boot `display` sent the saved volume
+    before `audio` was published, so audio kept its loud default (70 %);
+    it now retries for up to 10 s.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
