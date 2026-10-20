@@ -227,7 +227,13 @@ the touch panel's interrupt line, wired to GPIO X1 as on the Switch:
 GM20B's unit counts in the emulator's GPU model:
 `git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-gpu.patch`; the GPU
 firmware goes on the image with `tools/gm20b-fw.sh` then
-`tools/mksd.py -o build/sd.img --firmware firmware`.
+`tools/mksd.py -o build/sd.img --firmware firmware`. Under `nxk-bl31`
+(`hwboot/test-bl31.sh`, `NXTEST_QEMU_ARGS` below) the monitor's MiB stays
+out of the kernel's free memory only if the emulated MC keeps the TX1
+`MC_SECURITY_CFG0/1` offsets (its model has Tegra 2's):
+`git -C ../tegra_qemu apply ../nxk/tools/tegra_qemu-mc-tz.patch`. Without
+it the first PSCI call after boot (`cores`, `reboot`) finds the monitor
+overwritten.
 
 Build directories live in `~/.cache/nxk/`: the project is synced and
 does not have to carry build artifacts.
@@ -318,7 +324,7 @@ calls take a timeout (ns; 0 = unbounded).
 
 | Family | Calls |
 |---|---|
-| Base | `nop`, `yield`, `sleep`, `clock` (monotonic, real-time), `clock_set`, `getcpu`, `getpid`, `gettid`, `getrandom`, `debug_write`, `thread_exit`, `process_exit`, `system_power` |
+| Base | `nop`, `yield`, `sleep`, `clock` (monotonic, real-time), `clock_set`, `getcpu`, `getpid`, `gettid`, `getrandom`, `debug_write`, `thread_exit`, `process_exit`, `system_power` (reboot, off, CPU cores on/off under a PSCI monitor) |
 | Handles | `handle_close`, `handle_dup` (reduced rights, badge), `handle_revoke` |
 | Memory | `mem_map` (on demand or populated, free or fixed address, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguous, uncached, below 4 GiB for DMA), `mmio_map` (read-only without the `WRITE` right), `mmio_derive` |
 | Threads | `thread_create`, `thread_set` (priority, core), `futex_wait`, `futex_wake` |
@@ -384,7 +390,10 @@ stops threads.
 (as on a Switch with its secure firmware); DRAM size detected; device
 tree read when provided. On a Switch, hekate's L4T entry loads
 `hwboot/nxk-bl31`, an EL3 monitor doing ATF's job, which enters nxk in
-EL2 and starts the other cores through PSCI `CPU_ON`. If the loader left the screen on
+EL2 and starts the other cores through PSCI `CPU_ON`; `CPU_OFF` powers
+cores 1-3 down again (`cores MASK` in the shell, `display` at sleep), the
+dying core handing its threads, deadlines, FP state and interrupt lines to
+core 0 first. If the loader left the screen on
 (hekate), the kernel log is copied there until the `display` service
 takes over: the only visible output without a UART adapter.
 

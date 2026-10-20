@@ -131,6 +131,12 @@ pub fn set_target(irq: u32, cpu_mask: u8) {
     }
 }
 
+/// Core mask an SPI line is routed to.
+pub fn target(irq: u32) -> u8 {
+    let addr = GICD_ITARGETSR + (irq as usize & !3);
+    (unsafe { read32(addr) } >> ((irq as usize & 3) * 8)) as u8
+}
+
 /// Send a software interrupt to a core set.
 pub fn send_sgi(cpu_mask: u8, sgi: u32) {
     arch::dsb_sy();

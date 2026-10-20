@@ -205,6 +205,7 @@ pub extern "C" fn ksecondary(core: usize) -> ! {
     smp::mark_online();
     bkl::acquire();
     timer::init_cpu();
+    sched::adopt_pinned(core);
     sched::exit_to_user()
 }
 

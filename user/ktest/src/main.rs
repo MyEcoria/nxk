@@ -49,6 +49,7 @@ fn main() -> i32 {
         ("growable handle tables", t_many_handles),
         ("many threads", t_many_threads),
         ("affinity and migration", t_affinity),
+        ("core hotplug: CPU_OFF, CPU_ON", t_hotplug),
         ("priority preemption", t_priority),
         ("tickless round robin", t_round_robin),
         ("load balancing", t_balance),
@@ -489,6 +490,102 @@ fn t_affinity() -> R {
         ));
     }
     Ok(())
+}
+
+/// Cores on per `SYSINFO`.
+fn cores_online() -> [bool; 4] {
+    let cpus = cpus();
+    core::array::from_fn(|k| cpus[k].online != 0)
+}
+
+/// `power`'s CORES: the label (0 or -errno).
+fn set_cores(power: u32, mask: u64) -> i64 {
+    use libnx::abi::proto::power::CORES;
+    match ipc::call(power, &Msg::from_words(CORES, &[mask])) {
+        Ok(m) => -(m.label() as i64),
+        Err(e) => e,
+    }
+}
+
+/// Cores 2 and 3 off then on: a thread pinned to 3 runs on 0-1 meanwhile and
+/// goes back, a deadline armed on 2 still fires.
+fn t_hotplug() -> R {
+    let Ok(power) = libnx::ns::lookup("power") else {
+        println!("         (no power service: skipped)");
+        return Ok(());
+    };
+    let r = set_cores(power, 0b1111);
+    if r == -libnx::abi::err::ENOSYS {
+        println!("         (no monitor: skipped)");
+        return Ok(());
+    }
+    if r != 0 {
+        return Err(format!("CORES f: {}", err::name(r)));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(AtomicU32::new(99));
+    let (s, w) = (stop.clone(), seen.clone());
+    let pinned = thread::spawn_on(Some(3), 0, move || {
+        while !s.load(Ordering::Acquire) {
+            w.store(sys::getcpu(), Ordering::Release);
+            time::sleep_ms(1);
+        }
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    let slept = Arc::new(AtomicU64::new(0));
+    let sl = slept.clone();
+    let sleeper = thread::spawn_on(Some(2), 0, move || {
+        let t0 = time::now_ns();
+        time::sleep_ms(40);
+        sl.store(time::now_ns() - t0, Ordering::Release);
+    })
+    .map_err(|e| format!("thread {}", e))?;
+    time::sleep_ms(10);
+    let res = (|| {
+        let r = set_cores(power, 0b0011);
+        if r != 0 {
+            return Err(format!("CORES 3: {}", err::name(r)));
+        }
+        time::sleep_ms(20);
+        let on = cores_online();
+        if on != [true, true, false, false] {
+            return Err(format!("cores on after CORES 3: {:?}", on));
+        }
+        let off_core = seen.load(Ordering::Acquire);
+        if off_core > 1 {
+            return Err(format!("pinned thread on core {} while 2-3 off", off_core));
+        }
+        sleeper.join();
+        let ns = slept.load(Ordering::Acquire);
+        if !(40 * MS..200 * MS).contains(&ns) {
+            return Err(format!(
+                "40 ms sleep on a core gone off took {} us",
+                ns / 1000
+            ));
+        }
+        let r = set_cores(power, 0b1111);
+        if r != 0 {
+            return Err(format!("CORES f: {}", err::name(r)));
+        }
+        let t0 = time::now_ns();
+        while (cores_online() != [true; 4] || seen.load(Ordering::Acquire) != 3)
+            && time::now_ns() - t0 < 500 * MS
+        {
+            time::sleep_ms(1);
+        }
+        if cores_online() != [true; 4] {
+            return Err(format!("cores on after CORES f: {:?}", cores_online()));
+        }
+        match seen.load(Ordering::Acquire) {
+            3 => Ok(()),
+            k => Err(format!("pinned thread still on core {} once 3 is back", k)),
+        }
+    })();
+    let _ = set_cores(power, 0b1111);
+    stop.store(true, Ordering::Release);
+    pinned.join();
+    let _ = sys::handle_close(power);
+    res
 }
 
 fn t_priority() -> R {

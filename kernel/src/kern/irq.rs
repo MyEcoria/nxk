@@ -72,6 +72,15 @@ pub fn bind(intid: u32, notif: u16, notif_gen: u16, bits: u64) {
     gic::enable_irq(intid);
 }
 
+/// Lines routed to core `from` (going off) move to core `to`.
+pub fn retarget(from: usize, to: usize) {
+    for (intid, l) in LINES.get().iter().enumerate().skip(32) {
+        if l.owned && gic::target(intid as u32) == 1 << from {
+            gic::set_target(intid as u32, 1 << to);
+        }
+    }
+}
+
 pub fn ack(intid: u32) {
     gic::enable_irq(intid);
 }

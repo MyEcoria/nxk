@@ -205,7 +205,7 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
         sys::SYSINFO => sysinfo(a[0], a[1], a[2]),
         sys::SYSTEM_POWER => {
             cap::lookup(pi, a[0] as u32, Kind::SysControl, rights::CONTROL)?;
-            system_power(a[1])
+            system_power(a[1], a[2])
         }
         sys::KLOG_READ => {
             cap::lookup(pi, a[0] as u32, Kind::Log, 0)?;
@@ -271,10 +271,11 @@ fn handle(ti: u16, pi: u16, nr: u64, a: [u64; 6]) -> SysResult {
     }
 }
 
-/// Machine reboot or poweroff.
-fn system_power(cmd: u64) -> SysResult {
+/// Machine reboot or poweroff; cores on or off.
+fn system_power(cmd: u64, arg: u64) -> SysResult {
     use crate::arch::psci;
     match cmd {
+        nxk_abi::power::CORES => set_cores(arg),
         nxk_abi::power::REBOOT => {
             crate::kprintln!("[nxk] reboot");
             if psci::present() {
@@ -292,6 +293,38 @@ fn system_power(cmd: u64) -> SysResult {
             Err(-ENOSYS)
         }
         _ => Err(-EINVAL),
+    }
+}
+
+/// Cores in `mask` on, the others off (core 0 always on). EAGAIN: a core
+/// still going off could not be woken yet; the caller retries.
+fn set_cores(mask: u64) -> SysResult {
+    use crate::kern::percpu::NR_CPUS;
+    use crate::kern::sched;
+    extern "C" {
+        fn _start();
+    }
+    if !crate::arch::psci::present() {
+        return Err(-ENOSYS);
+    }
+    if mask & 1 == 0 || mask >> NR_CPUS != 0 {
+        return Err(-EINVAL);
+    }
+    let mut again = false;
+    for k in 1..NR_CPUS {
+        if mask & (1 << k) == 0 {
+            sched::core_down(k);
+        } else if let Err(e) = sched::core_up(k, _start as *const () as usize) {
+            if e != -EAGAIN {
+                return Err(e);
+            }
+            again = true;
+        }
+    }
+    if again {
+        Err(-EAGAIN)
+    } else {
+        val(0)
     }
 }
 

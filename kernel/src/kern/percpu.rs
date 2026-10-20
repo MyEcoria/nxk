@@ -49,6 +49,8 @@ pub struct PerCpu {
     /// MDSCR_EL1.SS set (current thread single-step).
     pub ss_enabled: bool,
     pub online: bool,
+    /// Asked to power off: it hands its threads over at its next kernel exit.
+    pub going_down: bool,
     /// TTBR0_EL1 value loaded (avoids redundant writes).
     pub cur_ttbr: u64,
     /// Running quantum end (0: no contender, no quantum).
@@ -82,6 +84,7 @@ impl PerCpu {
             push_pending: false,
             ss_enabled: false,
             online: false,
+            going_down: false,
             cur_ttbr: 0,
             slice_end: 0,
             timer_cval: u64::MAX,

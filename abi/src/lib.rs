@@ -145,6 +145,10 @@ pub mod ticks {
 pub mod power {
     pub const OFF: u64 = 0;
     pub const REBOOT: u64 = 1;
+    /// Third argument: mask of cores to keep on (bit 0 required); the others
+    /// power off (PSCI CPU_OFF). Needs a monitor (ENOSYS without), EAGAIN
+    /// while a core is still on its way off.
+    pub const CORES: u64 = 2;
 }
 
 /// Clocks for `clock`.
@@ -1316,6 +1320,11 @@ pub mod proto {
         pub const CHARGE_PRE: u64 = 1;
         pub const CHARGE_FAST: u64 = 2;
         pub const CHARGE_DONE: u64 = 3;
+        /// word 0 = mask of CPU cores to keep on (bit 0 required): the
+        /// others power off, threads moved to core 0 (`power::CORES`).
+        /// Waits up to 100 ms for a core still going off. ENOSYS without a
+        /// monitor. Reply: word 0 = the number of cores in the mask.
+        pub const CORES: u32 = 13;
     }
     /// Fan: speed from the SoC temperature, or set by hand.
     pub mod fan {

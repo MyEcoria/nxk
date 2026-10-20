@@ -5,10 +5,10 @@ use core::sync::atomic::Ordering;
 
 use nxk_abi::err::ETIMEDOUT;
 
-use crate::arch::{self, fpu, gic, timer};
+use crate::arch::{self, fpu, gic, psci, smp, timer};
 use crate::kern::percpu::{self, PerCpu, NR_CPUS};
 use crate::kern::thread::{self, State, ANY_CPU, NIL, NR_PRIO};
-use crate::kern::{bkl, debug, futex, ipc, notify, process};
+use crate::kern::{bkl, debug, futex, ipc, irq, notify, process};
 use crate::sysreg_write;
 
 /// Quantum: continuous runtime granted before yielding to a ready
@@ -199,6 +199,7 @@ pub fn make_ready(i: u16) {
         disarm(i);
     }
     t.state = State::Ready;
+    rehome_if_off(i);
 
     // Wake on a busy core while another is free: migrate the thread, unless
     // its FP state still lives on the old one.
@@ -335,6 +336,7 @@ pub fn arm(i: u16, deadline: u64) {
     }
     t.wake_at = deadline;
     t.timed = true;
+    rehome_if_off(i);
     let home = t.home as usize;
     let c = percpu::get(home);
     trace!(
@@ -671,6 +673,9 @@ extern "C" {
 pub fn exit_to_user() -> ! {
     let c = percpu::this();
 
+    if c.going_down {
+        go_offline(c);
+    }
     if c.mig_head != NIL {
         run_migrations(c);
     }
@@ -836,5 +841,97 @@ pub extern "C" fn nxk_idle_loop() -> ! {
 /// Does this core hold a thread to resume or migrations to run?
 pub fn has_work() -> bool {
     let c = percpu::this();
-    c.rq.len() > 0 || c.mig_head != NIL
+    c.rq.len() > 0 || c.mig_head != NIL || c.going_down
+}
+
+// --- core hotplug ---
+
+/// A thread homed on a core already off moves to core 0 (never off). While
+/// the core is still going down it keeps it: it may hold its FP state.
+fn rehome_if_off(i: u16) {
+    let t = thread::get(i);
+    let c = percpu::get(t.home as usize);
+    if !c.online && !c.going_down {
+        t.home = 0;
+    }
+}
+
+/// Ask core `k` (not 0) to power off: it takes no new work from now on and
+/// hands over what it holds at its next kernel exit.
+pub fn core_down(k: usize) {
+    let c = percpu::get(k);
+    if k == 0 || !c.online {
+        return;
+    }
+    c.online = false;
+    c.going_down = true;
+    if k != percpu::this().id {
+        kick(k);
+    }
+}
+
+/// Power core `k` back on; it rejoins from `entry` (`ksecondary`). EAGAIN:
+/// it has not finished going off yet.
+pub fn core_up(k: usize, entry: usize) -> Result<(), i64> {
+    let c = percpu::get(k);
+    if c.online {
+        return Ok(());
+    }
+    if c.going_down {
+        return Err(-nxk_abi::err::EAGAIN);
+    }
+    match psci::cpu_on(k as u64, entry as u64) {
+        0 => Ok(()),
+        // ALREADY_ON: between its hand-over and its CPU_OFF.
+        -4 | -5 => Err(-nxk_abi::err::EAGAIN),
+        _ => Err(-nxk_abi::err::EIO),
+    }
+}
+
+/// This core leaves: threads (running, ready, parked, with deadlines), FP
+/// state and interrupt lines go to core 0, then PSCI CPU_OFF.
+fn go_offline(c: &mut PerCpu) -> ! {
+    run_migrations(c);
+    if c.current != NIL && thread::get(c.current).state == State::Zombie {
+        let z = c.current;
+        c.current = NIL;
+        process::reap(z);
+    }
+    fpu::save_owner(c);
+    c.going_down = false;
+    for i in 0..thread::capacity() as u16 {
+        if thread::get(i).home as usize == c.id {
+            migrate_now(i, 0);
+        }
+    }
+    c.current = NIL;
+    irq::retarget(c.id, 0);
+    if c.acct_thread != NIL {
+        account(c, NIL);
+    }
+    sysreg_write!("cntp_ctl_el0", 0);
+    c.timer_cval = u64::MAX;
+    c.slice_end = 0;
+    c.need_resched = false;
+    c.push_pending = false;
+    c.last_run = NIL;
+    // `ksecondary` starts it afresh: FP trapped, no single-step.
+    c.fp_enabled = false;
+    c.ss_enabled = false;
+    smp::mark_offline();
+    crate::kprintln!("[smp] core {} off", c.id);
+    bkl::release();
+    arch::irq_disable();
+    psci::cpu_off();
+    arch::park()
+}
+
+/// A core back on: threads pinned to it, moved off meanwhile, return.
+pub fn adopt_pinned(k: usize) {
+    for i in 0..thread::capacity() as u16 {
+        let t = thread::get(i);
+        if t.affinity as usize == k && t.home as usize != k && t.state != State::Free {
+            set_affinity(i, k as u8);
+        }
+    }
 }

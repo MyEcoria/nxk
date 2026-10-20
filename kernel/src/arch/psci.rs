@@ -3,6 +3,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 const VERSION: u64 = 0x8400_0000;
+const CPU_OFF: u64 = 0x8400_0002;
 const CPU_ON_64: u64 = 0xC400_0003;
 const SYSTEM_OFF: u64 = 0x8400_0008;
 const SYSTEM_RESET: u64 = 0x8400_0009;
@@ -45,6 +46,11 @@ pub fn present() -> bool {
 /// Power on core `mpidr`, starting at physical address `entry`.
 pub fn cpu_on(mpidr: u64, entry: u64) -> i64 {
     smc(CPU_ON_64, mpidr, entry, 0) as i64
+}
+
+/// Power off the calling core; returns only if the monitor refuses.
+pub fn cpu_off() -> i64 {
+    smc(CPU_OFF, 0, 0, 0) as i64
 }
 
 /// Returns only if the monitor refuses (nxk-bl31 has no PMIC access).

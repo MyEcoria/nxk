@@ -39,6 +39,10 @@ pub fn mark_online() {
     ONLINE.fetch_add(1, Ordering::Release);
 }
 
+pub fn mark_offline() {
+    ONLINE.fetch_sub(1, Ordering::Release);
+}
+
 pub fn online_count() -> usize {
     ONLINE.load(Ordering::Acquire)
 }

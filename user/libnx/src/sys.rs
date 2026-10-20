@@ -65,6 +65,13 @@ pub fn system_power(sysctl: u32, cmd: u64) -> Result<()> {
     check(unsafe { syscall2(SYSTEM_POWER, sysctl as u64, cmd) }).map(|_| ())
 }
 
+/// Keep the cores in `mask` on and power the others off (core 0 always on;
+/// SysControl capability). EAGAIN: a core is still on its way off.
+pub fn set_cores(sysctl: u32, mask: u64) -> Result<()> {
+    let r = unsafe { syscall3(SYSTEM_POWER, sysctl as u64, nxk_abi::power::CORES, mask) };
+    check(r).map(|_| ())
+}
+
 /// Set the wall clock (SysControl capability).
 pub fn clock_set_realtime(sysctl: u32, ns: u64) -> Result<()> {
     check(unsafe { syscall3(CLOCK_SET, sysctl as u64, nxk_abi::clock::REALTIME, ns) }).map(|_| ())
