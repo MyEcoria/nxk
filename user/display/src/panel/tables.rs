@@ -13,7 +13,6 @@ pub const DSI_TRIGGER: usize = 0x13;
 pub const DSI_STATUS: usize = 0x15;
 pub const DSI_CONTROL: usize = 0x10;
 pub const DSI_CONTROL_VIDEO: u32 = 1 << 1;
-pub const DSI_INCR_SYNCPT_CNTRL: usize = 0x01;
 pub const DSI_BTA_TIMING: usize = 0x3F;
 pub const DSI_PAD_CONTROL_0: usize = 0x4B;
 pub const DSI_VIDEO_MODE_CONTROL: usize = 0x4E;
@@ -25,19 +24,15 @@ pub const TRIGGER_HOST: u32 = 2;
 pub const STATUS_RX_FIFO_SIZE: u32 = 0x1F;
 /// Host packets inside the video stream, on the 4th line.
 pub const CMD_PKT_VID_ENABLE: u32 = 1;
-pub const LINE_TYPE_4: u32 = 4 << 1;
 pub const PAD_POWERED_DOWN: u32 = (1 << 24) | (0xF << 16) | (1 << 8) | 0xF;
 
 // Display controller A registers used outside the tables.
-pub const DC_CMD_INT_STATUS: usize = 0x37;
-pub const DC_CMD_INT_ENABLE: usize = 0x39;
 pub const DC_CMD_STATE_ACCESS: usize = 0x40;
 pub const DC_CMD_DISPLAY_COMMAND: usize = 0x32;
 /// Display mode field: continuous display.
 pub const DISP_CTRL_MODE_MASK: u32 = 3 << 5;
 pub const DISP_CTRL_MODE_C: u32 = 1 << 5;
 pub const DC_DISP_DISP_CLOCK_CONTROL: usize = 0x42E;
-pub const FRAME_END_INT: u32 = 1 << 1;
 
 // MIPI CAL registers.
 pub const MIPI_CAL_CTRL: usize = 0x00;

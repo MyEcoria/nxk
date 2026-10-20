@@ -1,5 +1,5 @@
 //! DSI A host: packets to and from the panel (hekate `_display_dsi_*`,
-//! `display_dsi_read`, `display_dsi_vblank_read`). Every wait is bounded:
+//! `display_dsi_read`). Every wait is bounded:
 //! a model without a panel answers nothing.
 
 use libnx::drv::Mmio;
@@ -27,13 +27,10 @@ pub const DCS_DISPLAY_OFF: u32 = 0x28;
 pub const DCS_DISPLAY_ON: u32 = 0x29;
 /// A frame and the packet's transmission (hekate `display_end`).
 pub const FRAME_US: u64 = 16_666 + 230;
-/// Longest wait for a frame end: six frames.
-const FRAME_TIMEOUT_US: u64 = 100_000;
 
 #[derive(Clone, Copy)]
 pub struct Dsi {
     pub dsi: Mmio,
-    pub dc: Mmio,
 }
 
 impl Dsi {
@@ -121,56 +118,6 @@ impl Dsi {
         self.send(DCS_READ, cmd, 0);
         self.wait_clear(DSI_TRIGGER, TRIGGER_HOST | TRIGGER_VIDEO, 250_000);
         self.collect(len)
-    }
-
-    fn frame_end(&self) -> bool {
-        self.dc.w32(DC_CMD_INT_STATUS * 4, FRAME_END_INT);
-        self.dc.wait(
-            DC_CMD_INT_STATUS * 4,
-            FRAME_END_INT,
-            FRAME_END_INT,
-            FRAME_TIMEOUT_US,
-        )
-    }
-
-    /// Host packets inside the video stream, sent on its 4th line after a
-    /// frame end.
-    fn vblank_begin(&self) -> bool {
-        self.dc.modify(DC_CMD_INT_ENABLE * 4, 0, FRAME_END_INT);
-        self.dsi
-            .w32(DSI_VIDEO_MODE_CONTROL * 4, CMD_PKT_VID_ENABLE | LINE_TYPE_4);
-        self.frame_end()
-    }
-
-    /// After the next frame end: the sync points reset and the stream back
-    /// to video only.
-    fn vblank_end(&self) {
-        self.frame_end();
-        time::sleep_us(14);
-        self.dsi.w32(DSI_INCR_SYNCPT_CNTRL * 4, 1);
-        time::sleep_us(300);
-        self.dsi.w32(DSI_INCR_SYNCPT_CNTRL * 4, 0);
-        time::sleep_us(300);
-        self.dsi.w32(DSI_VIDEO_MODE_CONTROL * 4, 0);
-        self.dc.modify(DC_CMD_INT_ENABLE * 4, FRAME_END_INT, 0);
-        self.dc.w32(DC_CMD_INT_STATUS * 4, FRAME_END_INT);
-    }
-
-    /// Register `cmd` of the panel while it takes video (hekate
-    /// `display_dsi_vblank_read`): the request goes out in a frame's
-    /// blanking, the reply is read after.
-    pub fn read_running(&self, cmd: u32, len: u32) -> Option<u32> {
-        self.drain(&mut [0u32; 32]);
-        let hc = self.dsi.r32(DSI_HOST_CONTROL * 4);
-        let began = self.vblank_begin();
-        self.send(SET_MAXIMUM_RETURN_PACKET_SIZE, len, 0);
-        self.wait_clear(DSI_TRIGGER, TRIGGER_HOST | TRIGGER_VIDEO, 0);
-        self.send(DCS_READ, cmd, 0);
-        self.wait_clear(DSI_TRIGGER, TRIGGER_HOST | TRIGGER_VIDEO, 0);
-        self.vblank_end();
-        let r = if began { self.collect(len) } else { None };
-        self.dsi.w32(DSI_HOST_CONTROL * 4, hc);
-        r
     }
 
     /// A DCS short write while the panel takes video (hekate

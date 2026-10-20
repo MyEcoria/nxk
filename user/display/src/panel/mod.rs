@@ -49,7 +49,7 @@ const BIAS_CFG2_CAL: u32 = 0x10010;
 const BIAS_CFG1_T210: u32 = 0x300;
 const DISP_CLOCK_DIV3: u32 = 4;
 const BTA_TIMING_PANEL: u32 = 0x50204;
-/// Panel id reads: tries, and the pause between.
+/// Panel id reads before giving up.
 const ID_TRIES: u32 = 3;
 
 /// Panels (hekate `di.h`): the decoded id is the board byte over the vendor.
@@ -101,14 +101,90 @@ fn decode_id(raw: u32) -> u16 {
     (((raw >> 8) & 0xFF00) | (raw & 0xFF)) as u16
 }
 
+/// Where a watched register lives.
+#[derive(Clone, Copy)]
+enum Blk {
+    Car,
+    Dc,
+    Dsi,
+    Mipi,
+}
+
+/// The configuration the loader leaves and `power_up_2` must reproduce
+/// (byte offset for CAR, word index for the others): PLLD and the pixel
+/// clock source, the controller's timing and pin setup, DSI's mode,
+/// timings and packet sequence, MIPI CAL's calibration.
+const WATCH: [(Blk, usize); 57] = [
+    (Blk::Car, 0xD0),
+    (Blk::Car, 0xD8),
+    (Blk::Car, 0xDC),
+    (Blk::Car, 0x138),
+    (Blk::Dc, 0x402),
+    (Blk::Dc, 0x405),
+    (Blk::Dc, 0x406),
+    (Blk::Dc, 0x407),
+    (Blk::Dc, 0x408),
+    (Blk::Dc, 0x409),
+    (Blk::Dc, 0x40A),
+    (Blk::Dc, 0x42E),
+    (Blk::Dc, 0x42F),
+    (Blk::Dc, 0x430),
+    (Blk::Dc, 0x431),
+    (Blk::Dc, 0x432),
+    (Blk::Dc, 0x303),
+    (Blk::Dc, 0x307),
+    (Blk::Dc, 0x309),
+    (Blk::Dc, 0x36),
+    (Blk::Dc, 0x32),
+    (Blk::Dsi, 0x0B),
+    (Blk::Dsi, 0x0F),
+    (Blk::Dsi, 0x10),
+    (Blk::Dsi, 0x11),
+    (Blk::Dsi, 0x12),
+    (Blk::Dsi, 0x23),
+    (Blk::Dsi, 0x24),
+    (Blk::Dsi, 0x25),
+    (Blk::Dsi, 0x26),
+    (Blk::Dsi, 0x27),
+    (Blk::Dsi, 0x28),
+    (Blk::Dsi, 0x29),
+    (Blk::Dsi, 0x2A),
+    (Blk::Dsi, 0x2B),
+    (Blk::Dsi, 0x2C),
+    (Blk::Dsi, 0x2D),
+    (Blk::Dsi, 0x2E),
+    (Blk::Dsi, 0x34),
+    (Blk::Dsi, 0x35),
+    (Blk::Dsi, 0x36),
+    (Blk::Dsi, 0x37),
+    (Blk::Dsi, 0x3C),
+    (Blk::Dsi, 0x3D),
+    (Blk::Dsi, 0x3E),
+    (Blk::Dsi, 0x3F),
+    (Blk::Dsi, 0x44),
+    (Blk::Dsi, 0x45),
+    (Blk::Dsi, 0x4B),
+    (Blk::Dsi, 0x4F),
+    (Blk::Dsi, 0x50),
+    (Blk::Dsi, 0x51),
+    (Blk::Dsi, 0x52),
+    (Blk::Mipi, 0x0E),
+    (Blk::Mipi, 0x16),
+    (Blk::Mipi, 0x17),
+    (Blk::Mipi, 0x18),
+];
+
 #[derive(Clone, Copy)]
 pub struct Panel {
     soc: Soc,
     dsi: Dsi,
     mipi: Mmio,
     dc: Mmio,
+    /// 0: not read yet (an adopted path); read in command mode at the first power-down.
     id: u16,
     cold: bool,
+    /// The loader's values of `WATCH`, compared after each bring-up.
+    baseline: Option<[u32; WATCH.len()]>,
 }
 
 fn now_us() -> u64 {
@@ -120,8 +196,8 @@ impl Panel {
     /// chip is a T210. A path stopped (the display controller or DSI held
     /// in reset or without a clock: a loader that left no picture, a
     /// wake that failed) is brought up from scratch here, before anything
-    /// reads the controller; a running one is adopted, its panel id read
-    /// while it takes video. `None`: left as the loader set it.
+    /// reads the controller; a running one is adopted as it is (its panel
+    /// id is read at the first power-down). `None`: left as the loader set it.
     pub fn open(dc: Mmio, dsi: Mmio) -> Option<Self> {
         let map = |slot, base| Mmio::map(drv::dev_slot(slot), base, 0x1000).ok();
         let misc = map(SLOT_APB_MISC, APB_MISC)?;
@@ -138,36 +214,92 @@ impl Panel {
         };
         let mut p = Panel {
             soc,
-            dsi: Dsi { dsi, dc },
+            dsi: Dsi { dsi },
             mipi: map(SLOT_MIPI_CAL, MIPI_CAL)?,
             dc,
             id: 0,
             cold: false,
+            baseline: None,
         };
         // Clocked, PLLD locked, the controller in continuous display and
         // DSI sending video: what the loader (or a wake that got to its end) leaves.
-        let up = car.r32(CAR_CLK_OUT_ENB_L) & CLK_L_DISP1 != 0
-            && car.r32(CAR_RST_DEVICES_L) & CLK_L_DISP1 == 0
-            && car.r32(CAR_CLK_OUT_ENB_H) & CLK_H_DSI_CAL == CLK_H_DSI_CAL
-            && car.r32(CAR_RST_DEVICES_H) & CLK_H_DSI_CAL == 0
-            && car.r32(CAR_PLLD_BASE) & PLLD_RUNNING == PLLD_RUNNING
-            && dc.r32(DC_CMD_DISPLAY_COMMAND * 4) & DISP_CTRL_MODE_MASK == DISP_CTRL_MODE_C
-            && dsi.r32(DSI_CONTROL * 4) & DSI_CONTROL_VIDEO != 0;
+        let mut state = 0u32;
+        let mut check = |ok: bool| {
+            state = state << 1 | ok as u32;
+            ok
+        };
+        let up = check(car.r32(CAR_CLK_OUT_ENB_L) & CLK_L_DISP1 != 0)
+            && check(car.r32(CAR_RST_DEVICES_L) & CLK_L_DISP1 == 0)
+            && check(car.r32(CAR_CLK_OUT_ENB_H) & CLK_H_DSI_CAL == CLK_H_DSI_CAL)
+            && check(car.r32(CAR_RST_DEVICES_H) & CLK_H_DSI_CAL == 0)
+            && check(car.r32(CAR_PLLD_BASE) & PLLD_RUNNING == PLLD_RUNNING)
+            && check(dc.r32(DC_CMD_DISPLAY_COMMAND * 4) & DISP_CTRL_MODE_MASK == DISP_CTRL_MODE_C)
+            && check(dsi.r32(DSI_CONTROL * 4) & DSI_CONTROL_VIDEO != 0);
         if up {
-            let raw = p.dsi.read_running(DCS_GET_DISPLAY_ID, 3)?;
-            p.id = decode_id(raw);
-            println!(
-                "[display] panel id {:#x} ({}), adopted",
-                p.id,
-                Kind::of(p.id).name()
-            );
+            let base = p.sample();
+            p.dump("loader", &base);
+            p.baseline = Some(base);
+            println!("[display] panel: the loader's display path adopted");
         } else {
-            println!("[display] panel: display path down, bringing it up");
+            println!(
+                "[display] panel: display path down (checks passed {:#b}), bringing it up",
+                state
+            );
             let ready = p.power_up_1();
             p.power_up_2(ready);
             p.cold = true;
         }
         Some(p)
+    }
+
+    fn watched(&self, (blk, reg): (Blk, usize)) -> u32 {
+        match blk {
+            Blk::Car => self.soc.car.r32(reg),
+            Blk::Dc => self.dc.r32(reg * 4),
+            Blk::Dsi => self.dsi.dsi.r32(reg * 4),
+            Blk::Mipi => self.mipi.r32(reg * 4),
+        }
+    }
+
+    fn sample(&self) -> [u32; WATCH.len()] {
+        WATCH.map(|w| self.watched(w))
+    }
+
+    /// The watched registers, as the log's record of what a loader left.
+    fn dump(&self, what: &str, v: &[u32; WATCH.len()]) {
+        for (k, chunk) in WATCH.chunks(8).zip(v.chunks(8)).enumerate() {
+            let list: alloc::string::String = chunk
+                .0
+                .iter()
+                .zip(chunk.1)
+                .map(|(&(blk, reg), val)| {
+                    alloc::format!(" {}{:x}={:x}", ["c", "d", "s", "m"][blk as usize], reg, val)
+                })
+                .collect();
+            println!("[display] {} {}:{}", what, k, list);
+        }
+    }
+
+    /// The watched registers against the loader's: the ones that differ.
+    fn compare(&self) {
+        let Some(base) = self.baseline else { return };
+        let now = self.sample();
+        let mut n = 0;
+        for (&(blk, reg), (&a, &b)) in WATCH.iter().zip(base.iter().zip(now.iter())) {
+            if a != b {
+                n += 1;
+                let name = ["car", "dc", "dsi", "mipi"][blk as usize];
+                println!(
+                    "[display]   {} {:#x}: loader {:#x}, now {:#x}",
+                    name, reg, a, b
+                );
+            }
+        }
+        println!(
+            "[display] panel: {} of {} watched registers differ from the loader's",
+            n,
+            WATCH.len()
+        );
     }
 
     /// The path was brought up by `open` (the loader left it down).
@@ -283,6 +415,7 @@ impl Panel {
         }
         self.soc.backlight_pad();
         dcgate::resume(&self.dc);
+        self.compare();
         println!("[display] panel up, phase 2: {} ms", (now_us() - t0) / 1000);
     }
 
@@ -321,6 +454,11 @@ impl Panel {
         self.dsi.soft_reset();
         self.dsi.table(DSI_TIMING_LP);
         time::sleep_ms(10);
+        if self.id == 0 {
+            // An adopted path: the id is read now, in command mode.
+            self.id = self.read_id().unwrap_or(ID_UNKNOWN);
+            println!("[display] panel id {:#x} ({})", self.id, self.kind().name());
+        }
         match self.kind() {
             Kind::Jdi => self.dsi.table(PANEL_DEINIT_JDI),
             Kind::Auo => {
