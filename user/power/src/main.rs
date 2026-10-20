@@ -214,6 +214,18 @@ fn battery_health(i2c: &I2c) -> Result<Msg, i64> {
 
 libnx::entry!(main);
 
+/// Cores on or off; retries while one is still on its way off.
+fn cores(sysctl: u32, mask: u64) -> Result<u64, i64> {
+    for _ in 0..100 {
+        match sys::set_cores(sysctl, mask) {
+            Err(e) if e == -libnx::abi::err::EAGAIN => time::sleep_ms(1),
+            Err(e) => return Err(e),
+            Ok(()) => return Ok(u64::from(mask.count_ones())),
+        }
+    }
+    Err(-libnx::abi::err::EAGAIN)
+}
+
 fn main() -> i32 {
     let mariko = Mmio::map(drv::dev_slot(0), APB_MISC, 0x1000)
         .is_ok_and(|m| (m.r32(GP_HIDREV) >> 4) & 0xF >= 2);
@@ -307,6 +319,10 @@ fn main() -> i32 {
             proto::BATTERY_HEALTH => battery_health(&i2c).unwrap_or_else(Msg::error),
             proto::MEASURE => measure::start(rx.msg.mr[0], rx.msg.mr[1]),
             proto::MEASURE_RESULT => measure::result(),
+            proto::CORES => match cores(sysctl, rx.msg.mr[0]) {
+                Ok(n) => Msg::from_words(0, &[n]),
+                Err(e) => Msg::error(e),
+            },
             _ => Msg::error(-EINVAL),
         })
     })
