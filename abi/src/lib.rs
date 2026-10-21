@@ -1050,8 +1050,9 @@ pub mod info {
         pub deadline_in_ns: i64,
         /// Where the core's timer is set, ns from now (`i64::MAX`: off).
         pub timer_in_ns: i64,
-        /// Overdue deadlines another interrupt had to expire: a timer
-        /// interrupt went missing (the emulator's edge-triggered PPIs).
+        /// Deadlines more than 50 us overdue that another interrupt had to
+        /// expire: a timer interrupt went missing (the emulator's
+        /// edge-triggered PPIs).
         pub catch_ups: u64,
     }
 

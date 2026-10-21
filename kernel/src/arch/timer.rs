@@ -167,12 +167,23 @@ pub fn wake_irq() {
     }
 }
 
+/// Overdue by more than this, a deadline's timer interrupt went missing.
+const CATCH_UP_NS: u64 = 50_000;
+
 /// Deadlines already due but not expired (their timer edge was lost): handle
 /// them as the timer interrupt would.
 pub fn catch_up() {
     let c = percpu::this();
-    if c.tmo_head != NIL && thread::get(c.tmo_head).wake_at <= counter() {
-        c.stats.catch_ups += 1;
+    if c.tmo_head == NIL {
+        return;
+    }
+    let (due, now) = (thread::get(c.tmo_head).wake_at, counter());
+    if due <= now {
+        // Only a real miss counts, not a deadline that came due during
+        // this interrupt's own handling (its timer interrupt is on its way).
+        if now - due > ns_to_ticks(CATCH_UP_NS) {
+            c.stats.catch_ups += 1;
+        }
         on_irq();
     }
 }
