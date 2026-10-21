@@ -1430,9 +1430,9 @@ within 5 s.
     | old (DCS-only sleep, `6e1f73c`) | 1.259 W |
     | new, again | 1.107 W |
 
-    **-0.14 W (-11 %)** over run 49's panel-only sleep. Whether the picture
-    is right to the eye (and the drawer over Lumen after a wake) is for
-    the user to confirm. The emulator, which has no DSI or panel model, now
+    **-0.14 W (-11 %)** over run 49's panel-only sleep. Seen on the panel
+    after a native wake: the picture right, and the drawer over Lumen (the
+    overlay window still fetches after the controller's reset). The emulator, which has no DSI or panel model, now
     cold-starts the display path at every boot (the screen is 720x1280
     drawn turned, no longer 1280x720); a stopped path found at start
     (a wake that failed, a loader that left no picture) is brought up from
