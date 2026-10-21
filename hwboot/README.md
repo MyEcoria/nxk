@@ -1396,6 +1396,48 @@ within 5 s.
     default; `emc sleep on` after each boot. The path SC7 needs after the
     boot ROM's 204 MHz is the same call (`emc 800`).
 
+53. 21/10/2026, Erista (InnoLux P062CCA-AZ1, panel id 0x0F20), boot image
+    of `86d4cb0` (init grants CAR, GPIO, pinmux, MIPI CAL and APB_MISC
+    read-only to `display`; `--put` to `/nxk/bl33.new`, the pair before
+    kept as `.pre-display`): **`display` powers the whole display path off
+    asleep and brings it back from reset**. Boot: the loader's path is
+    adopted (clocks, PLLD locked, controller in continuous display, DSI
+    video: 7 checks), and the 57 watched PLLD / DC / DSI / MIPI CAL
+    registers read exactly what the bring-up tables write. Asleep: window A
+    and the overlay off, display off, controller stopped, PLLD back to
+    low power, the panel's deinit (none for this panel), sleep in, reset
+    low, AVDD channels off, WLED off, DSI, controller and MIPI CAL held in
+    reset with their clocks off, LDO0 off, PLLD stopped (IDDQ): 103 ms. The
+    wake: phase 1 87 ms (rails, clocks, PLLD at 100 MHz, controller and
+    DSI init, reset, id, sleep out), the CPU clock and the GPU resume
+    (56 ms) inside the panel's 180 ms, phase 2 171 ms (display on, PLLD
+    468 MHz, video, calibration, the windows replayed): the picture 443 ms
+    after the Power press (223 ms with the DCS-only sleep), the services
+    560 ms. After each wake 0 of 57 watched registers differ from the
+    loader's, and the output CRC of the held Lumen frame is the same
+    before and after (three sleeps: 0xdd2adb23, 0xa267bfb8, 0xa6f5c5c3,
+    0x35fd994d), Lumen back at 60 fps. The first try read the panel id
+    in command mode at the power-down without the device takeover timing
+    (`DSI_BTA_TIMING`) and got nothing; with it the id reads (0xF20) at
+    the first power-down, which JDI and AUO panels need for their deinit.
+    A/B in one boot (`powertest start 60 15` asleep, Lumen held, cell
+    3.98-3.99 V, cable in, cores 1-3 off, GPU suspended, `emc sleep` off
+    throughout), `display` reloaded between the legs:
+
+    | `display` | draw asleep |
+    |---|---|
+    | new, path off | 1.126 W, 1.116 W |
+    | old (DCS-only sleep, `6e1f73c`) | 1.259 W |
+    | new, again | 1.107 W |
+
+    **-0.14 W (-11 %)** over run 49's panel-only sleep. Whether the picture
+    is right to the eye (and the drawer over Lumen after a wake) is for
+    the user to confirm. The emulator, which has no DSI or panel model, now
+    cold-starts the display path at every boot (the screen is 720x1280
+    drawn turned, no longer 1280x720); a stopped path found at start
+    (a wake that failed, a loader that left no picture) is brought up from
+    scratch by `--reload display` too.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell

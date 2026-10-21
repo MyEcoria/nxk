@@ -455,8 +455,13 @@ impl Panel {
         self.dsi.table(DSI_TIMING_LP);
         time::sleep_ms(10);
         if self.id == 0 {
-            // An adopted path: the id is read now, in command mode.
-            self.id = self.read_id().unwrap_or(ID_UNKNOWN);
+            // An adopted path: the id is read now, in command mode (the
+            // device takeover timing as after a reset). Kept only if the panel answered.
+            self.dsi.dsi.w32(DSI_BTA_TIMING * 4, BTA_TIMING_PANEL);
+            match self.read_id() {
+                Some(id) => self.id = id,
+                None => println!("[display] panel: no answer to the id read at power-down"),
+            }
             println!("[display] panel id {:#x} ({})", self.id, self.kind().name());
         }
         match self.kind() {

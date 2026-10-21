@@ -85,8 +85,8 @@ Only DRAM and the PMC (always-on) keep their state. Everything else is reset:
   `RESUME`, not just ungate clocks. The hard ones:
   - `display`: DC, DSI, PLLD and the panel came from hekate (run 49). The
     service now has its own bring-up and power-down (`user/display/src/panel/`,
-    hekate `di.c`, panel id-specific sequences; written, emulator-tested,
-    silicon run pending: `README.md` run 53), which is what an SC7 exit needs
+    hekate `di.c`, panel id-specific sequences; run on the Erista,
+    `README.md` run 53), which is what an SC7 exit needs
     to see anything after the wake.
   - `gpu`: full re-init (PMU, ACR/WPR, FECS/GPCCS firmware) and the game's
     channel and context rebuilt, transparently to the game.
@@ -185,7 +185,7 @@ today's software sleep stays the default:
    first with only the console (`usbcon`) re-initialised.
 
 Long poles that do not depend on bl31, each its own piece of work: a native
-DSI and panel init in `display` (hekate `di.c`; written, silicon run pending), a GPU cold restore with a
+DSI and panel init in `display` (hekate `di.c`; done, `README.md` run 53), a GPU cold restore with a
 game held, an EMC clock change from the trained table (back from the boot
 ROM's 204 MHz to 800 MHz; written as the `emc` service, `hwboot/README.md`
 "DRAM clock": it also drops the DRAM to 204 MHz asleep today), and every other service re-initialising from reset
