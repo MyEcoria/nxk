@@ -66,8 +66,10 @@ const CSR_WFI_SHIFT: u32 = 8;
 const CSR_FLAGS: u32 = 1 << 14 | 1 << 15;
 /// HALT_CPUn_EVENTS.FLOW_MODE (31:29) = WAITEVENT, no wake source.
 const HALT_WAITEVENT: u32 = 2 << 29;
-/// Wake sources: GIC FIQ/IRQ (8, 9), legacy controller IRQ/FIQ (10, 11).
-const HALT_ON_IRQ: u32 = 0xF << 8;
+/// Wake sources: this core's GIC FIQ/IRQ (8, 9) only. The legacy
+/// controller (10, 11) sees every SoC line whatever its GIC target: on the
+/// Erista it woke a suspended core 0 within 139 us.
+const HALT_ON_IRQ: u32 = 0x3 << 8;
 const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 
 /// EL3 runs with caches off: volatile accesses are coherent between cores.
@@ -161,7 +163,8 @@ pub fn smc(regs: &mut [u64; 31]) {
                 INVALID_PARAMETERS
             } else {
                 let step = power_up(cpu);
-                diag_set(cpu, 0, step | 1 << 16);
+                // Added to the warm entry's record: bit 16, step in 15:8.
+                diag_set(cpu, 0, diag(cpu, 0) | 1 << 16 | step << 8);
                 if step == 0 {
                     INTERNAL_FAILURE
                 } else {
