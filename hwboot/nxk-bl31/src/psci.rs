@@ -70,6 +70,9 @@ const HALT_WAITEVENT: u32 = 2 << 29;
 /// controller (10, 11) sees every SoC line whatever its GIC target: on the
 /// Erista it woke a suspended core 0 within 139 us.
 const HALT_ON_IRQ: u32 = 0x3 << 8;
+const HALT_ON_LIC: u32 = 0x3 << 10;
+/// FLOW_MODE = STOP_UNTIL_IRQ.
+const HALT_STOP_UNTIL_IRQ: u32 = 4 << 29;
 const RST_CPUG_CMPLX_CLR: usize = CAR_BASE + 0x454;
 
 /// EL3 runs with caches off: volatile accesses are coherent between cores.
@@ -351,7 +354,15 @@ fn cpu_suspend(power_state: u64, entry: u64, ctx: u64) -> i64 {
         FLOW_CTLR + FLOW_CPU_CSR[cpu],
         CSR_FLAGS | (1 << cpu) << CSR_WFI_SHIFT | CSR_ENABLE,
     );
-    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], HALT_WAITEVENT | HALT_ON_IRQ);
+    // Halt setup by power_state's state id, to find on silicon what keeps
+    // the core gated until its own interrupt (stage 2 of SC7.md).
+    let halt = match power_state & 0xFF {
+        1 => 0, // CPU_CSR alone (Linux's CPU power-down)
+        2 => HALT_STOP_UNTIL_IRQ | HALT_ON_IRQ,
+        3 => HALT_WAITEVENT | HALT_ON_IRQ | HALT_ON_LIC,
+        _ => HALT_WAITEVENT | HALT_ON_IRQ,
+    };
+    wr(FLOW_CTLR + FLOW_HALT_CPU[cpu], halt);
     wr(FLOW_CTLR + FLOW_CC4_CORE_CTRL[cpu], 0);
     set_state(cpu, SUSPENDED);
     unsafe { cpu_power_down(1) }
