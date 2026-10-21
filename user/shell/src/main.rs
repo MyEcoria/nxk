@@ -208,7 +208,7 @@ fn command(line: &str) {
             println!("{}", core::str::from_utf8(&buf[..n]).unwrap_or("?"));
         }
         "cores" => cores_cmd(argv.get(1).copied()),
-        "coresleep" => coresleep(argv.get(1).copied()),
+        "coresleep" => coresleep(argv.get(1).copied(), argv.get(2).copied()),
         "poweroff" => power_cmd(power::OFF),
         "reboot" => power_cmd(power::REBOOT),
         "recv" if argv.len() == 4 => recv(argv[1], argv[2], argv[3]),
@@ -239,7 +239,7 @@ fn help() {
     println!("  threads         every thread: state, core, pin, deadline");
     println!("  soc             BPMP and EMC state the deep sleep depends on");
     println!("  cores MASK      CPU cores kept on (hex mask), the others off");
-    println!("  coresleep MS    core 0 powered down until a timer wakes it");
+    println!("  coresleep MS [M] core 0 powered down until a timer wakes it");
     println!("  uptime          time since boot");
     println!("  echo TEXT       print TEXT");
     println!("  date            wall-clock time (RTC)");
@@ -247,7 +247,9 @@ fn help() {
     println!("  temp            chip and package temperatures");
     println!("  fan [auto|PCT]  fan duty, speed, SoC temperature; PCT: set by hand");
     println!("  cpufreq [MHZ]   CPU clock, rail, steps; MHZ: a step, or boot");
-    println!("  emc [MHZ|bench|sleep on|off]  DRAM clock, trained rates; MHZ: switch; bench: DRAM MB/s");
+    println!(
+        "  emc [MHZ|bench|sleep on|off]  DRAM clock, trained rates; MHZ: switch; bench: DRAM MB/s"
+    );
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
     println!(
         "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
@@ -866,7 +868,11 @@ fn emc_cmd(argv: &[&str]) {
             }
             println!(
                 ", sleep drop {}, {} switches (last {} us)",
-                if st & emc::ST_SLEEP_MODE != 0 { "on" } else { "off" },
+                if st & emc::ST_SLEEP_MODE != 0 {
+                    "on"
+                } else {
+                    "off"
+                },
                 m.mr[3],
                 m.mr[4]
             );
@@ -882,7 +888,11 @@ fn emc_cmd(argv: &[&str]) {
                     Ok(e) => print!(
                         " {}{}",
                         e.mr[0] / 1000,
-                        if e.mr[2] != 0 { "(periodic training)" } else { "" }
+                        if e.mr[2] != 0 {
+                            "(periodic training)"
+                        } else {
+                            ""
+                        }
                     ),
                     Err(_) => break,
                 }
@@ -1383,14 +1393,17 @@ fn power_cmd(label: u32) {
     let _ = sys::handle_close(h);
 }
 
-/// `coresleep MS`: core 0 powered down at its next idle for MS ms.
-fn coresleep(arg: Option<&str>) {
-    let Some(ms) = arg.and_then(|a| a.parse::<u64>().ok()) else {
-        println!("usage: coresleep MS (core 0 powered down, woken by a timer)");
+/// `coresleep MS [MODE]`: core 0 powered down at its next idle for MS ms;
+/// MODE picks nxk-bl31's flow-controller halt variant (0-3).
+fn coresleep(ms: Option<&str>, mode: Option<&str>) {
+    let mode = mode.and_then(|m| m.parse::<u64>().ok()).unwrap_or(0);
+    let Some(ms) = ms.and_then(|a| a.parse::<u64>().ok()) else {
+        println!("usage: coresleep MS [MODE] (core 0 powered down, woken by a timer)");
         return fail(-err::EINVAL);
     };
     let Some(h) = power_service() else { return };
-    match ipc::call(h, &Msg::from_words(power::SUSPEND_TEST, &[ms * 1000])) {
+    let word = ms * 1000 | mode << 56;
+    match ipc::call(h, &Msg::from_words(power::SUSPEND_TEST, &[word])) {
         Ok(m) if m.label() != 0 => {
             println!("coresleep: {}", err::name(-(m.label() as i64)));
             fail(-(m.label() as i64));

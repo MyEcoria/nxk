@@ -59,6 +59,12 @@ pub struct PerCpu {
     pub suspended_at: u64,
     /// Powered down by CPU_SUSPEND, not back yet.
     pub suspended: bool,
+    /// nxk-bl31 halt variant for the next suspend (`psci::cpu_suspend`).
+    pub suspend_mode: u8,
+    /// GICC_HPPIR and GICD_ISPENDR0 (SGIs/PPIs) right before suspending.
+    pub suspend_pending: (u32, u32),
+    /// Log the first interrupt taken after a resume.
+    pub first_irq_probe: bool,
     /// TTBR0_EL1 value loaded (avoids redundant writes).
     pub cur_ttbr: u64,
     /// Running quantum end (0: no contender, no quantum).
@@ -96,6 +102,9 @@ impl PerCpu {
             suspend_req: false,
             suspended_at: 0,
             suspended: false,
+            suspend_mode: 0,
+            suspend_pending: (0, 0),
+            first_irq_probe: false,
             cur_ttbr: 0,
             slice_end: 0,
             timer_cval: u64::MAX,

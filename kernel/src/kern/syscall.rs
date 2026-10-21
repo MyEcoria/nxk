@@ -302,7 +302,9 @@ fn suspend_test(us: u64) -> SysResult {
     if !crate::arch::psci::present() || !crate::arch::mmu::monitor_reserved() {
         return Err(-ENOSYS);
     }
-    if us == 0 || us > 60_000_000 {
+    // Bits 63:56: nxk-bl31's halt variant (see `psci::cpu_suspend`).
+    let (mode, us) = ((us >> 56) as u8, us & ((1 << 56) - 1));
+    if us == 0 || us > 60_000_000 || mode > 3 {
         return Err(-EINVAL);
     }
     // The safety net (a missed wake interrupt) needs another core awake.
@@ -313,6 +315,7 @@ fn suspend_test(us: u64) -> SysResult {
     irq::retarget(0, other);
     timer::arm_wake(0, us as u32);
     let c = percpu::get(0);
+    c.suspend_mode = mode;
     c.suspend_req = true;
     if percpu::this().id != 0 {
         crate::kern::sched::kick(0);

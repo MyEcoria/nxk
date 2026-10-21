@@ -131,6 +131,12 @@ pub fn set_target(irq: u32, cpu_mask: u8) {
     }
 }
 
+/// This core's highest-priority pending interrupt (GICC_HPPIR) and its
+/// pending SGIs/PPIs (GICD_ISPENDR0, banked): what would wake it.
+pub fn pending_here() -> (u32, u32) {
+    unsafe { (read32(GICC_BASE + 0x18), read32(GICD_BASE + 0x200)) }
+}
+
 /// Core mask an SPI line is routed to.
 pub fn target(irq: u32) -> u8 {
     let addr = GICD_ITARGETSR + (irq as usize & !3);

@@ -966,7 +966,8 @@ fn suspend_idle(c: &mut PerCpu) {
     c.suspended = true;
     bkl::release();
     arch::irq_disable();
-    let r = psci::cpu_suspend(_start as *const () as usize as u64);
+    c.suspend_pending = gic::pending_here();
+    let r = psci::cpu_suspend(_start as *const () as usize as u64, c.suspend_mode as u64);
     bkl::acquire();
     c.suspended = false;
     crate::kprintln!("[smp] core {}: CPU_SUSPEND refused ({})", c.id, r);
@@ -995,11 +996,15 @@ pub fn resumed() {
         _ => "the safety net powered it back up from the gate",
     };
     crate::kprintln!(
-        "[smp] core {} back from CPU_SUSPEND after {} us: {}",
+        "[smp] core {} back from CPU_SUSPEND (mode {}) after {} us: {}; pending before: HPPIR {:#x}, SGI/PPI {:#x}",
         c.id,
+        c.suspend_mode,
         timer::ticks_to_ns(timer::counter() - c.suspended_at) / 1000,
-        how
+        how,
+        c.suspend_pending.0,
+        c.suspend_pending.1
     );
+    c.first_irq_probe = true;
 }
 
 /// A core back on: threads pinned to it, moved off meanwhile, return.

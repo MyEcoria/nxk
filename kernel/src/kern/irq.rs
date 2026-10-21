@@ -123,6 +123,13 @@ pub fn handle() -> bool {
         if cfg!(feature = "trace-sched") {
             crate::kprintln!("[s{}] irq {}", percpu::this().id, id);
         }
+        if core::mem::take(&mut percpu::this().first_irq_probe) {
+            crate::kprintln!(
+                "[smp] core {}: first interrupt after resume: {}",
+                percpu::this().id,
+                id
+            );
+        }
         match id {
             gic::IRQ_TIMER => timer::on_irq(),
             timer::IRQ_WAKE_TMR => timer::wake_irq(),

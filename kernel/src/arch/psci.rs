@@ -74,8 +74,15 @@ pub fn nxk_diag(cpu: u64) -> Option<[u64; 4]> {
 
 /// Power the calling core down until an interrupt; it comes back at the
 /// kernel's `_start` (then `kresume`). Returns only if the monitor refuses.
-pub fn cpu_suspend(entry: u64) -> i64 {
-    smc(CPU_SUSPEND_64, 1 << 16, entry, RESUME_MAGIC) as i64
+/// `state_id`: nxk-bl31's flow-controller halt variant (0: WAITEVENT + GIC
+/// interrupts, 1: none, 2: STOP_UNTIL_IRQ, 3: WAITEVENT + GIC + legacy).
+pub fn cpu_suspend(entry: u64, state_id: u64) -> i64 {
+    smc(
+        CPU_SUSPEND_64,
+        1 << 16 | (state_id & 0xFF),
+        entry,
+        RESUME_MAGIC,
+    ) as i64
 }
 
 /// nxk-bl31: power up `cpu`, suspended and not woken by its interrupt.
