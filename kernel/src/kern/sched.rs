@@ -984,10 +984,15 @@ pub fn resumed() {
     c.ss_enabled = false;
     c.timer_cval = u64::MAX;
     c.timer_dirty = true;
-    let how = match psci::nxk_diag(c.id as u64).map(|d| d[0]) {
-        Some(d) if d & 1 != 0 => "its wfi returned, not gated",
-        Some(d) if d >> 24 & 1 != 0 => "powered back up from the gate",
-        _ => "monitor did not say how",
+    // nxk-bl31's DIAG[0]: bit 24 a wake, bit 0 the wfi returned, bit 16
+    // the safety net powered it up (its step in 15:8).
+    let d = psci::nxk_diag(c.id as u64).map_or(0, |d| d[0]);
+    let how = match (d >> 24 & 1, d & 1, d >> 16 & 1) {
+        (0, ..) => "monitor did not say how",
+        (_, 1, 0) => "its wfi returned, not gated",
+        (_, 1, _) => "its wfi returned once the safety net stepped in",
+        (_, 0, 0) => "an interrupt powered it back up from the gate",
+        _ => "the safety net powered it back up from the gate",
     };
     crate::kprintln!(
         "[smp] core {} back from CPU_SUSPEND after {} us: {}",
