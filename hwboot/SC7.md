@@ -179,6 +179,10 @@ today's software sleep stays the default:
 2. **Core 0 power-down rehearsal** with the CPU rail on, woken by a Tegra
    timer (the arch timer dies with the core): warm entry, EL2/EL1 and GIC
    distributor restore, no DRAM or PMIC risk.
+   **Done** (`README.md` run 54): gated, powered back up by an interrupt,
+   resumed through `_start_warm` and `kresume`. It wakes within 139 us (a
+   pending reschedule SGI in the emulator; to confirm on silicon), so the
+   timer-only wake was not seen; SC7 wakes through the PMC instead.
 3. **SC7** proper: PMIC sleep (FPS), wake mask on event 51 only (PMIC
    IRQ, ONOFF unmasked in the MAX77620), `sc7entry.bin` on the BPMP, warm
    entry through SECURE_SCRATCH34/35, the Erista boot ROM scratch writes;

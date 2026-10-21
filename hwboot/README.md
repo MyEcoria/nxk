@@ -1438,6 +1438,25 @@ within 5 s.
     (a wake that failed, a loader that left no picture) is brought up from
     scratch by `--reload display` too.
 
+54. 21/10/2026, Erista, boot images of `fd48a51` then `edebc38` (`.pre-sc7s2`
+    and `.pre-gicwake` kept): **SC7 stage 2, core 0 powered down and back**
+    (`coresleep MS` in the shell, PSCI CPU_SUSPEND in `nxk-bl31`, `SC7.md`).
+    Core 0 is really gated: the warm entry reports a power-up from the gate,
+    not a `wfi` that returned. An interrupt powers it back up through the
+    flow controller, `_start_warm` and the kernel's `kresume` rebuild
+    EL2/EL1 and the GIC CPU interface, and the system goes on: ktest 0
+    failed, stdtest 17/17 after six suspends. It never stayed down for its
+    timer: back after 133-139 us every time, with the device lines moved off
+    core 0, and with the legacy interrupt controller's wake (it sees every SoC
+    line) removed from `HALT_CPUn_EVENTS`. The emulator shows a reschedule
+    SGI pending at the power-down (a thread homed on core 0 made ready by
+    another core), which a woken core must take; the next image logs the
+    pending state and first interrupt on silicon. Also read live (`soc`):
+    the BPMP is halted under nxk (`HALT_COP_EVENTS` 0x50000000: hekate's
+    `bpmpfw` runs nothing), and the cores' MISSED timer column is non-zero
+    on silicon (60/19/6/1 over a million interrupts), likely the race between
+    the last interrupt acknowledge and the deadline check.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
