@@ -402,8 +402,18 @@ cpu_power_down:
     dsb     sy
 .Loff:
     wfi
-    cbnz    x9, _start_warm
+    cbnz    x9, .Lfell
     b       .Loff
+// The wfi returned (no gate): noted, so a wake can tell it from a power-up.
+.Lfell:
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xFF
+    adrp    x1, SUSPEND_FELL
+    add     x1, x1, :lo12:SUSPEND_FELL
+    mov     w2, #1
+    strb    w2, [x1, x0]
+    dsb     sy
+    b       _start_warm
 
 .macro SAVE
     sub     sp, sp, #256

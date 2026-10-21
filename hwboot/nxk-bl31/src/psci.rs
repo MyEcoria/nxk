@@ -354,6 +354,11 @@ fn cpu_suspend(power_state: u64, entry: u64, ctx: u64) -> i64 {
     unsafe { cpu_power_down(1) }
 }
 
+/// Set by `cpu_power_down` when a suspend's `wfi` returned instead of the
+/// core being gated (read and cleared by the warm entry).
+#[no_mangle]
+static mut SUSPEND_FELL: [u8; NR_CPUS] = [0; NR_CPUS];
+
 /// A core powering up after boot: CPU_ON's, or a suspended one waking.
 #[no_mangle]
 extern "C" fn bl31_warm(cpu: usize) -> ! {
@@ -363,6 +368,14 @@ extern "C" fn bl31_warm(cpu: usize) -> ! {
     match state(cpu) {
         PENDING => bl31_secondary(cpu),
         SUSPENDED => {
+            // DIAG[0] for a wake: bit 24 set, bit 0 = the wfi returned.
+            let fell = unsafe {
+                let p = (addr_of_mut!(SUSPEND_FELL) as *mut u8).add(cpu);
+                let v = read_volatile(p);
+                write_volatile(p, 0);
+                v
+            };
+            diag_set(cpu, 0, 1 << 24 | fell as u64);
             flow_reset(cpu);
             crate::gic_secure_init_cpu();
             let (entry, ctx) = unsafe {
