@@ -984,10 +984,16 @@ pub fn resumed() {
     c.ss_enabled = false;
     c.timer_cval = u64::MAX;
     c.timer_dirty = true;
+    let how = match psci::nxk_diag(c.id as u64).map(|d| d[0]) {
+        Some(d) if d & 1 != 0 => "its wfi returned, not gated",
+        Some(d) if d >> 24 & 1 != 0 => "powered back up from the gate",
+        _ => "monitor did not say how",
+    };
     crate::kprintln!(
-        "[smp] core {} back from CPU_SUSPEND after {} us",
+        "[smp] core {} back from CPU_SUSPEND after {} us: {}",
         c.id,
-        timer::ticks_to_ns(timer::counter() - c.suspended_at) / 1000
+        timer::ticks_to_ns(timer::counter() - c.suspended_at) / 1000,
+        how
     );
 }
 

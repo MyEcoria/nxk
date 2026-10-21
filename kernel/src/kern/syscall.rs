@@ -306,9 +306,11 @@ fn suspend_test(us: u64) -> SysResult {
         return Err(-EINVAL);
     }
     // The safety net (a missed wake interrupt) needs another core awake.
-    if !(1..percpu::NR_CPUS).any(|k| percpu::get(k).online) {
+    let Some(other) = (1..percpu::NR_CPUS).find(|&k| percpu::get(k).online) else {
         return Err(-EBUSY);
-    }
+    };
+    // Device lines would wake core 0 at once: only its timer may.
+    irq::retarget(0, other);
     timer::arm_wake(0, us as u32);
     let c = percpu::get(0);
     c.suspend_req = true;
