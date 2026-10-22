@@ -79,6 +79,14 @@ if not a.no_bin:
             cover = os.path.join(ROOT, "build", "covers", name + ".bin")
             if os.path.exists(cover):
                 put(f"/games/{name}/cover.bin", open(cover, "rb").read())
+    # Game catalogs (services/ dir): /services/NAME/NAME and its service.txt.
+    svcsrc = os.path.join(ROOT, "services")
+    for name in sorted(os.listdir(svcsrc)) if os.path.isdir(svcsrc) else []:
+        exe = os.path.join(appdir, name)
+        manifest = os.path.join(svcsrc, name, "service.txt")
+        if os.path.exists(exe) and os.path.exists(manifest):
+            put(f"/services/{name}/{name}", open(exe, "rb").read())
+            put(f"/services/{name}/service.txt", open(manifest, "rb").read())
 put("/etc/motd", "Welcome to nxk: this file comes from the SD card (FAT32).\n".encode())
 put("/Documents/Read me.txt",
     "Long name and spaces: FAT32 LFN entries.\n".encode())

@@ -35,6 +35,11 @@ echo "== games"
 # (/games/NAME), not in the boot image: tools/mksd.py installs them.
 (cd "$ici/jeux" && RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$cache/target-apps" cargo build --release)
 
+echo "== services"
+# Game catalogs (services/ dir): std programs on the SD card too
+# (/services/NAME), started by display when a user picks them.
+(cd "$ici/services" && RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$cache/target-apps" cargo build --release)
+
 python3 "$ici/tools/mkbootfs.py" -o "$ici/build/bootfs.img" "${bins[@]}"
 
 echo "== kernel"

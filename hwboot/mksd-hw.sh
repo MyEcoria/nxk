@@ -63,6 +63,15 @@ for dir in "$root"/jeux/*/; do
         if [ -f "$cover" ]; then cp "$cover" "$sd/games/$name/cover.bin"; fi
     fi
 done
+# Game catalogs (services/): /services/NAME/NAME and its service.txt.
+for dir in "$root"/services/*/; do
+    name="$(basename "$dir")"
+    if [ -x "$appdir/$name" ] && [ -f "$dir/service.txt" ]; then
+        mkdir -p "$sd/services/$name"
+        cp "$appdir/$name" "$sd/services/$name/$name"
+        cp "$dir/service.txt" "$sd/services/$name/service.txt"
+    fi
+done
 printf 'Welcome to nxk: this file comes from the SD card (FAT32).\n' > "$sd/motd-nxk.txt"
 
 # Wi-Fi firmware and calibration data, GPU firmware: never in the repo.
