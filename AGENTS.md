@@ -110,8 +110,10 @@ Key details agents must respect:
   `--net [hostfwd...]`, `--usb-kbd --keys`, `--bt` (an emulated BCM4356 and
   Pro Controller on UART-D, `tools/btfake.py`), `--usb-cmd CMD` (typed on the
   USB-C console, the script as the PC), `--usb-put LOCAL:REMOTE`,
-  `--screendump out.ppm`, `--timeout SECS`. Extra QEMU args via
-  `NXTEST_QEMU_ARGS`.
+  `--dbg COMMANDS` (`tools/nxdbg.py` over the USB-C console),
+  `--uart-log FILE` (all UART-A output, also the logs read unshown while
+  the USB-C console runs), `--screendump out.ppm`, `--timeout SECS`.
+  Extra QEMU args via `NXTEST_QEMU_ARGS`. The shell's `sleep N` is in ms.
 - On a connected Switch, iterate on a boot driver without an SD swap:
   `./tools/build.sh && ./tools/usbterm.py --reload DRIVER -c "..."`
   (init's `RESTART`, see `hwboot/README.md`). Kernel, init, shell and

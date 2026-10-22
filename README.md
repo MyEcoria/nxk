@@ -260,7 +260,9 @@ the PC), `--usb-put LOCAL:REMOTE` (file copied to the SD card over that
 console first), `--usb-net share|quiet` (with `--usb-cmd`: the PC also
 turns the USB-C network on and shares its connection at 10.42.0.1, or
 answers nothing), `--tap X,Y[:OUT.ppm]` (touch the screen at landscape
-pixel X,Y after the commands and the `[input] touchscreen` line, then capture it), `--dbg COMMANDS` (the debug channel's `tools/nxdbg.py` commands over the USB-C console, e.g. `"shot a.png tap 640 670 button R"`). On a real Switch, `tools/usbterm.py --reload DRIVER`
+pixel X,Y after the commands and the `[input] touchscreen` line, then capture it), `--dbg COMMANDS` (the debug channel's `tools/nxdbg.py` commands over the USB-C console, e.g. `"shot a.png tap 640 670 button R"`), `--uart-log FILE` (every
+UART-A byte, also those read unshown while the USB-C console runs: the
+services' logs during `--usb-cmd` and `--dbg`). On a real Switch, `tools/usbterm.py --reload DRIVER`
 replaces a running boot driver by a new build without touching the SD
 card (`hwboot/README.md`, "Driver updates over USB-C").
 
