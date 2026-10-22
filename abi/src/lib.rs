@@ -242,6 +242,7 @@ pub mod err {
     pub const EHOSTUNREACH: i64 = 113;
     pub const EALREADY: i64 = 114;
     pub const EINPROGRESS: i64 = 115;
+    pub const ESTALE: i64 = 116;
     /// Same as EAGAIN, as on Linux.
     pub const EWOULDBLOCK: i64 = EAGAIN;
 
@@ -309,6 +310,7 @@ pub mod err {
             EHOSTUNREACH => "EHOSTUNREACH",
             EALREADY => "EALREADY",
             EINPROGRESS => "EINPROGRESS",
+            ESTALE => "ESTALE",
             _ => "E?",
         }
     }
@@ -1935,7 +1937,8 @@ pub mod proto {
         pub const SNAPSHOT: u32 = 3;
         /// A game takes the screen (the UI stops): `SCANOUT_BUFFERS`
         /// block-linear images for the GPU to draw on, `CONTIGUOUS |
-        /// DMA32 | UNCACHED`, handles 0-2 with the `DMA` and `MAP` rights;
+        /// DMA32 | UNCACHED`, handles 0-2 with the `DMA`, `MAP` and `WRITE`
+        /// rights (the CPU may draw too);
         /// handle 3: the endpoint `FLIP` and `EVENT` go to (served by their
         /// own thread: a frame never waits behind the UI drawing over the
         /// game). Reply: words = width, height (of the panel as it scans out),
@@ -1955,8 +1958,73 @@ pub mod proto {
         /// up to word 0 ns (0: no limit). While a game has the screen the
         /// UI reads none. Sent on `SCANOUT`'s handle 3 only.
         pub const EVENT: u32 = 7;
+        /// A game catalog `display` started (`provider`) hands over its
+        /// endpoint: word 0 = the key `display` put in its environment
+        /// (`provider::KEY_ENV`), handle 0 = the endpoint (SEND). `EPERM`:
+        /// not the key of the provider running, or it said hello already.
+        pub const PROVIDER: u32 = 8;
         pub const SCANOUT_BUFFERS: usize = 3;
         pub const FORMAT_RGBA8888: u64 = 1;
+    }
+    /// Game catalogs ("services" on screen): `/services/NAME/NAME` on the
+    /// card, with `/services/NAME/service.txt` (`title=`, `color=RRGGBB`,
+    /// `description=`). `display` keeps the selected one running, with
+    /// `KEY_ENV`, `NXK_USER`, `NXK_USER_ID` and `DIR_ENV` in its
+    /// environment; it says `display::PROVIDER`, then serves these on its
+    /// endpoint. A launched game takes the screen as any game
+    /// (`display::SCANOUT`). `proto::SUSPEND` and `RESUME` come too.
+    pub mod provider {
+        /// The state: word 0 = the version known (0: none), word 1 = how
+        /// long to wait for another one (ns, 0: answer now). Reply: words
+        /// = version, `ST_*`, the list's version, its game count, progress
+        /// (`ST_LAUNCHING`: place in the queue, 0: none); bytes: the text
+        /// to show (`MAX_TEXT`, UTF-8; `ST_LOGIN`: the code and the URL,
+        /// one per line).
+        pub const STATE: u32 = 1;
+        /// Game word 0 of list version word 1. Reply: word 0 = color (RGB),
+        /// word 1 = flags (0); bytes: id, title, publisher, version,
+        /// description, each ended by a 0 byte. `ESTALE`: another list.
+        pub const GAME: u32 = 2;
+        /// Cover of game word 0 of list version word 1, from byte word 2.
+        /// Reply: word 0 = the cover's size, bytes: the next part of it.
+        /// A cover is u16 side, u16 side (square, `COVER_MAX` at most),
+        /// then RGB565 pixels, little-endian. `ENOENT`: none (yet).
+        pub const COVER: u32 = 3;
+        /// Start the game whose id is in the bytes. Reply at once; the
+        /// state goes `ST_LAUNCHING`, then `ST_PLAYING` once the game
+        /// has the screen, or back to `ST_READY` (its text: why).
+        pub const LAUNCH: u32 = 4;
+        /// End the game (HOME, or the launch cancelled): reply once the
+        /// screen is released and what it held elsewhere is closed.
+        /// Past `STOP_NS` the provider is killed.
+        pub const STOP: u32 = 5;
+
+        pub const ST_LOADING: u64 = 0;
+        pub const ST_READY: u64 = 1;
+        /// An account is needed: the text says how.
+        pub const ST_LOGIN: u64 = 2;
+        pub const ST_LAUNCHING: u64 = 3;
+        pub const ST_PLAYING: u64 = 4;
+        pub const ST_ERROR: u64 = 5;
+
+        pub const KEY_ENV: &str = "NXK_PROVIDER_KEY";
+        /// The user's own directory for this catalog (accounts, caches).
+        pub const DIR_ENV: &str = "NXK_SERVICE_DIR";
+        pub const MAX_TEXT: usize = 512;
+        /// Games beyond this are not listed.
+        pub const MAX_GAMES: usize = 512;
+        /// Ids are 1 to 40 of `[A-Za-z0-9._-]`.
+        pub const MAX_ID: usize = 40;
+        pub const COVER_MAX: usize = 256;
+        pub const STOP_NS: u64 = 8_000_000_000;
+
+        /// Whether `id` is a valid game id.
+        pub fn valid_id(id: &str) -> bool {
+            (1..=MAX_ID).contains(&id.len())
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        }
     }
     /// USB-C console (`usbcon`), published as "usbcon".
     pub mod usbcon {
