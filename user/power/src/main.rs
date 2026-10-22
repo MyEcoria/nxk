@@ -1,5 +1,6 @@
-//! power: board power, RTC wall-clock sync, TMP451 temperatures, SD,
-//! PCIe and touchscreen rails, the charger's input status, the fuel gauge.
+//! power: board power, wall clock (RTC plus a network-time offset,
+//! `ntp`), TMP451 temperatures, SD, PCIe and touchscreen rails, the
+//! charger's input status, the fuel gauge.
 //! RTC is read-only; its BCD/12-24h mode is honored as left.
 //! `MEASURE` cuts the charger's input to read the battery's own load.
 //! The TMP451 is started again as hekate's `tmp451_init` does.
@@ -7,7 +8,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod measure;
+mod ntp;
 
 use libnx::abi::err::EINVAL;
 use libnx::abi::proto::power as proto;
@@ -118,7 +122,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// RTC time, in seconds since 1970 (UTC).
-fn rtc_seconds(i2c: &I2c) -> Result<i64, i64> {
+pub(crate) fn rtc_seconds(i2c: &I2c) -> Result<i64, i64> {
     // Copy current time into readable registers (RBUDR).
     i2c.write_reg(5, RTC, 0x04, 1 << 4)?;
     time::sleep_ms(16);
@@ -142,8 +146,9 @@ fn rtc_seconds(i2c: &I2c) -> Result<i64, i64> {
     Ok(days * 86_400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64)
 }
 
-fn sync_time(i2c: &I2c, sysctl: u32) -> Result<i64, i64> {
-    let s = rtc_seconds(i2c)?;
+/// The kernel wall clock from the RTC and the network-time offset.
+pub(crate) fn sync_time(i2c: &I2c, sysctl: u32) -> Result<i64, i64> {
+    let s = ntp::real_seconds(rtc_seconds(i2c)?);
     sys::clock_set_realtime(sysctl, s as u64 * 1_000_000_000)?;
     Ok(s)
 }
@@ -257,6 +262,9 @@ fn main() -> i32 {
     // A previous instance may have died mid-measurement.
     if let Ok(true) = measure::clear_hiz(&i2c) {
         println!("[power] charger input was cut, restored");
+    }
+    if libnx::thread::spawn(move || ntp::run(sysctl)).is_err() {
+        println!("[power] no network time thread");
     }
     let ep = drv::publish("power").expect("power: publish");
     drv::serve(ep, |rx| {
