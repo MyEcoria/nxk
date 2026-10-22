@@ -1,7 +1,8 @@
 //! A game catalog with no network: three games whose launch waits in a
 //! pretend queue, then fills the screen with the game's color (B or HOME
-//! ends it), and "Crash", which exits while launching. It exercises
-//! `display`'s side of the provider protocol in the emulator.
+//! ends it), "Offline", which never starts, and "Crash", which exits while
+//! launching. Covers come 1.5 s after the list, as downloads would. It
+//! exercises `display`'s side of the provider protocol in the emulator.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::sleep;
@@ -11,7 +12,7 @@ use nxk_abi::proto::input;
 use nxsvc::screen::Screen;
 use nxsvc::{Catalog, Cover, Game, Request, State};
 
-const GAMES: [(&str, &str, u32, &str); 4] = [
+const GAMES: [(&str, &str, u32, &str); 5] = [
     (
         "aurora",
         "Aurora",
@@ -29,6 +30,12 @@ const GAMES: [(&str, &str, u32, &str); 4] = [
         "Cobalt",
         0x16A085,
         "A blue mine deep under the hills",
+    ),
+    (
+        "offline",
+        "Offline",
+        0x5D6D7E,
+        "Never starts: no machine is free",
     ),
     (
         "crash",
@@ -60,10 +67,14 @@ fn main() {
         })
         .collect();
     cat.set_games(games);
-    for &(id, _, color, _) in &GAMES[..3] {
-        cat.set_cover(id, &cover(color));
-    }
     cat.set_state(State::Ready(String::new()));
+    let c2 = cat.clone();
+    std::thread::spawn(move || {
+        sleep(Duration::from_millis(1500));
+        for &(id, _, color, _) in &GAMES[..4] {
+            c2.set_cover(id, &cover(color));
+        }
+    });
     println!("demo: {} games listed", GAMES.len());
     while let Ok(r) = rx.recv() {
         match r {
@@ -90,6 +101,10 @@ fn play(cat: &Catalog, rx: &Receiver<Request>, id: &str) {
     let Some(g) = cat.game(id) else {
         return;
     };
+    if id == "offline" {
+        cat.set_state(State::Ready(format!("{}: no machine is free", g.title)));
+        return;
+    }
     for place in (1..=3).rev() {
         let text = "Waiting for a free machine".to_string();
         cat.set_state(State::Launching { text, place });

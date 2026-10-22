@@ -124,7 +124,8 @@ impl Done {
 
 /// What `display` asks of the catalog.
 pub enum Request {
-    /// Start the game with this id (already checked to be listed).
+    /// Start the game with this id (already checked to be listed; the
+    /// state is `Launching` already). Any other state set after ends it.
     Launch(String),
     /// End the game or the launch: release the screen, close the rest.
     Stop(Done),
@@ -139,6 +140,8 @@ struct Shared {
     list_version: u64,
     games: Vec<Game>,
     covers: HashMap<String, Arc<Vec<u8>>>,
+    /// Bumped by each new cover: `display` asks again for missing ones.
+    covers_version: u64,
     /// `STATE` callers waiting for a new version: token, its deadline.
     waiters: Vec<(u64, u64)>,
 }
@@ -174,11 +177,11 @@ impl Catalog {
 
     /// Game `id`'s cover: `display` reads it when it shows the game.
     pub fn set_cover(&self, id: &str, c: &Cover) {
-        self.shared
-            .lock()
-            .unwrap()
-            .covers
-            .insert(id.to_string(), Arc::new(c.encode()));
+        let mut s = self.shared.lock().unwrap();
+        s.covers.insert(id.to_string(), Arc::new(c.encode()));
+        s.covers_version += 1;
+        s.version += 1;
+        answer_waiters(&mut s, u64::MAX);
     }
 
     pub fn game(&self, id: &str) -> Option<Game> {
@@ -197,6 +200,7 @@ fn state_msg(s: &Shared) -> Msg {
         s.list_version,
         s.games.len() as u64,
         s.state.place(),
+        s.covers_version,
     ];
     user::pack_at(0, &head, text).0
 }
@@ -247,6 +251,7 @@ pub fn connect() -> Result<(Catalog, Receiver<Request>)> {
             list_version: 1,
             games: Vec::new(),
             covers: HashMap::new(),
+            covers_version: 0,
             waiters: Vec::new(),
         })),
     };
@@ -356,8 +361,18 @@ fn launch(cat: &Catalog, m: &Msg, tx: &Sender<Request>) -> Msg {
         Ok(id) if valid_id(id) && cat.game(id).is_some() => id.to_string(),
         _ => return Msg::error(-ENOENT),
     };
+    let title = cat.game(&id).map(|g| g.title).unwrap_or_default();
+    // Launching from now: a quick failure is a newer version.
+    cat.set_state(State::Launching {
+        text: format!("Starting {}", title),
+        place: 0,
+    });
+    let version = cat.shared.lock().unwrap().version;
     match tx.send(Request::Launch(id)) {
-        Ok(()) => Msg::new(0, 0, 0),
-        Err(_) => Msg::error(-EINVAL),
+        Ok(()) => Msg::from_words(0, &[version]),
+        Err(_) => {
+            cat.set_state(State::Ready(String::new()));
+            Msg::error(-EINVAL)
+        }
     }
 }
