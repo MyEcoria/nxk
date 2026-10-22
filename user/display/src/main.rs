@@ -1429,7 +1429,8 @@ fn main() -> i32 {
     let mut prov: Option<catalog::Provider> = None;
     let (mut prov_retry_at, mut prov_fails) = (0u64, 0u32);
     let mut prov_key: Option<String> = None;
-    let mut prov_seen = false;
+    // The version of the launch's own ST_LAUNCHING (LAUNCH's reply).
+    let mut launch_version: Option<u64> = None;
     let mut prov_play: Option<u64> = None;
     let mut stop_at: Option<u64> = None;
     let mut shown_wait: Option<u64> = None;
@@ -1487,6 +1488,7 @@ fn main() -> i32 {
                 }
             }
             prov_key = None;
+            launch_version = None;
             ui.starting = None;
             stop_at = None;
         }};
@@ -1570,7 +1572,7 @@ fn main() -> i32 {
                             ui.play.started(&key);
                             let games = ui.take_games();
                             ui.set_games(games);
-                            (prov_key, prov_seen, prov_play) = (Some(key), false, None);
+                            (prov_key, launch_version, prov_play) = (Some(key), None, None);
                             if let Some(path) = play_path(&ui).filter(|_| play_loaded) {
                                 worker
                                     .jobs
@@ -1786,11 +1788,10 @@ fn main() -> i32 {
                 ui.set_services(services.clone());
                 // A catalog picked but gone from the card stays picked.
                 if !ui.service.is_empty() && !services.iter().any(|s| s.name == ui.service) {
-                    ui.prov = Some(catalog::View {
-                        state: provproto::ST_ERROR,
-                        text: format!("/services/{} is not on the card", ui.service),
-                        place: 0,
-                    });
+                    ui.prov = Some(catalog::View::local(
+                        provproto::ST_ERROR,
+                        format!("/services/{} is not on the card", ui.service),
+                    ));
                 }
                 if ui.service.is_empty() {
                     let found = games::scan(ui.take_games());
@@ -1824,11 +1825,10 @@ fn main() -> i32 {
                     match catalog::Provider::start(s, u, notif) {
                         Ok(p) => prov = Some(p),
                         Err(e) => {
-                            ui.prov = Some(catalog::View {
-                                state: provproto::ST_ERROR,
-                                text: format!("cannot start it: {}", libnx::abi::err::name(e)),
-                                place: 0,
-                            });
+                            ui.prov = Some(catalog::View::local(
+                                provproto::ST_ERROR,
+                                format!("cannot start it: {}", libnx::abi::err::name(e)),
+                            ));
                             prov_retry_at = now + 5_000_000_000;
                         }
                     }
@@ -2251,25 +2251,43 @@ fn main() -> i32 {
                 let now = time::now_ns();
                 dirty = true;
                 let up = prov.as_ref().map(|p| p.take()).unwrap_or_default();
+                if up.launched.is_some() && prov_key.is_some() {
+                    launch_version = up.launched;
+                }
                 if let Some(v) = up.view {
-                    match v.state {
-                        provproto::ST_LAUNCHING => prov_seen = true,
-                        provproto::ST_PLAYING => {
-                            prov_seen = true;
-                            ui.starting = None;
-                            if prov_key.is_some() {
-                                prov_play.get_or_insert(now);
-                            }
-                        }
-                        // Back from a game, or a launch that ended (a fresh
-                        // launch reads READY until the catalog takes it).
-                        _ if prov_seen || prov_play.is_some() => {
-                            catalog_game_over!(now);
-                            prov_seen = false;
-                        }
-                        _ => {}
+                    if ui.prov.as_ref().is_some_and(|o| o.covers != v.covers) {
+                        ui.covers_absent.clear();
                     }
                     ui.prov = Some(v);
+                }
+                // The launch's own state, or a newer one: playing, or over
+                // (READY with why, LOGIN, ERROR) even if LAUNCHING was missed.
+                let since_launch = ui
+                    .prov
+                    .as_ref()
+                    .zip(launch_version)
+                    .filter(|(v, lv)| v.version >= *lv)
+                    .map(|(v, lv)| (v.state, v.version > lv));
+                match since_launch {
+                    Some((provproto::ST_PLAYING, _)) => {
+                        ui.starting = None;
+                        prov_play.get_or_insert(now);
+                    }
+                    Some((provproto::ST_LAUNCHING, _)) | Some((_, false)) | None => {}
+                    Some(_) => {
+                        // Why it did not start, or how it ended.
+                        let why = ui.prov.as_ref().map_or(String::new(), |v| v.text.clone());
+                        if !why.is_empty() {
+                            ui.toast(why, now);
+                        }
+                        catalog_game_over!(now);
+                    }
+                }
+                if up.stopped {
+                    stop_at = None;
+                }
+                for (list, id, absent) in up.covers_missed {
+                    ui.cover_missed(list, &id, absent);
                 }
                 if let (Some((list, g)), Some(p)) = (up.games, &prov) {
                     if p.name == ui.service {
@@ -2285,7 +2303,7 @@ fn main() -> i32 {
                 }
                 for n in up.notes {
                     ui.starting = None;
-                    prov_key = None;
+                    (prov_key, launch_version) = (None, None);
                     ui.toast(n, now);
                 }
                 if up.stop_failed {
@@ -2300,24 +2318,23 @@ fn main() -> i32 {
                         release_game!();
                     }
                     catalog_game_over!(now);
-                    prov_seen = false;
                     println!("[display] {} ended (code {})", p.title, code);
                     // 137: ended by us (STOP unanswered, or another catalog picked).
                     if code != 0 && code != 137 {
                         ui.toast(format!("{} stopped (code {})", p.title, code), now);
                     }
-                    // Back after 2 s, then longer when it keeps failing.
+                    // Back after 2 s, then twice longer each time it fails
+                    // again within a minute (64 s at most).
                     prov_fails = if now - p.since > 60_000_000_000 {
                         1
                     } else {
                         prov_fails + 1
                     };
-                    prov_retry_at = now + (2_000_000_000u64 << prov_fails.min(5));
-                    ui.prov = Some(catalog::View {
-                        state: provproto::ST_ERROR,
-                        text: format!("{} stopped (code {}): starting it again", p.title, code),
-                        place: 0,
-                    });
+                    prov_retry_at = now + (2_000_000_000u64 << (prov_fails - 1).min(5));
+                    ui.prov = Some(catalog::View::local(
+                        provproto::ST_ERROR,
+                        format!("{} stopped (code {}): starting it again", p.title, code),
+                    ));
                 }
             }
             if ev & EV_DONE != 0 {

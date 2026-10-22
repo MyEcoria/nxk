@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use libnx::abi::err::{ESTALE, ETIMEDOUT};
+use libnx::abi::err::{ENOENT, ESTALE, ETIMEDOUT};
 use libnx::abi::proto::provider as proto;
 use libnx::fs;
 use libnx::ipc::{self, Msg};
@@ -70,10 +70,27 @@ fn exe(name: &str) -> String {
 /// What the home screen shows of the catalog.
 #[derive(Clone)]
 pub struct View {
+    /// Its version (0: made up by `display`, not the catalog's).
+    pub version: u64,
     pub state: u64,
     pub text: String,
     /// `ST_LAUNCHING`: the place in the queue (0: none).
     pub place: u64,
+    /// The covers' version: a new one may answer an `ENOENT`.
+    pub covers: u64,
+}
+
+impl View {
+    /// A state of `display`'s own (the catalog not running).
+    pub fn local(state: u64, text: String) -> Self {
+        Self {
+            version: 0,
+            state,
+            text,
+            place: 0,
+            covers: 0,
+        }
+    }
 }
 
 enum Cmd {
@@ -91,6 +108,13 @@ pub struct Update {
     pub games: Option<(u64, Vec<GameInfo>)>,
     /// Covers: list version, game id, the cover.
     pub covers: Vec<(u64, String, Vec<u8>)>,
+    /// Covers not read: list version, game id, and whether the catalog
+    /// has none yet (`ENOENT`) rather than the read being cut short.
+    pub covers_missed: Vec<(u64, String, bool)>,
+    /// A `LAUNCH` taken: the version of its `ST_LAUNCHING` state.
+    pub launched: Option<u64>,
+    /// A `STOP` answered.
+    pub stopped: bool,
     /// Calls that failed, for a toast.
     pub notes: Vec<String>,
     /// `STOP` got no answer in time: the catalog has to go.
@@ -308,15 +332,17 @@ fn watch_state(l: &Arc<Link>) {
                 continue;
             }
         };
-        let w: [u64; 5] = core::array::from_fn(|i| ipc::header(&r, i));
-        let n = ipc::unpack_at(&r, 5, &mut text);
+        let w: [u64; 6] = core::array::from_fn(|i| ipc::header(&r, i));
+        let n = ipc::unpack_at(&r, 6, &mut text);
         let view = View {
+            version: w[0],
             state: w[1],
             text: String::from_utf8_lossy(&text[..n])
                 .chars()
                 .take(300)
                 .collect(),
             place: w[4],
+            covers: w[5],
         };
         known = w[0];
         l.post(|u| u.view = Some(view));
@@ -393,61 +419,81 @@ fn run_cmds(l: &Arc<Link>) {
         match cmd {
             Cmd::Launch(id) => {
                 let m = ipc::pack(proto::LAUNCH, id.as_bytes());
-                if let Err(e) = ipc::call_timeout(ep, &m, LAUNCH_NS).and_then(ipc::checked) {
-                    let note = format!("cannot start {}: {}", id, libnx::abi::err::name(e));
-                    l.post(|u| u.notes.push(note));
+                match ipc::call_timeout(ep, &m, LAUNCH_NS).and_then(ipc::checked) {
+                    Ok(r) => {
+                        let v = ipc::header(&r, 0);
+                        l.post(|u| u.launched = Some(v));
+                    }
+                    Err(e) => {
+                        let note = format!("cannot start {}: {}", id, libnx::abi::err::name(e));
+                        l.post(|u| u.notes.push(note));
+                    }
                 }
             }
             Cmd::Stop => {
                 let m = Msg::new(proto::STOP, 0, 0);
-                if ipc::call_timeout(ep, &m, proto::STOP_NS)
-                    .and_then(ipc::checked)
-                    .is_err()
-                {
-                    l.post(|u| u.stop_failed = true);
+                match ipc::call_timeout(ep, &m, proto::STOP_NS).and_then(ipc::checked) {
+                    Ok(_) => l.post(|u| u.stopped = true),
+                    Err(_) => l.post(|u| u.stop_failed = true),
                 }
             }
-            Cmd::Covers(list, games) => {
-                for id in games {
-                    let at = {
-                        let s = l.sh.lock();
-                        if s.quit || !s.cmds.is_empty() || s.ids.0 != list {
-                            break;
-                        }
-                        s.ids.1.iter().position(|g| *g == id)
-                    };
-                    let cover = at.and_then(|i| read_cover(ep, list, i, &mut buf));
-                    if let Some(c) = cover {
-                        l.post(|u| u.covers.push((list, id, c)));
-                    }
-                }
-            }
+            Cmd::Covers(list, games) => read_covers(l, ep, list, games, &mut buf),
         }
     }
 }
 
-/// Cover `i` of list `list`, checked: square, `COVER_MAX` at most, all there.
-fn read_cover(ep: u32, list: u64, i: usize, buf: &mut [u8]) -> Option<Vec<u8>> {
+/// Covers `games` (ids) of list `list`, one by one; the ones not read go
+/// back to the UI, which asks again (an `ENOENT` once the covers change).
+fn read_covers(l: &Link, ep: u32, list: u64, games: Vec<String>, buf: &mut [u8]) {
+    let mut left = games.into_iter();
+    while let Some(id) = left.next() {
+        let at = {
+            let s = l.sh.lock();
+            if s.quit || !s.cmds.is_empty() || s.ids.0 != list {
+                None
+            } else {
+                Some(s.ids.1.iter().position(|g| *g == id))
+            }
+        };
+        let Some(at) = at else {
+            // Cut short by a newer request: the rest is asked again.
+            let rest: Vec<(u64, String, bool)> = core::iter::once(id)
+                .chain(left)
+                .map(|id| (list, id, false))
+                .collect();
+            l.post(|u| u.covers_missed.extend(rest));
+            return;
+        };
+        match at.map(|i| read_cover(ep, list, i, buf)) {
+            Some(Ok(c)) => l.post(|u| u.covers.push((list, id, c))),
+            Some(Err(e)) => l.post(|u| u.covers_missed.push((list, id, e == -ENOENT))),
+            None => l.post(|u| u.covers_missed.push((list, id, true))),
+        }
+    }
+}
+
+/// Cover `i` of list `list`, checked: square, `COVER_MAX` at most, all
+/// there (`EINVAL` when it is not).
+fn read_cover(ep: u32, list: u64, i: usize, buf: &mut [u8]) -> Result<Vec<u8>, i64> {
+    let bad = -libnx::abi::err::EINVAL;
     let mut out: Vec<u8> = Vec::new();
     let mut total = 0usize;
     loop {
         let m = Msg::from_words(proto::COVER, &[i as u64, list, out.len() as u64]);
-        let r = ipc::call_timeout(ep, &m, CALL_NS)
-            .and_then(ipc::checked)
-            .ok()?;
+        let r = ipc::call_timeout(ep, &m, CALL_NS).and_then(ipc::checked)?;
         let size = ipc::header(&r, 0) as usize;
         if out.is_empty() {
             if !(5..=COVER_BYTES).contains(&size) {
-                return None;
+                return Err(bad);
             }
             total = size;
             out.reserve_exact(total);
         } else if size != total {
-            return None;
+            return Err(bad);
         }
         let n = ipc::unpack_at(&r, 1, buf);
         if n == 0 || out.len() + n > total {
-            return None;
+            return Err(bad);
         }
         out.extend_from_slice(&buf[..n]);
         if out.len() == total {
@@ -459,7 +505,11 @@ fn read_cover(ep: u32, list: u64, i: usize, buf: &mut [u8]) -> Option<Vec<u8>> {
         && side <= proto::COVER_MAX
         && u16::from_le_bytes([out[2], out[3]]) as usize == side
         && total == 4 + 2 * side * side;
-    ok.then_some(out)
+    if ok {
+        Ok(out)
+    } else {
+        Err(bad)
+    }
 }
 
 /// A catalog's games as the UI keeps them, named `NAME~ID` (their play

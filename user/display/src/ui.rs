@@ -320,6 +320,9 @@ pub struct Ui {
     /// The catalog list `games` holds, and the covers asked of it.
     pub prov_list: u64,
     pub(crate) covers_asked: Vec<String>,
+    /// Covers the catalog had not (`ENOENT`): asked again when its covers
+    /// change.
+    pub covers_absent: Vec<String>,
 }
 
 impl Ui {
@@ -380,6 +383,7 @@ impl Ui {
             starting: None,
             prov_list: 0,
             covers_asked: Vec::new(),
+            covers_absent: Vec::new(),
         }
     }
 
@@ -547,6 +551,7 @@ impl Ui {
         self.prov = None;
         self.prov_list = 0;
         self.covers_asked.clear();
+        self.covers_absent.clear();
         self.home = 0;
         self.last_game = 0;
         self.scroll = 0.0;
@@ -585,13 +590,27 @@ impl Ui {
         let mut idx: Vec<usize> = (lo..=hi)
             .filter(|&i| {
                 let g = &self.games[i];
-                g.cover.is_none() && !self.covers_asked.contains(&g.id)
+                g.cover.is_none()
+                    && !self.covers_asked.contains(&g.id)
+                    && !self.covers_absent.contains(&g.id)
             })
             .collect();
         idx.sort_by_key(|&i| i.abs_diff(at));
         let want: Vec<String> = idx.iter().map(|&i| self.games[i].id.clone()).collect();
         self.covers_asked.extend(want.iter().cloned());
         (!want.is_empty()).then_some(want)
+    }
+
+    /// A cover not read: asked again soon, or once the catalog's covers
+    /// change when it had none (`absent`).
+    pub fn cover_missed(&mut self, list: u64, id: &str, absent: bool) {
+        if list != self.prov_list {
+            return;
+        }
+        self.covers_asked.retain(|a| a != id);
+        if absent && !self.covers_absent.iter().any(|a| a == id) {
+            self.covers_absent.push(id.into());
+        }
     }
 
     /// A catalog's cover arrived (for list `list`).
