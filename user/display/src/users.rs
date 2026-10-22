@@ -31,6 +31,9 @@ pub struct Profile {
     pub light: bool,
     /// Hash of the PIN (`pin_hash`).
     pub pin: Option<u64>,
+    /// The game catalog picked on the home screen (`catalog`; empty:
+    /// the console's own games).
+    pub service: String,
 }
 
 impl Profile {
@@ -42,6 +45,7 @@ impl Profile {
             glyph,
             light,
             pin: None,
+            service: String::new(),
         }
     }
 
@@ -60,6 +64,9 @@ impl Profile {
         if let Some(p) = self.pin {
             t.push_str(&format!("pin={:016x}\n", p));
         }
+        if !self.service.is_empty() {
+            t.push_str(&format!("service={}\n", self.service));
+        }
         t
     }
 
@@ -76,6 +83,7 @@ impl Profile {
                 "glyph" => p.glyph = v.parse::<u8>().unwrap_or(0) % GLYPHS as u8,
                 "theme" => p.light = v == "light",
                 "pin" => p.pin = u64::from_str_radix(v, 16).ok(),
+                "service" => p.service = v.chars().take(64).collect(),
                 _ => {}
             }
         }

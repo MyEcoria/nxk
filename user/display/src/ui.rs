@@ -12,10 +12,11 @@ use libnx::abi::proto::{cpufreq, fan, gpu, input, power};
 
 use crate::art;
 use crate::backlight::MIN_PCT;
+use crate::catalog::{ServiceInfo, View};
 use crate::config::{Config, SLEEP_MIN};
 use crate::flow::Flow;
 use crate::font::{self, Face};
-use crate::games::GameInfo;
+use crate::games::{Cover, GameInfo};
 use crate::playtime::Playtime;
 use crate::screen::{mix, Screen};
 use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
@@ -25,6 +26,12 @@ use crate::theme::{self, pal};
 use crate::users::Users;
 use crate::widgets::{battery, button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
 use crate::Messages;
+
+/// The console's own games (`/games`), the first catalog.
+pub const INTERN: &str = "Intern";
+/// Covers kept around the selected game of a catalog, and read ahead.
+const COVERS_KEPT: usize = 16;
+const COVERS_AHEAD: usize = 6;
 
 /// The layout is made for the Switch's 1280x720 (landscape).
 pub const W: usize = 1280;
@@ -148,6 +155,10 @@ pub enum Id {
     FlowBack,
     FlowSkip,
     LockOther,
+    /// A catalog's tab on the home screen, by index in `Ui::services`.
+    Service(usize),
+    /// Cancel the catalog game being started.
+    Cancel,
 }
 
 /// What a tap asks the service to do.
@@ -192,6 +203,10 @@ pub enum Action {
     UserDelete(usize),
     /// Erase user `n`'s saves of the game at this index of `Ui::saves`.
     EraseSave(usize, usize),
+    /// Show the games of catalog `n` of `Ui::services`.
+    Service(usize),
+    /// Stop the catalog game being started.
+    Cancel,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -293,6 +308,18 @@ pub struct Ui {
     drag: Option<(Id, usize, usize)>,
     /// Wall clock of the frame being drawn.
     pub(crate) wall: u64,
+    /// The game catalogs ("services"): name, title; the console's own
+    /// games first, with no name.
+    pub(crate) services: Vec<(String, String)>,
+    /// The catalog shown, by name (empty: the console's own games).
+    pub service: String,
+    /// The running catalog's state; `None` with the console's games.
+    pub prov: Option<View>,
+    /// The catalog game being started: its title, cover, when.
+    pub starting: Option<(String, Option<Cover>, u64)>,
+    /// The catalog list `games` holds, and the covers asked of it.
+    pub prov_list: u64,
+    pub(crate) covers_asked: Vec<String>,
 }
 
 impl Ui {
@@ -347,6 +374,12 @@ impl Ui {
             nav_at: 0,
             drag: None,
             wall: 0,
+            services: alloc::vec![(String::new(), INTERN.into())],
+            service: String::new(),
+            prov: None,
+            starting: None,
+            prov_list: 0,
+            covers_asked: Vec::new(),
         }
     }
 
@@ -438,7 +471,16 @@ impl Ui {
     pub fn set_games(&mut self, mut v: Vec<GameInfo>) {
         let kept = self.games.get(self.home).map(|g| g.name.clone());
         let order = |g: &GameInfo| self.play.get(&g.name).map_or(0, |e| e.order);
-        v.sort_by(|a, b| order(b).cmp(&order(a)).then_with(|| a.title.cmp(&b.title)));
+        // A catalog's own order stands after the last played (stable sort).
+        v.sort_by(|a, b| {
+            order(b).cmp(&order(a)).then_with(|| {
+                if a.id.is_empty() {
+                    a.title.cmp(&b.title)
+                } else {
+                    core::cmp::Ordering::Equal
+                }
+            })
+        });
         let old = self.games.len();
         self.home = match kept {
             Some(name) => v.iter().position(|g| g.name == name).unwrap_or(0),
@@ -456,6 +498,110 @@ impl Ui {
 
     pub fn game(&self, i: usize) -> Option<&GameInfo> {
         self.games.get(i)
+    }
+
+    /// The catalogs on the card, after the console's own games.
+    pub fn set_services(&mut self, list: Vec<ServiceInfo>) {
+        self.services.truncate(1);
+        self.services
+            .extend(list.into_iter().map(|s| (s.name, s.title)));
+        // The one picked keeps its tab while it is not on the card.
+        if !self.service.is_empty() && !self.services.iter().any(|(n, _)| *n == self.service) {
+            self.services
+                .push((self.service.clone(), self.service.clone()));
+        }
+    }
+
+    /// The catalog shown, by index in `services` (0 if it is gone).
+    pub fn service_index(&self) -> usize {
+        self.services
+            .iter()
+            .position(|(n, _)| *n == self.service)
+            .unwrap_or(0)
+    }
+
+    /// A catalog game is starting or running: the catalog must stay.
+    pub fn catalog_busy(&self) -> bool {
+        self.starting.is_some()
+            || self.prov.as_ref().is_some_and(|v| {
+                matches!(
+                    v.state,
+                    libnx::abi::proto::provider::ST_LAUNCHING
+                        | libnx::abi::proto::provider::ST_PLAYING
+                )
+            })
+    }
+
+    /// Show catalog `k`'s games: the list goes, the catalog's comes.
+    pub fn pick_service(&mut self, k: usize) {
+        if let Some((name, _)) = self.services.get(k) {
+            self.show_service(name.clone());
+        }
+    }
+
+    /// Show the games of the catalog named `name` (a user's choice; it
+    /// may not be on the card yet).
+    pub fn show_service(&mut self, name: String) {
+        self.service = name;
+        self.games.clear();
+        self.prov = None;
+        self.prov_list = 0;
+        self.covers_asked.clear();
+        self.home = 0;
+        self.last_game = 0;
+        self.scroll = 0.0;
+        self.scroll_to = 0.0;
+    }
+
+    /// L or R on the home screen: the catalog before or after.
+    fn step_service(&mut self, next: bool) -> Option<Action> {
+        let n = self.services.len();
+        let k = self.service_index();
+        Some(Action::Service(if next {
+            (k + 1) % n
+        } else {
+            (k + n - 1) % n
+        }))
+    }
+
+    /// A catalog's covers to read now (the games near the selection), the
+    /// ones far from it dropped.
+    pub fn want_covers(&mut self) -> Option<Vec<String>> {
+        if self.service.is_empty() || self.page != LIBRARY || self.games.is_empty() {
+            return None;
+        }
+        let at = self.last_game.min(self.games.len() - 1);
+        let mut near = Vec::new();
+        for (i, g) in self.games.iter_mut().enumerate() {
+            if i.abs_diff(at) > COVERS_KEPT {
+                g.cover = None;
+            } else {
+                near.push(g.id.clone());
+            }
+        }
+        self.covers_asked.retain(|id| near.contains(id));
+        let lo = at.saturating_sub(COVERS_AHEAD);
+        let hi = (at + COVERS_AHEAD).min(self.games.len() - 1);
+        let mut idx: Vec<usize> = (lo..=hi)
+            .filter(|&i| {
+                let g = &self.games[i];
+                g.cover.is_none() && !self.covers_asked.contains(&g.id)
+            })
+            .collect();
+        idx.sort_by_key(|&i| i.abs_diff(at));
+        let want: Vec<String> = idx.iter().map(|&i| self.games[i].id.clone()).collect();
+        self.covers_asked.extend(want.iter().cloned());
+        (!want.is_empty()).then_some(want)
+    }
+
+    /// A catalog's cover arrived (for list `list`).
+    pub fn set_cover(&mut self, list: u64, id: &str, c: Cover) {
+        if list != self.prov_list {
+            return;
+        }
+        if let Some(g) = self.games.iter_mut().find(|g| g.id == id) {
+            g.cover = Some(c);
+        }
     }
 
     pub fn animating(&self) -> bool {
@@ -659,9 +805,22 @@ impl Ui {
         if self.flow.is_some() && !open {
             return self.flow_pad(code);
         }
+        if self.page == LIBRARY && !open && self.starting.is_some() {
+            return match code {
+                BTN_B | BTN_HOME => Some(Action::Cancel),
+                _ => None,
+            };
+        }
         if self.page == LIBRARY && !open {
             if let Some(a) = self.home_pad(code) {
                 return a;
+            }
+        }
+        if self.page == LIBRARY && !open && self.services.len() > 1 && !self.catalog_busy() {
+            match code {
+                BTN_L => return self.step_service(false),
+                BTN_R => return self.step_service(true),
+                _ => {}
             }
         }
         if let (Some(f), BTN_LEFT | BTN_RIGHT) = (self.focus, code) {
@@ -793,6 +952,9 @@ impl Ui {
                 self.sheet = None;
             }
             Id::StatusQuick => self.toggle_quick(),
+            Id::Service(k) if !self.catalog_busy() => return Some(Action::Service(k)),
+            Id::Service(_) => {}
+            Id::Cancel => return Some(Action::Cancel),
             Id::Game(i) if self.home == i => return Some(Action::Launch(i)),
             Id::Game(i) => {
                 self.home = i;
@@ -1019,6 +1181,10 @@ impl Ui {
                 _ => self.logs(s, msgs),
             }
             self.top_bar(s, d);
+            if self.page == LIBRARY && self.starting.is_some() {
+                self.zones.clear();
+                self.launch_card(s, now);
+            }
         }
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
@@ -1167,6 +1333,7 @@ impl Ui {
         let p = pal();
         let cy = STATUS_Y;
         if self.page == LIBRARY {
+            self.service_tabs(s);
             match self.users.active() {
                 Some(u) => crate::avatar::avatar(s, 94, cy, 30, u.color, u.glyph),
                 None => {

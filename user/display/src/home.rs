@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::proto::{input, power};
+use libnx::abi::proto::{input, power, provider};
 
 use crate::art;
 use crate::font::{self, Face};
@@ -15,8 +15,10 @@ use crate::screen::Screen;
 use crate::stats::{Data, Seen};
 use crate::status::usb_short;
 use crate::theme::{pal, BLACK, WHITE};
-use crate::ui::{Action, Id, Ui, CONTROLLERS, LOGS, NETWORK, SETTINGS, SYSTEM, TERMINAL, W};
-use crate::widgets::{fit, icon, Icon};
+use crate::ui::{
+    Action, Id, Ui, CONTROLLERS, H, LOGS, NETWORK, SETTINGS, STATUS_Y, SYSTEM, TERMINAL, W,
+};
+use crate::widgets::{button_glyph, fit, icon, Icon, Tone};
 
 /// The round buttons under the game row, in `art::button` / `art::head` order.
 pub const BUTTONS: [&str; 7] = [
@@ -215,14 +217,10 @@ impl Ui {
                 s.fill_round(x, ICON_Y, ICON, ICON, ICON_R, p.surface);
                 s.ring_round(x, ICON_Y, ICON, ICON, ICON_R, 2, p.rule);
                 if n == 0 && i == 0 {
-                    s.label_c(x + ICON / 2, ICON_Y + 108, "No games", Face::BodyB, p.text);
-                    s.label_c(
-                        x + ICON / 2,
-                        ICON_Y + 148,
-                        "Copy them to /games",
-                        Face::Cap,
-                        p.dim,
-                    );
+                    let (head, line) = self.empty_text();
+                    let line = fit(Face::Cap, &line, ICON - 24);
+                    s.label_c(x + ICON / 2, ICON_Y + 108, head, Face::BodyB, p.text);
+                    s.label_c(x + ICON / 2, ICON_Y + 148, &line, Face::Cap, p.dim);
                 }
             }
         }
@@ -313,6 +311,110 @@ impl Ui {
         }
     }
 
+    /// What an empty game row says: the console's games, or the catalog's
+    /// state (loading, an account to sign in, why it is unavailable).
+    fn empty_text(&self) -> (&'static str, String) {
+        if self.service.is_empty() {
+            return ("No games", "Copy them to /games".into());
+        }
+        let Some(v) = &self.prov else {
+            return ("Starting", "The service is on its way".into());
+        };
+        let first = v.text.lines().next().unwrap_or("").into();
+        match v.state {
+            provider::ST_LOADING => ("Loading", first),
+            provider::ST_LOGIN => ("Sign in", first),
+            provider::ST_ERROR => ("Unavailable", first),
+            _ if first.is_empty() => ("No games", "This service lists none".into()),
+            _ => ("No games", first),
+        }
+    }
+
+    /// The catalogs' tabs at the top of the home screen (L and R move
+    /// between them), when the card has any.
+    pub(crate) fn service_tabs(&mut self, s: &mut Screen) {
+        if self.services.len() < 2 {
+            return;
+        }
+        let p = pal();
+        const PAD: usize = 22;
+        const GAP: usize = 10;
+        const TAB_H: usize = 44;
+        let widths: Vec<usize> = self
+            .services
+            .iter()
+            .map(|(_, t)| font::width(Face::BodyB, t) + 2 * PAD)
+            .collect();
+        let total = widths.iter().sum::<usize>() + GAP * (widths.len() - 1);
+        let mut x = W.saturating_sub(total) / 2;
+        let y = STATUS_Y - TAB_H / 2;
+        let cur = self.service_index();
+        button_glyph(s, x.saturating_sub(28), STATUS_Y, "L", p.dim, p.bg);
+        for (k, w) in widths.into_iter().enumerate() {
+            let title = self.services[k].1.clone();
+            if k == cur {
+                s.fill_round(x, y, w, TAB_H, TAB_H / 2, p.accent);
+                s.label_c(x + w / 2, STATUS_Y, &title, Face::BodyB, p.on_accent);
+            } else {
+                s.ring_round(x, y, w, TAB_H, TAB_H / 2, 2, p.rule);
+                s.label_c(x + w / 2, STATUS_Y, &title, Face::Body, p.dim);
+            }
+            self.zone(Id::Service(k), x, y, w, TAB_H, TAB_H / 2);
+            x += w + GAP;
+        }
+        button_glyph(s, x - GAP + 28, STATUS_Y, "R", p.dim, p.bg);
+    }
+
+    /// A catalog game starting: its cover, the catalog's words, the place
+    /// in its queue and the time waited; B cancels.
+    pub(crate) fn launch_card(&mut self, s: &mut Screen, now: u64) {
+        let Some((title, cover, since)) = &self.starting else {
+            return;
+        };
+        let p = pal();
+        let (title, since) = (title.clone(), *since);
+        s.fill_alpha(0, 0, W, H, BLACK, 150);
+        let (cw, ch) = (640, 300);
+        let (x, y) = ((W - cw) / 2, (H - ch) / 2);
+        s.fill_round(x, y, cw, ch, 24, p.surface);
+        let art = 180;
+        match cover.as_ref().and_then(|c| c.image()) {
+            Some(img) => s.image(&img, x + 40, y + 40, art, art, ICON_R),
+            None => s.fill_round(x + 40, y + 40, art, art, ICON_R, p.raised),
+        }
+        let tx = x + 40 + art + 32;
+        let tw = cw - (tx - x) - 32;
+        let head = fit(Face::TitleB, &format!("Starting {}", title), tw);
+        s.label(tx, y + 66, &head, Face::TitleB, p.text);
+        let v = self.prov.as_ref();
+        let text = v.map_or(String::new(), |v| v.text.clone());
+        let text = fit(Face::Body, text.lines().next().unwrap_or(""), tw);
+        s.label(tx, y + 112, &text, Face::Body, p.dim);
+        if let Some(place) = v.map(|v| v.place).filter(|&q| q > 0) {
+            s.label(
+                tx,
+                y + 150,
+                &format!("Place in queue: {}", place),
+                Face::CapB,
+                p.accent,
+            );
+        }
+        let secs = now.saturating_sub(since) / 1_000_000_000;
+        s.label(tx, y + 182, &format!("{} s", secs), Face::Cap, p.dim);
+        self.button(
+            s,
+            Id::Cancel,
+            tx,
+            y + ch - 84,
+            180,
+            52,
+            "Cancel",
+            Tone::Plain,
+            true,
+        );
+        button_glyph(s, tx + 200, y + ch - 58, "B", p.dim, p.surface);
+    }
+
     /// A zone for an item drawn at row coordinate `x`, the row shifted by
     /// `off`: only its visible part on the screen.
     #[allow(clippy::too_many_arguments)]
@@ -329,7 +431,7 @@ impl Ui {
 
 /// A game's square icon from its `cover.bin`, or its title on its color.
 fn game_icon(s: &mut Screen, g: &GameInfo, x: usize, y: usize) {
-    match g.cover.as_deref().and_then(|c| art::get(c, art::ICON)) {
+    match g.cover.as_ref().and_then(|c| c.image()) {
         Some(img) => s.image(&img, x, y, ICON, ICON, ICON_R),
         None => {
             s.fill_round(x, y, ICON, ICON, ICON_R, g.color);

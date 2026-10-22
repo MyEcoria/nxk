@@ -19,6 +19,7 @@ extern crate alloc;
 mod art;
 mod avatar;
 mod backlight;
+mod catalog;
 mod config;
 mod controllers;
 mod dcgate;
@@ -49,8 +50,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use libnx::abi::err::{EINVAL, EIO, ENODEV};
+use libnx::abi::err::{EINVAL, EIO, ENODEV, EPERM};
 use libnx::abi::proto::gpu as gpuproto;
+use libnx::abi::proto::provider as provproto;
 use libnx::abi::proto::{
     audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, power, wifi,
 };
@@ -562,6 +564,8 @@ fn sleep_steps(
         if saved.is_some() {
             return;
         }
+        // A catalog ends what needs the network before Wi-Fi goes.
+        catalog::tell_sleeper(libnx::abi::proto::SUSPEND, SLEEP_CALL_NS);
         tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
         if let Some(v) = hw.ov {
             let _l = link.lock();
@@ -685,6 +689,7 @@ fn sleep_steps(
     awake.notify_all();
     let back = time::now_ns();
     tell_sleepers(libnx::abi::proto::RESUME, SLEEPERS.iter().rev());
+    catalog::tell_sleeper(libnx::abi::proto::RESUME, SLEEP_CALL_NS);
     println!(
         "[display] awake: picture in {} ms, services in {} ms",
         back.saturating_sub(at) / 1_000_000,
@@ -819,7 +824,9 @@ fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Con
             | Action::UserSave(..)
             | Action::UserActivate(_)
             | Action::UserDelete(_)
-            | Action::EraseSave(..) => continue,
+            | Action::EraseSave(..)
+            | Action::Service(_)
+            | Action::Cancel => continue,
         };
         w.done.lock().push_back(done);
         let _ = sys::notify_signal(notif, EV_DONE);
@@ -887,7 +894,7 @@ fn take_screen(
         images.push(m);
     }
     for (i, m) in images.iter().enumerate() {
-        let h2 = sys::handle_dup(m.handle(), MAP | DMA | GRANT | DUP, 0)?;
+        let h2 = sys::handle_dup(m.handle(), MAP | WRITE | DMA | GRANT | DUP, 0)?;
         ipc::set_send_handle(i, h2);
         sent.push(h2);
     }
@@ -1231,8 +1238,9 @@ fn activate(ui: &mut Ui, i: usize) -> bool {
     let Some(p) = ui.users.list.get(i) else {
         return false;
     };
-    let (id, light) = (p.id.clone(), p.light);
+    let (id, light, service) = (p.id.clone(), p.light, p.service.clone());
     ui.users.current = Some(i);
+    ui.show_service(service);
     ui.apply_theme(light);
     let _ = users::write_last(&id);
     let loaded = playtime::Playtime::load(&users::playtime_path(&id));
@@ -1413,6 +1421,18 @@ fn main() -> i32 {
         notif,
     };
     let (mut next_scan, mut next_live) = (0u64, 0u64);
+    // The catalogs on the card, the one running (for the user and the
+    // catalog shown), when it may start again after a failure (and how many
+    // failed in a row), its game's play time key and start, and when a
+    // STOP it got unanswered ends it.
+    let mut services: Vec<catalog::ServiceInfo> = Vec::new();
+    let mut prov: Option<catalog::Provider> = None;
+    let (mut prov_retry_at, mut prov_fails) = (0u64, 0u32);
+    let mut prov_key: Option<String> = None;
+    let mut prov_seen = false;
+    let mut prov_play: Option<u64> = None;
+    let mut stop_at: Option<u64> = None;
+    let mut shown_wait: Option<u64> = None;
     // Over a game: the overlay window's area of the UI's image (None: off), the
     // finger the overlay follows, and the frames counted while the drawer
     // is open (since, flips, longest gap, last flip, longest redraw).
@@ -1448,6 +1468,27 @@ fn main() -> i32 {
             dirty = true;
             next_refresh = 0;
             last_input = time::now_ns();
+        }};
+    }
+    // A catalog game is over: its play time counted and saved.
+    macro_rules! catalog_game_over {
+        ($now:expr) => {{
+            if let (Some(since), Some(key)) = (prov_play.take(), prov_key.as_ref()) {
+                let secs = ($now - since) / 1_000_000_000;
+                ui.play.ended(key, secs, time::realtime_ns());
+                if play_loaded {
+                    if let Some(path) = play_path(&ui) {
+                        worker
+                            .jobs
+                            .lock()
+                            .push_back(Job::SavePlay(path, ui.play.text()));
+                        worker.wake.notify_one();
+                    }
+                }
+            }
+            prov_key = None;
+            ui.starting = None;
+            stop_at = None;
         }};
     }
     // Latest volume wins in the worker's queue; the config is saved a bit later.
@@ -1512,6 +1553,57 @@ fn main() -> i32 {
             let now = $now;
             match $action {
                 Some(Action::ClearLogs) => msgs.clear(),
+                Some(Action::Launch(i)) if !ui.service.is_empty() => {
+                    let ready = prov.as_ref().filter(|p| p.pid().is_some());
+                    match (ready, ui.game(i)) {
+                        _ if ui.users.active().is_none() => {
+                            ui.toast("Nobody is playing: set up a user first".into(), now)
+                        }
+                        _ if launcher.running.is_some() || ui.catalog_busy() => {
+                            ui.toast("A game is running".into(), now)
+                        }
+                        (Some(p), Some(g)) => {
+                            p.launch(&g.id);
+                            let (key, title, cover) =
+                                (g.name.clone(), g.title.clone(), g.cover.clone());
+                            ui.starting = Some((title, cover, now));
+                            ui.play.started(&key);
+                            let games = ui.take_games();
+                            ui.set_games(games);
+                            (prov_key, prov_seen, prov_play) = (Some(key), false, None);
+                            if let Some(path) = play_path(&ui).filter(|_| play_loaded) {
+                                worker
+                                    .jobs
+                                    .lock()
+                                    .push_back(Job::SavePlay(path, ui.play.text()));
+                                worker.wake.notify_one();
+                            }
+                        }
+                        _ => ui.toast("The service is not ready".into(), now),
+                    }
+                }
+                Some(Action::Service(k)) => {
+                    if !ui.catalog_busy() {
+                        ui.pick_service(k);
+
+                        if let Some(c) = ui.users.current {
+                            if let Some(p) = ui.users.list.get_mut(c) {
+                                p.service = ui.service.clone();
+                                worker.jobs.lock().push_back(Job::Profile(p.clone()));
+                                worker.wake.notify_one();
+                            }
+                        }
+                        next_scan = 0;
+                    }
+                }
+                Some(Action::Cancel) => {
+                    if let Some(p) = &prov {
+                        p.stop();
+                        stop_at.get_or_insert(now + provproto::STOP_NS);
+                    } else {
+                        ui.starting = None;
+                    }
+                }
                 Some(Action::Launch(i)) => {
                     if launcher.launch(&mut ui, i) && play_loaded {
                         if let Some(path) = play_path(&ui) {
@@ -1571,7 +1663,7 @@ fn main() -> i32 {
                     }
                 }
                 Some(Action::UserActivate(i)) => {
-                    if launcher.running.is_some() {
+                    if launcher.running.is_some() || ui.catalog_busy() {
                         ui.toast("Close the game first".into(), now);
                     } else {
                         play_loaded = activate(&mut ui, i);
@@ -1581,7 +1673,7 @@ fn main() -> i32 {
                     }
                 }
                 Some(Action::UserDelete(i)) => {
-                    if launcher.running.is_some() {
+                    if launcher.running.is_some() || ui.catalog_busy() {
                         ui.toast("Close the game first".into(), now);
                     } else if let Some(dir) = ui.users.list.get(i).map(|p| p.dir()) {
                         worker.jobs.lock().push_back(Job::RemoveTree(dir));
@@ -1690,15 +1782,66 @@ fn main() -> i32 {
                 dirty = true;
             }
             if ui.page == ui::LIBRARY && now >= next_scan {
-                let found = games::scan(ui.take_games());
-                next_scan = now
-                    + if found.is_empty() {
-                        3_000_000_000
-                    } else {
-                        SCAN_NS
-                    };
-                ui.set_games(found);
+                services = catalog::scan();
+                ui.set_services(services.clone());
+                // A catalog picked but gone from the card stays picked.
+                if !ui.service.is_empty() && !services.iter().any(|s| s.name == ui.service) {
+                    ui.prov = Some(catalog::View {
+                        state: provproto::ST_ERROR,
+                        text: format!("/services/{} is not on the card", ui.service),
+                        place: 0,
+                    });
+                }
+                if ui.service.is_empty() {
+                    let found = games::scan(ui.take_games());
+                    next_scan = now
+                        + if found.is_empty() {
+                            3_000_000_000
+                        } else {
+                            SCAN_NS
+                        };
+                    ui.set_games(found);
+                } else {
+                    next_scan = now + SCAN_NS;
+                }
                 dirty = true;
+            }
+            // The catalog shown runs for the user playing; another one goes.
+            let want = (!ui.service.is_empty())
+                .then(|| services.iter().find(|s| s.name == ui.service))
+                .flatten()
+                .zip(ui.users.active());
+            let same = match (&prov, want) {
+                (Some(p), Some((s, u))) => p.name == s.name && p.user == u.id,
+                (None, None) => true,
+                _ => false,
+            };
+            if !same && !ui.catalog_busy() {
+                if prov.take().is_some() {
+                    ui.prov = None;
+                }
+                if let Some((s, u)) = want.filter(|_| now >= prov_retry_at) {
+                    match catalog::Provider::start(s, u, notif) {
+                        Ok(p) => prov = Some(p),
+                        Err(e) => {
+                            ui.prov = Some(catalog::View {
+                                state: provproto::ST_ERROR,
+                                text: format!("cannot start it: {}", libnx::abi::err::name(e)),
+                                place: 0,
+                            });
+                            prov_retry_at = now + 5_000_000_000;
+                        }
+                    }
+                    dirty = true;
+                }
+            }
+            if prov.as_ref().is_some_and(|p| p.pid().is_some()) && ui.prov_list != 0 {
+                if let (Some(p), Some(ids)) = (&prov, ui.want_covers()) {
+                    p.covers(ui.prov_list, ids);
+                }
+            }
+            if prov.is_none() && !ui.service.is_empty() && prov_retry_at > now {
+                wake = wake.min(prov_retry_at);
             }
             if ui.animating() {
                 dirty = true;
@@ -1730,6 +1873,12 @@ fn main() -> i32 {
                 blink = now / BLINK_NS;
                 dirty = true;
             }
+            // The launch card counts the seconds waited.
+            let waited = ui.starting.as_ref().map(|s| (now - s.2) / 1_000_000_000);
+            if waited.is_some() && waited != shown_wait {
+                shown_wait = waited;
+                dirty = true;
+            }
             if ui.deadline().is_some_and(|d| now >= d) {
                 dirty = true;
             }
@@ -1751,6 +1900,9 @@ fn main() -> i32 {
             if terminal {
                 wake = wake.min((blink + 1) * BLINK_NS);
             }
+            if let (Some(st), Some(n)) = (&ui.starting, shown_wait) {
+                wake = wake.min(st.2 + (n + 1) * 1_000_000_000);
+            }
             if let Some(d) = ui.deadline() {
                 wake = wake.min(d);
             }
@@ -1762,6 +1914,17 @@ fn main() -> i32 {
             }
             if ui.animating() {
                 wake = wake.min(now + ui.frame_ns());
+            }
+        }
+        if let Some(at) = stop_at {
+            if now >= at {
+                stop_at = None;
+                if let Some(p) = &prov {
+                    println!("[display] {}: no answer to STOP, ended", p.title);
+                    p.kill();
+                }
+            } else {
+                wake = wake.min(at);
             }
         }
         if let Some(g) = &game {
@@ -1844,7 +2007,22 @@ fn main() -> i32 {
                 if game.is_some() && batch.iter().any(home) {
                     let pressed = batch.iter().any(|e| home(e) && e.2 == 1);
                     batch.retain(|e| !home(e));
-                    if pressed && !launcher.stop() {
+                    let owner = game.as_ref().map(|g| g.owner);
+                    let catalog_game = prov
+                        .as_ref()
+                        .filter(|p| p.pid().is_some() && p.pid() == owner);
+                    if let (true, Some(p)) = (pressed, catalog_game) {
+                        if stop_at.is_none() {
+                            p.stop();
+                            stop_at = Some(now + provproto::STOP_NS);
+                            let title = prov_key
+                                .as_ref()
+                                .and_then(|k| ui.games.iter().find(|g| g.name == *k))
+                                .map_or(p.title.clone(), |g| g.title.clone());
+                            ui.toast(format!("Closing {}", title), now);
+                            dirty = true;
+                        }
+                    } else if pressed && !launcher.stop() {
                         release_game!();
                     }
                 }
@@ -2069,6 +2247,79 @@ fn main() -> i32 {
                     }
                 }
             }
+            if ev & catalog::EV_PROV != 0 {
+                let now = time::now_ns();
+                dirty = true;
+                let up = prov.as_ref().map(|p| p.take()).unwrap_or_default();
+                if let Some(v) = up.view {
+                    match v.state {
+                        provproto::ST_LAUNCHING => prov_seen = true,
+                        provproto::ST_PLAYING => {
+                            prov_seen = true;
+                            ui.starting = None;
+                            if prov_key.is_some() {
+                                prov_play.get_or_insert(now);
+                            }
+                        }
+                        // Back from a game, or a launch that ended (a fresh
+                        // launch reads READY until the catalog takes it).
+                        _ if prov_seen || prov_play.is_some() => {
+                            catalog_game_over!(now);
+                            prov_seen = false;
+                        }
+                        _ => {}
+                    }
+                    ui.prov = Some(v);
+                }
+                if let (Some((list, g)), Some(p)) = (up.games, &prov) {
+                    if p.name == ui.service {
+                        let mut old = ui.take_games();
+                        let merged = catalog::merge(&p.name, g, &mut old);
+                        ui.prov_list = list;
+                        ui.covers_asked.clear();
+                        ui.set_games(merged);
+                    }
+                }
+                for (list, id, c) in up.covers {
+                    ui.set_cover(list, &id, catalog::cover(c));
+                }
+                for n in up.notes {
+                    ui.starting = None;
+                    prov_key = None;
+                    ui.toast(n, now);
+                }
+                if up.stop_failed {
+                    if let Some(p) = &prov {
+                        println!("[display] {}: STOP failed, ended", p.title);
+                        p.kill();
+                    }
+                }
+                if let Some((code, p)) = up.exit.and_then(|c| prov.take().map(|p| (c, p))) {
+                    let owned_by = game.as_ref().map(|g| g.owner);
+                    if p.pid().is_some() && p.pid() == owned_by {
+                        release_game!();
+                    }
+                    catalog_game_over!(now);
+                    prov_seen = false;
+                    println!("[display] {} ended (code {})", p.title, code);
+                    // 137: ended by us (STOP unanswered, or another catalog picked).
+                    if code != 0 && code != 137 {
+                        ui.toast(format!("{} stopped (code {})", p.title, code), now);
+                    }
+                    // Back after 2 s, then longer when it keeps failing.
+                    prov_fails = if now - p.since > 60_000_000_000 {
+                        1
+                    } else {
+                        prov_fails + 1
+                    };
+                    prov_retry_at = now + (2_000_000_000u64 << prov_fails.min(5));
+                    ui.prov = Some(catalog::View {
+                        state: provproto::ST_ERROR,
+                        text: format!("{} stopped (code {}): starting it again", p.title, code),
+                        place: 0,
+                    });
+                }
+            }
             if ev & EV_DONE != 0 {
                 let batch: Vec<Done> = worker.done.lock().drain(..).collect();
                 let now = time::now_ns();
@@ -2241,6 +2492,29 @@ fn main() -> i32 {
                 }
             }
             proto::SCANOUT => Msg::error(-ENODEV),
+            proto::PROVIDER => {
+                let h = if rx.msg.handles() > 0 {
+                    ipc::received_handle(0)
+                } else {
+                    0
+                };
+                let said = prov.as_mut().filter(|p| p.pid().is_none()).map(|p| {
+                    let ok = p.hello(rx.msg.mr[0], rx.pid, h);
+                    if ok {
+                        println!("[display] {}: catalog up (pid {})", p.title, rx.pid);
+                    }
+                    ok
+                });
+                match said {
+                    Some(true) => Msg::new(0, 0, 0),
+                    _ => {
+                        if h != 0 {
+                            let _ = sys::handle_close(h);
+                        }
+                        Msg::error(-EPERM)
+                    }
+                }
+            }
             proto::RELEASE if game.is_some() => {
                 release_game!();
                 Msg::new(0, 0, 0)

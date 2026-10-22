@@ -23,8 +23,26 @@ pub struct GameInfo {
     /// Card color, A B G R (as the screen's).
     pub color: u32,
     pub exe: String,
-    /// `cover.bin`, checked.
-    pub cover: Option<Vec<u8>>,
+    /// A catalog's game: its id there (`exe` is empty).
+    pub id: String,
+    pub cover: Option<Cover>,
+}
+
+/// A game's art, checked: `cover.bin` (paletted) or a catalog's
+/// (`art::direct`).
+#[derive(Clone)]
+pub enum Cover {
+    Art(Vec<u8>),
+    Direct(Vec<u8>),
+}
+
+impl Cover {
+    pub fn image(&self) -> Option<art::Image<'_>> {
+        match self {
+            Cover::Art(c) => art::get(c, art::ICON),
+            Cover::Direct(c) => art::direct(c),
+        }
+    }
 }
 
 /// The games, by title; nothing while the card is not mounted. Covers
@@ -47,6 +65,7 @@ pub fn scan(mut old: Vec<GameInfo>) -> Vec<GameInfo> {
             fs::read(&format!("{}/{}/cover.bin", DIR, e.name))
                 .ok()
                 .filter(|c| art::get(c, art::ICON).is_some_and(|i| i.w == i.h))
+                .map(Cover::Art)
         });
         let mut g = GameInfo {
             name: e.name.clone(),
@@ -56,6 +75,7 @@ pub fn scan(mut old: Vec<GameInfo>) -> Vec<GameInfo> {
             desc: String::new(),
             color: 0xFFF8_A824,
             exe,
+            id: String::new(),
             cover,
         };
         if let Ok(text) = fs::read(&format!("{}/{}/game.txt", DIR, e.name)) {
@@ -67,7 +87,7 @@ pub fn scan(mut old: Vec<GameInfo>) -> Vec<GameInfo> {
     out
 }
 
-fn parse(text: &str, g: &mut GameInfo) {
+pub fn parse(text: &str, g: &mut GameInfo) {
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;

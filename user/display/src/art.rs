@@ -1,7 +1,8 @@
 //! Paletted RGB565 images from tools/mkcovers.py: the UI's own (avatar,
 //! round buttons, header glyphs), built in, and each game's icon, read
 //! from the card. `u8 count`, then per image `u16 w, u16 h, u32 offset`;
-//! at the offset 256 RGB565 colors, then one index per pixel.
+//! at the offset 256 RGB565 colors, then one index per pixel. A
+//! catalog's covers come without a palette (`direct`).
 
 pub const UI: &[u8] = include_bytes!("../../../build/uiart.bin");
 /// In `UI`: the avatar, then the round buttons (`home::BUTTONS`' order)
@@ -52,10 +53,23 @@ pub fn get(data: &[u8], i: usize) -> Option<Image<'_>> {
     (w > 0 && h > 0).then_some(Image { w, h, pal, px })
 }
 
+/// A catalog's cover (`provider::COVER`): u16 side twice, then RGB565
+/// pixels, no palette.
+pub fn direct(data: &[u8]) -> Option<Image<'_>> {
+    let w = u16::from_le_bytes([*data.first()?, *data.get(1)?]) as usize;
+    let h = u16::from_le_bytes([*data.get(2)?, *data.get(3)?]) as usize;
+    let px = data.get(4..4 + w * h * 2)?;
+    (w > 0 && h > 0).then_some(Image { w, h, pal: &[], px })
+}
+
 impl Image<'_> {
     /// RGB565 color of pixel (x, y).
     pub fn at(&self, x: usize, y: usize) -> u16 {
-        let i = self.px[y * self.w + x] as usize * 2;
+        let k = y * self.w + x;
+        if self.pal.is_empty() {
+            return u16::from_le_bytes([self.px[k * 2], self.px[k * 2 + 1]]);
+        }
+        let i = self.px[k] as usize * 2;
         u16::from_le_bytes([self.pal[i], self.pal[i + 1]])
     }
 }
