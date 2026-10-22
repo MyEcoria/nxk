@@ -1977,9 +1977,10 @@ pub mod proto {
         /// The state: word 0 = the version known (0: none), word 1 = how
         /// long to wait for another one (ns, 0: answer now). Reply: words
         /// = version, `ST_*`, the list's version, its game count, progress
-        /// (`ST_LAUNCHING`: place in the queue, 0: none); bytes: the text
-        /// to show (`MAX_TEXT`, UTF-8; `ST_LOGIN`: the code and the URL,
-        /// one per line).
+        /// (`ST_LAUNCHING`: place in the queue, 0: none), the covers'
+        /// version (a cover came: ask again those that were `ENOENT`);
+        /// bytes: the text to show (`MAX_TEXT`, UTF-8; `ST_LOGIN`: the
+        /// code and the URL, one per line). A new cover is a new version.
         pub const STATE: u32 = 1;
         /// Game word 0 of list version word 1. Reply: word 0 = color (RGB),
         /// word 1 = flags (0); bytes: id, title, publisher, version,
@@ -1990,9 +1991,11 @@ pub mod proto {
         /// A cover is u16 side, u16 side (square, `COVER_MAX` at most),
         /// then RGB565 pixels, little-endian. `ENOENT`: none (yet).
         pub const COVER: u32 = 3;
-        /// Start the game whose id is in the bytes. Reply at once; the
-        /// state goes `ST_LAUNCHING`, then `ST_PLAYING` once the game
-        /// has the screen, or back to `ST_READY` (its text: why).
+        /// Start the game whose id is in the bytes. Reply at once, word 0
+        /// = the version of the `ST_LAUNCHING` state it set; then
+        /// `ST_PLAYING` once the game has the screen. Any later version in
+        /// another state (`ST_READY` with why, `ST_LOGIN`, `ST_ERROR`)
+        /// ends the launch or the game.
         pub const LAUNCH: u32 = 4;
         /// End the game (HOME, or the launch cancelled): reply once the
         /// screen is released and what it held elsewhere is closed.
