@@ -5,6 +5,10 @@ kernel/target/
 user/target/
 abi/target/
 refs/
+# The Luna client's reverse (APK, decompiled code, builds): never published.
+sources/
+tools/__pycache__/
+services/target/
 hwboot/dl/
 hwboot/venv/
 hwboot/fusee-nano/fusee-nano
