@@ -214,8 +214,10 @@ permissions, so a token there is readable by anyone with the card),
 `STATE` (loading, ready, sign-in needed with the code and URL, launching
 with the place in a queue, playing, error; held until it changes),
 `GAME` and `COVER` (square RGB565, up to 256x256, read for the games near
-the selection only), `LAUNCH`, `STOP`, and `SUSPEND`/`RESUME` around
-sleep. Two threads of `display` make these calls with timeouts, and every
+the selection only; one the catalog has not yet is asked again when its
+covers change), `LAUNCH` (its reply is the version of the launching
+state: any later state but playing ends the launch, its text shown),
+`STOP`, and `SUSPEND`/`RESUME` around sleep. Two threads of `display` make these calls with timeouts, and every
 reply is checked, so a slow or broken catalog never holds the UI. While a
 game starts, a card shows its cover, the catalog's words, the place in the
 queue and the seconds waited; B cancels (`STOP`). HOME over a catalog's
@@ -229,9 +231,10 @@ protocol on a thread; the program fills a `Catalog` (`set_games`,
 `set_cover`, `set_state`) and answers `Request`s (`Launch`, `Stop`,
 `Suspend`, `Resume`); `nxsvc::screen` fills `SCANOUT`'s images from the
 CPU (their handles carry `WRITE`) for screens that need no GPU.
-`services/demo` lists four games with no network, waits in a pretend
-queue, shows a game as its color, and has "Crash", whose catalog exits
-while launching: it checks this whole path in the emulator
+`services/demo` lists five games with no network, their covers 1.5 s
+later, waits in a pretend queue, shows a game as its color, and has
+"Offline", which never starts, and "Crash", whose catalog exits while
+launching: it checks this whole path in the emulator
 (`nxtest.py --dbg 'button R shot a.png button A ...'`).
 
 ## Build, run, test
