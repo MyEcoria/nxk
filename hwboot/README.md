@@ -294,6 +294,12 @@ data: `/users/ID/`, README "Users and save data"). `mksd-hw.sh` installs the one
 `./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
 `-c "mkdir /games/NAME"` in an earlier call).
 
+Game catalogs ("services", README "Services: game catalogs") go the same
+way: `mksd-hw.sh` installs `services/*/` in `/services/NAME/`; for a card
+in the console, `-c "mkdir /services" -c "mkdir /services/NAME"`, then
+`--put` the program and its `service.txt`. L and R on the home screen
+switch between Intern (`/games`) and them (run 55).
+
 Console buttons (`input`, GPIO X6 and X7, active low, interrupt on both
 edges): Volume+ is LEFT, Volume- is RIGHT, both together are A (a lone
 button counts after 120 ms, so a chord does not move first). The port
@@ -1456,6 +1462,20 @@ within 5 s.
     `bpmpfw` runs nothing), and the cores' MISSED timer column is non-zero
     on silicon (60/19/6/1 over a million interrupts), likely the race between
     the last interrupt acknowledge and the deadline check.
+
+55. 22/10/2026, Erista, boot image of run 54 with `display` of `d8fd421`
+    reloaded over USB-C (`usbterm.py --reload display`) and `services/demo`
+    put in `/services/demo/` (`mkdir` first): **game catalogs (services)
+    on silicon**. The home screen shows the Intern / Demo tabs; R switches
+    and starts the catalog, its list comes, then its covers 1.5 s later; A
+    shows the launch card (cover, queue place, seconds), then the game
+    takes the screen (its color, from CPU writes to `SCANOUT`'s images); HOME
+    sends `STOP`: "Closing Basalt", the list back. B during a launch
+    ("launch cancelled"), Offline ("no machine is free"), Crash (the
+    catalog exits with code 3, "Demo stopped (code 3)", restarted) all as
+    in the emulator; L goes back to Intern and ends the catalog (no `demo`
+    process left). Seen with `nxdbg.py shot` (display's copy of the image),
+    not yet confirmed by eye on the panel.
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
