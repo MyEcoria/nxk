@@ -277,11 +277,12 @@ A taps the outlined one, B closes a panel or goes back, L and R (or ZL
 and ZR) turn the page, HOME and + go to the home page. A finger on the
 screen hides the outline.
 
-Right after boot `display` and `input` are not published yet (about 3 s
-for `display`, which then takes up to 0.2 s per request while it draws
-its first frames): `nxdbg.py` sends a request again while it is refused
-with `ENOSYS` or `EPIPE` (nothing was delivered), and a capture also
-after `ETIMEDOUT`, up to `--timeout`. A press is never sent twice: a
+Right after boot `display` and `input` are not published yet (in
+tegra_qemu, about 3 s for `display`, which then takes up to 0.2 s per
+request while it draws its first frames; not yet timed on the Erista,
+where it adopts hekate's display path): `nxdbg.py` sends a request
+again while it is refused with `ENOSYS` or `EPIPE` (nothing was
+delivered), and a capture also after `ETIMEDOUT`, up to `--timeout`. A press is never sent twice: a
 timed-out `INJECT` may have reached `input`.
 
 Frames only flow while a terminal is open on the host (DTR), and a
