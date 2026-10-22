@@ -1,0 +1,7 @@
+[build]
+target = "../std/aarch64-unknown-nxk.json"
+
+[unstable]
+json-target-spec = true
+build-std = ["std", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]

@@ -21,6 +21,11 @@ pub fn handle_close(h: u32) {
     unsafe { syscall1(sys::HANDLE_CLOSE, h as u64) };
 }
 
+/// Another handle to `h`'s object with `rights` (within `h`'s).
+pub fn handle_dup(h: u32, rights: u16) -> Result<u32> {
+    check(unsafe { syscall3(sys::HANDLE_DUP, h as u64, rights as u64, 0) }).map(|v| v as u32)
+}
+
 /// Monotonic time, ns.
 pub fn now_ns() -> u64 {
     user::monotonic_ns()
@@ -41,6 +46,22 @@ pub struct Shm {
 impl Shm {
     pub fn new(len: usize, flags: u64) -> Result<Self> {
         let handle = check(unsafe { syscall2(sys::SHM_CREATE, len as u64, flags) })? as u32;
+        match check(unsafe { syscall3(sys::SHM_MAP, handle as u64, 0, prot::READ | prot::WRITE) }) {
+            Ok(a) => Ok(Self {
+                handle,
+                len,
+                ptr: a as *mut u8,
+            }),
+            Err(e) => {
+                handle_close(handle);
+                Err(e)
+            }
+        }
+    }
+
+    /// Map memory a service handed over (`len` bytes); the handle is
+    /// closed with it.
+    pub fn from_handle(handle: u32, len: usize) -> Result<Self> {
         match check(unsafe { syscall3(sys::SHM_MAP, handle as u64, 0, prot::READ | prot::WRITE) }) {
             Ok(a) => Ok(Self {
                 handle,
@@ -139,4 +160,36 @@ impl Service {
 /// Handle `k` of the reply just received.
 pub fn received_handle(k: usize) -> u32 {
     user::received_handle(k)
+}
+
+/// An endpoint this program serves (a game catalog's, for `display`).
+pub struct Endpoint {
+    ep: u32,
+}
+
+impl Endpoint {
+    pub fn new() -> Result<Self> {
+        let ep = check(unsafe { syscall1(sys::ENDPOINT_CREATE, 0) })? as u32;
+        Ok(Self { ep })
+    }
+
+    pub fn handle(&self) -> u32 {
+        self.ep
+    }
+
+    /// The next request, waiting at most `ns` (0: no limit; `-ETIMEDOUT`).
+    pub fn recv(&self, ns: u64) -> Result<user::Received> {
+        user::ipc_checked(sys::IPC_RECV, self.ep as u64, &Msg::default(), ns)
+    }
+
+    /// Answer the request `token` came with (`Received::token`).
+    pub fn reply_to(token: u64, m: &Msg) -> Result<()> {
+        user::ipc_checked(sys::IPC_REPLY_TO, token, m, 0).map(|_| ())
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        handle_close(self.ep);
+    }
 }

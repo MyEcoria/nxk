@@ -1,0 +1,18 @@
+# Game catalogs for nxk ("services" on screen): ordinary Rust (std)
+# programs `display` starts from /services/NAME/NAME on the card, on top
+# of `nxsvc`, the SDK that serves `abi::proto::provider`.
+#
+# Build: tools/build.sh (or here: cargo build --release), with the
+# "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
+[workspace]
+resolver = "2"
+members = ["nxsvc", "demo"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

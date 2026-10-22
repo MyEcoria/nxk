@@ -1,0 +1,9 @@
+[package]
+name = "nxsvc"
+version = "0.1.0"
+edition = "2021"
+description = "Game catalog SDK for nxk: the provider protocol, covers, a CPU-drawn screen"
+
+[dependencies]
+nxk-abi = { path = "../../abi" }
+nxgfx = { path = "../../jeux/nxgfx" }
