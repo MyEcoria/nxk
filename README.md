@@ -189,6 +189,51 @@ A game keeps everything it saves in the directory `display` hands it as
 `NXK_USER` and `NXK_USER_ID` give the user's name and id. Never write
 under `/games`: `jeux/starlane` keeps its best score in its save directory.
 
+### Services: game catalogs
+
+The home screen shows one catalog of games at a time ("services" on
+screen). **Intern** is the console's own: the games of `/games`, built
+into `display`. Every other one is a program on the card,
+`/services/NAME/NAME`, with `/services/NAME/service.txt` (`title=`,
+`color=`, `description=`): it lists its games and their covers, says how
+to launch them, and takes the screen as a game does. L and R (or a tap on
+the tabs at the top) go from one catalog to the next; the choice is the
+user's (`service=` in `profile.cfg`).
+
+```bash
+./tools/build.sh && ./tools/mksd.py -o build/sd.img   # puts services/*/ in /services
+./tools/usbterm.py --put ~/.cache/nxk/target-apps/aarch64-unknown-nxk/release/demo:/services/demo/demo
+```
+
+`display` starts the catalog picked, for the user playing, with
+`NXK_PROVIDER_KEY` (a random key), `NXK_SERVICE_DIR`
+(`/users/ID/services/NAME`, its own data: accounts, caches; FAT keeps no
+permissions, so a token there is readable by anyone with the card),
+`NXK_USER` and `NXK_USER_ID`. The program hands its endpoint back with
+`display::PROVIDER` and the key, then serves `abi::proto::provider`:
+`STATE` (loading, ready, sign-in needed with the code and URL, launching
+with the place in a queue, playing, error; held until it changes),
+`GAME` and `COVER` (square RGB565, up to 256x256, read for the games near
+the selection only), `LAUNCH`, `STOP`, and `SUSPEND`/`RESUME` around
+sleep. Two threads of `display` make these calls with timeouts, and every
+reply is checked, so a slow or broken catalog never holds the UI. While a
+game starts, a card shows its cover, the catalog's words, the place in the
+queue and the seconds waited; B cancels (`STOP`). HOME over a catalog's
+game sends `STOP` rather than killing it (a cloud session must be ended),
+and kills it only past `STOP_NS` (8 s). A catalog that exits is shown
+stopped and started again after 2 s, then longer when it keeps failing.
+Play time counts per game as `NAME~ID`.
+
+`services/nxsvc` is the SDK: `connect()` says hello and serves the
+protocol on a thread; the program fills a `Catalog` (`set_games`,
+`set_cover`, `set_state`) and answers `Request`s (`Launch`, `Stop`,
+`Suspend`, `Resume`); `nxsvc::screen` fills `SCANOUT`'s images from the
+CPU (their handles carry `WRITE`) for screens that need no GPU.
+`services/demo` lists four games with no network, waits in a pretend
+queue, shows a game as its color, and has "Crash", whose catalog exits
+while launching: it checks this whole path in the emulator
+(`nxtest.py --dbg 'button R shot a.png button A ...'`).
+
 ## Build, run, test
 
 Prerequisites: stable Rust with `rust-src`
@@ -304,6 +349,7 @@ user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
+services/   game catalogs (std) and nxsvc, their SDK: a demo catalog
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),

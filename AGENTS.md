@@ -43,6 +43,8 @@ user/       workspace: libnx (no_std) + init, shell, drivers, services, tests
 std/        Rust std port: std/library overlay, target JSON, linker script
 apps/       ordinary std programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, the game SDK (on nxk-abi alone)
+services/   game catalogs ("services" on screen, std) and nxsvc, their SDK
+            (`abi::proto::provider`; installed as /services/NAME/NAME)
 bench/      nxk vs L4T comparison (lbench, scripts, RESULTS.md)
 tools/      build.sh, mksd.py, run.sh, debug.sh, nxtest.py, mkstd.py,
             usbterm.py, tegra_qemu patches, ...
@@ -137,7 +139,9 @@ Key details agents must respect:
   (cards from `/games`), then status pages and a read-only mirror of the
   USB-C terminal; a game takes the whole screen (`display::SCANOUT`,
   three block-linear images, flips at the vertical blank) and gets the
-  input `display` routes to it. Games draw through `gpu`'s command
+  input `display` routes to it. Catalogs other than the built-in Intern
+  (`/games`) are card programs `display` runs and talks to
+  (`abi::proto::provider`), never code in the kernel or in `display`. Games draw through `gpu`'s command
   streams (`gpu::RENDER`: checked before anything runs), never by
   writing GPU registers or pushbuffers themselves.
 - EL1/EL0 split: no driver or filesystem logic in the kernel. Services get
