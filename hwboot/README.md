@@ -1550,6 +1550,19 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+60. 23/10/2026, Erista charged (gauge 16 %), boot image with the `fs`
+    readahead fix (`23cf707`), Luna of `7fb2e75` (adaptive delay, audio
+    out of SPP order), PC downloads paused: **no crash**, the catalog came
+    up at its first start. Wobbly Life for ~105 s at 10 % volume. Play
+    started with 3 packets in hand (40 ms after the first), and the first
+    75 s had **0 lost, 0 late, 0 underruns**: 112 frames waited for (the
+    delay grew to its 300 ms ceiling) and 94 dropped to shed bursts. The
+    packets still came 0.4 to 1 s late at the 95th percentile, in bursts,
+    while datagrams never stopped more than 177 ms and luna's thread was
+    never busy: the server's audio comes in bursts over this network. In
+    the last 30 s the PC's link broke down again (pings 328 ms on average,
+    4.2 s at most; 192 audio packets lost on the network): 238 lost.
+    nxopus: 285 us a frame on average, 0.67 ms at most.
 
     Cause found afterwards, in the emulator (not yet shown on silicon): `fs`'s
     sector cache read ahead into the shared I/O buffer, then took a victim
