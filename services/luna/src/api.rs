@@ -3,6 +3,7 @@
 //! token, and these messages reach the screen and the logs.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use lunacore::auth::Session;
 use lunacore::{config, cover, proxy};
@@ -21,6 +22,8 @@ pub struct Api {
     panda: Option<Client>,
     proxy: Option<Client>,
     images: HashMap<String, Client>,
+    /// Connections and reads give up past this (`None`: nxhttp's own).
+    timeout: Option<Duration>,
 }
 
 impl Api {
@@ -30,7 +33,31 @@ impl Api {
             panda: None,
             proxy: None,
             images: HashMap::new(),
+            timeout: None,
         }
+    }
+
+    /// One whose calls give up past `t` (a session to end before a deadline).
+    pub fn quick(serial: &str, t: Duration) -> Self {
+        Self {
+            timeout: Some(t),
+            ..Self::new(serial)
+        }
+    }
+
+    fn client(&self, host: &str) -> Client {
+        match self.timeout {
+            Some(t) => Client::with_timeout(host, t),
+            None => Client::new(host),
+        }
+    }
+
+    /// How long a GET of `url` takes (a region's ping), within `t`.
+    pub fn ping(url: &str, t: Duration) -> Option<Duration> {
+        let (host, path) = nxhttp::split_url(url)?;
+        let started = std::time::Instant::now();
+        let r = Client::with_timeout(host, t).get(path, &[]).ok()?;
+        (r.status < 500).then(|| started.elapsed())
     }
 
     fn post(c: &mut Client, path: &str, headers: &[(&str, String)], body: &Value) -> Result<Value> {
@@ -50,7 +77,7 @@ impl Api {
     pub fn panda(&mut self, domain: &str, path: &str, body: &Value) -> Result<(u16, Value)> {
         let host = config::panda_host(domain);
         if self.panda.as_ref().is_none_or(|c| c.host() != host) {
-            self.panda = Some(Client::new(&host));
+            self.panda = Some(self.client(&host));
         }
         let c = self.panda.as_mut().expect("panda client");
         let h = proxy::panda_headers(&host);
@@ -74,7 +101,7 @@ impl Api {
             .trim_end_matches('/')
             .to_string();
         if self.proxy.as_ref().is_none_or(|c| c.host() != host) {
-            self.proxy = Some(Client::new(&host));
+            self.proxy = Some(self.client(&host));
         }
         let headers = proxy::headers(&self.serial, session);
         let c = self.proxy.as_mut().expect("proxy client");

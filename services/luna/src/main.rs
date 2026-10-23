@@ -1,12 +1,18 @@
 //! Amazon Luna as a game catalog of nxk (`abi::proto::provider`): the
-//! sign-in by code, the games the account can play and their covers.
-//! Playing (the stream) comes later. The Amazon domain of the account is
+//! sign-in by code, the games the account can play and their covers, and
+//! playing them: the cloud session, the stream, the gamepad (the picture and
+//! the sound are not decoded yet). The Amazon domain of the account is
 //! `domain=` in this catalog's `service.txt` (amazon.com by default).
 
 mod account;
 mod api;
+mod launch;
+mod pad;
 mod qr;
 mod store;
+mod stream;
+
+use std::time::Duration;
 
 use nxsvc::{Request, State};
 
@@ -30,6 +36,9 @@ fn domain() -> String {
         .unwrap_or_else(|| "amazon.com".into())
 }
 
+/// A stop waits this long for the cloud session to end (display's limit is 8 s).
+const STOP_WAIT: Duration = Duration::from_secs(6);
+
 fn main() {
     let (cat, rx) = match nxsvc::connect() {
         Ok(c) => c,
@@ -42,16 +51,24 @@ fn main() {
     let user = std::env::var("NXK_USER").unwrap_or_default();
     let (c2, d) = (cat.clone(), domain());
     std::thread::spawn(move || account::run(c2, d, user));
+    let mut playing: Option<launch::Launch> = None;
     while let Ok(r) = rx.recv() {
         match r {
             Request::Launch(id) => {
-                let title = cat.game(&id).map(|g| g.title).unwrap_or(id);
-                cat.set_state(State::Ready(format!(
-                    "{}: playing comes in a later version",
-                    title
-                )));
+                if playing.as_ref().is_some_and(|l| l.running()) {
+                    cat.set_state(State::Ready("A game is already starting".into()));
+                } else {
+                    playing = Some(launch::Launch::start(cat.clone(), id));
+                }
             }
-            Request::Stop(d) | Request::Suspend(d) | Request::Resume(d) => d.done(),
+            // Asleep the network goes: the stream and its session end too.
+            Request::Stop(d) | Request::Suspend(d) => {
+                if let Some(l) = playing.take() {
+                    l.stop(STOP_WAIT);
+                }
+                d.done();
+            }
+            Request::Resume(d) => d.done(),
         }
     }
 }
