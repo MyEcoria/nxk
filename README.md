@@ -217,7 +217,9 @@ with the place in a queue, playing, error; held until it changes),
 the selection only; one the catalog has not yet is asked again when its
 covers change), `LAUNCH` (its reply is the version of the launching
 state: any later state but playing ends the launch, its text shown),
-`STOP`, and `SUSPEND`/`RESUME` around sleep. Two threads of `display` make these calls with timeouts, and every
+`STOP`, and `SUSPEND`/`RESUME` around sleep (the catalog gets as long as a
+`STOP` to answer `SUSPEND`, before Wi-Fi goes: it may have a cloud
+session to end). Two threads of `display` make these calls with timeouts, and every
 reply is checked, so a slow or broken catalog never holds the UI. While a
 game starts, a card shows its cover, the catalog's words, the place in the
 queue and the seconds waited; B cancels (`STOP`). HOME over a catalog's

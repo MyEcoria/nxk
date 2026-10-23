@@ -4,7 +4,7 @@
 //! (acks, time requests, RTCP, pongs). Display and audio messages are
 //! counted only: decoding them comes later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver as Inbox;
@@ -458,12 +458,14 @@ fn streaming(
         Instant::now() + REPORT_EVERY,
     );
     let mut sync_id = 0u32;
-    let mut held = std::mem::take(&mut s.link.held);
+    let mut last_report = String::new();
+    // Read while the channels were set up, in arrival order.
+    let mut held: VecDeque<Event> = s.link.held.drain(..).collect();
     let end = loop {
         if stop.load(Ordering::Relaxed) {
             break End::Stopped;
         }
-        let event = match held.pop() {
+        let event = match held.pop_front() {
             Some(e) => Some(e),
             None => s
                 .link
@@ -522,11 +524,19 @@ fn streaming(
         }
         if now >= next_report {
             let mut line = String::from("luna: received");
-            for (id, (n, bytes)) in &counts {
+            let mut ids: Vec<&u8> = counts.keys().collect();
+            ids.sort();
+            for id in ids {
+                let (n, bytes) = counts[id];
                 let name = s.names.get(id).map_or("?", String::as_str);
                 line.push_str(&format!(" {} {} msgs {} KB,", name, n, bytes / 1024));
             }
-            println!("{}", line.trim_end_matches(','));
+            // Only when something new came: these lines reach the LOGS page.
+            let line = line.trim_end_matches(',').to_string();
+            if line != last_report {
+                println!("{}", line);
+                last_report = line;
+            }
             next_report = now + REPORT_EVERY;
         }
     };
