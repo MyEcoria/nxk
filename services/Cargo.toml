@@ -6,7 +6,7 @@
 # "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
 [workspace]
 resolver = "2"
-members = ["nxsvc", "nxhttp", "nxdtls", "lunacore", "luna", "demo"]
+members = ["nxsvc", "nxhttp", "nxdtls", "lunacore", "luna", "demo", "nxopus"]
 
 [profile.release]
 opt-level = 3

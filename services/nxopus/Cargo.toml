@@ -1,0 +1,8 @@
+[package]
+name = "nxopus"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "An Opus decoder for CELT-only streams, ported from libopus 1.6.1 (cargo test on the PC)"
+
+[dependencies]
