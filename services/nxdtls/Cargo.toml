@@ -1,0 +1,13 @@
+[package]
+name = "nxdtls"
+version = "0.1.0"
+edition = "2021"
+description = "DTLS 1.2 client with no I/O: ECDHE-RSA-CHACHA20-POLY1305, a pinned server certificate (cargo test on the PC)"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "arithmetic"] }
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
