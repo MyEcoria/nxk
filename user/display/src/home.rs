@@ -186,45 +186,50 @@ impl Ui {
             .and_then(|name| self.games.iter().position(|g| g.name == name))
             .unwrap_or(0);
 
-        // 1. Horizontal row of square game icons (and empty Switch slots).
-        s.dx = -off;
-        for i in 0..slots {
-            let x = X0 + i * (ICON + GAP);
-            if i < n {
-                game_icon(s, &self.games[i], x, ICON_Y);
-                if i == last_idx {
-                    game_badge(
-                        s,
-                        x,
-                        ICON_Y,
-                        self.users.active().map(|u| (u.color, u.glyph)),
-                    );
-                }
-                if sel_btn.is_none() && self.home == i {
-                    s.ring_round(
-                        x - FRAME,
-                        ICON_Y - FRAME,
-                        ICON + 2 * FRAME,
-                        ICON + 2 * FRAME,
-                        ICON_R + 6,
-                        FRAME_T,
-                        p.focus,
-                    );
-                    s.ring_round(x - 3, ICON_Y - 3, ICON + 6, ICON + 6, ICON_R + 2, 2, WHITE);
-                }
-                self.zone_at(Id::Game(i), x, ICON_Y, ICON, ICON, ICON_R, off);
-            } else {
-                s.fill_round(x, ICON_Y, ICON, ICON, ICON_R, p.surface);
-                s.ring_round(x, ICON_Y, ICON, ICON, ICON_R, 2, p.rule);
-                if n == 0 && i == 0 {
-                    let (head, line) = self.empty_text();
-                    let line = fit(Face::Cap, &line, ICON - 24);
-                    s.label_c(x + ICON / 2, ICON_Y + 108, head, Face::BodyB, p.text);
-                    s.label_c(x + ICON / 2, ICON_Y + 148, &line, Face::Cap, p.dim);
+        // 1. Horizontal row of square game icons (and empty Switch slots),
+        // or the catalog's sign-in.
+        if self.signing_in() {
+            self.login_panel(s);
+        } else {
+            s.dx = -off;
+            for i in 0..slots {
+                let x = X0 + i * (ICON + GAP);
+                if i < n {
+                    game_icon(s, &self.games[i], x, ICON_Y);
+                    if i == last_idx {
+                        game_badge(
+                            s,
+                            x,
+                            ICON_Y,
+                            self.users.active().map(|u| (u.color, u.glyph)),
+                        );
+                    }
+                    if sel_btn.is_none() && self.home == i {
+                        s.ring_round(
+                            x - FRAME,
+                            ICON_Y - FRAME,
+                            ICON + 2 * FRAME,
+                            ICON + 2 * FRAME,
+                            ICON_R + 6,
+                            FRAME_T,
+                            p.focus,
+                        );
+                        s.ring_round(x - 3, ICON_Y - 3, ICON + 6, ICON + 6, ICON_R + 2, 2, WHITE);
+                    }
+                    self.zone_at(Id::Game(i), x, ICON_Y, ICON, ICON, ICON_R, off);
+                } else {
+                    s.fill_round(x, ICON_Y, ICON, ICON, ICON_R, p.surface);
+                    s.ring_round(x, ICON_Y, ICON, ICON, ICON_R, 2, p.rule);
+                    if n == 0 && i == 0 {
+                        let (head, line) = self.empty_text();
+                        let line = fit(Face::Cap, &line, ICON - 24);
+                        s.label_c(x + ICON / 2, ICON_Y + 108, head, Face::BodyB, p.text);
+                        s.label_c(x + ICON / 2, ICON_Y + 148, &line, Face::Cap, p.dim);
+                    }
                 }
             }
+            s.dx = 0;
         }
-        s.dx = 0;
 
         // 2. Selected game's title and play time above its square icon.
         if sel_btn.is_none() && n > 0 {
@@ -328,6 +333,48 @@ impl Ui {
             _ if first.is_empty() => ("No games", "This service lists none".into()),
             _ => ("No games", first),
         }
+    }
+
+    /// The catalog shown asks for an account.
+    fn signing_in(&self) -> bool {
+        !self.service.is_empty()
+            && self
+                .prov
+                .as_ref()
+                .is_some_and(|v| v.state == provider::ST_LOGIN)
+    }
+
+    /// Sign-in in place of the game row: the code to scan on white (whole
+    /// modules, square corners, as a QR code needs), then the page and the
+    /// code to type (the catalog's text: the code, then the page).
+    fn login_panel(&mut self, s: &mut Screen) {
+        let p = pal();
+        let (x, y, w, h) = (X0, ICON_Y - 16, W - 2 * X0, ICON + 32);
+        s.fill_round(x, y, w, h, ICON_R, p.surface);
+        let qr = 256;
+        let (qx, qy) = (x + 16, y + 16);
+        s.fill(qx, qy, qr, qr, WHITE);
+        if let Some(img) = self.login_art.as_ref().and_then(|c| c.image()) {
+            let side = img.w.max(1);
+            let px = side * (qr / side).max(1);
+            let off = (qr - px.min(qr)) / 2;
+            s.image(&img, qx + off, qy + off, px.min(qr), px.min(qr), 0);
+        }
+        let text = self.prov.as_ref().map_or(String::new(), |v| v.text.clone());
+        let mut lines = text.lines();
+        let code = String::from(lines.next().unwrap_or("").trim());
+        let page = String::from(lines.next().unwrap_or("").trim());
+        let tx = qx + qr + 40;
+        let tw = x + w - tx - 32;
+        let title = self.services[self.service_index()].1.clone();
+        let head = fit(Face::TitleB, &format!("Sign in to {}", title), tw);
+        s.label(tx, y + 50, &head, Face::TitleB, p.text);
+        s.label(tx, y + 100, "Scan the code, or open", Face::Body, p.dim);
+        let page = fit(Face::BodyB, &page, tw);
+        s.label(tx, y + 136, &page, Face::BodyB, p.accent);
+        s.label(tx, y + 172, "and enter", Face::Body, p.dim);
+        let code = fit(Face::Head, &code, tw);
+        s.label(tx, y + 230, &code, Face::Head, p.text);
     }
 
     /// The catalogs' tabs at the top of the home screen (L and R move

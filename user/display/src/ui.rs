@@ -323,6 +323,8 @@ pub struct Ui {
     /// Covers the catalog had not (`ENOENT`): asked again when its covers
     /// change.
     pub covers_absent: Vec<String>,
+    /// The catalog's sign-in code to scan, while it asks for an account.
+    pub login_art: Option<Cover>,
 }
 
 impl Ui {
@@ -384,6 +386,7 @@ impl Ui {
             prov_list: 0,
             covers_asked: Vec::new(),
             covers_absent: Vec::new(),
+            login_art: None,
         }
     }
 
@@ -552,6 +555,7 @@ impl Ui {
         self.prov_list = 0;
         self.covers_asked.clear();
         self.covers_absent.clear();
+        self.login_art = None;
         self.home = 0;
         self.last_game = 0;
         self.scroll = 0.0;

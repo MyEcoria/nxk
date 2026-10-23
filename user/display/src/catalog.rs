@@ -98,6 +98,8 @@ enum Cmd {
     Stop,
     /// Covers of these games (ids) of list version `.0`.
     Covers(u64, Vec<String>),
+    /// The sign-in image (`ART_LOGIN`).
+    LoginArt,
 }
 
 /// What changed since the last `take`.
@@ -115,6 +117,8 @@ pub struct Update {
     pub launched: Option<u64>,
     /// A `STOP` answered.
     pub stopped: bool,
+    /// The sign-in image read again: the image, or none.
+    pub login_art: Option<Option<Vec<u8>>>,
     /// Calls that failed, for a toast.
     pub notes: Vec<String>,
     /// `STOP` got no answer in time: the catalog has to go.
@@ -271,6 +275,15 @@ impl Provider {
 
     pub fn stop(&self) {
         self.command(Cmd::Stop);
+    }
+
+    /// Read the sign-in image again (its state changed).
+    pub fn login_art(&self) {
+        let mut s = self.link.sh.lock();
+        s.cmds.retain(|c| !matches!(c, Cmd::LoginArt));
+        s.cmds.push_back(Cmd::LoginArt);
+        drop(s);
+        self.link.wake.notify_all();
     }
 
     pub fn covers(&self, list: u64, games: Vec<String>) {
@@ -438,6 +451,11 @@ fn run_cmds(l: &Arc<Link>) {
                 }
             }
             Cmd::Covers(list, games) => read_covers(l, ep, list, games, &mut buf),
+            Cmd::LoginArt => {
+                let art = |off: usize| Msg::from_words(proto::ART, &[proto::ART_LOGIN, off as u64]);
+                let got = read_image(ep, art, &mut buf).ok();
+                l.post(|u| u.login_art = Some(got));
+            }
         }
     }
 }
@@ -472,14 +490,20 @@ fn read_covers(l: &Link, ep: u32, list: u64, games: Vec<String>, buf: &mut [u8])
     }
 }
 
-/// Cover `i` of list `list`, checked: square, `COVER_MAX` at most, all
-/// there (`EINVAL` when it is not).
+/// Cover `i` of list `list` (see `read_image`).
 fn read_cover(ep: u32, list: u64, i: usize, buf: &mut [u8]) -> Result<Vec<u8>, i64> {
+    let cover = |off: usize| Msg::from_words(proto::COVER, &[i as u64, list, off as u64]);
+    read_image(ep, cover, buf)
+}
+
+/// An image the catalog sends by parts (`ask(offset)`), checked: square,
+/// `COVER_MAX` at most, all there (`EINVAL` when it is not).
+fn read_image(ep: u32, ask: impl Fn(usize) -> Msg, buf: &mut [u8]) -> Result<Vec<u8>, i64> {
     let bad = -libnx::abi::err::EINVAL;
     let mut out: Vec<u8> = Vec::new();
     let mut total = 0usize;
     loop {
-        let m = Msg::from_words(proto::COVER, &[i as u64, list, out.len() as u64]);
+        let m = ask(out.len());
         let r = ipc::call_timeout(ep, &m, CALL_NS).and_then(ipc::checked)?;
         let size = ipc::header(&r, 0) as usize;
         if out.is_empty() {

@@ -2258,7 +2258,14 @@ fn main() -> i32 {
                     if ui.prov.as_ref().is_some_and(|o| o.covers != v.covers) {
                         ui.covers_absent.clear();
                     }
+                    match (&prov, v.state == provproto::ST_LOGIN) {
+                        (Some(p), true) => p.login_art(),
+                        _ => ui.login_art = None,
+                    }
                     ui.prov = Some(v);
+                }
+                if let Some(art) = up.login_art {
+                    ui.login_art = art.map(catalog::cover);
                 }
                 // The launch's own state, or a newer one: playing, or over
                 // (READY with why, LOGIN, ERROR) even if LAUNCHING was missed.
