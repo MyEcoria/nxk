@@ -275,9 +275,10 @@ decoded by `services/nxopus` on a thread of their own, and written to the
 packet still missing when the ring runs low is concealed (libopus's
 pitch-based concealment, then noise), and a resampler (32-tap windowed
 sinc) runs up to 2000 ppm off 1 to follow the server's clock, steered by
-the buffered audio, so nothing is dropped or repeated for drift. Every 5 s
-a line gives packets, losses, the decoding time, the buffer and the
-packets' arrival jitter. Speakers that do not take 48 kHz (the
+the buffered audio, so nothing is dropped or repeated for drift. A line gives packets,
+losses, the decoding time, the buffer and the packets' arrival jitter
+when a loss, a late packet, a drop or an underrun happens, else every
+minute. Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
 the rest still runs there. The picture is not decoded yet: the screen
 stays dark and `display` waits at its handshake. The serial and the tokens are `state.json` in

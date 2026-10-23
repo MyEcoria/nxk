@@ -31,6 +31,9 @@ const TICK: Duration = Duration::from_millis(3);
 /// The speakers' pace is checked once this long after the first write.
 const RATE_CHECK: Duration = Duration::from_secs(4);
 const REPORT_EVERY: Duration = Duration::from_secs(1);
+/// The line is renewed when something goes wrong, else this often: it
+/// reaches the LOGS page each time.
+const HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Where the PCM goes.
 trait Sink {
@@ -199,6 +202,7 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
         first_write: None,
     };
     let (mut last_tick, mut last_report) = (Instant::now(), Instant::now());
+    let (mut shown, mut shown_at) = (None, Instant::now());
     loop {
         match rx.recv_timeout(TICK) {
             Ok(p) => st.take(p),
@@ -224,8 +228,13 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
         last_tick = now;
         if now - last_report >= REPORT_EVERY {
             last_report = now;
-            if let Ok(mut r) = report.lock() {
-                *r = st.report(sink.as_ref());
+            let events = st.events(sink.as_ref());
+            if shown != Some(events) || now - shown_at >= HEARTBEAT {
+                shown = Some(events);
+                shown_at = now;
+                if let Ok(mut r) = report.lock() {
+                    *r = st.report(sink.as_ref());
+                }
             }
         }
     }
@@ -326,6 +335,20 @@ impl State {
         let ns = t.elapsed().as_nanos() as u64;
         self.counts.decode_ns += ns;
         self.counts.decode_max_ns = self.counts.decode_max_ns.max(ns);
+    }
+
+    /// What going wrong counts: the line is renewed when one moves.
+    fn events(&self, sink: &dyn Sink) -> [u64; 7] {
+        let j = &self.jitter;
+        [
+            self.counts.errors,
+            j.lost,
+            j.late,
+            j.dropped,
+            j.resyncs,
+            sink.underruns() as u64,
+            (self.counts.packets > 0) as u64 | ((sink.name() == "clock") as u64) << 1,
+        ]
     }
 
     fn report(&self, sink: &dyn Sink) -> String {
