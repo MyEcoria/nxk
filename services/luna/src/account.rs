@@ -1,13 +1,16 @@
-//! The account side, on a thread of its own: network time, sign-in by
-//! code, the token kept fresh, the player profile, then the catalog and
-//! its covers, read again every half hour.
+//! The account side, on a thread of its own: the library kept on the card
+//! shown at once, network time, sign-in by code, the token kept fresh, the
+//! player profile, then the catalog and its covers (only the new ones are
+//! downloaded), read again every half hour.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lunacore::auth::{self, Session, State as Stored};
 use lunacore::catalog::{self, ENTITLEMENT_BATCH};
+use lunacore::library::{self, Library};
 use lunacore::{config, cover, pages};
 use nxsvc::{Catalog, Cover, Game, State};
 use serde_json::json;
@@ -22,6 +25,9 @@ const RETRY: Duration = Duration::from_secs(15);
 const REFRESH: Duration = Duration::from_secs(30 * 60);
 const COVER_SIDE: usize = 256;
 
+/// The address each game's cover on show was made from.
+type Shown = HashMap<String, String>;
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -29,7 +35,15 @@ fn unix_now() -> u64 {
 }
 
 pub fn run(cat: Catalog, domain: String, user: String) {
-    let mut with_cover: HashSet<String> = HashSet::new();
+    let dir = store::dir();
+    let dir = Path::new(&dir);
+    let mut lib = library::load(dir);
+    let mut shown = Shown::new();
+    if !lib.games.is_empty() {
+        println!("luna: {} games on the card", lib.games.len());
+        list(&cat, &lib);
+        from_card(&cat, dir, &lib, &mut shown);
+    }
     loop {
         while unix_now() < TIME_FLOOR_S {
             cat.set_state(State::Loading("Waiting for the network time".into()));
@@ -41,8 +55,20 @@ pub fn run(cat: Catalog, domain: String, user: String) {
             .and_then(|()| read_catalog(&mut api, &mut st));
         let wait = match games {
             Ok(games) => {
-                show(&cat, &games);
-                covers(&cat, &mut api, &games, &mut with_cover);
+                let new = Library::of(&games, COVER_SIDE as u32);
+                list(&cat, &new);
+                cat.set_state(State::Ready(if games.is_empty() {
+                    "No game this account can play".into()
+                } else {
+                    String::new()
+                }));
+                shown.retain(|id, _| new.has(id));
+                library::prune(dir, &lib, &new);
+                if library::save(dir, &new).is_err() {
+                    println!("luna: the library could not be kept on the card");
+                }
+                lib = new;
+                covers(&cat, &mut api, dir, &lib, &mut shown);
                 REFRESH
             }
             Err(e) => {
@@ -194,63 +220,74 @@ fn read_catalog(api: &mut Api, st: &mut Stored) -> Result<Vec<catalog::Game>> {
     }
 }
 
-fn show(cat: &Catalog, games: &[catalog::Game]) {
-    let list = games
+/// The games on the home screen (the state is the caller's).
+fn list(cat: &Catalog, lib: &Library) {
+    let games = lib
+        .games
         .iter()
-        .filter(|g| nxsvc::valid_id(&g.id))
-        .map(|g| Game {
-            id: g.id.clone(),
-            title: g.title.clone(),
-            publisher: g.publisher.clone().unwrap_or_default(),
+        .filter(|e| nxsvc::valid_id(&e.id))
+        .map(|e| Game {
+            id: e.id.clone(),
+            title: e.title.clone(),
+            publisher: e.publisher.clone(),
             version: String::new(),
-            description: g.genres.join(", "),
+            description: e.genres.join(", "),
             color: 0x232F3E,
         })
         .collect();
-    cat.set_games(list);
-    let text = if games.is_empty() {
-        "No game this account can play"
-    } else {
-        ""
-    };
-    cat.set_state(State::Ready(text.into()));
+    cat.set_games(games);
 }
 
-/// Each game's box art, in list order (the first ones show first).
-fn covers(cat: &Catalog, api: &mut Api, games: &[catalog::Game], done: &mut HashSet<String>) {
+/// The cover made of a decoded picture: the middle of it, `COVER_SIDE` square.
+fn make(p: &cover::Picture) -> Cover {
+    let px = cover::square(p, COVER_SIDE);
+    Cover::from_fn(COVER_SIDE, |x, y| px[y * COVER_SIDE + x])
+}
+
+/// The covers kept on the card, from the first game on.
+fn from_card(cat: &Catalog, dir: &Path, lib: &Library, shown: &mut Shown) {
+    for e in &lib.games {
+        let pic = library::read_cover(dir, e).and_then(|b| cover::decode(&b));
+        if let (Some(p), Some(url)) = (pic, &e.cover_url) {
+            cat.set_cover(&e.id, &make(&p));
+            shown.insert(e.id.clone(), url.clone());
+        }
+    }
+    println!("luna: {} covers from the card", shown.len());
+}
+
+/// Each game's box art, in list order (the first ones show first); the
+/// ones on show already, from the same picture, are not asked for again.
+fn covers(cat: &Catalog, api: &mut Api, dir: &Path, lib: &Library, shown: &mut Shown) {
     let (mut got, mut first_err) = (0, None);
-    for g in games {
-        if done.contains(&g.id) {
+    for e in &lib.games {
+        let Some(url) = &e.cover_url else {
+            first_err.get_or_insert("no picture URL".to_string());
+            continue;
+        };
+        if shown.get(&e.id) == Some(url) {
             continue;
         }
-        let url = g
-            .portrait
-            .as_deref()
-            .or(g.landscape.as_deref())
-            .and_then(|u| cover::sized_url(u, COVER_SIDE as u32));
-        let pic = url
-            .ok_or_else(|| "no picture URL".to_string())
-            .and_then(|u| api.image(&u))
-            .and_then(|b| {
-                cover::decode(&b).ok_or_else(|| format!("not a JPEG ({} bytes)", b.len()))
-            });
+        let pic = api.image(url).and_then(|b| match cover::decode(&b) {
+            Some(p) => Ok((b, p)),
+            None => Err(format!("not a JPEG ({} bytes)", b.len())),
+        });
         match pic {
-            Ok(p) => {
-                let px = cover::square(&p, COVER_SIDE);
-                cat.set_cover(
-                    &g.id,
-                    &Cover::from_fn(COVER_SIDE, |x, y| px[y * COVER_SIDE + x]),
-                );
-                done.insert(g.id.clone());
+            Ok((jpeg, p)) => {
+                cat.set_cover(&e.id, &make(&p));
+                shown.insert(e.id.clone(), url.clone());
+                if library::write_cover(dir, e, &jpeg).is_err() {
+                    first_err.get_or_insert("a cover could not be kept".to_string());
+                }
                 got += 1;
             }
-            Err(e) => {
-                first_err.get_or_insert(e);
+            Err(err) => {
+                first_err.get_or_insert(err);
             }
         }
     }
     println!(
-        "luna: {} covers, first failure: {}",
+        "luna: {} new covers, first failure: {}",
         got,
         first_err.as_deref().unwrap_or("none")
     );

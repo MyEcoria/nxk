@@ -8,6 +8,7 @@ pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod cover;
+pub mod library;
 pub mod pages;
 pub mod proto;
 pub mod proxy;

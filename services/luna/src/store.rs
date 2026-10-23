@@ -1,13 +1,18 @@
 //! The device's serial and the session, in `state.json` of the user's
-//! directory for this catalog (`NXK_SERVICE_DIR`). FAT keeps no
+//! directory for this catalog (`dir`). FAT keeps no
 //! permissions: anyone with the card can read the tokens.
 
 use lunacore::auth::State;
 
-fn path() -> String {
+/// This catalog's directory for the user (`NXK_SERVICE_DIR`).
+pub fn dir() -> String {
     let dir =
         std::env::var(nxk_abi::proto::provider::DIR_ENV).unwrap_or_else(|_| "/config/luna".into());
-    format!("{}/state.json", dir.trim_end_matches('/'))
+    dir.trim_end_matches('/').to_string()
+}
+
+fn path() -> String {
+    format!("{}/state.json", dir())
 }
 
 /// The state on the card, or a new device.

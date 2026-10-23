@@ -247,9 +247,12 @@ is refreshed before it expires, `getAppConfig` gives the account's
 region's proxy and the player profile named as the console's user (or the
 first) is taken. The list is the games the account can play (entitlements
 checked by 25), continue playing first, then recently added, then the
-rest by title; each game's box art comes resized by Amazon's image server,
-fitted into the square on a blurred copy of itself. The list is read again
-every 30 minutes.
+rest by title; each game's box art comes resized by Amazon's image server
+and fills the square, its middle kept (a portrait loses its top and
+bottom). The list and the pictures are kept on the card, in the user's
+directory for the catalog (`library.json`, one `cover-HASH.jpg` a game):
+the next start shows them at once, before the network, and only new
+covers are downloaded. The list is read again every 30 minutes.
 
 Playing a game: a session left open by a crash is ended first (one stream
 per account), the game page gives the launch parameters, every region is
@@ -296,7 +299,8 @@ ECDHE-RSA-CHACHA20-POLY1305), `services/nxopus` (an Opus decoder for
 CELT-only packets, ported from libopus 1.6.1's float build: the same
 final range as libopus on every packet of its vectors and of a capture
 of the live stream, samples 105 dB or closer, concealment 70 dB) and
-`services/lunacore` (requests and replies, the catalog, cover fitting,
+`services/lunacore` (requests and replies, the catalog, cover cropping and the
+library kept on the card,
 the stream's protocol and the audio playout's timing, with no I/O;
 ported from the desktop client in `sources/luna`):
 
