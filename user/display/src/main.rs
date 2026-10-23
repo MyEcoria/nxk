@@ -95,6 +95,8 @@ const EV_EXIT: u64 = 4;
 const SCAN_NS: u64 = 8_000_000_000;
 /// A game that took the screen by itself: its process checked this often.
 const LIVE_NS: u64 = 1_000_000_000;
+/// A catalog's covers it had not are asked again this often.
+const ABSENT_RETRY_NS: u64 = 10_000_000_000;
 
 // 32-bit word register indices.
 const CMD_DISPLAY_COMMAND: usize = 0x32;
@@ -1434,6 +1436,7 @@ fn main() -> i32 {
     let mut prov_play: Option<u64> = None;
     let mut stop_at: Option<u64> = None;
     let mut shown_wait: Option<u64> = None;
+    let mut absent_retry = 0u64;
     // Over a game: the overlay window's area of the UI's image (None: off), the
     // finger the overlay follows, and the frames counted while the drawer
     // is open (since, flips, longest gap, last flip, longest redraw).
@@ -1836,6 +1839,15 @@ fn main() -> i32 {
                 }
             }
             if prov.as_ref().is_some_and(|p| p.pid().is_some()) && ui.prov_list != 0 {
+                // Covers the catalog had not are asked again now and then
+                // too: a cover set while its ENOENT was on its way is not missed.
+                if !ui.covers_absent.is_empty() {
+                    if now >= absent_retry {
+                        ui.covers_absent.clear();
+                        absent_retry = now + ABSENT_RETRY_NS;
+                    }
+                    wake = wake.min(absent_retry);
+                }
                 if let (Some(p), Some(ids)) = (&prov, ui.want_covers()) {
                     p.covers(ui.prov_list, ids);
                 }
