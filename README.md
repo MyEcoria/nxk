@@ -252,18 +252,35 @@ first) is taken. The list is the games the account can play (entitlements
 checked by 25), continue playing first, then recently added, then the
 rest by title; each game's box art comes resized by Amazon's image server,
 fitted into the square on a blurred copy of itself. The list is read again
-every 30 minutes. Playing is not there yet (the stream: DTLS, video,
-audio). The serial and the tokens are `state.json` in
+every 30 minutes.
+
+Playing a game: a session left open by a crash is ended first (one stream
+per account), the game page gives the launch parameters, every region is
+pinged, `createGameSessionJob` asks for 1280x720 H.264 and the job is
+followed through Luna's queue on the launch card (its place in line).
+Then the stream: DTLS 1.2 to the session server (`services/nxdtls`, the
+certificate pinned as the session names it), SPP over it (connect, acks,
+time replies, RTCP every 100 ms, messages reassembled and kept in order),
+`main` set up with the session's token, then every channel the server
+announces (`display`, `audio`, `input`, `participant`). The console's
+controls go to `input` as an Xbox 360 pad, by position (Nintendo's B is
+Xbox's A); `main`'s pings are answered. HOME or sleep end the stream and
+`terminateGameSession` ends the cloud session (checked with
+`getPlayingGameSession`). The picture and the sound are not decoded yet:
+the screen stays dark and `display` and `audio` wait at their handshake. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 
 Under it: `services/nxhttp` (HTTPS: rustls on the pure-Rust RustCrypto
 provider, Mozilla's roots, HTTP/1.1 kept open, random bytes from the
-kernel) and `services/lunacore` (requests and replies, the catalog, cover
-fitting, with no I/O; ported from the desktop client in `sources/luna`):
+kernel), `services/nxdtls` (a DTLS 1.2 client with no I/O, one suite:
+ECDHE-RSA-CHACHA20-POLY1305) and `services/lunacore` (requests and
+replies, the catalog, cover fitting, the stream's protocol, with no I/O;
+ported from the desktop client in `sources/luna`):
 
 ```bash
 cargo test --manifest-path services/lunacore/Cargo.toml   # on the PC
+cargo test --manifest-path services/nxdtls/Cargo.toml     # against openssl s_server
 ```
 
 ## Build, run, test
@@ -384,7 +401,8 @@ std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
 services/   game catalogs (std) and nxsvc, their SDK: a demo catalog, Amazon
-            Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS)
+            Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS),
+            nxdtls (DTLS 1.2)
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),
