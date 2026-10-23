@@ -566,8 +566,9 @@ fn sleep_steps(
         if saved.is_some() {
             return;
         }
-        // A catalog ends what needs the network before Wi-Fi goes.
-        catalog::tell_sleeper(libnx::abi::proto::SUSPEND, SLEEP_CALL_NS);
+        // A catalog ends what needs the network (a cloud session) before
+        // Wi-Fi goes: as long as a STOP may take; the screen is dark already.
+        catalog::tell_sleeper(libnx::abi::proto::SUSPEND, provproto::STOP_NS);
         tell_sleepers(libnx::abi::proto::SUSPEND, SLEEPERS.iter());
         if let Some(v) = hw.ov {
             let _l = link.lock();
