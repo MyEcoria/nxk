@@ -1520,6 +1520,24 @@ within 5 s.
     two periods under a busy GPU; depth 3 would have had one. Not yet
     heard or measured: the real latency of Luna's sound (the user's ears)
     and the display redrawing at the same time (the library was on screen).
+58. 23/10/2026, Erista (gauge at 7 %, plugged), boot image of run 54,
+    `power`, `display` and `audio` of `93466f6` reloaded, Luna of the same
+    build in `/services/luna/`: **Luna's sound on silicon** (Wobbly Life,
+    speakers at 10 %, about 105 s, the network shared by the PC over the
+    cable). nxopus decodes a 20 ms frame in 270 us on average, 0.8 ms at
+    most (about 1.4 % of a core); the stream asked the service for 4
+    periods of 128 frames. Of ~4600 packets, 332 were concealed (289 came
+    after their deadline) and the ring ran dry 140 times: 85 losses in the
+    first 2.6 s (the buffer at 23 ms, the drift loop at its -2000 ppm
+    limit), the rest in bursts where packets stalled 0.3 to 0.5 s (arrival
+    p99 333 to 508 ms) between calm stretches (p99 21 to 34 ms). Not known
+    yet: whether the stalls are the network, SPP holding a channel for a
+    retransmission, or the console. Before that, the first start of the
+    catalog died: `undefined instruction` at `+0xd8560` on a TLS worker
+    thread (`num_bigint_dig`), a valid `str x30` in the file: the CPU ran
+    other bytes than the file's on a code page loaded on demand, like the
+    zero pages of run 56; display's restart of the catalog ran. Covers:
+    `HTTP 400` from the image server (none shown).
 
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
