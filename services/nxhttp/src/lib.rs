@@ -130,20 +130,7 @@ impl Client {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> io::Result<Response> {
-        let mut head = format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\nContent-Length: {}\r\n",
-            method,
-            path,
-            self.host,
-            body.len()
-        );
-        for (n, v) in headers {
-            if n.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
-                return Err(bad("line break in a header"));
-            }
-            head.push_str(&format!("{}: {}\r\n", n, v));
-        }
-        head.push_str("\r\n");
+        let head = request_head(method, path, &self.host, headers, body.len())?;
         if self.conn.is_none() {
             self.conn = Some(self.connect()?);
         }
@@ -274,6 +261,33 @@ fn read_chunked(conn: &mut Conn) -> io::Result<Vec<u8>> {
     }
 }
 
+/// The request line and headers. `Content-Length` goes only with a body
+/// (or a method that takes one): Amazon's image origin answers 400 to a GET
+/// that has `Content-Length: 0` whenever its CDN has no copy.
+fn request_head(
+    method: &str,
+    path: &str,
+    host: &str,
+    headers: &[(&str, &str)],
+    body_len: usize,
+) -> io::Result<String> {
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n",
+        method, path, host
+    );
+    if body_len > 0 || matches!(method, "POST" | "PUT" | "PATCH") {
+        head.push_str(&format!("Content-Length: {}\r\n", body_len));
+    }
+    for (n, v) in headers {
+        if n.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            return Err(bad("line break in a header"));
+        }
+        head.push_str(&format!("{}: {}\r\n", n, v));
+    }
+    head.push_str("\r\n");
+    Ok(head)
+}
+
 /// Splits `https://host/path` into its host and path.
 pub fn split_url(url: &str) -> Option<(&str, &str)> {
     let rest = url.strip_prefix("https://")?;
@@ -298,3 +312,39 @@ fn kernel_random(buf: &mut [u8]) -> Result<(), getrandom::Error> {
 
 #[cfg(target_os = "nxk")]
 getrandom::register_custom_getrandom!(kernel_random);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_get_has_no_content_length() {
+        let h = request_head(
+            "GET",
+            "/a.png",
+            "m.media-amazon.com",
+            &[("Accept", "*/*")],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            h,
+            "GET /a.png HTTP/1.1\r\nHost: m.media-amazon.com\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_post_says_its_length_even_when_empty() {
+        assert!(request_head("POST", "/x", "h", &[], 0)
+            .unwrap()
+            .contains("Content-Length: 0\r\n"));
+        assert!(request_head("POST", "/x", "h", &[], 5)
+            .unwrap()
+            .contains("Content-Length: 5\r\n"));
+    }
+
+    #[test]
+    fn a_line_break_in_a_header_is_refused() {
+        assert!(request_head("GET", "/", "h", &[("A", "b\r\nC: d")], 0).is_err());
+    }
+}
