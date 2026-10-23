@@ -1538,6 +1538,18 @@ within 5 s.
     other bytes than the file's on a code page loaded on demand, like the
     zero pages of run 56; display's restart of the catalog ran. Covers:
     `HTTP 400` from the image server (none shown).
+59. 23/10/2026, same console and image as run 58 (gauge 5-7 %, plugged),
+    a second Luna session with the run 58 build: again 37 packets
+    concealed in the first 3 s (the buffer at 26 ms: only two packets were
+    in hand when play started) and stalls of 0.2 to 0.5 s after. The PC's
+    own link was the bottleneck then: its Wi-Fi uplink, loaded by the
+    PC's downloads (1.1 MB/s), answered pings in 632 ms on average (3.3 s
+    at most, 4 % lost), and an emulator session over it at the same time
+    saw a third of the audio packets lost on the network while luna's
+    stream thread was never busy more than 5 ms. An instrumented build
+    then died at once on the code-page fault of run 58 (`+0xd5170`, a
+    page-aligned address, right after "SPP connected"). Reloading
+    `display` leaves the old catalog process running (two orphans).
 
     Cause found afterwards, in the emulator (not yet shown on silicon): `fs`'s
     sector cache read ahead into the shared I/O buffer, then took a victim
