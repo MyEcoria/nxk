@@ -218,26 +218,40 @@ fn show(cat: &Catalog, games: &[catalog::Game]) {
 
 /// Each game's box art, in list order (the first ones show first).
 fn covers(cat: &Catalog, api: &mut Api, games: &[catalog::Game], done: &mut HashSet<String>) {
+    let (mut got, mut first_err) = (0, None);
     for g in games {
         if done.contains(&g.id) {
             continue;
         }
-        let Some(url) = g
+        let url = g
             .portrait
             .as_deref()
             .or(g.landscape.as_deref())
-            .and_then(|u| cover::sized_url(u, COVER_SIDE as u32))
-        else {
-            continue;
-        };
-        let pic = api.image(&url).ok().and_then(|b| cover::decode(&b));
-        if let Some(p) = pic {
-            let px = cover::square(&p, COVER_SIDE);
-            cat.set_cover(
-                &g.id,
-                &Cover::from_fn(COVER_SIDE, |x, y| px[y * COVER_SIDE + x]),
-            );
-            done.insert(g.id.clone());
+            .and_then(|u| cover::sized_url(u, COVER_SIDE as u32));
+        let pic = url
+            .ok_or_else(|| "no picture URL".to_string())
+            .and_then(|u| api.image(&u))
+            .and_then(|b| {
+                cover::decode(&b).ok_or_else(|| format!("not a JPEG ({} bytes)", b.len()))
+            });
+        match pic {
+            Ok(p) => {
+                let px = cover::square(&p, COVER_SIDE);
+                cat.set_cover(
+                    &g.id,
+                    &Cover::from_fn(COVER_SIDE, |x, y| px[y * COVER_SIDE + x]),
+                );
+                done.insert(g.id.clone());
+                got += 1;
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
         }
     }
+    println!(
+        "luna: {} covers, first failure: {}",
+        got,
+        first_err.as_deref().unwrap_or("none")
+    );
 }

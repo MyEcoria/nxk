@@ -1477,6 +1477,28 @@ within 5 s.
     process left). Seen with `nxdbg.py shot` (display's copy of the image),
     not yet confirmed by eye on the panel.
 
+56. 23/10/2026, Erista, boot image of run 54, `power` and `display` of
+    `9142d46` reloaded over USB-C, `services/luna` in `/services/luna/`:
+    **Amazon Luna signed in on silicon**. No Wi-Fi joined, so the PC
+    shared its connection over the cable (README "Internet over USB-C",
+    `nmcli ... nxk-share`). `power`'s SNTP set the clock from 2000-01-07 to
+    the real time (`RTC offset 845468256 s`, kept in `/config/rtc_offset`).
+    The Luna tab showed the QR code and a code; the user entered it at
+    amazon.fr/code, the device registered, the player profile was taken
+    and the account's playable games listed (Wobbly Life, Avatar: Frontiers
+    of Pandora, Goat Simulator 3, Shadow of the Tomb Raider...), their box
+    art on its blurred backdrop after a restart of the catalog (none came
+    in the first minute after the sign-in: not explained). A later `luna`
+    build (one more log line; fine in the emulator) died at once, four
+    times, on "undefined instruction" at the start of code pages
+    (0xac000, 0xdd000, 0xde000): pages read as zeros. Copying it over the
+    running file, or as a new file, made no difference, while the first
+    build ran again. Meanwhile the SD card answered EIO before the reboot,
+    and the battery read 6, 3, 2 then 1 % **while plugged in**: under nxk
+    it drains rather than charges. Tests stopped there: charge under
+    Horizon or hekate first, then load that build again to tell a loader
+    or SD fault from the low battery.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
