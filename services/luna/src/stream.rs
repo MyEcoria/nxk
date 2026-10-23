@@ -2,7 +2,8 @@
 //! SPP over it, the setup of `main` and of every channel the server
 //! announces, then the gamepad sent on `input` and the rest kept alive
 //! (acks, time requests, RTCP, pongs). Audio messages go to the player
-//! (`audio`); display messages are counted only: decoding them comes later.
+//! (`audio`); display messages are answered and counted (`video`):
+//! decoding them comes later.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
@@ -529,11 +530,21 @@ fn streaming(
     let mut counts: HashMap<u8, (u64, u64)> = HashMap::new();
     let audio_id = s.names.iter().find(|(_, n)| *n == "audio").map(|(i, _)| *i);
     let mut audio = crate::audio::Audio::default();
+    let display_id = s
+        .names
+        .iter()
+        .find(|(_, n)| n.starts_with("display"))
+        .map(|(i, _)| *i);
+    let mut video = crate::video::Video::default();
     s.link.stats.audio_channel = audio_id;
     // The player orders audio by frame_index: SPP holding a missing
     // message would only delay every packet behind it.
     if let Some(a) = audio_id {
         s.link.recv.unordered(a);
+    }
+    // Same for video: a late frame is dropped by the decoder's numbering.
+    if let Some(d) = display_id {
+        s.link.recv.unordered(d);
     }
     let (mut link_shown, mut link_events) = (Instant::now(), u64::MAX);
     let (mut next_rtcp, mut next_sync, mut next_report) = (
@@ -579,6 +590,17 @@ fn streaming(
                     }
                 }
             }
+            Some(Event::Message(m)) if Some(m.channel) == display_id => {
+                if let Ok(f) = Frame::decode(&m.bytes) {
+                    for reply in video.on_frame(f) {
+                        let r = Frame {
+                            message: reply.encode_to_vec(),
+                            raw: Vec::new(),
+                        };
+                        s.link.send_frame(m.channel, &r)?;
+                    }
+                }
+            }
             Some(Event::Message(m)) => {
                 let c = counts.entry(m.channel).or_default();
                 (c.0, c.1) = (c.0 + 1, c.1 + m.bytes.len() as u64);
@@ -593,6 +615,15 @@ fn streaming(
                     raw: Vec::new(),
                 };
                 s.link.send_frame(id, &f)?;
+            }
+        }
+        if let Some(d) = display_id {
+            for reply in video.on_tick() {
+                let r = Frame {
+                    message: reply.encode_to_vec(),
+                    raw: Vec::new(),
+                };
+                s.link.send_frame(d, &r)?;
             }
         }
         let now = Instant::now();
@@ -644,6 +675,9 @@ fn streaming(
             if line != last_report {
                 println!("{}", line);
                 last_report = line;
+            }
+            if let Some(v) = video.report() {
+                println!("{}", v);
             }
             next_report = now + REPORT_EVERY;
         }

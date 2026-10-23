@@ -13,6 +13,7 @@ mod player;
 mod qr;
 mod store;
 mod stream;
+mod video;
 
 use std::time::Duration;
 

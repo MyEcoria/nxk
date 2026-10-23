@@ -6,6 +6,7 @@
 //! audio playout's timing (`playout`).
 
 pub mod audio;
+pub mod display;
 pub mod framing;
 pub mod input;
 pub mod playout;
