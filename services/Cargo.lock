@@ -437,8 +437,10 @@ version = "0.1.0"
 dependencies = [
  "lunacore",
  "nxdtls",
+ "nxgfx",
  "nxhttp",
  "nxk-abi",
+ "nxopus",
  "nxsvc",
  "prost",
  "qrcode",
@@ -544,6 +546,10 @@ version = "0.1.0"
 
 [[package]]
 name = "nxk-shader"
+version = "0.1.0"
+
+[[package]]
+name = "nxopus"
 version = "0.1.0"
 
 [[package]]

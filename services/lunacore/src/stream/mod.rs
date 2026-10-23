@@ -1,11 +1,14 @@
 //! Luna's streaming protocol with no I/O, ported from the desktop client
 //! (docs/PROTOCOL.md there): SPP packets over DTLS (`spp`), their
 //! reassembly and ordering (`reliability`), the message framing of every
-//! channel (`framing`), the session's setup messages (`setup`) and the
-//! input channel's events (`input`).
+//! channel (`framing`), the session's setup messages (`setup`), the
+//! input channel's events (`input`), the audio channel (`audio`) and the
+//! audio playout's timing (`playout`).
 
+pub mod audio;
 pub mod framing;
 pub mod input;
+pub mod playout;
 pub mod reliability;
 pub mod setup;
 pub mod spp;

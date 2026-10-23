@@ -6,8 +6,10 @@
 
 mod account;
 mod api;
+mod audio;
 mod launch;
 mod pad;
+mod player;
 mod qr;
 mod store;
 mod stream;

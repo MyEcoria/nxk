@@ -70,3 +70,15 @@ Also open: no headphone path or jack detect (GPIO V6), no volume control,
 one client at a time, no mipmaps for textures (Starlane's far grid is
 faded to dark instead), and no alpha blending (Starlane's crash banner
 is an opaque black band).
+
+## 4. `audio`: 85 ms queued before the speakers
+
+The service keeps the whole DMA ring full: 8 periods of 512 frames, 85 ms
+of sound between a client's ring and the speakers. Fine for a game's
+effects, but a cloud stream (Luna) adds it to its own 50 ms of jitter
+buffer and to the network. Known: the pump refills a period as one is
+played (`fill`, `PERIODS`, `PERIOD_FRAMES`); Luna's player measures what
+it writes, not what the DMA holds. To weigh: (a) fewer or shorter periods
+for every client (more wake-ups, the pump must never be late: check `max
+step` on the Erista), (b) a client asks for a shallow queue at `OPEN`,
+(c) the client ring feeding the DMA ring directly.

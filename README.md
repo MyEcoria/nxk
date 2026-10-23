@@ -268,21 +268,38 @@ announces (`display`, `audio`, `input`, `participant`). The console's
 controls go to `input` as an Xbox 360 pad, by position (Nintendo's B is
 Xbox's A); `main`'s pings are answered. HOME or sleep end the stream and
 `terminateGameSession` ends the cloud session (checked with
-`getPlayingGameSession`). The picture and the sound are not decoded yet:
-the screen stays dark and `display` and `audio` wait at their handshake. The serial and the tokens are `state.json` in
+`getPlayingGameSession`). The sound plays: `audio`'s Opus packets (CELT
+only, 20 ms, stereo, 96 to 160 kb/s) are put back in `frame_index` order,
+decoded by `services/nxopus` on a thread of their own, and written to the
+`audio` service's ring, kept 50 ms ahead (`nxgfx::audio::Stream`); a
+packet still missing when the ring runs low is concealed (libopus's
+pitch-based concealment, then noise), and a resampler (32-tap windowed
+sinc) runs up to 2000 ppm off 1 to follow the server's clock, steered by
+the buffered audio, so nothing is dropped or repeated for drift. Every 5 s
+a line gives packets, losses, the decoding time, the buffer and the
+packets' arrival jitter. Speakers that do not take 48 kHz (the
+emulator's run at a quarter of it) are replaced by a clock after 4 s, so
+the rest still runs there. The picture is not decoded yet: the screen
+stays dark and `display` waits at its handshake. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 
 Under it: `services/nxhttp` (HTTPS: rustls on the pure-Rust RustCrypto
 provider, Mozilla's roots, HTTP/1.1 kept open, random bytes from the
 kernel), `services/nxdtls` (a DTLS 1.2 client with no I/O, one suite:
-ECDHE-RSA-CHACHA20-POLY1305) and `services/lunacore` (requests and
-replies, the catalog, cover fitting, the stream's protocol, with no I/O;
+ECDHE-RSA-CHACHA20-POLY1305), `services/nxopus` (an Opus decoder for
+CELT-only packets, ported from libopus 1.6.1's float build: the same
+final range as libopus on every packet of its vectors and of a capture
+of the live stream, samples 105 dB or closer, concealment 70 dB) and
+`services/lunacore` (requests and replies, the catalog, cover fitting,
+the stream's protocol and the audio playout's timing, with no I/O;
 ported from the desktop client in `sources/luna`):
 
 ```bash
 cargo test --manifest-path services/lunacore/Cargo.toml   # on the PC
 cargo test --manifest-path services/nxdtls/Cargo.toml     # against openssl s_server
+cargo test --manifest-path services/nxopus/Cargo.toml     # against libopus's vectors
+python3 services/nxopus/tests/gen_vectors.py services/nxopus/tests/vectors   # remake them
 ```
 
 ## Build, run, test
@@ -404,7 +421,7 @@ apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
 services/   game catalogs (std) and nxsvc, their SDK: a demo catalog, Amazon
             Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS),
-            nxdtls (DTLS 1.2)
+            nxdtls (DTLS 1.2), nxopus (Opus decoder)
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),
@@ -738,3 +755,9 @@ with libnx), versus 836 µs with pthread on L4T.
 
 The screen font comes from Terminus (Dimitar Zhekov, SIL Open Font
 License 1.1), converted at build time from the host system console font.
+
+`services/nxopus` is a port of libopus 1.6.1 (Xiph.Org, Skype Limited,
+Octasic, Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell,
+Mark Borgerding, Erik de Castro Lopo, Mozilla, Amazon), BSD 3-clause:
+`services/nxopus/LICENSE`. Its test vectors are made with the PC's
+libopus.

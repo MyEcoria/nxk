@@ -1,8 +1,8 @@
 //! A Luna stream on one thread: DTLS to the session server (`nxdtls`),
 //! SPP over it, the setup of `main` and of every channel the server
 //! announces, then the gamepad sent on `input` and the rest kept alive
-//! (acks, time requests, RTCP, pongs). Display and audio messages are
-//! counted only: decoding them comes later.
+//! (acks, time requests, RTCP, pongs). Audio messages go to the player
+//! (`audio`); display messages are counted only: decoding them comes later.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
@@ -452,6 +452,8 @@ fn streaming(
     stop: &AtomicBool,
 ) -> Result<End> {
     let mut counts: HashMap<u8, (u64, u64)> = HashMap::new();
+    let audio_id = s.names.iter().find(|(_, n)| *n == "audio").map(|(i, _)| *i);
+    let mut audio = crate::audio::Audio::default();
     let (mut next_rtcp, mut next_sync, mut next_report) = (
         Instant::now(),
         Instant::now() + TIMESYNC_EVERY,
@@ -481,6 +483,17 @@ fn streaming(
                             break End::Closed;
                         }
                         _ => {}
+                    }
+                }
+            }
+            Some(Event::Message(m)) if Some(m.channel) == audio_id => {
+                if let Ok(f) = Frame::decode(&m.bytes) {
+                    for reply in audio.on_frame(&f) {
+                        let r = Frame {
+                            message: reply.encode_to_vec(),
+                            raw: Vec::new(),
+                        };
+                        s.link.send_frame(m.channel, &r)?;
                     }
                 }
             }
@@ -532,7 +545,7 @@ fn streaming(
                 line.push_str(&format!(" {} {} msgs {} KB,", name, n, bytes / 1024));
             }
             // Only when something new came: these lines reach the LOGS page.
-            let line = line.trim_end_matches(',').to_string();
+            let line = format!("{}\n{}", line.trim_end_matches(','), audio.report());
             if line != last_report {
                 println!("{}", line);
                 last_report = line;
