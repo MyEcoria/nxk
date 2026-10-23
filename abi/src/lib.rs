@@ -1278,7 +1278,13 @@ pub mod proto {
     pub mod audio {
         /// handle 0 = shm (any flags, read/write) of `RING_HEADER` bytes
         /// plus the frames: 4 bytes each, left then right, 16-bit signed.
-        /// word 0 = its length. Reply: word 0 = frames in the ring.
+        /// word 0 = its length; optional word 1 = frames the client wants
+        /// held ahead of the speakers at most (0 or absent: the whole DMA
+        /// ring, 4096 frames = 85 ms; less: shorter DMA periods, so the
+        /// sound is nearer to the client's write at the price of a pump
+        /// with less time to spare). Reply: word 0 = frames in the ring,
+        /// word 1 = DMA period (frames), word 2 = periods kept ahead
+        /// (older services reply word 0 alone).
         pub const OPEN: u32 = 3;
         /// Stop playing the client's ring.
         pub const CLOSE: u32 = 4;

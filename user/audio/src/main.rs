@@ -9,7 +9,9 @@
 //!
 //! A client shares a ring of frames; a pump thread copies them, a DMA
 //! period at a time, into the ring an ADMA channel loops over to the
-//! ADMAIF FIFO (silence when the client has nothing).
+//! ADMAIF FIFO (silence when the client has nothing). The pump keeps
+//! `Mode::depth` periods filled ahead of the speakers: all 8 (85 ms) by
+//! default, a few short ones for a client that asks for a shallow queue.
 
 #![no_std]
 #![no_main]
@@ -412,19 +414,60 @@ const ADMA_CH_TC: usize = 0x44;
 const ADMA_CH_XFER_STATUS: usize = 0x54;
 /// Memory to AHUB, continuous, flow control; request: ADMAIF channel 1.
 const ADMA_CTRL: u32 = 1 << 28 | 4 << 12 | 2 << 8 | 1 << 1;
-/// DMA ring: `PERIODS` periods of `PERIOD_FRAMES` frames, a period
-/// being one ADMA buffer (the position counts them).
-const PERIODS: u32 = 8;
-const PERIOD_FRAMES: u32 = 512;
-const PERIOD_BYTES: u32 = PERIOD_FRAMES * 4;
-/// Burst of 16 words (fls(16) = 5), weight 1; ring of PERIODS buffers.
-const ADMA_CONFIG: u32 = (PERIODS - 1) << 28 | 5 << 20 | 1;
+/// DMA ring: `RING_PERIODS` ADMA buffers (the position counts them) of
+/// `Mode::period` frames each; the memory is sized for the longest.
+const RING_PERIODS: u32 = 8;
+const MAX_PERIOD_FRAMES: u32 = 512;
+const MIN_PERIOD_FRAMES: u32 = 128;
+/// Fewest periods kept filled: the pump looks every millisecond or so.
+const MIN_DEPTH: u32 = 2;
+/// Burst of 16 words (fls(16) = 5), weight 1; ring of RING_PERIODS buffers.
+const ADMA_CONFIG: u32 = (RING_PERIODS - 1) << 28 | 5 << 20 | 1;
 /// ADMA FIFO size 3, the transmit field (ADMAIF channel 1).
 const ADMA_FIFO_CTRL: u32 = 3 << 8;
 /// The pump's nap while suspended.
 const ASLEEP_NAP_US: u64 = 50_000;
 /// Silent for this long, the DMA stops until something plays.
 const IDLE_NS: u64 = 3_000_000_000;
+
+/// How the DMA ring runs: buffers of `period` frames, `depth` of them
+/// kept filled ahead of the speakers; the other slots hold silence, so a
+/// late pump plays silence and not old sound again.
+#[derive(Clone, Copy, PartialEq)]
+struct Mode {
+    period: u32,
+    depth: u32,
+}
+
+impl Mode {
+    /// The whole ring of the longest periods (85 ms ahead): games.
+    const DEEP: Mode = Mode {
+        period: MAX_PERIOD_FRAMES,
+        depth: RING_PERIODS,
+    };
+
+    /// For a client that wants about `queue` frames ahead at most (0 and
+    /// the whole ring's worth or more: `DEEP`). The shortest period that
+    /// reaches it in 8 slots keeps the wake-ups few.
+    fn for_queue(queue: u64) -> Self {
+        let q = queue.min(u32::MAX as u64) as u32;
+        if q == 0 || q >= MAX_PERIOD_FRAMES * RING_PERIODS {
+            return Self::DEEP;
+        }
+        let period = q
+            .div_ceil(RING_PERIODS)
+            .next_power_of_two()
+            .clamp(MIN_PERIOD_FRAMES, MAX_PERIOD_FRAMES);
+        Self {
+            period,
+            depth: q.div_ceil(period).clamp(MIN_DEPTH, RING_PERIODS),
+        }
+    }
+
+    fn period_bytes(&self) -> usize {
+        self.period as usize * 4
+    }
+}
 
 /// ADMA reset and enabled (its clock must run).
 fn adma_init(d: &Mmio) {
@@ -458,6 +501,7 @@ fn scale_frame(w: u32, gain: i32) -> u32 {
 struct Client {
     mem: SharedMemory,
     frames: u32,
+    mode: Mode,
 }
 
 impl Client {
@@ -642,12 +686,21 @@ struct Shared {
     /// Asleep: the codec and clocks are off (`Audio::down`).
     suspended: bool,
     playing: bool,
+    /// How the running (or last) stream is laid out in the DMA ring.
+    mode: Mode,
     underruns: u32,
     periods: u32,
     /// Most periods the DMA went on between two looks, and how often it
     /// went a whole lap (the ring played again: a late pump).
     max_step: u32,
     laps: u32,
+    /// Looks that found the filled periods all played (silence went
+    /// out), fewest filled periods left at a look, and longest time
+    /// between two looks (us): how much margin the pump has. Kept for
+    /// the mode they were measured in.
+    late: u32,
+    min_left: u32,
+    max_gap_us: u32,
 }
 
 impl Default for Shared {
@@ -660,10 +713,14 @@ impl Default for Shared {
             ready: false,
             suspended: false,
             playing: false,
+            mode: Mode::DEEP,
             underruns: 0,
             periods: 0,
             max_step: 0,
             laps: 0,
+            late: 0,
+            min_left: u32::MAX,
+            max_gap_us: 0,
         }
     }
 }
@@ -674,21 +731,37 @@ struct Pump {
     ahub: Mmio,
     adma: Mmio,
     ring: SharedMemory,
+    mode: Mode,
     /// Periods filled and played since the DMA started; the ADMA's count
     /// (16 bits) at the start and at the last look.
     filled: u32,
     played: u32,
     last: u16,
+    last_look_ns: u64,
     quiet_since: u64,
 }
 
 impl Pump {
+    fn slot(&self, n: u32) -> *mut u32 {
+        let at = (n % RING_PERIODS) as usize * self.mode.period_bytes();
+        unsafe { self.ring.as_ptr().add(at) as *mut u32 }
+    }
+
+    /// Silence in the DMA ring's slot of period `n`.
+    fn silence(&self, n: u32) {
+        let dst = self.slot(n);
+        for i in 0..self.mode.period as usize {
+            unsafe { core::ptr::write_volatile(dst.add(i), 0) };
+        }
+    }
+
     /// Fill the DMA ring's slot of period `n` with the next frames.
     fn fill(&mut self, sh: &mut Shared, n: u32) -> bool {
-        let mut buf = [0u32; PERIOD_FRAMES as usize];
+        let period = self.mode.period;
+        let mut buf = [0u32; MAX_PERIOD_FRAMES as usize];
         let mut got = 0u32;
         if let Some(m) = sh.music.as_mut() {
-            while got < PERIOD_FRAMES {
+            while got < period {
                 let Some(w) = m.frame() else {
                     sh.music = None;
                     break;
@@ -697,7 +770,7 @@ impl Pump {
                 got += 1;
             }
         } else if let Some(t) = sh.tone.as_mut() {
-            while got < PERIOD_FRAMES && t.frames > 0 {
+            while got < period && t.frames > 0 {
                 buf[got as usize] = t.frame();
                 got += 1;
                 t.frames -= 1;
@@ -706,16 +779,15 @@ impl Pump {
                 sh.tone = None;
             }
         } else if let Some(c) = sh.client.as_ref() {
-            got = c.take(&mut buf, PERIOD_FRAMES);
-            if got < PERIOD_FRAMES {
+            got = c.take(&mut buf, period);
+            if got < period {
                 c.underrun();
                 sh.underruns = sh.underruns.wrapping_add(1);
             }
         }
         let gain = sw_gain(sh.volume);
-        let at = (n % PERIODS * PERIOD_BYTES) as usize;
-        let dst = unsafe { self.ring.as_ptr().add(at) as *mut u32 };
-        for (i, w) in buf.iter().enumerate() {
+        let dst = self.slot(n);
+        for (i, w) in buf[..period as usize].iter().enumerate() {
             let scaled = if i < got as usize {
                 scale_frame(*w, gain)
             } else {
@@ -727,10 +799,27 @@ impl Pump {
     }
 
     fn begin(&mut self, sh: &mut Shared) {
-        for n in 0..PERIODS {
+        let mode = sh.client.as_ref().map_or(Mode::DEEP, |c| c.mode);
+        if mode != self.mode {
+            // The margins are those of the mode that runs.
+            self.mode = mode;
+            sh.laps = 0;
+            sh.max_step = 0;
+            sh.late = 0;
+            sh.min_left = u32::MAX;
+            sh.max_gap_us = 0;
+        }
+        sh.mode = mode;
+        // Silence in every slot but the filled ones; a ring last laid out
+        // with other periods would leave old sound in them.
+        let ring_words = (RING_PERIODS * MAX_PERIOD_FRAMES) as usize;
+        for i in 0..ring_words {
+            unsafe { core::ptr::write_volatile((self.ring.as_ptr() as *mut u32).add(i), 0) };
+        }
+        for n in 0..mode.depth {
             self.fill(sh, n);
         }
-        self.filled = PERIODS;
+        self.filled = mode.depth;
         self.played = 0;
         let (a, d) = (&self.ahub, &self.adma);
         // The block's reset needs it enabled; the stream path is reset
@@ -752,7 +841,7 @@ impl Pump {
         a.w32(ADMAIF_TX1 + ADMAIF_TX_ENABLE, 1);
         let pa = self.ring.paddr(0).unwrap_or(0);
         d.w32(ADMA_CH_INT_CLEAR, 1);
-        d.w32(ADMA_CH_TC, PERIOD_BYTES);
+        d.w32(ADMA_CH_TC, mode.period * 4);
         d.w32(ADMA_CH_CTRL, ADMA_CTRL);
         d.w32(ADMA_CH_SRC, pa as u32);
         d.w32(
@@ -763,10 +852,11 @@ impl Pump {
         d.w32(ADMA_CH_CONFIG, ADMA_CONFIG);
         d.w32(ADMA_CH_CMD, 1);
         // The count may start again from zero with the channel: take the
-        // reference after it runs (a period lasts 2.7 ms).
+        // reference after it runs (a period lasts 2.7 ms or more).
         time::sleep_us(100);
         self.last = d.r32(ADMA_CH_XFER_STATUS) as u16;
         self.quiet_since = time::now_ns();
+        self.last_look_ns = self.quiet_since;
         // The stream is running: let it through (the pops of the
         // amplifier go by while the first periods play).
         time::sleep_ms(2);
@@ -782,9 +872,8 @@ impl Pump {
 
     /// One look, every millisecond or so.
     fn tick(&mut self, sh: &mut Shared) {
-        let active = sh.music.is_some()
-            || sh.tone.is_some()
-            || sh.client.as_ref().is_some_and(|c| c.pending());
+        let wants = sh.client.as_ref().filter(|c| c.pending()).map(|c| c.mode);
+        let active = sh.music.is_some() || sh.tone.is_some() || wants.is_some();
         if !sh.playing {
             // Asleep: the clocks are off, the ADMA must not be touched.
             if active && !sh.suspended {
@@ -792,22 +881,47 @@ impl Pump {
             }
             return;
         }
+        // A client that wants another layout restarts the DMA; a chime
+        // or the melody plays in the one that runs.
+        if sh.music.is_none() && sh.tone.is_none() && wants.is_some_and(|m| m != self.mode) {
+            self.hw.stop(&self.adma);
+            sh.playing = false;
+            return;
+        }
+        let t = time::now_ns();
+        sh.max_gap_us = sh.max_gap_us.max(((t - self.last_look_ns) / 1000) as u32);
+        self.last_look_ns = t;
         let now = self.adma.r32(ADMA_CH_XFER_STATUS) as u16;
         let step = now.wrapping_sub(self.last) as u32;
         sh.max_step = sh.max_step.max(step);
-        if step >= PERIODS {
+        if step >= RING_PERIODS {
             sh.laps += 1;
+        }
+        let ahead = self.filled.wrapping_sub(self.played);
+        sh.min_left = sh.min_left.min(ahead.saturating_sub(step));
+        // The periods played are stale: silence behind the filled ones,
+        // so a late pump plays that and not old sound again.
+        if self.mode.depth < RING_PERIODS {
+            for k in 0..step.min(ahead) {
+                self.silence(self.played.wrapping_add(k));
+            }
         }
         self.played = self.played.wrapping_add(step);
         self.last = now;
         sh.periods = self.played;
+        if step >= ahead {
+            // Every filled period played: silence went out. Start again
+            // after the one the DMA is in, which the pump must not write.
+            sh.late += 1;
+            self.silence(self.played);
+            self.filled = self.played.wrapping_add(1);
+        }
         let mut loud = false;
         // A period played is a slot to refill with the frames to come.
-        while self.filled.wrapping_sub(self.played) < PERIODS {
+        while self.filled.wrapping_sub(self.played) < self.mode.depth {
             loud |= self.fill(sh, self.filled);
             self.filled = self.filled.wrapping_add(1);
         }
-        let t = time::now_ns();
         if loud || active {
             self.quiet_since = t;
         } else if t - self.quiet_since > IDLE_NS {
@@ -901,7 +1015,7 @@ fn main() -> i32 {
                 // The DMA ring (a few frames, below 4 GiB, uncached) and
                 // the ADMA, reset and enabled.
                 let ring = SharedMemory::new(
-                    (PERIODS * PERIOD_BYTES) as usize,
+                    (RING_PERIODS * MAX_PERIOD_FRAMES * 4) as usize,
                     shm::CONTIGUOUS | shm::UNCACHED | shm::DMA32,
                 )?;
                 adma_init(&adma);
@@ -910,9 +1024,11 @@ fn main() -> i32 {
                     ahub,
                     adma,
                     ring,
+                    mode: Mode::DEEP,
                     filled: 0,
                     played: 0,
                     last: 0,
+                    last_look_ns: 0,
                     quiet_since: 0,
                 };
                 let sh2 = shared.clone();
@@ -944,13 +1060,17 @@ fn main() -> i32 {
                 };
                 let len = m.mr[0] as usize;
                 let frames = len.saturating_sub(proto::RING_HEADER) / 4;
+                // Older clients send the length alone: the default queue.
+                let mode = Mode::for_queue(if m.words() > 1 { m.mr[1] } else { 0 });
                 match SharedMemory::map(h, len, prot::READ | prot::WRITE) {
-                    Ok(mem) if frames >= PERIOD_FRAMES as usize => {
+                    Ok(mem) if frames >= mode.period as usize => {
                         sh.client = Some(Client {
                             mem,
                             frames: frames as u32,
+                            mode,
                         });
-                        Some(Msg::from_words(0, &[frames as u64]))
+                        let (p, d) = (mode.period as u64, mode.depth as u64);
+                        Some(Msg::from_words(0, &[frames as u64, p, d]))
                     }
                     Ok(_) => Some(Msg::error(-libnx::abi::err::EINVAL)),
                     Err(e) => {
@@ -989,8 +1109,20 @@ fn main() -> i32 {
                 Some(Msg::from_words(0, &[sh.volume as u64]))
             }
             proto::STATUS => {
+                let up = sh.ready && !sh.suspended;
+                let flags = if up { proto::ST_READY } else { 0 }
+                    | if sh.playing { proto::ST_PLAYING } else { 0 };
+                let reply = Msg::from_words(
+                    0,
+                    &[
+                        flags,
+                        sh.underruns as u64,
+                        sh.periods as u64,
+                        sh.volume as u64,
+                    ],
+                );
                 println!(
-                    "[audio] client {}, tone {}, music {}, vol {}%, playing {}, underruns {}, periods {}, max step {}, laps {}",
+                    "[audio] client {}, tone {}, music {}, vol {}%, playing {}, underruns {}, periods {}, max step {}, laps {}; {} x {} frames, late {}, fewest left {}, longest gap {} us",
                     sh.client.is_some(),
                     sh.tone.is_some(),
                     sh.music.is_some(),
@@ -999,22 +1131,21 @@ fn main() -> i32 {
                     sh.underruns,
                     sh.periods,
                     sh.max_step,
-                    sh.laps
+                    sh.laps,
+                    sh.mode.depth,
+                    sh.mode.period,
+                    sh.late,
+                    if sh.min_left == u32::MAX { 0 } else { sh.min_left },
+                    sh.max_gap_us
                 );
-                let up = sh.ready && !sh.suspended;
+                // The codec reads take milliseconds: not with the pump
+                // waiting. The hardware cannot go to sleep meanwhile, this
+                // thread being the one that serves SUSPEND.
+                drop(sh);
                 if up {
                     hw.dump(&adma, "status");
                 }
-                Some(Msg::from_words(
-                    0,
-                    &[
-                        if up { proto::ST_READY } else { 0 }
-                            | if sh.playing { proto::ST_PLAYING } else { 0 },
-                        sh.underruns as u64,
-                        sh.periods as u64,
-                        sh.volume as u64,
-                    ],
-                ))
+                Some(reply)
             }
             _ => Some(Msg::error(-libnx::abi::err::EINVAL)),
         }

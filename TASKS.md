@@ -73,12 +73,33 @@ is an opaque black band).
 
 ## 4. `audio`: 85 ms queued before the speakers
 
-The service keeps the whole DMA ring full: 8 periods of 512 frames, 85 ms
-of sound between a client's ring and the speakers. Fine for a game's
-effects, but a cloud stream (Luna) adds it to its own 50 ms of jitter
-buffer and to the network. Known: the pump refills a period as one is
-played (`fill`, `PERIODS`, `PERIOD_FRAMES`); Luna's player measures what
-it writes, not what the DMA holds. To weigh: (a) fewer or shorter periods
-for every client (more wake-ups, the pump must never be late: check `max
-step` on the Erista), (b) a client asks for a shallow queue at `OPEN`,
-(c) the client ring feeding the DMA ring directly.
+Done in code (emulator only; the timing needs the Erista, see below). The
+service's DMA ring is 8 ADMA buffers; how many are kept filled and how
+long they are is now a `Mode` per client. `OPEN` takes an optional word 1,
+the frames the client wants ahead of the speakers at most (0 or absent:
+the default, 8 x 512 frames = 85 ms, for games). Luna asks for 512
+(`Stream::open_ahead`): 4 periods of 128 frames, about 8 to 11 ms, and its
+`DEADLINE` is 384 frames. Slots past the filled ones hold silence, so a
+late pump plays silence and not old sound again; the DMA restarts when a
+client wants another mode than the one running (a tone or the melody plays
+in whatever runs). The reply carries the period and depth granted.
+
+Options weighed: (a) shorter periods for every client: changes game audio
+while TASKS 3 is open and gives games a pump with no slack they do not
+need; (b) the client asks at `OPEN` (chosen: games keep what they have,
+the margin is per stream); (c) the client ring feeding the ADMA directly:
+refused, a client's shared memory is not contiguous, DMA32 and uncached,
+the ADMA wraps by its buffer count and the software gain and silence
+padding would go.
+
+Left to do on the Erista (needs the user's go-ahead; low volume): run
+`audio stream 512 20000 10` (a quiet 440 Hz sine, 20 s, through a shallow
+client ring), then `audio status` and read `late`, `fewest left` and
+`longest gap`. `late` must be 0 and `fewest left` at least 1 with the
+GPU and display busy (try `gpu bench` meanwhile); if not, raise
+the queue Luna asks for (`AHEAD` in `player.rs`: 768 gives 6 periods of
+128, 2048 gives 8 of 256). The emulator's DMA runs at 12.8 kHz, so its numbers prove the
+logic, not the timing. Luna's own jitter buffer is still 50 ms (`TARGET`);
+it can come down once the pump's margin is known. Games still have the
+85 ms (their effects follow 43 ms of ring plus it): a follow-up once
+TASKS 3 is settled.

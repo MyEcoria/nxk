@@ -19,9 +19,13 @@ const FRAME: usize = 960;
 const RING_FRAMES: usize = 8192;
 /// Frames kept in the ring (50 ms).
 const TARGET: u32 = 2400;
+/// Frames the audio service may hold between the ring and the speakers
+/// (about 11 ms in 128-frame periods, instead of its default 85 ms).
+const AHEAD: u32 = 512;
 /// Below this the next packet is given up for lost: the service takes a
-/// period of 512 frames at a time, and a short take is an underrun.
-const DEADLINE: u32 = 768;
+/// period of 128 frames at a time, a short take is an underrun, and the
+/// ring is topped up every `TICK` (144 frames).
+const DEADLINE: u32 = 384;
 /// Packets kept waiting at most; a burst past it is dropped.
 const MAX_QUEUED: usize = 8;
 /// Buffered audio this far past the set point (smoothed) is dropped a
@@ -174,8 +178,12 @@ struct State {
 }
 
 fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
-    let mut sink: Box<dyn Sink> = match Stream::open(RING_FRAMES) {
-        Ok(s) => Box::new(s),
+    let mut sink: Box<dyn Sink> = match Stream::open_ahead(RING_FRAMES, AHEAD) {
+        Ok(s) => {
+            let (period, depth) = s.dma();
+            println!("luna: audio service plays {depth} periods of {period} frames ahead");
+            Box::new(s)
+        }
         Err(e) => {
             println!("luna: no audio service ({:?}): audio played to a clock", e);
             Box::new(Clock {

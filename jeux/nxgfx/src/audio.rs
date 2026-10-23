@@ -88,20 +88,30 @@ struct Ring {
     frames: usize,
     wpos: u32,
     open: bool,
+    /// The service's DMA period and the periods it keeps ahead (frames
+    /// and count; 0 from a service that does not tell).
+    period: u32,
+    depth: u32,
 }
 
 impl Ring {
-    fn open(frames: usize) -> Result<Self> {
+    fn open(frames: usize, ahead: u32) -> Result<Self> {
         let svc = Service::lookup("audio")?;
         let len = proto::RING_HEADER + frames * 4;
         let shm = Shm::new(len, 0)?;
-        svc.call_with(Msg::from_words(proto::OPEN, &[len as u64]), shm.handle())?;
+        let r = svc.call_with(
+            Msg::from_words(proto::OPEN, &[len as u64, ahead as u64]),
+            shm.handle(),
+        )?;
+        let granted = |i: usize| if r.words() > i { r.mr[i] as u32 } else { 0 };
         Ok(Self {
             svc,
             shm,
             frames,
             wpos: 0,
             open: true,
+            period: granted(1),
+            depth: granted(2),
         })
     }
 
@@ -154,13 +164,27 @@ impl Stream {
     /// A ring of `frames` frames with the audio service. Errors: no
     /// service (the emulator), or the codec did not come up.
     pub fn open(frames: usize) -> Result<Self> {
+        Self::open_ahead(frames, 0)
+    }
+
+    /// Like `open`, with the service holding about `ahead` frames at most
+    /// between the ring and the speakers (the default is 4096, 85 ms): for
+    /// a program whose sound should follow what it writes closely. A
+    /// service that does not know the request keeps its default.
+    pub fn open_ahead(frames: usize, ahead: u32) -> Result<Self> {
         Ok(Self {
-            ring: Ring::open(frames)?,
+            ring: Ring::open(frames, ahead)?,
         })
     }
 
-    /// Frames waiting to be played: the latency ahead of the speakers,
-    /// beyond the service's own period.
+    /// The service's DMA period in frames and how many it keeps ahead of
+    /// the speakers, as it granted them (0, 0 if it did not tell).
+    pub fn dma(&self) -> (u32, u32) {
+        (self.ring.period, self.ring.depth)
+    }
+
+    /// Frames waiting in the ring: the latency ahead of the speakers,
+    /// beyond what the service holds in its DMA ring (`dma`).
     pub fn queued(&self) -> u32 {
         self.ring.queued()
     }
@@ -213,7 +237,7 @@ impl Audio {
     /// the codec did not come up.
     pub fn open() -> Result<Self> {
         Ok(Self {
-            ring: Ring::open(RING_FRAMES)?,
+            ring: Ring::open(RING_FRAMES, 0)?,
             voices: Vec::new(),
             next_id: 1,
         })
