@@ -39,6 +39,8 @@ impl Response {
 pub struct Client {
     host: String,
     conn: Option<Conn>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
 }
 
 fn config() -> Arc<ClientConfig> {
@@ -66,6 +68,17 @@ impl Client {
         Self {
             host: host.to_string(),
             conn: None,
+            connect_timeout: CONNECT_TIMEOUT,
+            io_timeout: IO_TIMEOUT,
+        }
+    }
+
+    /// The same, giving up on the connection or a read past `t`.
+    pub fn with_timeout(host: &str, t: Duration) -> Self {
+        Self {
+            connect_timeout: t,
+            io_timeout: t,
+            ..Self::new(host)
         }
     }
 
@@ -78,9 +91,9 @@ impl Client {
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| bad("no address"))?;
-        let sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-        sock.set_read_timeout(Some(IO_TIMEOUT))?;
-        sock.set_write_timeout(Some(IO_TIMEOUT))?;
+        let sock = TcpStream::connect_timeout(&addr, self.connect_timeout)?;
+        sock.set_read_timeout(Some(self.io_timeout))?;
+        sock.set_write_timeout(Some(self.io_timeout))?;
         let _ = sock.set_nodelay(true);
         let name = self
             .host

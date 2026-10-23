@@ -73,6 +73,16 @@ impl Screen {
         Some((r.mr[0], r.mr[1], r.mr[2]))
     }
 
+    /// The next input event, all its words (kind, code, value, x, y,
+    /// source: `input::READ`'s), waiting at most `ns`.
+    pub fn event_words(&self, ns: u64) -> Option<[u64; 6]> {
+        let r = self
+            .link
+            .call(&Msg::from_words(display::EVENT, &[ns]))
+            .ok()?;
+        Some(r.mr)
+    }
+
     /// Give the screen back (also on drop).
     pub fn release(mut self) {
         self.give_back();
