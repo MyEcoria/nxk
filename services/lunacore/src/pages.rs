@@ -72,6 +72,22 @@ pub fn qr_url(page: &Value) -> Option<String> {
     found
 }
 
+/// The parsed payload of the first `GAME_SESSION_ASYNC` action of a game
+/// page (`game_detail`): what `createGameSessionJob` needs to launch it.
+pub fn game_session_payload(page: &Value) -> Option<Value> {
+    let mut found = None;
+    walk(page, &mut |m| {
+        if found.is_none() && m.get("target").and_then(Value::as_str) == Some("GAME_SESSION_ASYNC")
+        {
+            found = m
+                .get("payload")
+                .and_then(Value::as_str)
+                .and_then(|t| serde_json::from_str(t).ok());
+        }
+    });
+    found
+}
+
 /// Every object of `v`, depth first.
 pub(crate) fn walk(v: &Value, f: &mut dyn FnMut(&serde_json::Map<String, Value>)) {
     match v {
@@ -131,6 +147,16 @@ mod tests {
         assert_eq!(pick_profile(&all, "bob").unwrap().id, "b");
         assert_eq!(pick_profile(&all, "Zoe").unwrap().id, "a");
         assert!(pick_profile(&[], "x").is_none());
+    }
+
+    #[test]
+    fn game_session_payloads() {
+        let page = json!({"x":[{"target":"OTHER","payload":"{}"},
+            {"target":"GAME_SESSION_ASYNC","payload":"{\"buildId\":\"b\"}"}]});
+        assert_eq!(game_session_payload(&page).unwrap()["buildId"], "b");
+        assert!(
+            game_session_payload(&json!({"target":"GAME_SESSION_ASYNC","payload":"no"})).is_none()
+        );
     }
 
     #[test]

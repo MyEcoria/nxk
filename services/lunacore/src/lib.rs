@@ -9,7 +9,10 @@ pub mod catalog;
 pub mod config;
 pub mod cover;
 pub mod pages;
+pub mod proto;
 pub mod proxy;
+pub mod session;
+pub mod stream;
 
 use serde_json::Value;
 
