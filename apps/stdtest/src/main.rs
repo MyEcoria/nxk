@@ -553,6 +553,49 @@ fn serve(port: u16, count: usize) {
     println!("RESULT stdtest_serve {} replies", served.load(Ordering::SeqCst));
 }
 
+/// CRC-32 (zlib) of `data`.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (!(crc & 1)).wrapping_add(1));
+        }
+    }
+    !crc
+}
+
+/// `stdtest readcheck FILE CRC [N]`: read FILE N times (default 5) while a
+/// writer keeps dirty sectors; every read must have the CRC (hex) given.
+fn readcheck(args: &[String]) -> i32 {
+    let want = u32::from_str_radix(&args[1], 16).expect("hex crc");
+    let n: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(5);
+    let stop = Arc::new(AtomicUsize::new(0));
+    let w = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut f = fs::File::create("/tmp/readcheck.w").unwrap();
+            while stop.load(Ordering::Relaxed) == 0 {
+                f.write_all(&[0x55; 4096]).unwrap();
+                thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let mut bad = 0;
+    for i in 0..n {
+        let data = fs::read(&args[0]).unwrap();
+        let got = crc32(&data);
+        let ok = got == want;
+        bad += !ok as i32;
+        println!("readcheck {i}: {} bytes, crc {got:08x} {}", data.len(), if ok { "ok" } else { "WRONG" });
+    }
+    stop.store(1, Ordering::Relaxed);
+    w.join().unwrap();
+    let _ = fs::remove_file("/tmp/readcheck.w");
+    println!("RESULT readcheck {}/{n} reads right", n as i32 - bad);
+    bad
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -565,6 +608,7 @@ fn main() {
         }
         // Hold a resource then abort: the service
         // must release it.
+        Some("readcheck") => std::process::exit(readcheck(&args[2..])),
         Some("holdfile") => {
             let _f = fs::File::open(&args[2]).unwrap();
             std::process::abort();

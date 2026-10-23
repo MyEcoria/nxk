@@ -1560,6 +1560,16 @@ within 5 s.
     cache or DMA fault. Fixed in `user/fs/src/cache.rs` (victims taken before
     the read); `stdtest fs_cache` failed before and passes now.
 
+59. 23/10/2026, Erista (battery above 15 %), boot image rebuilt at `23cf707`
+    (`fs` with the readahead fix; the old pair saved as
+    `/nxk/{bl33,bl31}.pre-fsfix`), `gpu` and `display` reloaded. The new
+    `stdtest readcheck FILE CRC N` reads a file N times while a writer keeps
+    dirty sectors: luna's 3,037,568-byte build, **40 of 40 reads had the PC's
+    CRC**. Six `luna` starts from the shell (a fresh load each, 3 MB) ended
+    without a fault. Not done: the same test on the old `fs` (it needs a
+    second reboot), and the catalog running for a long time (network, SPP,
+    where the faults came after a while).
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
