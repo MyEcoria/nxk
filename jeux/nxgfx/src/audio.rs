@@ -2,7 +2,8 @@
 //! game makes `Sound`s (samples of its own, or the synthesised ones here),
 //! `play`s them, and calls `pump` once a frame: it mixes the voices ahead
 //! into a ring shared with the service, which plays silence when it runs
-//! dry.
+//! dry. A `Stream` hands the ring to a program that produces its own PCM
+//! as it goes (a decoder).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -80,6 +81,118 @@ impl Sound {
     }
 }
 
+/// A ring of frames shared with the service, and the frames written to it.
+struct Ring {
+    svc: Service,
+    shm: Shm,
+    frames: usize,
+    wpos: u32,
+    open: bool,
+}
+
+impl Ring {
+    fn open(frames: usize) -> Result<Self> {
+        let svc = Service::lookup("audio")?;
+        let len = proto::RING_HEADER + frames * 4;
+        let shm = Shm::new(len, 0)?;
+        svc.call_with(Msg::from_words(proto::OPEN, &[len as u64]), shm.handle())?;
+        Ok(Self {
+            svc,
+            shm,
+            frames,
+            wpos: 0,
+            open: true,
+        })
+    }
+
+    fn word(&self, at: usize) -> &AtomicU32 {
+        unsafe { &*(self.shm.as_ptr().add(at) as *const AtomicU32) }
+    }
+
+    /// Frames written and not yet taken by the service.
+    fn queued(&self) -> u32 {
+        let read = self.word(proto::RING_READ).load(Ordering::Acquire);
+        self.wpos.wrapping_sub(read).min(self.frames as u32)
+    }
+
+    /// Frame `i` past the last one committed.
+    fn put(&mut self, i: u32, left: i16, right: i16) {
+        let data = unsafe { self.shm.as_ptr().add(proto::RING_HEADER) as *mut u32 };
+        let w = (left as u16 as u32) | (right as u16 as u32) << 16;
+        let at = (self.wpos.wrapping_add(i) as usize) % self.frames;
+        unsafe { core::ptr::write_volatile(data.add(at), w) };
+    }
+
+    /// Hands the next `n` frames put to the service.
+    fn commit(&mut self, n: u32) {
+        self.wpos = self.wpos.wrapping_add(n);
+        self.word(proto::RING_WRITE)
+            .store(self.wpos, Ordering::Release);
+    }
+
+    fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            let _ = self.svc.call(&Msg::new(proto::CLOSE, 0, 0));
+        }
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// PCM a program writes as it makes it: the ring is played as it is
+/// filled, silence when it runs dry.
+pub struct Stream {
+    ring: Ring,
+}
+
+impl Stream {
+    /// A ring of `frames` frames with the audio service. Errors: no
+    /// service (the emulator), or the codec did not come up.
+    pub fn open(frames: usize) -> Result<Self> {
+        Ok(Self {
+            ring: Ring::open(frames)?,
+        })
+    }
+
+    /// Frames waiting to be played: the latency ahead of the speakers,
+    /// beyond the service's own period.
+    pub fn queued(&self) -> u32 {
+        self.ring.queued()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.ring.frames
+    }
+
+    /// Times the service found the ring empty.
+    pub fn underruns(&self) -> u32 {
+        self.ring
+            .word(proto::RING_UNDERRUNS)
+            .load(Ordering::Relaxed)
+    }
+
+    /// Writes interleaved stereo `pcm` (left then right) as far as there
+    /// is room; returns the frames written.
+    pub fn write(&mut self, pcm: &[i16]) -> usize {
+        let room = self.ring.frames - self.ring.queued() as usize;
+        let n = (pcm.len() / 2).min(room);
+        for i in 0..n {
+            self.ring.put(i as u32, pcm[2 * i], pcm[2 * i + 1]);
+        }
+        self.ring.commit(n as u32);
+        n
+    }
+
+    pub fn close(&mut self) {
+        self.ring.close();
+    }
+}
+
 struct Voice {
     id: u32,
     sound: Sound,
@@ -89,12 +202,9 @@ struct Voice {
 }
 
 pub struct Audio {
-    svc: Service,
-    ring: Shm,
-    wpos: u32,
+    ring: Ring,
     voices: Vec<Voice>,
     next_id: u32,
-    open: bool,
 }
 
 impl Audio {
@@ -102,22 +212,11 @@ impl Audio {
     /// on the first request). Errors: no service (the emulator), or
     /// the codec did not come up.
     pub fn open() -> Result<Self> {
-        let svc = Service::lookup("audio")?;
-        let len = proto::RING_HEADER + RING_FRAMES * 4;
-        let ring = Shm::new(len, 0)?;
-        svc.call_with(Msg::from_words(proto::OPEN, &[len as u64]), ring.handle())?;
         Ok(Self {
-            svc,
-            ring,
-            wpos: 0,
+            ring: Ring::open(RING_FRAMES)?,
             voices: Vec::new(),
             next_id: 1,
-            open: true,
         })
-    }
-
-    fn word(&self, at: usize) -> &AtomicU32 {
-        unsafe { &*(self.ring.as_ptr().add(at) as *const AtomicU32) }
     }
 
     /// Start `sound` at `volume` (0..1); the voice's id.
@@ -158,10 +257,7 @@ impl Audio {
         if self.voices.is_empty() {
             return;
         }
-        let read = self.word(proto::RING_READ).load(Ordering::Acquire);
-        let queued = self.wpos.wrapping_sub(read).min(RING_FRAMES as u32);
-        let n = AHEAD.saturating_sub(queued);
-        let data = unsafe { self.ring.as_ptr().add(proto::RING_HEADER) as *mut u32 };
+        let n = AHEAD.saturating_sub(self.ring.queued());
         for i in 0..n {
             let (mut l, mut r) = (0i32, 0i32);
             for v in self.voices.iter_mut() {
@@ -175,28 +271,18 @@ impl Audio {
                     v.pos = 0;
                 }
             }
-            let w = (l.clamp(-32768, 32767) as i16 as u16 as u32)
-                | (r.clamp(-32768, 32767) as i16 as u16 as u32) << 16;
-            let at = (self.wpos.wrapping_add(i) as usize) % RING_FRAMES;
-            unsafe { core::ptr::write_volatile(data.add(at), w) };
+            self.ring.put(
+                i,
+                l.clamp(-32768, 32767) as i16,
+                r.clamp(-32768, 32767) as i16,
+            );
         }
-        self.wpos = self.wpos.wrapping_add(n);
-        self.word(proto::RING_WRITE)
-            .store(self.wpos, Ordering::Release);
+        self.ring.commit(n);
         self.voices
             .retain(|v| v.looped || v.pos < v.sound.pcm.len());
     }
 
     pub fn close(&mut self) {
-        if self.open {
-            self.open = false;
-            let _ = self.svc.call(&Msg::new(proto::CLOSE, 0, 0));
-        }
-    }
-}
-
-impl Drop for Audio {
-    fn drop(&mut self) {
-        self.close();
+        self.ring.close();
     }
 }
