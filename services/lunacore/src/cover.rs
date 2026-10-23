@@ -1,6 +1,6 @@
 //! Covers: Amazon's image servers resize on request (`._SL<side>_` before
-//! the extension, a JPEG back); the box art is fitted into the square the
-//! home screen shows, on a blurred, darker copy of itself.
+//! the extension, a JPEG back); the box art fills the square the home
+//! screen shows: scaled until it covers it, the middle kept.
 
 use std::io::Cursor;
 
@@ -22,6 +22,16 @@ pub fn sized_url(url: &str, side: u32) -> Option<String> {
     let name = url.rfind('/')?;
     let dot = url.rfind('.').filter(|&d| d > name)?;
     Some(format!("{}._SL{}_{}", &url[..dot], side, &url[dot..]))
+}
+
+/// The address of the picture a `side` square cover is made from: the
+/// portrait art if the game has it (a square cut of it loses the least),
+/// else the landscape one, asked for large enough that its short side
+/// reaches `side` (3:4 and 16:9 at least).
+pub fn source_url(portrait: Option<&str>, landscape: Option<&str>, side: u32) -> Option<String> {
+    portrait
+        .and_then(|u| sized_url(u, side * 3 / 2))
+        .or_else(|| landscape.and_then(|u| sized_url(u, side * 16 / 9)))
 }
 
 /// An RGB picture, 3 bytes a pixel, rows from the top.
@@ -54,6 +64,21 @@ impl Picture {
         let n = ((x1 - x0) * (y1 - y0)) as u32;
         s.map(|v| v / n)
     }
+
+    /// The color at (`fx`, `fy`) in 1/256 pixels, between the four pixels
+    /// around it.
+    fn bilinear(&self, fx: usize, fy: usize) -> [u32; 3] {
+        let (x0, y0, tx, ty) = (fx >> 8, fy >> 8, (fx & 255) as u32, (fy & 255) as u32);
+        let (a, b) = (self.at(x0, y0), self.at(x0 + 1, y0));
+        let (c, d) = (self.at(x0, y0 + 1), self.at(x0 + 1, y0 + 1));
+        let mut o = [0u32; 3];
+        for (k, v) in o.iter_mut().enumerate() {
+            let top = a[k] * (256 - tx) + b[k] * tx;
+            let bottom = c[k] * (256 - tx) + d[k] * tx;
+            *v = (top * (256 - ty) + bottom * ty) >> 16;
+        }
+        o
+    }
 }
 
 /// A JPEG's pixels; `None` if it does not decode or is too large.
@@ -69,58 +94,31 @@ pub fn decode(jpeg: &[u8]) -> Option<Picture> {
     (w > 0 && h > 0 && rgb.len() == w * h * 3).then_some(Picture { w, h, rgb })
 }
 
-/// `p` fitted into a `side` square (ratio kept, by area means), on itself
-/// stretched, blurred and darkened: 0xRRGGBB pixels, rows from the top.
+/// `p` scaled to cover a `side` square, its middle kept (a portrait loses
+/// its top and bottom, a landscape its sides): 0xRRGGBB pixels, rows from
+/// the top. Area means going down in size, bilinear going up.
 pub fn square(p: &Picture, side: usize) -> Vec<u32> {
-    const GRID: usize = 8;
-    let cells: Vec<[u32; 3]> = (0..GRID * GRID)
-        .map(|i| {
-            let (cx, cy) = (i % GRID, i / GRID);
-            p.mean(
-                cx * p.w / GRID,
-                (cx + 1) * p.w / GRID,
-                cy * p.h / GRID,
-                (cy + 1) * p.h / GRID,
-            )
-        })
-        .collect();
-    let back = |x: usize, y: usize| -> [u32; 3] {
-        // Bilinear between the cell means: a blur.
-        let fx = (x * GRID * 256 / side).saturating_sub(128) as u32;
-        let fy = (y * GRID * 256 / side).saturating_sub(128) as u32;
-        let (x0, y0) = ((fx >> 8) as usize, (fy >> 8) as usize);
-        let (x1, y1) = ((x0 + 1).min(GRID - 1), (y0 + 1).min(GRID - 1));
-        let (tx, ty) = (fx & 255, fy & 255);
-        let c = |cx: usize, cy: usize| cells[cy * GRID + cx];
-        let mut o = [0u32; 3];
-        for (k, v) in o.iter_mut().enumerate() {
-            let top = c(x0, y0)[k] * (256 - tx) + c(x1, y0)[k] * tx;
-            let bottom = c(x0, y1)[k] * (256 - tx) + c(x1, y1)[k] * tx;
-            *v = (top * (256 - ty) + bottom * ty) >> 16;
-        }
-        o.map(|v| v * 3 / 5)
-    };
-    // The fitted picture's size and place.
-    let (fw, fh) = if p.w >= p.h {
-        (side, (p.h * side / p.w).max(1))
-    } else {
-        ((p.w * side / p.h).max(1), side)
-    };
-    let (ox, oy) = ((side - fw) / 2, (side - fh) / 2);
+    // The centered square of the picture, `s` pixels a side.
+    let s = p.w.min(p.h);
+    let (left, top) = ((p.w - s) / 2, (p.h - s) / 2);
     let mut out = Vec::with_capacity(side * side);
     for y in 0..side {
         for x in 0..side {
-            let inside = (ox..ox + fw).contains(&x) && (oy..oy + fh).contains(&y);
-            let c = if inside {
-                let (u, v) = (x - ox, y - oy);
+            let c = if s >= side {
                 p.mean(
-                    u * p.w / fw,
-                    (u + 1) * p.w / fw,
-                    v * p.h / fh,
-                    (v + 1) * p.h / fh,
+                    left + x * s / side,
+                    left + (x + 1) * s / side,
+                    top + y * s / side,
+                    top + (y + 1) * s / side,
                 )
             } else {
-                back(x, y)
+                // Pixel centers: output pixel `u` is at (u + 1/2) / side of the way.
+                let along = |u: usize| ((2 * u + 1) * s * 256 / (2 * side)).saturating_sub(128);
+                let max = (s - 1) * 256;
+                p.bilinear(
+                    (left << 8) + along(x).min(max),
+                    (top << 8) + along(y).min(max),
+                )
             };
             out.push(c[0] << 16 | c[1] << 8 | c[2]);
         }
@@ -142,29 +140,71 @@ mod tests {
         assert_eq!(sized_url("https://example.com/noext", 256), None);
     }
 
-    fn picture(w: usize, h: usize, rgb: [u8; 3]) -> Picture {
-        Picture {
-            w,
-            h,
-            rgb: rgb.iter().copied().cycle().take(w * h * 3).collect(),
+    #[test]
+    fn the_portrait_art_is_asked_for_first_and_large_enough() {
+        let (p, l) = (Some("https://x.com/p.png"), Some("https://x.com/l.png"));
+        // 3:4 art at 384 is 288 wide; 16:9 art at 455 is 256 high.
+        assert_eq!(
+            source_url(p, l, 256).as_deref(),
+            Some("https://x.com/p._SL384_.png")
+        );
+        assert_eq!(
+            source_url(None, l, 256).as_deref(),
+            Some("https://x.com/l._SL455_.png")
+        );
+        assert_eq!(source_url(None, None, 256), None);
+        assert_eq!(source_url(Some("http://x.com/p.png"), None, 256), None);
+    }
+
+    /// A picture of `w` x `h` whose pixels are `rgb(x, y)`.
+    fn made(w: usize, h: usize, rgb: impl Fn(usize, usize) -> [u8; 3]) -> Picture {
+        let rgb = (0..w * h).flat_map(|i| rgb(i % w, i / w)).collect();
+        Picture { w, h, rgb }
+    }
+
+    const RED: u32 = 255 << 16;
+    const GREEN: u32 = 255 << 8;
+    const BLUE: u32 = 255;
+
+    #[test]
+    fn a_portrait_loses_its_top_and_bottom() {
+        // 20 x 30: 5 red rows, 20 green rows (the middle square), 5 blue rows.
+        let p = made(20, 30, |_, y| match y {
+            0..=4 => [255, 0, 0],
+            5..=24 => [0, 255, 0],
+            _ => [0, 0, 255],
+        });
+        for side in [10, 20, 40] {
+            let s = square(&p, side);
+            assert_eq!(s.len(), side * side);
+            assert!(s.iter().all(|&c| c == GREEN), "side {}", side);
         }
     }
 
     #[test]
-    fn a_portrait_is_centered_on_its_darker_self() {
-        let p = picture(20, 30, [200, 100, 50]);
-        let s = square(&p, 30);
-        assert_eq!(s.len(), 900);
-        // Middle: the picture; left edge: the backdrop, 3/5 as bright.
-        assert_eq!(s[15 * 30 + 15], 200 << 16 | 100 << 8 | 50);
-        assert_eq!(s[15 * 30], 120 << 16 | 60 << 8 | 30);
+    fn a_landscape_loses_its_sides() {
+        let p = made(40, 20, |x, _| match x {
+            0..=9 => [255, 0, 0],
+            10..=29 => [0, 255, 0],
+            _ => [0, 0, 255],
+        });
+        for side in [10, 20, 40] {
+            assert!(
+                square(&p, side).iter().all(|&c| c == GREEN),
+                "side {}",
+                side
+            );
+        }
+        assert_ne!(RED, BLUE);
     }
 
     #[test]
-    fn a_landscape_fills_the_width() {
-        let s = square(&picture(40, 20, [10, 20, 30]), 20);
-        assert_eq!(s[10 * 20], 10 << 16 | 20 << 8 | 30);
-        assert_eq!(s[0], 6 << 16 | 12 << 8 | 18);
+    fn going_up_in_size_blends_smoothly() {
+        // Left column black, right column white, blown up to 4 pixels.
+        let p = made(2, 2, |x, _| [x as u8 * 255; 3]);
+        let row: Vec<u32> = square(&p, 4)[..4].iter().map(|c| c & 255).collect();
+        assert_eq!((row[0], row[3]), (0, 255));
+        assert!(row.windows(2).all(|w| w[0] < w[1]), "{:?}", row);
     }
 
     #[test]
@@ -172,5 +212,29 @@ mod tests {
         let p = decode(include_bytes!("../tests/sample.jpg")).expect("decodes");
         assert_eq!((p.w, p.h), (24, 36));
         assert!(decode(b"not a jpeg").is_none());
+    }
+
+    #[test]
+    fn a_progressive_jpeg_decodes_and_fills_a_cover() {
+        // What Amazon sends for the larger sizes.
+        let p = decode(include_bytes!("../tests/progressive.jpg")).expect("decodes");
+        assert_eq!((p.w, p.h), (96, 128));
+        let s = square(&p, 64);
+        let rgb = |x: usize, y: usize| {
+            [
+                s[y * 64 + x] >> 16 & 255,
+                s[y * 64 + x] >> 8 & 255,
+                s[y * 64 + x] & 255,
+            ]
+        };
+        // The 96 x 96 middle of the picture, shrunk by 2/3: the yellow
+        // band is at row 16, the red disc at row 49.
+        let (yellow, red) = (rgb(32, 16), rgb(33, 49));
+        assert!(
+            yellow[0] > 200 && yellow[1] > 150 && yellow[2] < 100,
+            "{:?}",
+            yellow
+        );
+        assert!(red[0] > 150 && red[1] < 100 && red[2] < 100, "{:?}", red);
     }
 }
