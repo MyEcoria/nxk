@@ -672,9 +672,9 @@ program that vanished without closing them (crash) are reclaimed.
   `Sound` for games; `audio tone HZ MS LEVEL` in the shell). The DMA holds
   85 ms by default (8 periods of 512 frames); a client that asks at `OPEN`
   (`nxgfx::audio::Stream::open_ahead`, Luna: 512 frames) gets shorter
-  periods and fewer filled, about 8 to 11 ms (`audio stream AHEAD MS LEVEL`
+  periods and fewer filled, about 8 to 11 ms (`audiotest AHEAD MS LEVEL`
   tries it; `audio status` shows `late`, `fewest left`, `longest gap`;
-  the Erista timing check is TASKS.md 4). Asleep
+  run 57 on the Erista: no late look under a busy GPU). Asleep
   (`proto::SUSPEND`) the codec's blocks, the hub and the audio clocks are
   off, its LDO kept (cut, the codec missed its reset after it). Not done:
   headphones and jack detection, volume control, capture, mixing several

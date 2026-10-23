@@ -58,7 +58,7 @@ def put(dest, data):
 
 if not a.no_bin:
     bindir = os.path.join(CACHE, "target-user", "aarch64-unknown-none", "release")
-    for prog in ["hello", "ktest", "true", "fptest", "crash", "bench", "ipcbench", "powertest"]:
+    for prog in ["hello", "ktest", "true", "fptest", "crash", "bench", "ipcbench", "powertest", "audiotest"]:
         p = os.path.join(bindir, prog)
         if os.path.exists(p):
             put("/bin/" + prog, open(p, "rb").read())

@@ -73,7 +73,8 @@ is an opaque black band).
 
 ## 4. `audio`: 85 ms queued before the speakers
 
-Done in code (emulator only; the timing needs the Erista, see below). The
+Done, and checked on the Erista (hwboot run 57: 0 late looks, 2 of 4
+periods left at worst, longest gap 3.5 ms under `gpu bench`). The
 service's DMA ring is 8 ADMA buffers; how many are kept filled and how
 long they are is now a `Mode` per client. `OPEN` takes an optional word 1,
 the frames the client wants ahead of the speakers at most (0 or absent:
@@ -92,14 +93,14 @@ refused, a client's shared memory is not contiguous, DMA32 and uncached,
 the ADMA wraps by its buffer count and the software gain and silence
 padding would go.
 
-Left to do on the Erista (needs the user's go-ahead; low volume): run
-`audio stream 512 20000 10` (a quiet 440 Hz sine, 20 s, through a shallow
-client ring), then `audio status` and read `late`, `fewest left` and
-`longest gap`. `late` must be 0 and `fewest left` at least 1 with the
-GPU and display busy (try `gpu bench` meanwhile); if not, raise
-the queue Luna asks for (`AHEAD` in `player.rs`: 768 gives 6 periods of
-128, 2048 gives 8 of 256). The emulator's DMA runs at 12.8 kHz, so its numbers prove the
-logic, not the timing. Luna's own jitter buffer is still 50 ms (`TARGET`);
-it can come down once the pump's margin is known. Games still have the
+To repeat the check on the Erista (low volume, battery above 15 %):
+`audiotest 512 20000 10` (a quiet 440 Hz sine through a shallow client
+ring; `--put` it to `/bin` first), then `audio status` and read `late`
+(must be 0), `fewest left` (at least 1) and `longest gap`, with the GPU
+and display busy. If the margin shrinks, raise the queue Luna asks for
+(`AHEAD` in `player.rs`: 768 gives 6 periods of 128, 2048 gives 8 of 256).
+Still open: how Luna sounds in the real game (by ear). Its own jitter
+buffer is still 50 ms (`TARGET`); it can come down now the pump's margin
+is known. Games still have the
 85 ms (their effects follow 43 ms of ring plus it): a follow-up once
 TASKS 3 is settled.

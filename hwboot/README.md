@@ -1507,6 +1507,20 @@ within 5 s.
     Horizon or hekate first, then load that build again to tell a loader
     or SD fault from the low battery.
 
+57. 23/10/2026, Erista (battery 8 %, a short test), boot image of run 54,
+    `audio` of the shallow-queue change reloaded over USB-C and the new
+    `audiotest` put in `/bin`: the shallow DMA queue on silicon. Speaker
+    volume 10 %, level 10 (the console had been left at 0 %). `audiotest
+    512 20000 10` twice (a client ring asking for 512 frames: 4 periods
+    of 128, about 8 to 11 ms before the speakers), with `gpu on` and two
+    `gpu bench` (30.5 GFLOP/s) running meanwhile: 12629 periods played
+    over both runs, **0 underruns, 0 late looks, 0 laps, max step 2,
+    fewest periods left at a look 2 of 4, longest gap between two looks
+    3.5 ms** (a period lasts 2.67 ms). So a depth of 4 has a margin of
+    two periods under a busy GPU; depth 3 would have had one. Not yet
+    heard or measured: the real latency of Luna's sound (the user's ears)
+    and the display redrawing at the same time (the library was on screen).
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell

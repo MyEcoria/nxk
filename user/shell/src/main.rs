@@ -252,7 +252,7 @@ fn help() {
     );
     println!("  gpu [on|off]    GPU state, clock, rail; on / off: power it up / down");
     println!(
-        "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]|stream [AHEAD [MS [LEVEL]]]]  sound output and test melody"
+        "  audio [status|volume [PCT]|music|tone [HZ [MS [LEVEL]]]]  sound output and test melody"
     );
     println!("  gpu suspend     GPU rail off, its state kept; gpu resume: back as it was");
     println!("  gpu test        GPU self-test: 2D fill and copy, three compute kernels, 3D clear and triangle");
@@ -1201,13 +1201,10 @@ fn gpu_sweep(argv: &[&str]) {
 
 /// `audio`: bring the codec up and show the hub; `audio volume [PCT]`:
 /// speaker volume (0..100%); `audio music`: polyphonic test melody;
-/// `audio tone [HZ [MS [LEVEL]]]`: a sine on the speakers (440 Hz, 1000 ms, level 25);
-/// `audio stream [AHEAD [MS [LEVEL]]]`: the same 440 Hz sine through a client ring that
-/// asks the service to hold about AHEAD frames (0: its default, 4096) before the speakers.
+/// `audio tone [HZ [MS [LEVEL]]]`: a sine on the speakers (440 Hz, 1000 ms, level 25).
 fn audio_cmd(argv: &[&str]) {
     let num = |i: usize, d: u64| argv.get(i).and_then(|v| v.parse().ok()).unwrap_or(d);
     let req = match argv.get(1).copied() {
-        Some("stream") => return audio_stream(num(2, 512), num(3, 2000), num(4, 10).min(100)),
         None | Some("status") => Msg::new(audio::STATUS, 0, 0),
         Some("music") => Msg::new(audio::MUSIC, 0, 0),
         Some("volume") | Some("vol") => {
@@ -1257,75 +1254,6 @@ fn audio_cmd(argv: &[&str]) {
             fail(e);
         }
     }
-    let _ = sys::handle_close(h);
-}
-
-/// A parabolic sine, `phase` in 0..65536 -> `-32768..=32768`.
-fn sine16(phase: u32) -> i32 {
-    let half = phase & 0x7FFF;
-    let v = ((half * (32768 - half)) >> 13) as i32;
-    if phase & 0x8000 == 0 {
-        v
-    } else {
-        -v
-    }
-}
-
-/// `audio stream`: `ms` of a quiet 440 Hz sine written into a ring of 4096
-/// frames shared with the service, opened with `ahead` as its queue.
-fn audio_stream(ahead: u64, ms: u64, level: u64) {
-    use core::sync::atomic::AtomicU32;
-    const FRAMES: usize = 4096;
-    const KEEP: u32 = 2048;
-    let Some(h) = service("audio") else { return };
-    let len = audio::RING_HEADER + FRAMES * 4;
-    let Ok(shm) = libnx::mem::SharedMemory::new(len, 0) else {
-        println!("audio: no memory");
-        return;
-    };
-    ipc::set_send_handle(0, shm.handle());
-    let open = Msg::from_words(audio::OPEN, &[len as u64, ahead]).with_handles(1);
-    let granted = match ipc::call(h, &open).and_then(ipc::checked) {
-        Ok(m) => m,
-        Err(e) => {
-            println!("audio: {}", err::name(e));
-            fail(e);
-            let _ = sys::handle_close(h);
-            return;
-        }
-    };
-    println!(
-        "audio: ring of {} frames, {} periods of {} frames ahead",
-        granted.mr[0], granted.mr[2], granted.mr[1]
-    );
-    let word = |at: usize| unsafe { &*(shm.as_ptr().add(at) as *const AtomicU32) };
-    let data = unsafe { shm.as_ptr().add(audio::RING_HEADER) as *mut u32 };
-    let (mut wpos, mut left, mut phase) = (0u32, ms * audio::RATE as u64 / 1000, 0u32);
-    let step = ((440u64 << 16) / audio::RATE as u64) as u32;
-    let amp = level as i32 * 300;
-    let mut drain = 0;
-    while left > 0 || (drain < 100 && word(audio::RING_READ).load(Ordering::Acquire) != wpos) {
-        let queued = wpos.wrapping_sub(word(audio::RING_READ).load(Ordering::Acquire));
-        let n = (KEEP.saturating_sub(queued) as u64).min(left) as u32;
-        for i in 0..n {
-            let v = (sine16(phase) * amp / 32768) as i16 as u16 as u32;
-            phase = phase.wrapping_add(step);
-            let at = (wpos.wrapping_add(i) as usize) % FRAMES;
-            unsafe { core::ptr::write_volatile(data.add(at), v | v << 16) };
-        }
-        wpos = wpos.wrapping_add(n);
-        word(audio::RING_WRITE).store(wpos, Ordering::Release);
-        left -= n as u64;
-        if left == 0 {
-            drain += 1;
-        }
-        time::sleep_ms(4);
-    }
-    println!(
-        "audio: stream done, {} underruns",
-        word(audio::RING_UNDERRUNS).load(Ordering::Relaxed)
-    );
-    let _ = ipc::call(h, &Msg::new(audio::CLOSE, 0, 0));
     let _ = sys::handle_close(h);
 }
 

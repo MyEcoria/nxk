@@ -6,7 +6,7 @@ ici="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="${NXK_CACHE:-$HOME/.cache/nxk}"
 export PATH="$HOME/.cargo/bin:$PATH"
 
-progs=(init console shell hello ipcbench crash fptest bench true ktest clk i2c power fan cpufreq emc sd fs display input joycon audio usb usbcon net nettest wlan wifi bluetooth bt gpu powertest)
+progs=(init console shell hello ipcbench crash fptest bench true ktest clk i2c power fan cpufreq emc sd fs display input joycon audio usb usbcon net nettest wlan wifi bluetooth bt gpu powertest audiotest)
 # Ordinary (std) programs, apps/ dir.
 apps=(hello-std stdtest)
 
