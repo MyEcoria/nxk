@@ -620,9 +620,9 @@ fn launch(st: &State, strings: &Strings, pm: u32, io: &Stdio, console: u32) -> R
     let elf = load(st, path)?;
     let name = path.rsplit('/').next().unwrap_or(path);
     let [stdin, stdout, stderr] = io.handles.map(|h| h.unwrap_or(console));
-    // Only kernel-owned spawn flags (debugger stop).
+    // Only kernel-owned spawn flags (debugger stop, tied to the handle).
     let mut strings = strings.clone();
-    strings.flags &= spawn::SUSPENDED as u32;
+    strings.flags &= (spawn::SUSPENDED | spawn::KILL_ON_CLOSE) as u32;
     process::spawn_elf(&Spawn {
         elf: &elf,
         name,

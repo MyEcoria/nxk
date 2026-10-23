@@ -366,7 +366,9 @@ impl Launcher {
         env.push(format!("NXK_SAVE_DIR={}", dir));
         env.push(format!("NXK_USER={}", user.name));
         env.push(format!("NXK_USER_ID={}", user.id));
-        match libnx::process::spawn_with(&libnx::process::Strings::new(&[&exe], &env)) {
+        match libnx::process::spawn_with(
+            &libnx::process::Strings::new(&[&exe], &env).kill_on_close(),
+        ) {
             Ok(h) => {
                 let (q, notif) = (self.exits.clone(), self.notif);
                 let spawned = thread::spawn(move || {

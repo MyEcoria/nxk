@@ -32,7 +32,7 @@ pub struct Strings {
     pub data: Vec<u8>,
     pub argc: u32,
     pub envc: u32,
-    /// Spawn flags (`nxk_abi::spawn::SUSPENDED`).
+    /// Spawn flags (`nxk_abi::spawn::SUSPENDED`, `KILL_ON_CLOSE`).
     pub flags: u32,
 }
 
@@ -58,6 +58,13 @@ impl Strings {
     /// Suspended spawn: the program waits for a debugger.
     pub fn suspended(mut self) -> Self {
         self.flags |= nxk_abi::spawn::SUSPENDED as u32;
+        self
+    }
+
+    /// The program dies with its last handle: the caller's death
+    /// included, so a crashed or restarted owner leaves no orphan.
+    pub fn kill_on_close(mut self) -> Self {
+        self.flags |= nxk_abi::spawn::KILL_ON_CLOSE as u32;
         self
     }
 

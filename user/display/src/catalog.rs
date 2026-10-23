@@ -205,7 +205,9 @@ impl Provider {
         env.push(format!("NXK_USER={}", p.name));
         env.push(format!("NXK_USER_ID={}", p.id));
         let path = exe(&s.name);
-        let h = libnx::process::spawn_with(&libnx::process::Strings::new(&[&path], &env))?;
+        let h = libnx::process::spawn_with(
+            &libnx::process::Strings::new(&[&path], &env).kill_on_close(),
+        )?;
         let link = Arc::new(Link {
             sh: Mutex::new(Shared {
                 ep: 0,

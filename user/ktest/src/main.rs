@@ -62,6 +62,7 @@ fn main() -> i32 {
         ("contiguous DMA buffer and rights", t_shm_dma),
         ("revocation", t_revoke),
         ("args and environment", t_args),
+        ("KILL_ON_CLOSE: dies with its last handle", t_kill_on_close),
         ("ASLR (static-PIE)", t_aslr),
         ("just-in-time code (JIT)", t_jit),
         ("faults: RO write, no access, W^X", t_faults),
@@ -1190,6 +1191,41 @@ fn t_args() -> R {
         0 => Ok(()),
         c => Err(format!("child missed its arguments (code {})", c)),
     }
+}
+
+/// Whether process `pid` is still alive.
+fn is_live(pid: u32) -> bool {
+    process::live_pids().contains(&pid)
+}
+
+/// Poll up to 200 ms for `pid` to be gone (its cores finish the kill).
+fn gone_soon(pid: u32) -> bool {
+    (0..200).any(|_| {
+        let gone = !is_live(pid);
+        if !gone {
+            time::sleep_ms(1);
+        }
+        gone
+    })
+}
+
+fn t_kill_on_close() -> R {
+    let argv = ["ktest", "--child", "loop"];
+    let h = process::spawn_with(&Strings::new(&argv, &[]).kill_on_close())
+        .map_err(|e| format!("spawn {}", err::name(e)))?;
+    let pid = sys::getpid(h).map_err(|e| format!("getpid {}", err::name(e)))?;
+    let h2 = sys::handle_dup(h, rights::WAIT | rights::KILL | rights::DUP, 0)
+        .map_err(|e| format!("dup {}", err::name(e)))?;
+    let _ = sys::handle_close(h);
+    time::sleep_ms(20);
+    if !is_live(pid) {
+        return Err("died with a handle left".into());
+    }
+    let _ = sys::handle_close(h2);
+    if !gone_soon(pid) {
+        return Err("alive after its last handle closed".into());
+    }
+    Ok(())
 }
 
 fn t_aslr() -> R {

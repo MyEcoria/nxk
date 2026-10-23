@@ -727,6 +727,7 @@ fn spawn(pi: u16, args_ptr: u64) -> SysResult {
         process::abort_unstarted(child);
         return Err(e);
     }
+    process::get(child).kill_on_close = a.flags & nxk_abi::spawn::KILL_ON_CLOSE != 0;
     let gen = process::get(child).gen;
     let r = rights::WAIT | rights::KILL | rights::GRANT | rights::DUP | rights::CONTROL;
     cap::insert(pi, Cap::new(Kind::Process, child as u32, gen, r)).map(|h| Some(h as u64))

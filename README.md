@@ -209,7 +209,9 @@ user's (`service=` in `profile.cfg`).
 `NXK_PROVIDER_KEY` (a random key), `NXK_SERVICE_DIR`
 (`/users/ID/services/NAME`, its own data: accounts, caches; FAT keeps no
 permissions, so a token there is readable by anyone with the card),
-`NXK_USER` and `NXK_USER_ID`. The program hands its endpoint back with
+`NXK_USER` and `NXK_USER_ID`, and holds its process handle with `KILL_ON_CLOSE`
+(games too): when `display` dies or is restarted (`restart display`), the
+kernel ends the catalog with it, so no orphan keeps running. The program hands its endpoint back with
 `display::PROVIDER` and the key, then serves `abi::proto::provider`:
 `STATE` (loading, ready, sign-in needed with the code and URL, launching
 with the place in a queue, playing, error; held until it changes),
@@ -455,7 +457,7 @@ calls take a timeout (ns; 0 = unbounded).
 | Handles | `handle_close`, `handle_dup` (reduced rights, badge), `handle_revoke` |
 | Memory | `mem_map` (on demand or populated, free or fixed address, W^X), `mem_unmap`, `mem_protect`, `shm_create`/`shm_map`/`shm_paddr` (contiguous, uncached, below 4 GiB for DMA), `mmio_map` (read-only without the `WRITE` right), `mmio_derive` |
 | Threads | `thread_create`, `thread_set` (priority, core), `futex_wait`, `futex_wake` |
-| Processes | `process_spawn` (static-PIE ELF, arguments, environment), `process_wait`, `process_kill` |
+| Processes | `process_spawn` (static-PIE ELF, arguments, environment; `KILL_ON_CLOSE`: the process dies with its last handle, its holder's death included), `process_wait`, `process_kill` |
 | IPC | `endpoint_create` (pipe option), `ipc_call`, `ipc_send`, `ipc_recv`, `ipc_reply`, `ipc_reply_recv`, `ipc_reply_to` |
 | Notifications, IRQ | `notify_create`, `notify_signal`, `notify_wait`, `notify_bind`, `irq_get`, `irq_bind`, `irq_ack` |
 | Inspection, debugging | `sysinfo` (processes, threads with their state, core and deadline, memory, cores with their timer-interrupt lateness, wake-ups for nothing, nearest deadline and timer), `klog_read`, `klog_bind` (kernel log, console only), `debug_attach`, `debug_regs`, `debug_mem`, `debug_threads`, `debug_stop` |
@@ -567,7 +569,7 @@ program that vanished without closing them (crash) are reclaimed.
 | Bluetooth | BCM4356 on UART-D (patch RAM, 3 Mbaud), pairing (SSP), HID host for Joy-Cons and Pro Controllers, reconnection on a button press (a Pro Controller on an Erista) | Joy-Cons on hardware, rumble, motion sensors, players, Bluetooth audio, BLE |
 | Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), speakers (codec, audio hub), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps and float render targets (written, not yet run on the console), audio quality in games, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power and volume buttons (read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
 | Security | capabilities, revocation, Spectre v2, isolation | |
-| Tools | build, SD card, tests (`ktest` 29, `stdtest` 17, `wlan` crypto and WPA2 on the PC, an emulated Bluetooth controller), debugger (gdb), L4T comparison, USB-C terminal | |
+| Tools | build, SD card, tests (`ktest` 30, `stdtest` 18, `wlan` crypto and WPA2 on the PC, an emulated Bluetooth controller), debugger (gdb), L4T comparison, USB-C terminal | |
 
 ## Limits
 

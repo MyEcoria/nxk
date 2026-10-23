@@ -56,6 +56,8 @@ pub struct Process {
     pub utcb_map: [u64; MAX_THREADS_PER_PROCESS / 64],
     pub pages: u64,
     pub parent: u16,
+    /// Killed when its last handle goes (`spawn::KILL_ON_CLOSE`).
+    pub kill_on_close: bool,
     /// CPU time of all its threads (counter units).
     pub cpu_time: u64,
 }
@@ -97,8 +99,13 @@ pub fn incref(i: u16) {
 pub fn decref(i: u16) {
     let p = get(i);
     p.refs -= 1;
-    if p.refs == 0 && p.state == PState::Zombie {
-        free_slot(i);
+    if p.refs != 0 {
+        return;
+    }
+    match p.state {
+        PState::Zombie => free_slot(i),
+        PState::Alive if p.kill_on_close => kill(i, 137),
+        _ => {}
     }
 }
 
@@ -171,6 +178,7 @@ pub fn create(name: &[u8], parent: u16) -> Result<u16, i64> {
         utcb_map: [0; MAX_THREADS_PER_PROCESS / 64],
         pages: 0,
         parent,
+        kill_on_close: false,
         cpu_time: 0,
     };
     let n = name.len().min(15);

@@ -774,6 +774,10 @@ pub mod spawn {
     /// instruction until a debugger attaches.
     pub const SUSPENDED: u64 = 1 << 0;
 
+    /// The process is killed when its last handle is closed (or lost
+    /// with its holder's death): a child that must not outlive its owner.
+    pub const KILL_ON_CLOSE: u64 = 1 << 1;
+
     // stdio of a manager-spawned program (`proto::pm::SPAWN` flags):
     // one pipe for stdin/stdout/stderr, else console or nothing.
     pub const STDIN_PIPE: u64 = 1 << 8;
