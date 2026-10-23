@@ -142,6 +142,8 @@ struct Shared {
     covers: HashMap<String, Arc<Vec<u8>>>,
     /// Bumped by each new cover: `display` asks again for missing ones.
     covers_version: u64,
+    /// The sign-in code to scan (`ART_LOGIN`).
+    login_art: Option<Arc<Vec<u8>>>,
     /// `STATE` callers waiting for a new version: token, its deadline.
     waiters: Vec<(u64, u64)>,
 }
@@ -180,6 +182,14 @@ impl Catalog {
         let mut s = self.shared.lock().unwrap();
         s.covers.insert(id.to_string(), Arc::new(c.encode()));
         s.covers_version += 1;
+        s.version += 1;
+        answer_waiters(&mut s, u64::MAX);
+    }
+
+    /// The image `display` shows while `State::Login` (a QR code), or none.
+    pub fn set_login_art(&self, c: Option<&Cover>) {
+        let mut s = self.shared.lock().unwrap();
+        s.login_art = c.map(|c| Arc::new(c.encode()));
         s.version += 1;
         answer_waiters(&mut s, u64::MAX);
     }
@@ -252,6 +262,7 @@ pub fn connect() -> Result<(Catalog, Receiver<Request>)> {
             games: Vec::new(),
             covers: HashMap::new(),
             covers_version: 0,
+            login_art: None,
             waiters: Vec::new(),
         })),
     };
@@ -291,6 +302,7 @@ fn serve(ep: Endpoint, cat: Catalog, tx: Sender<Request>) {
             }
             proto::GAME => Some(game_msg(&cat, m)),
             proto::COVER => Some(cover_msg(&cat, m)),
+            proto::ART => Some(art_msg(&cat, m)),
             proto::LAUNCH => Some(launch(&cat, m, &tx)),
             proto::STOP => send(&tx, Request::Stop(Done(rx.token))),
             nxk_abi::proto::SUSPEND => send(&tx, Request::Suspend(Done(rx.token))),
@@ -334,6 +346,21 @@ fn game_msg(cat: &Catalog, m: &Msg) -> Msg {
     user::pack_at(0, &[g.color as u64 & 0xFF_FFFF, 0], &b).0
 }
 
+/// Part of an image blob from byte `off`, its size in word 0.
+fn chunk_msg(blob: Option<Arc<Vec<u8>>>, off: usize) -> Msg {
+    match blob {
+        Some(b) if off <= b.len() => user::pack_at(0, &[b.len() as u64], &b[off..]).0,
+        Some(_) => Msg::error(-EINVAL),
+        None => Msg::error(-ENOENT),
+    }
+}
+
+fn art_msg(cat: &Catalog, m: &Msg) -> Msg {
+    let (kind, off) = (user::header(m, 0), user::header(m, 1) as usize);
+    let art = cat.shared.lock().unwrap().login_art.clone();
+    chunk_msg(art.filter(|_| kind == proto::ART_LOGIN), off)
+}
+
 fn cover_msg(cat: &Catalog, m: &Msg) -> Msg {
     let (i, list, off) = (
         user::header(m, 0) as usize,
@@ -347,11 +374,7 @@ fn cover_msg(cat: &Catalog, m: &Msg) -> Msg {
         }
         s.games.get(i).and_then(|g| s.covers.get(&g.id)).cloned()
     };
-    match blob {
-        Some(b) if off <= b.len() => user::pack_at(0, &[b.len() as u64], &b[off..]).0,
-        Some(_) => Msg::error(-EINVAL),
-        None => Msg::error(-ENOENT),
-    }
+    chunk_msg(blob, off)
 }
 
 fn launch(cat: &Catalog, m: &Msg, tx: &Sender<Request>) -> Msg {
