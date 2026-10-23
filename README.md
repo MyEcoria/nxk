@@ -271,14 +271,23 @@ Xbox's A); `main`'s pings are answered. HOME or sleep end the stream and
 `getPlayingGameSession`). The sound plays: `audio`'s Opus packets (CELT
 only, 20 ms, stereo, 96 to 160 kb/s) are put back in `frame_index` order,
 decoded by `services/nxopus` on a thread of their own, and written to the
-`audio` service's ring, kept 50 ms ahead (`nxgfx::audio::Stream`); a
-packet still missing when the ring runs low is concealed (libopus's
-pitch-based concealment, then noise), and a resampler (32-tap windowed
-sinc) runs up to 2000 ppm off 1 to follow the server's clock, steered by
-the buffered audio, so nothing is dropped or repeated for drift. A line gives packets,
-losses, the decoding time, the buffer and the packets' arrival jitter
-when a loss, a late packet, a drop or an underrun happens, else every
-minute. Speakers that do not take 48 kHz (the
+`audio` service's ring (`nxgfx::audio::Stream`, the service asked for a
+shallow queue). SPP does not hold the audio channel behind a missing
+message: the player orders by `frame_index` itself. The delay follows the
+network (`lunacore::stream::playout::Playout`): the packets' lateness
+(95th percentile over 3 s) above what a steady network needs, kept
+between 50 and 300 ms, rising at once and coming down over ~15 s; play
+starts once that delay is in hand. A packet missing when the ring runs
+low is waited for a frame more while less than the delay is buffered
+(the decoder fills it, libopus's pitch-based concealment), else given up
+and concealed; a backlog past the delay is shed by dropping quiet frames.
+A resampler (32-tap windowed sinc) runs up to 2000 ppm off 1 to follow
+the server's clock, steered by the buffered audio, so nothing is dropped
+or repeated for drift. A line gives packets, losses, waits, the decoding
+time, the delay and the packets' arrival jitter when something goes
+wrong, else every minute; another gives the link (longest time without a
+datagram, the stream thread's longest busy spell and send, audio packets
+lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
 the rest still runs there. The picture is not decoded yet: the screen
 stays dark and `display` waits at its handshake. The serial and the tokens are `state.json` in

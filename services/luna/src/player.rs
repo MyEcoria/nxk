@@ -1,8 +1,10 @@
 //! Plays the audio channel on a thread of its own: packets put back in
-//! order (`lunacore::stream::playout`), decoded by `nxopus`, resampled a
-//! few hundred ppm off 1 to follow the server's clock, and written to the
-//! audio service's ring, kept `TARGET` ahead. A packet still missing when
-//! the ring runs low is concealed. Without an audio service, or with one
+//! order and timed by `lunacore::stream::playout::Playout` (a delay that
+//! follows the network's lateness, 50 to 300 ms), decoded by `nxopus`,
+//! resampled a few hundred ppm off 1 to follow the server's clock, and
+//! written to the audio service's ring, kept `RING_TOP` ahead. A packet
+//! still missing when the ring runs low is waited for a frame more (the
+//! delay grows) or concealed. Without an audio service, or with one
 //! that does not play at 48 kHz (the emulator's), a clock stands in for
 //! the speakers, so the rest still runs.
 
@@ -11,14 +13,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use lunacore::stream::playout::{Arrivals, Drift, Jitter, Next, Payload, Resampler};
+use lunacore::stream::playout::{Drop as Skip, Next, Payload, Playout, Resampler, FRAME};
 use nxgfx::audio::Stream;
 
 const RATE: f64 = 48_000.0;
-const FRAME: usize = 960;
 const RING_FRAMES: usize = 8192;
-/// Frames kept in the ring (50 ms).
-const TARGET: u32 = 2400;
+/// Frames kept in the ring (50 ms); more waits as packets.
+const RING_TOP: u32 = 2400;
+/// The least delay kept (50 ms), and what a steady network needs: the
+/// deadline, a frame and 10 ms.
+const FLOOR: f64 = 2400.0;
+const BASE: f64 = (DEADLINE as usize + FRAME + 480) as f64;
+/// A decoded frame this quiet may be dropped to shed a backlog (-40 dBFS).
+const QUIET_RMS: f32 = 0.01;
 /// Frames the audio service may hold between the ring and the speakers
 /// (about 11 ms in 128-frame periods, instead of its default 85 ms).
 const AHEAD: u32 = 512;
@@ -26,11 +33,6 @@ const AHEAD: u32 = 512;
 /// period of 128 frames at a time, a short take is an underrun, and the
 /// ring is topped up every `TICK` (144 frames).
 const DEADLINE: u32 = 384;
-/// Packets kept waiting at most; a burst past it is dropped.
-const MAX_QUEUED: usize = 8;
-/// Buffered audio this far past the set point (smoothed) is dropped a
-/// frame at a time: resampling would take minutes to absorb it.
-const MAX_EXCESS: f64 = 1920.0;
 const TICK: Duration = Duration::from_millis(3);
 /// The speakers' pace is checked once this long after the first write.
 const RATE_CHECK: Duration = Duration::from_secs(4);
@@ -160,9 +162,7 @@ struct Counts {
 }
 
 struct State {
-    jitter: Jitter,
-    arrivals: Arrivals,
-    drift: Drift,
+    playout: Playout,
     resampler: Resampler,
     decoder: nxopus::Decoder,
     pcm: Vec<f32>,
@@ -170,12 +170,16 @@ struct State {
     out16: Vec<i16>,
     counts: Counts,
     started: Instant,
-    primed: bool,
     ratio: f64,
     /// Frames written, and when the first was.
     written: u64,
     first_write: Option<Instant>,
+    /// The first seconds, event by event, printed if they went wrong.
+    trace: Vec<String>,
+    trace_wanted: bool,
 }
+
+const TRACE_FOR: Duration = Duration::from_secs(4);
 
 fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
     let mut sink: Box<dyn Sink> = match Stream::open_ahead(RING_FRAMES, AHEAD) {
@@ -194,9 +198,7 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
         }
     };
     let mut st = State {
-        jitter: Jitter::default(),
-        arrivals: Arrivals::new((FRAME as f64 / RATE * 1e6) as i64),
-        drift: Drift::new((TARGET as usize + FRAME / 2) as f64),
+        playout: Playout::new(BASE, FLOOR, true),
         resampler: Resampler::new(),
         decoder: nxopus::Decoder::new(),
         pcm: vec![0.0; 2 * nxopus::MAX_FRAME],
@@ -204,10 +206,11 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
         out16: Vec::with_capacity(2 * RING_FRAMES),
         counts: Counts::default(),
         started: Instant::now(),
-        primed: false,
         ratio: 1.0,
         written: 0,
         first_write: None,
+        trace: Vec::new(),
+        trace_wanted: false,
     };
     let (mut last_tick, mut last_report) = (Instant::now(), Instant::now());
     let (mut shown, mut shown_at) = (None, Instant::now());
@@ -233,6 +236,14 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
             });
         }
         st.feed(sink.as_mut(), (now - last_tick).as_secs_f64());
+        if !st.trace.is_empty() && st.started.elapsed() >= TRACE_FOR {
+            if st.trace_wanted {
+                for chunk in st.trace.chunks(24) {
+                    println!("luna: audio start {}", chunk.join(" "));
+                }
+            }
+            st.trace = Vec::new();
+        }
         last_tick = now;
         if now - last_report >= REPORT_EVERY {
             last_report = now;
@@ -248,18 +259,26 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
     }
 }
 
+fn rms(pcm: &[f32]) -> f32 {
+    (pcm.iter().map(|v| v * v).sum::<f32>() / pcm.len().max(1) as f32).sqrt()
+}
+
 impl State {
-    fn take(&mut self, p: In) {
-        if let Some(i) = p.index {
-            self.arrivals
-                .arrived((p.at - self.started).as_micros() as i64, i);
+    fn note(&mut self, what: std::fmt::Arguments) {
+        let ms = self.started.elapsed().as_millis();
+        if ms < TRACE_FOR.as_millis() && self.trace.len() < 600 {
+            self.trace.push(format!("{}@{}", what, ms));
         }
+    }
+
+    fn take(&mut self, p: In) {
+        self.note(format_args!("a{}", p.index.map_or(-1, |i| i as i64)));
         match &p.payload {
             Payload::Silent => self.counts.silent += 1,
             Payload::Opus(_) => self.counts.packets += 1,
         }
-        self.jitter.push(p.index, p.payload);
-        self.jitter.trim(MAX_QUEUED);
+        let us = (p.at - self.started).as_micros() as i64;
+        self.playout.arrived(us, p.index, p.payload);
     }
 
     /// Once, `RATE_CHECK` after the first write: the rate the sink took
@@ -274,30 +293,25 @@ impl State {
         ((rate - RATE).abs() > 0.1 * RATE).then_some(rate)
     }
 
-    /// Tops the ring up to `TARGET`, decoding or concealing frames as the
-    /// resampler runs out.
+    /// Frames held ahead of the speakers: ring, resampler, packets.
+    fn buffered(&self, queued: u32) -> f64 {
+        queued as f64 + self.resampler.pending() + (self.playout.jitter.queued() * FRAME) as f64
+    }
+
+    /// Tops the ring up to `RING_TOP`, decoding, expanding or concealing
+    /// frames as the resampler runs out.
     fn feed(&mut self, sink: &mut dyn Sink, dt: f64) {
-        if !self.primed {
-            // Start with two frames in hand, so the first wait is covered.
-            if self.jitter.queued() < 2 {
-                return;
-            }
-            self.primed = true;
+        let mut queued = sink.queued();
+        self.ratio = self.playout.tick(self.buffered(queued), dt);
+        let now_us = self.started.elapsed().as_micros() as i64;
+        if !self.playout.ready(now_us) {
+            return;
         }
-        let queued = sink.queued();
-        let buffered =
-            queued as f64 + self.resampler.pending() + (self.jitter.queued() * FRAME) as f64;
-        self.ratio = self.drift.update(buffered, dt);
-        if self.drift.excess() > MAX_EXCESS && self.jitter.queued() > 0 {
-            self.jitter.trim(self.jitter.queued() - 1);
-            self.drift.dropped(FRAME as f64);
-        }
-        let mut queued = queued;
-        while queued < TARGET {
+        while queued < RING_TOP {
             self.out.clear();
             let n = self
                 .resampler
-                .pull((TARGET - queued) as usize, self.ratio, &mut self.out);
+                .pull((RING_TOP - queued) as usize, self.ratio, &mut self.out);
             if n > 0 {
                 self.out16.clear();
                 self.out16.extend(
@@ -313,16 +327,29 @@ impl State {
                 queued += n as u32;
                 continue;
             }
-            match self.jitter.pop(queued < DEADLINE) {
+            let next = self.playout.next(self.buffered(queued), queued < DEADLINE);
+            match &next {
+                Next::Opus(_) => self.note(format_args!("d{}", queued)),
+                Next::Conceal => {
+                    self.note(format_args!("C{}", queued));
+                    self.trace_wanted = true;
+                }
+                Next::Expand => {
+                    self.note(format_args!("E{}", queued));
+                    self.trace_wanted = true;
+                }
+                _ => {}
+            }
+            match next {
                 Next::Opus(b) => self.decode(&b),
                 Next::Silent => self.resampler.push(&[0.0; 2 * FRAME]),
-                Next::Conceal => {
+                Next::Conceal | Next::Expand => {
                     let n = self.decoder.conceal_float(&mut self.pcm);
                     self.resampler.push(&self.pcm[..2 * n]);
                 }
                 Next::Wait => {
-                    if self.jitter.queued() == 0 && queued == 0 {
-                        self.primed = false;
+                    if self.playout.jitter.queued() == 0 && queued == 0 {
+                        self.playout.restart();
                     }
                     break;
                 }
@@ -330,30 +357,43 @@ impl State {
         }
     }
 
+    /// Decodes a packet into the resampler, unless a backlog is being
+    /// shed and the frame can go.
     fn decode(&mut self, opus: &[u8]) {
         let t = Instant::now();
-        match self.decoder.decode_float(opus, &mut self.pcm) {
-            Ok(n) => self.resampler.push(&self.pcm[..2 * n]),
+        let n = match self.decoder.decode_float(opus, &mut self.pcm) {
+            Ok(n) => n,
             Err(_) => {
                 self.counts.errors += 1;
-                let n = self.decoder.conceal_float(&mut self.pcm);
-                self.resampler.push(&self.pcm[..2 * n]);
+                self.decoder.conceal_float(&mut self.pcm)
             }
-        }
+        };
         let ns = t.elapsed().as_nanos() as u64;
         self.counts.decode_ns += ns;
         self.counts.decode_max_ns = self.counts.decode_max_ns.max(ns);
+        let pcm = &self.pcm[..2 * n];
+        let skip = match self.playout.drop_next() {
+            Skip::Keep => false,
+            Skip::IfQuiet => rms(pcm) < QUIET_RMS,
+            Skip::Always => true,
+        };
+        if skip {
+            self.playout.frame_dropped();
+        } else {
+            self.resampler.push(pcm);
+        }
     }
 
     /// What going wrong counts: the line is renewed when one moves.
-    fn events(&self, sink: &dyn Sink) -> [u64; 7] {
-        let j = &self.jitter;
+    fn events(&self, sink: &dyn Sink) -> [u64; 8] {
+        let j = &self.playout.jitter;
         [
             self.counts.errors,
             j.lost,
             j.late,
-            j.dropped,
+            j.dropped + self.playout.dropped,
             j.resyncs,
+            j.expansions,
             sink.underruns() as u64,
             (self.counts.packets > 0) as u64 | ((sink.name() == "clock") as u64) << 1,
         ]
@@ -361,25 +401,27 @@ impl State {
 
     fn report(&self, sink: &dyn Sink) -> String {
         let c = &self.counts;
-        let j = &self.jitter;
-        let p = self.arrivals.percentiles();
+        let j = &self.playout.jitter;
+        let p = self.playout.arrivals.percentiles();
         format!(
-            "luna: audio to {}: {} packets, {} silent, {} errors, {} lost, {} late, {} dup, {} dropped, \
-             {} resyncs, {} underruns; decode {} us mean {} us max; buffered {:.0} ms at {:+.0} ppm; \
-             arrival p50 {:.1} p95 {:.1} p99 {:.1} max {:.1} ms",
+            "luna: audio to {}: {} packets, {} silent, {} errors, {} lost, {} late, {} waited for, \
+             {} dup, {} dropped, {} resyncs, {} underruns; decode {} us mean {} us max; delay {:.0} ms \
+             (buffered {:.0} ms at {:+.0} ppm); arrival p50 {:.1} p95 {:.1} p99 {:.1} max {:.1} ms",
             sink.name(),
             c.packets,
             c.silent,
             c.errors,
             j.lost,
             j.late,
+            j.expansions,
             j.duplicates,
-            j.dropped,
+            j.dropped + self.playout.dropped,
             j.resyncs,
             sink.underruns(),
             c.decode_ns / 1000 / c.packets.max(1),
             c.decode_max_ns / 1000,
-            self.drift.smoothed() / RATE * 1000.0,
+            self.playout.target() / RATE * 1000.0,
+            self.playout.buffered() / RATE * 1000.0,
             (self.ratio - 1.0) * 1e6,
             p[0],
             p[1],

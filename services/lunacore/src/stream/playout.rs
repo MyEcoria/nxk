@@ -3,7 +3,9 @@
 //! concealed), the arrival jitter measured, and the drift between the
 //! server's clock and the speakers' taken up by resampling at a ratio a
 //! few hundred ppm from 1 (`Drift`, `Resampler`): inaudible, unlike
-//! dropping or repeating frames.
+//! dropping or repeating frames. `Playout` puts them together with a
+//! delay that follows the network: it grows by concealing a frame without
+//! giving the late packet up (an expansion), and shrinks slowly.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -12,6 +14,10 @@ use std::collections::BTreeMap;
 pub const MAX_CONCEALED: u32 = 10;
 /// A jump in `frame_index` past this is a restart, not losses (500 ms).
 pub const RESYNC_GAP: u64 = 25;
+/// Frames inserted in a row to wait for a late packet (300 ms).
+pub const MAX_EXPANDED: u32 = 15;
+/// Samples per channel of a packet (20 ms at 48 kHz).
+pub const FRAME: usize = 960;
 
 /// A packet's content.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +34,9 @@ pub enum Next {
     Silent,
     /// Lost: the decoder fills it.
     Conceal,
+    /// Late: the decoder fills a frame and the packet is still awaited
+    /// (the delay grows by a frame).
+    Expand,
     /// Nothing to play yet.
     Wait,
 }
@@ -49,17 +58,20 @@ impl From<Payload> for Next {
 /// let mut j = Jitter::default();
 /// j.push(Some(1), Payload::Silent);
 /// j.push(Some(0), Payload::Opus(vec![0xfc]));
-/// assert_eq!(j.pop(false), Next::Opus(vec![0xfc]));
-/// assert_eq!(j.pop(false), Next::Silent);
-/// assert_eq!(j.pop(false), Next::Wait);
-/// assert_eq!(j.pop(true), Next::Conceal);
+/// assert_eq!(j.pop(false, false), Next::Opus(vec![0xfc]));
+/// assert_eq!(j.pop(false, false), Next::Silent);
+/// assert_eq!(j.pop(false, false), Next::Wait);
+/// assert_eq!(j.pop(true, true), Next::Expand);
+/// assert_eq!(j.pop(true, false), Next::Conceal);
 /// ```
 #[derive(Debug, Default)]
 pub struct Jitter {
     pending: BTreeMap<u64, Payload>,
     next: Option<u64>,
     concealed_run: u32,
+    expand_run: u32,
     pub lost: u64,
+    pub expansions: u64,
     pub late: u64,
     pub duplicates: u64,
     pub resyncs: u64,
@@ -110,8 +122,9 @@ impl Jitter {
     }
 
     /// The next frame to play; `due`: the output cannot wait any longer,
-    /// so a missing packet is given up for lost.
-    pub fn pop(&mut self, due: bool) -> Next {
+    /// so a missing packet is waited for a frame more (`grow`) or given
+    /// up for lost.
+    pub fn pop(&mut self, due: bool, grow: bool) -> Next {
         let first = self.pending.keys().next().copied();
         let next = match (self.next, first) {
             (Some(n), _) => n,
@@ -121,6 +134,7 @@ impl Jitter {
         if let Some(p) = self.pending.remove(&next) {
             self.next = Some(next + 1);
             self.concealed_run = 0;
+            self.expand_run = 0;
             return p.into();
         }
         if let Some(f) = first {
@@ -128,11 +142,16 @@ impl Jitter {
                 self.lost += f - next;
                 self.resyncs += 1;
                 self.next = Some(f);
-                return self.pop(due);
+                return self.pop(due, grow);
             }
         }
         if !due {
             return Next::Wait;
+        }
+        if grow && self.expand_run < MAX_EXPANDED {
+            self.expand_run += 1;
+            self.expansions += 1;
+            return Next::Expand;
         }
         if self.concealed_run >= MAX_CONCEALED {
             // Stalled: start again from whatever comes next.
@@ -178,6 +197,27 @@ impl Arrivals {
         }
     }
 
+    /// Lateness in microseconds at quantile `q` over the last `n` packets,
+    /// against the earliest of them.
+    pub fn recent(&self, n: usize, q: f64) -> i64 {
+        let len = self.offsets.len();
+        let n = n.min(len);
+        if n == 0 {
+            return 0;
+        }
+        let mut last: Vec<i64> = if len < ARRIVALS_KEPT {
+            self.offsets[len - n..].to_vec()
+        } else {
+            (0..n)
+                .map(|k| self.offsets[(self.at + ARRIVALS_KEPT - n + k) % ARRIVALS_KEPT])
+                .collect()
+        };
+        let min = *last.iter().min().unwrap_or(&0);
+        last.iter_mut().for_each(|o| *o -= min);
+        last.sort_unstable();
+        last[((n - 1) as f64 * q) as usize]
+    }
+
     /// Lateness in ms at the 50th, 95th and 99th percentiles and the most.
     pub fn percentiles(&self) -> [f64; 4] {
         let Some(&min) = self.offsets.iter().min() else {
@@ -216,6 +256,9 @@ const KP: f64 = 2.0;
 const KI: f64 = 0.05;
 /// The steady drift learnt at most.
 const MAX_DRIFT_PPM: f64 = 1500.0;
+/// The integral learns the drift only this close to the set point, so a
+/// set point that moves (an adaptive delay) does not teach it a drift.
+const INTEGRATE_WITHIN: f64 = 960.0;
 
 impl Drift {
     /// `setpoint`: the frames to keep buffered.
@@ -237,11 +280,16 @@ impl Drift {
         self.smoothed = Some(s);
         let error = s - self.setpoint;
         let free = KP * error + self.integral;
-        if free.abs() < MAX_PPM {
+        if free.abs() < MAX_PPM && error.abs() < INTEGRATE_WITHIN {
             self.integral = (self.integral + KI * error * dt).clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM);
         }
         let ppm = (KP * error + self.integral).clamp(-MAX_PPM, MAX_PPM);
         1.0 + ppm * 1e-6
+    }
+
+    /// A new set point, in frames.
+    pub fn set_setpoint(&mut self, setpoint: f64) {
+        self.setpoint = setpoint;
     }
 
     /// The smoothed buffered frames.
@@ -260,6 +308,167 @@ impl Drift {
         if let Some(s) = self.smoothed.as_mut() {
             *s -= frames;
         }
+    }
+}
+
+/// The most audio held to ride out the network's stalls (300 ms).
+pub const MAX_TARGET: f64 = 14_400.0;
+/// Packets the delay is worked out over (3 s): it follows the network fast.
+const TARGET_WINDOW: usize = 150;
+const TARGET_QUANTILE: f64 = 0.95;
+/// How slowly a delay no longer needed comes down (and by resampling).
+const TARGET_DECAY_SECS: f64 = 15.0;
+/// Packets kept waiting at most; a burst past it is dropped.
+pub const MAX_QUEUED: usize = 24;
+
+/// What to do with the next decoded frame when too much is buffered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Drop {
+    Keep,
+    /// Drop it if it is quiet (a skip there goes unheard).
+    IfQuiet,
+    /// Drop it anyway: far too much is buffered.
+    Always,
+}
+
+/// # The playout's decisions: when to start, what to play, the delay.
+///
+/// The delay (`target`, in frames buffered) is the network's recent
+/// lateness (95th percentile over 3 s) above `base`, kept within
+/// `floor..MAX_TARGET`; it rises at once and comes down over ~15 s. At
+/// the start nothing plays until the delay is in hand. A packet missing
+/// at the deadline is waited for one more frame while less than the
+/// delay is buffered, else given up. Fixed (`adaptive` false), the delay
+/// stays at `floor`.
+///
+/// ## Example
+/// ```
+/// use lunacore::stream::playout::{Next, Payload, Playout};
+/// let mut p = Playout::new(1824.0, 2400.0, true);
+/// for i in 0..3 {
+///     p.arrived(i * 20_000, Some(i as u64), Payload::Silent);
+/// }
+/// assert!(p.ready(40_000));
+/// assert_eq!(p.next(0.0, true), Next::Silent);
+/// ```
+#[derive(Debug)]
+pub struct Playout {
+    pub jitter: Jitter,
+    pub arrivals: Arrivals,
+    drift: Drift,
+    base: f64,
+    floor: f64,
+    target: f64,
+    adaptive: bool,
+    pub primed: bool,
+    first_us: Option<i64>,
+    pub dropped: u64,
+}
+
+impl Playout {
+    /// `base`: the frames the output needs on a steady network (its
+    /// deadline and a frame); `floor`: the least delay kept.
+    pub fn new(base: f64, floor: f64, adaptive: bool) -> Self {
+        Self {
+            jitter: Jitter::default(),
+            arrivals: Arrivals::new((FRAME as i64 * 1_000_000) / 48_000),
+            drift: Drift::new(floor),
+            base,
+            floor,
+            target: floor,
+            adaptive,
+            primed: false,
+            first_us: None,
+            dropped: 0,
+        }
+    }
+
+    /// A packet came at `us` (any steady clock).
+    pub fn arrived(&mut self, us: i64, index: Option<u64>, p: Payload) {
+        if let Some(i) = index {
+            self.arrivals.arrived(us, i);
+        }
+        if !self.primed && self.first_us.is_none() {
+            self.first_us = Some(us);
+        }
+        self.jitter.push(index, p);
+        self.jitter.trim(MAX_QUEUED);
+    }
+
+    /// Whether playing may start (or go on): once the delay is in hand,
+    /// by packets or by the time since the first one.
+    pub fn ready(&mut self, now_us: i64) -> bool {
+        if self.primed {
+            return true;
+        }
+        let queued = self.jitter.queued();
+        let waited = self
+            .first_us
+            .map_or(0.0, |f| (now_us - f) as f64 * 48_000.0 / 1e6);
+        if queued > 0 && ((queued * FRAME) as f64 >= self.target || waited >= self.target) {
+            self.primed = true;
+            self.first_us = None;
+        }
+        self.primed
+    }
+
+    /// Play nothing until the delay is in hand again (after a stall).
+    pub fn restart(&mut self) {
+        self.primed = false;
+        self.first_us = None;
+    }
+
+    /// Updates the delay and returns the resampling ratio for the
+    /// `buffered` frames, `dt` seconds after the last call.
+    pub fn tick(&mut self, buffered: f64, dt: f64) -> f64 {
+        if self.adaptive {
+            let late = self.arrivals.recent(TARGET_WINDOW, TARGET_QUANTILE) as f64 * 48_000.0 / 1e6;
+            let want = (self.base + late).clamp(self.floor, MAX_TARGET);
+            if want > self.target {
+                self.target = want;
+            } else {
+                self.target -= (self.target - want) * (dt / TARGET_DECAY_SECS).min(1.0);
+            }
+        }
+        self.drift.set_setpoint(self.target);
+        self.drift.update(buffered, dt)
+    }
+
+    /// The next frame, `buffered` frames held and `due` when the output
+    /// cannot wait.
+    pub fn next(&mut self, buffered: f64, due: bool) -> Next {
+        let grow = self.adaptive && buffered < self.target - (FRAME / 2) as f64;
+        self.jitter.pop(due, grow)
+    }
+
+    /// Whether to drop the next decoded frame (too much buffered after a
+    /// burst: resampling would take minutes).
+    pub fn drop_next(&self) -> Drop {
+        let limit = (self.target * 0.5).max(1920.0);
+        let excess = self.drift.excess();
+        if excess > 2.0 * limit {
+            Drop::Always
+        } else if excess > limit {
+            Drop::IfQuiet
+        } else {
+            Drop::Keep
+        }
+    }
+
+    /// A decoded frame was dropped.
+    pub fn frame_dropped(&mut self) {
+        self.dropped += 1;
+        self.drift.dropped(FRAME as f64);
+    }
+
+    /// The delay aimed at, in frames.
+    pub fn target(&self) -> f64 {
+        self.target
+    }
+
+    /// The buffered frames, smoothed.
+    pub fn buffered(&self) -> f64 {
+        self.drift.smoothed()
     }
 }
 
@@ -389,14 +598,14 @@ mod tests {
         let mut j = Jitter::default();
         j.push(Some(10), opus(10));
         j.push(Some(12), opus(12));
-        assert_eq!(j.pop(false), Next::Opus(vec![10]));
-        assert_eq!(j.pop(false), Next::Wait);
+        assert_eq!(j.pop(false, false), Next::Opus(vec![10]));
+        assert_eq!(j.pop(false, false), Next::Wait);
         j.push(Some(11), opus(11));
-        assert_eq!(j.pop(false), Next::Opus(vec![11]));
-        assert_eq!(j.pop(false), Next::Opus(vec![12]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![11]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![12]));
         j.push(Some(14), opus(14));
-        assert_eq!(j.pop(true), Next::Conceal);
-        assert_eq!(j.pop(false), Next::Opus(vec![14]));
+        assert_eq!(j.pop(true, false), Next::Conceal);
+        assert_eq!(j.pop(false, false), Next::Opus(vec![14]));
         j.push(Some(13), opus(13));
         assert_eq!((j.lost, j.late), (1, 1));
     }
@@ -407,16 +616,16 @@ mod tests {
         j.push(Some(0), opus(0));
         j.push(Some(0), opus(9));
         assert_eq!(j.duplicates, 1);
-        assert_eq!(j.pop(false), Next::Opus(vec![0]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![0]));
     }
 
     #[test]
     fn a_big_jump_resyncs() {
         let mut j = Jitter::default();
         j.push(Some(0), opus(0));
-        assert_eq!(j.pop(false), Next::Opus(vec![0]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![0]));
         j.push(Some(1000), opus(1));
-        assert_eq!(j.pop(false), Next::Opus(vec![1]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![1]));
         assert_eq!(j.resyncs, 1);
     }
 
@@ -424,13 +633,13 @@ mod tests {
     fn a_stall_stops_concealing_then_restarts() {
         let mut j = Jitter::default();
         j.push(Some(0), opus(0));
-        j.pop(true);
+        j.pop(true, false);
         for _ in 0..MAX_CONCEALED {
-            assert_eq!(j.pop(true), Next::Conceal);
+            assert_eq!(j.pop(true, false), Next::Conceal);
         }
-        assert_eq!(j.pop(true), Next::Wait);
+        assert_eq!(j.pop(true, false), Next::Wait);
         j.push(Some(500), opus(5));
-        assert_eq!(j.pop(false), Next::Opus(vec![5]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![5]));
     }
 
     #[test]
@@ -441,7 +650,7 @@ mod tests {
         }
         j.trim(3);
         assert_eq!(j.dropped, 5);
-        assert_eq!(j.pop(false), Next::Opus(vec![5]));
+        assert_eq!(j.pop(false, false), Next::Opus(vec![5]));
     }
 
     #[test]
@@ -505,6 +714,133 @@ mod tests {
                 assert!(lowest > setpoint - 720.0, "{} {}: {}", drift, start, lowest);
             }
         }
+    }
+
+    /// What a simulated minute of playout gave.
+    #[derive(Debug)]
+    struct Run {
+        concealed: u64,
+        underrun_ms: u64,
+        mean_target_ms: f64,
+        last_target_ms: f64,
+    }
+
+    /// A server sending a packet every 20 ms over a network adding 10-18
+    /// ms, plus a stall of `stall_ms` every 10 s (the packets sent during
+    /// it come together at its end); the speakers take 48 frames a ms
+    /// from a ring topped up to 50 ms every 3 ms, as luna's player does.
+    fn simulate(adaptive: bool, stall_ms: u64, secs: u64) -> Run {
+        const TOP: f64 = 2400.0;
+        const DEADLINE: f64 = 384.0;
+        let mut p = Playout::new(1824.0, 2400.0, adaptive);
+        let mut arrivals: Vec<(u64, u64)> = Vec::new();
+        let mut seed = 12345u32;
+        for i in 0..secs * 50 {
+            let sent = i * 20;
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let mut at = sent + 10 + (seed >> 29) as u64;
+            let phase = sent % 10_000;
+            if stall_ms > 0 && sent >= 5_000 && phase >= 5_000 && phase < 5_000 + stall_ms {
+                at = at.max(sent - phase + 5_000 + stall_ms + (i % 3));
+            }
+            arrivals.push((at, i));
+        }
+        arrivals.sort();
+        let (mut ring, mut pcm) = (0f64, 0f64);
+        let mut run = Run {
+            concealed: 0,
+            underrun_ms: 0,
+            mean_target_ms: 0.0,
+            last_target_ms: 0.0,
+        };
+        let mut next_arrival = 0;
+        let mut target_sum = 0.0;
+        for ms in 0..secs * 1000 {
+            while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= ms {
+                let (at, i) = arrivals[next_arrival];
+                p.arrived(at as i64 * 1000, Some(i), Payload::Opus(vec![0]));
+                next_arrival += 1;
+            }
+            if ring >= 48.0 {
+                ring -= 48.0;
+            } else if p.primed {
+                run.underrun_ms += 1;
+                ring = 0.0;
+            }
+            if ms % 3 != 0 {
+                continue;
+            }
+            let buffered = ring + pcm + (p.jitter.queued() * FRAME) as f64;
+            p.tick(buffered, 0.003);
+            target_sum += p.target();
+            if !p.ready(ms as i64 * 1000) {
+                continue;
+            }
+            while ring < TOP {
+                if pcm > 0.0 {
+                    let n = pcm.min(TOP - ring);
+                    ring += n;
+                    pcm -= n;
+                    continue;
+                }
+                let buffered = ring + (p.jitter.queued() * FRAME) as f64;
+                match p.next(buffered, ring < DEADLINE) {
+                    Next::Opus(_) | Next::Silent => {
+                        if p.drop_next() == Drop::Always {
+                            p.frame_dropped();
+                        } else {
+                            pcm += FRAME as f64;
+                        }
+                    }
+                    Next::Conceal => {
+                        run.concealed += 1;
+                        pcm += FRAME as f64;
+                    }
+                    Next::Expand => pcm += FRAME as f64,
+                    Next::Wait => {
+                        if p.jitter.queued() == 0 && ring == 0.0 {
+                            p.restart();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        run.mean_target_ms = target_sum / (secs * 1000 / 3) as f64 / 48.0;
+        run.last_target_ms = p.target() / 48.0;
+        run
+    }
+
+    #[test]
+    fn a_steady_network_plays_without_loss_at_the_floor() {
+        for adaptive in [false, true] {
+            let r = simulate(adaptive, 0, 30);
+            assert_eq!((r.concealed, r.underrun_ms), (0, 0), "{:?}", r);
+            assert!(r.mean_target_ms < 55.0, "{:?}", r);
+        }
+    }
+
+    #[test]
+    fn stalls_cost_far_less_with_an_adaptive_delay() {
+        let fixed = simulate(false, 250, 60);
+        let adaptive = simulate(true, 250, 60);
+        assert!(fixed.concealed >= 30, "{:?}", fixed);
+        assert!(
+            adaptive.concealed * 4 <= fixed.concealed,
+            "{:?} vs {:?}",
+            adaptive,
+            fixed
+        );
+        assert!(adaptive.last_target_ms <= 300.0, "{:?}", adaptive);
+    }
+
+    #[test]
+    fn the_delay_comes_down_once_the_stalls_stop() {
+        // Stalls for 30 s (in `simulate`, from 5 s), then none for 30 s.
+        let mut quiet = simulate(true, 250, 20);
+        assert!(quiet.last_target_ms > 100.0, "{:?}", quiet);
+        quiet = simulate(true, 0, 20);
+        assert!(quiet.last_target_ms < 60.0, "{:?}", quiet);
     }
 
     /// A tone through the resampler at ratio 1 is the tone; at 1.001 it
