@@ -46,7 +46,7 @@ pub fn run(cat: Catalog, domain: String, user: String) {
     }
     loop {
         while unix_now() < TIME_FLOOR_S {
-            cat.set_state(State::Loading("Waiting for the network time".into()));
+            cat.set_state_idle(State::Loading("Waiting for the network time".into()));
             sleep(Duration::from_secs(2));
         }
         let mut st = store::load();
@@ -57,7 +57,7 @@ pub fn run(cat: Catalog, domain: String, user: String) {
             Ok(games) => {
                 let new = Library::of(&games, COVER_SIDE as u32);
                 list(&cat, &new);
-                cat.set_state(State::Ready(if games.is_empty() {
+                cat.set_state_idle(State::Ready(if games.is_empty() {
                     "No game this account can play".into()
                 } else {
                     String::new()
@@ -73,7 +73,7 @@ pub fn run(cat: Catalog, domain: String, user: String) {
             }
             Err(e) => {
                 println!("luna: {}", e);
-                cat.set_state(State::Error(e));
+                cat.set_state_idle(State::Error(e));
                 RETRY
             }
         };
@@ -97,7 +97,7 @@ fn signed_in(
     }
     let s = st.session.as_mut().expect("session");
     if auth::needs_refresh(s, unix_now()) {
-        cat.set_state(State::Loading("Signing in".into()));
+        cat.set_state_idle(State::Loading("Signing in".into()));
         let (code, reply) = api.panda(
             &s.domain,
             "/auth/token",
@@ -117,7 +117,7 @@ fn signed_in(
     }
     let s = st.session.as_mut().expect("session");
     if s.profile_token.is_none() {
-        cat.set_state(State::Loading("Choosing the player".into()));
+        cat.set_state_idle(State::Loading("Choosing the player".into()));
         let cfg = api.call(Some(s), "getAppConfig", &json!({}))?;
         s.proxy = cfg["endpoints"]["clientProxy"].as_str().map(str::to_owned);
         let page = api.call(

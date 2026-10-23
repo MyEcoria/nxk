@@ -157,9 +157,16 @@ pub struct Catalog {
 impl Catalog {
     pub fn set_state(&self, st: State) {
         let mut s = self.shared.lock().unwrap();
-        s.state = st;
-        s.version += 1;
-        answer_waiters(&mut s, u64::MAX);
+        put_state(&mut s, st);
+    }
+
+    /// `set_state` unless a launch or a game is under way: any later state
+    /// ends it, and a background refresh or error must not.
+    pub fn set_state_idle(&self, st: State) {
+        let mut s = self.shared.lock().unwrap();
+        if !matches!(s.state, State::Launching { .. } | State::Playing) {
+            put_state(&mut s, st);
+        }
     }
 
     /// A new list (ids not `valid_id`, and past `MAX_GAMES`, left out).
@@ -198,6 +205,12 @@ impl Catalog {
         let s = self.shared.lock().unwrap();
         s.games.iter().find(|g| g.id == id).cloned()
     }
+}
+
+fn put_state(s: &mut Shared, st: State) {
+    s.state = st;
+    s.version += 1;
+    answer_waiters(s, u64::MAX);
 }
 
 /// The state reply, built on the calling thread (its UTCB).
