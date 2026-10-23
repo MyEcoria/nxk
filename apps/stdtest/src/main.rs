@@ -378,6 +378,30 @@ fn files() -> R {
     Ok("dirs, append, seek, 200 KiB, copy, rename, relative".into())
 }
 
+/// Dirty sectors of an open writer while a file bigger than the volume
+/// cache (1 MiB) is read: its readahead must not be overwritten by a flush.
+fn fs_cache() -> R {
+    let root = "/tmp/stdcache";
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root).map_err(|e| format!("create_dir_all: {e}"))?;
+    let data: Vec<u8> = (0..3u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8 | 1).collect();
+    fs::write(format!("{root}/big.bin"), &data).map_err(|e| e.to_string())?;
+    // The writer stays open and keeps adding dirty sectors between the reads.
+    let mut w = fs::File::create(format!("{root}/open.bin")).map_err(|e| e.to_string())?;
+    let mut r = fs::File::open(format!("{root}/big.bin")).map_err(|e| e.to_string())?;
+    let mut got = vec![0u8; data.len()];
+    for chunk in got.chunks_mut(16 << 10) {
+        r.read_exact(chunk).map_err(|e| e.to_string())?;
+        w.write_all(&[0xAA; 4096]).map_err(|e| e.to_string())?;
+    }
+    let bad = got.iter().zip(&data).position(|(a, b)| a != b);
+    drop(r);
+    drop(w);
+    ensure(got.len() == data.len() && bad.is_none(), format!("big.bin differs at {bad:?}, len {}", got.len()))?;
+    fs::remove_dir_all(root).map_err(|e| e.to_string())?;
+    Ok("3 MiB read with a writer open".into())
+}
+
 fn processes() -> R {
     let st = Command::new("true").status().map_err(|e| format!("true: {e}"))?;
     ensure(st.success(), format!("true: {st}"))?;
@@ -587,6 +611,7 @@ fn main() {
         ("collections", collections),
         ("math", math),
         ("files", files),
+        ("fs_cache", fs_cache),
         ("processes", processes),
         ("pipes", pipes),
     ];

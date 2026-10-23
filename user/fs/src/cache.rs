@@ -92,19 +92,20 @@ impl Cache {
         {
             n += 1;
         }
+        // Free the slots first: a flush in `victim` reuses the I/O buffer.
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            slots.push(self.victim()?);
+        }
         self.io(blk::READ, lba, n)?;
-        let mut first = 0;
-        for k in 0..n {
-            let s = self.victim()?;
+        for (k, &s) in slots.iter().enumerate() {
             let src = &self.io.as_slice()[k * SECTOR..(k + 1) * SECTOR];
             self.data[s * SECTOR..(s + 1) * SECTOR].copy_from_slice(src);
             self.tags[s] = lba + k as u64;
             self.map.insert(lba + k as u64, s);
             self.used[s] = k == 0;
-            if k == 0 {
-                first = s;
-            }
         }
+        let first = slots[0];
         Ok(first)
     }
 

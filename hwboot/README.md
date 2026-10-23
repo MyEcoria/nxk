@@ -1539,6 +1539,15 @@ within 5 s.
     zero pages of run 56; display's restart of the catalog ran. Covers:
     `HTTP 400` from the image server (none shown).
 
+    Cause found afterwards, in the emulator (not yet shown on silicon): `fs`'s
+    sector cache read ahead into the shared I/O buffer, then took a victim
+    slot for each sector; a victim with dirty data flushed through the same
+    buffer and replaced the sectors still to copy (here at byte 837120 of a
+    3 MiB read with a writer open). Any dirty sector (an open writer, a file
+    being copied) made a large read return other bytes: not an instruction
+    cache or DMA fault. Fixed in `user/fs/src/cache.rs` (victims taken before
+    the read); `stdtest fs_cache` failed before and passes now.
+
 1. `./mksd-hw.sh /mount/point` (rebuilds nxk + bl31, installs the entry).
 2. Put the card back in the Switch, inject hekate, **More Configs → nxk**.
 3. Read the screen (see above). The shell: over the USB-C cable ("Shell
