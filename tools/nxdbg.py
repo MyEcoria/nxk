@@ -33,6 +33,13 @@ BUTTONS = ["A", "B", "X", "Y", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "UP",
            "POWER", "POWER_LONG"]
 # Bytes held back by usbcon after the terminal opens (100 ms), and a margin.
 SETTLE = 0.3
+# Refusals that delivered nothing (service not published yet, or restarted):
+# any request is sent again. A capture is also sent again after a timeout;
+# a press is not (the service may have taken it).
+ENOSYS, EPIPE, ETIMEDOUT = 38, 32, 110
+RETRY = {ENOSYS, EPIPE}
+RETRY_SCREEN = RETRY | {ETIMEDOUT}
+RETRY_DELAY = 0.1
 
 
 class Channel:
@@ -72,7 +79,20 @@ class Channel:
             self.pump(min(left, 0.2))
 
     def request(self, op, args=b""):
-        """Send a request; payloads of its replies, until the last one."""
+        """Send a request; payloads of its replies, until the last one.
+        Sent again while nxk refuses it in a way that is safe to retry (a
+        service still starting after boot), up to the timeout."""
+        retry = RETRY_SCREEN if op == SCREEN else RETRY
+        end = time.time() + self.timeout
+        while True:
+            try:
+                return self.request_once(op, args)
+            except OSError as e:
+                if e.errno not in retry or time.time() + RETRY_DELAY > end:
+                    raise
+            time.sleep(RETRY_DELAY)
+
+    def request_once(self, op, args):
         self.next_id = self.next_id % 255 + 1
         rid = self.next_id
         payload = bytes([rid, op]) + args

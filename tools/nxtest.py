@@ -6,6 +6,7 @@
     nxtest.py -c "ipcbench" --timeout 120
     nxtest.py --usb-cmd "ps"             # type over the USB-C console (usbterm.py host)
     nxtest.py --dbg "tap 640 670 shot net.png"   # debug channel (nxdbg.py) over the USB-C console
+    nxtest.py --usb-cmd ps --uart-log uart.txt   # UART-A kept whole, logs read while USB runs too
     nxtest.py --tap 640,670:home.ppm     # touch the screen at (x, y), then capture it
     nxtest.py --usb-net share --usb-cmd "nettest ping 10.42.0.1"   # the PC shares its connection
     nxtest.py --bt -c "bt pair 10" -c "bt list"   # emulated BCM4356 and Pro Controller on UART-D
@@ -29,6 +30,10 @@ QEMU = os.environ.get("QEMU", os.path.expanduser("~/.cache/tegra_qemu/build/qemu
 PROMPT = b"nxk> "
 
 
+# Raw UART-A bytes, also those drained unshown (--uart-log).
+RAW = None
+
+
 def read_until(sock, marker, timeout, out):
     """Read until `marker` (or timeout). Returns (text, found)."""
     buf = b""
@@ -42,11 +47,20 @@ def read_until(sock, marker, timeout, out):
         if not chunk:
             break
         buf += chunk
+        if RAW:
+            RAW.write(chunk)
         out.write(SHOWN(chunk).decode("utf-8", "replace"))
         out.flush()
         if marker in buf:
             return buf, True
     return buf, False
+
+
+def drain(sock):
+    """UART-A read to the end (into --uart-log only)."""
+    for chunk in iter(lambda: sock.recv(65536), b""):
+        if RAW:
+            RAW.write(chunk)
 
 
 def symbolizer(elf):
@@ -229,7 +243,12 @@ def main():
                     help="emulated BCM4356 on UART-D with a Pro Controller in pairing mode (btfake.py)")
     ap.add_argument("--bt-hw-errors", type=int, default=0, metavar="N",
                     help="with --bt: the first N HCI resets answer with a Hardware Error")
+    ap.add_argument("--uart-log", default=None, metavar="FILE",
+                    help="every UART-A byte to FILE, also while the USB-C console runs")
     a = ap.parse_args()
+    global RAW
+    if a.uart_log:
+        RAW = open(a.uart_log, "wb", buffering=0)
 
     tmp = tempfile.mkdtemp(prefix="nxk-")
     uart = os.path.join(tmp, "uart.sock")
@@ -305,7 +324,7 @@ def main():
         if ok and (a.usb_cmd or a.usb_put or a.dbg):
             # Unread, the emulated UART stalls the console that feeds USB too.
             s.settimeout(None)
-            threading.Thread(target=lambda: all(iter(lambda: s.recv(65536), b"")), daemon=True).start()
+            threading.Thread(target=drain, args=(s,), daemon=True).start()
             print("[nxtest] USB-C console: typing as the PC")
             try:
                 link = usbterm.EmuHost(usb, timeout=a.timeout)
