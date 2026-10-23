@@ -218,6 +218,14 @@ impl ChannelReassembly {
         self.ordering.as_ref()?.deadline()
     }
 
+    /// Stops ordering: whatever waits behind a gap is released now.
+    fn unordered(&mut self, out: &mut Vec<Vec<u8>>) {
+        if let Some(d) = self.deadline() {
+            self.expire(d + Duration::from_secs(3600), out);
+        }
+        self.ordering = None;
+    }
+
     /// Drops the partial messages that ordering gave up on, and copies the ordering counters.
     fn after_ordering(&mut self) {
         let Some(ordering) = &self.ordering else {
@@ -335,6 +343,18 @@ impl Reassembler {
         out.extend(released.into_iter().map(|bytes| Message { channel, bytes }));
     }
 
+    /// # Delivers `channel`'s messages as soon as they are complete, out of order; held ones go to `out`.
+    ///
+    /// For a channel whose receiver orders by itself (the audio channel's `frame_index`): a missing
+    /// message then holds nothing back.
+    pub fn unordered(&mut self, channel: u8, out: &mut Vec<Message>) {
+        if let Some(state) = self.channels.get_mut(usize::from(channel)) {
+            let mut released = Vec::new();
+            state.unordered(&mut released);
+            out.extend(released.into_iter().map(|bytes| Message { channel, bytes }));
+        }
+    }
+
     /// # Gives up on the gaps that have waited a whole budget; released messages are appended to `out`.
     pub fn expire(&mut self, now: Instant, out: &mut Vec<Message>) {
         for (channel, state) in self.channels.iter_mut().enumerate() {
@@ -397,6 +417,13 @@ impl Receiver {
     /// # When the next gap has to be given up, if any is open.
     pub fn deadline(&self) -> Option<Instant> {
         self.reassembler.deadline()
+    }
+
+    /// # Delivers `channel` out of order from now on (see [`Reassembler::unordered`]).
+    pub fn unordered(&mut self, channel: u8) {
+        let mut released = Vec::new();
+        self.reassembler.unordered(channel, &mut released);
+        self.queue.extend(released.into_iter().map(Event::Message));
     }
 
     /// # Gives up on the gaps that have waited long enough; the released messages become events for [`Receiver::pop`].
@@ -598,6 +625,23 @@ mod tests {
     }
 
     const SHORT: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn an_unordered_channel_holds_nothing_behind_a_gap() {
+        let now = Instant::now();
+        let mut r = Receiver::with_reassembler(Reassembler::ordered(SHORT));
+        // Message 1 waits for message 0, then the channel stops ordering.
+        assert_eq!(r.classify_at(&fragment(3, 1, 11, 1, b"b"), now), None);
+        r.unordered(3);
+        assert!(matches!(r.pop(), Some(Event::Message(m)) if m.bytes == b"b"));
+        assert!(
+            matches!(r.classify_at(&fragment(3, 3, 13, 1, b"d"), now), Some(Event::Message(m)) if m.bytes == b"d")
+        );
+        assert!(
+            matches!(r.classify_at(&fragment(3, 2, 12, 1, b"c"), now), Some(Event::Message(m)) if m.bytes == b"c")
+        );
+        assert_eq!(r.deadline(), None);
+    }
 
     #[test]
     fn fragments_beyond_the_size_of_the_message_are_not_kept() {

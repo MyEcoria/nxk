@@ -30,6 +30,10 @@ const STEP: Duration = Duration::from_secs(10);
 const RTCP_EVERY: Duration = Duration::from_millis(100);
 const TIMESYNC_EVERY: Duration = Duration::from_secs(10);
 const REPORT_EVERY: Duration = Duration::from_secs(5);
+/// The link's line comes when nothing arrived for this long in a report
+/// period, or audio packets went missing, else every `LINK_HEARTBEAT`.
+const LINK_GAP: Duration = Duration::from_millis(150);
+const LINK_HEARTBEAT: Duration = Duration::from_secs(60);
 /// Receive rate announced when less is measured (the Android client's
 /// starting estimate).
 const NOMINAL_RATE: u32 = 10 * 1024 * 1024;
@@ -67,6 +71,61 @@ struct Link {
     rtcp_sent: u64,
     /// Events read while waiting for another.
     held: Vec<Event>,
+    stats: LinkStats,
+}
+
+/// How the link behaves over a report period (the longest waits).
+#[derive(Default)]
+struct LinkStats {
+    datagrams: u64,
+    last_datagram: Option<Instant>,
+    /// Longest time without a datagram, between two that came.
+    recv_gap: Duration,
+    /// Longest time between two reads of the socket (the thread busy).
+    busy: Duration,
+    last_read_end: Option<Instant>,
+    send_max: Duration,
+    /// The audio channel's SPP packet numbers that never came.
+    audio_seq_gaps: u64,
+    audio_last_seq: Option<u16>,
+    audio_channel: Option<u8>,
+}
+
+impl LinkStats {
+    fn packet(&mut self, p: &Packet) {
+        if Some(p.header.channel) != self.audio_channel || p.header.payload_type != pt::DATA {
+            return;
+        }
+        let seq = p.header.packet_seq;
+        if let Some(last) = self.audio_last_seq {
+            let ahead = seq.wrapping_sub(last);
+            if ahead > 1 && ahead < 1000 {
+                self.audio_seq_gaps += (ahead - 1) as u64;
+            }
+            if ahead == 0 || ahead >= 1000 {
+                return;
+            }
+        }
+        self.audio_last_seq = Some(seq);
+    }
+
+    /// The period's line, its maxima then reset.
+    fn take(&mut self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let line = format!(
+            "luna: link {} datagrams, longest without one {:.0} ms, thread busy {:.0} ms, \
+             send {:.1} ms, audio packets missing {}",
+            self.datagrams,
+            ms(self.recv_gap),
+            ms(self.busy),
+            ms(self.send_max),
+            self.audio_seq_gaps
+        );
+        self.recv_gap = Duration::ZERO;
+        self.busy = Duration::ZERO;
+        self.send_max = Duration::ZERO;
+        line
+    }
 }
 
 fn random<const N: usize>() -> [u8; N] {
@@ -84,9 +143,11 @@ impl Link {
         let now = self.now_us();
         for d in self.send.fragment(channel, kind, msg, max, now)? {
             let sealed = self.dtls.seal(&d).ok_or("DTLS: not connected")?;
+            let t = Instant::now();
             self.sock
                 .send(&sealed)
                 .map_err(|e| format!("send: {}", e))?;
+            self.stats.send_max = self.stats.send_max.max(t.elapsed());
         }
         Ok(())
     }
@@ -123,10 +184,22 @@ impl Link {
             let _ = self
                 .sock
                 .set_read_timeout(Some(wait.min(Duration::from_millis(20))));
-            let n = match self.sock.recv(&mut buf) {
+            let read_start = Instant::now();
+            if let Some(end) = self.stats.last_read_end {
+                self.stats.busy = self.stats.busy.max(read_start - end);
+            }
+            let got = self.sock.recv(&mut buf);
+            let read_end = Instant::now();
+            self.stats.last_read_end = Some(read_end);
+            let n = match got {
                 Ok(n) => n,
                 Err(_) => continue,
             };
+            if let Some(last) = self.stats.last_datagram {
+                self.stats.recv_gap = self.stats.recv_gap.max(read_end - last);
+            }
+            self.stats.last_datagram = Some(read_end);
+            self.stats.datagrams += 1;
             let (out, app) = self
                 .dtls
                 .on_datagram(Instant::now(), &buf[..n])
@@ -140,6 +213,7 @@ impl Link {
                 };
                 self.bytes += d.len() as u64;
                 self.last_ts = p.header.timestamp;
+                self.stats.packet(&p);
                 self.service(&p)?;
                 if let Some(e) = self.recv.classify(&p) {
                     return Ok(Some(e));
@@ -279,6 +353,7 @@ fn connect(t: &Target) -> Result<Link> {
         rate_mark: (0, Instant::now()),
         rtcp_sent: 0,
         held: Vec::new(),
+        stats: LinkStats::default(),
     };
     let id = u32::from_le_bytes(random());
     let req = ConnectRequest::new(ConnectForm::Full, id).encode();
@@ -454,6 +529,13 @@ fn streaming(
     let mut counts: HashMap<u8, (u64, u64)> = HashMap::new();
     let audio_id = s.names.iter().find(|(_, n)| *n == "audio").map(|(i, _)| *i);
     let mut audio = crate::audio::Audio::default();
+    s.link.stats.audio_channel = audio_id;
+    // The player orders audio by frame_index: SPP holding a missing
+    // message would only delay every packet behind it.
+    if let Some(a) = audio_id {
+        s.link.recv.unordered(a);
+    }
+    let (mut link_shown, mut link_events) = (Instant::now(), u64::MAX);
     let (mut next_rtcp, mut next_sync, mut next_report) = (
         Instant::now(),
         Instant::now() + TIMESYNC_EVERY,
@@ -546,6 +628,19 @@ fn streaming(
             }
             // Only when something new came: these lines reach the LOGS page.
             let line = format!("{}\n{}", line.trim_end_matches(','), audio.report());
+            // The link's line when audio packets went missing or nothing
+            // came for a while, else each minute.
+            let stats = &s.link.stats;
+            if stats.audio_seq_gaps != link_events
+                || stats.recv_gap > LINK_GAP
+                || now - link_shown >= LINK_HEARTBEAT
+            {
+                link_events = stats.audio_seq_gaps;
+                link_shown = now;
+                println!("{}", s.link.stats.take());
+            } else {
+                s.link.stats.take();
+            }
             if line != last_report {
                 println!("{}", line);
                 last_report = line;
