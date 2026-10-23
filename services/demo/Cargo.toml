@@ -1,9 +1,0 @@
-[package]
-name = "demo"
-version = "0.1.0"
-edition = "2021"
-description = "A game catalog with no network: exercises the provider protocol"
-
-[dependencies]
-nxsvc = { path = "../nxsvc" }
-nxk-abi = { path = "../../abi" }

@@ -1,6 +1,6 @@
 //! The screen drawn by the CPU, without the GPU: `display::SCANOUT`'s
 //! images, filled in place. For screens that change little (a catalog's
-//! own waiting screen, the demo's games); games draw with `nxgfx`.
+//! own waiting screen); games draw with `nxgfx`.
 
 use nxgfx::os::{received_handle, Service, Shm};
 use nxk_abi::proto::display;

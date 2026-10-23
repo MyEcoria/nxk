@@ -1,3 +1,0 @@
-title=Demo
-color=7C4DFF
-description=A catalog with no network, to try services

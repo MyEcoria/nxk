@@ -202,7 +202,7 @@ user's (`service=` in `profile.cfg`).
 
 ```bash
 ./tools/build.sh && ./tools/mksd.py -o build/sd.img   # puts services/*/ in /services
-./tools/usbterm.py --put ~/.cache/nxk/target-apps/aarch64-unknown-nxk/release/demo:/services/demo/demo
+./tools/usbterm.py --put ~/.cache/nxk/target-apps/aarch64-unknown-nxk/release/luna:/services/luna/luna
 ```
 
 `display` starts the catalog picked, for the user playing, with
@@ -233,11 +233,6 @@ protocol on a thread; the program fills a `Catalog` (`set_games`,
 `set_cover`, `set_state`) and answers `Request`s (`Launch`, `Stop`,
 `Suspend`, `Resume`); `nxsvc::screen` fills `SCANOUT`'s images from the
 CPU (their handles carry `WRITE`) for screens that need no GPU.
-`services/demo` lists five games with no network, their covers 1.5 s
-later, waits in a pretend queue, shows a game as its color, and has
-"Offline", which never starts, and "Crash", whose catalog exits while
-launching: it checks this whole path in the emulator
-(`nxtest.py --dbg 'button R shot a.png button A ...'`).
 
 ### Luna
 
@@ -429,7 +424,7 @@ user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
-services/   game catalogs (std) and nxsvc, their SDK: a demo catalog, Amazon
+services/   game catalogs (std) and nxsvc, their SDK: Amazon
             Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS),
             nxdtls (DTLS 1.2), nxopus (Opus decoder)
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
