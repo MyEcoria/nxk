@@ -44,7 +44,9 @@ std/        Rust std port: std/library overlay, target JSON, linker script
 apps/       ordinary std programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, the game SDK (on nxk-abi alone)
 services/   game catalogs ("services" on screen, std) and nxsvc, their SDK
-            (`abi::proto::provider`; installed as /services/NAME/NAME)
+            (`abi::proto::provider`; installed as /services/NAME/NAME):
+            demo, luna (Amazon Luna), lunacore (its logic: `cargo test
+            --manifest-path services/lunacore/Cargo.toml` on the PC), nxhttp
 bench/      nxk vs L4T comparison (lbench, scripts, RESULTS.md)
 tools/      build.sh, mksd.py, run.sh, debug.sh, nxtest.py, mkstd.py,
             usbterm.py, tegra_qemu patches, ...

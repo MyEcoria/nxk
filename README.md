@@ -237,6 +237,35 @@ later, waits in a pretend queue, shows a game as its color, and has
 launching: it checks this whole path in the emulator
 (`nxtest.py --dbg 'button R shot a.png button A ...'`).
 
+### Luna
+
+`services/luna` is Amazon Luna as a catalog (`domain=` in its
+`service.txt`: the account's Amazon site, `amazon.fr` as shipped). It
+waits for the network time (`power`: certificates need the date), then
+signs in by code the way Luna's Android app does: the home screen shows a
+QR code of the page Luna names (or `amazon.<tld>/code`) and a code to
+enter there, a new one as each expires; once entered, the device is
+registered in the account ("Manage your devices" removes it). The token
+is refreshed before it expires, `getAppConfig` gives the account's
+region's proxy and the player profile named as the console's user (or the
+first) is taken. The list is the games the account can play (entitlements
+checked by 25), continue playing first, then recently added, then the
+rest by title; each game's box art comes resized by Amazon's image server,
+fitted into the square on a blurred copy of itself. The list is read again
+every 30 minutes. Playing is not there yet (the stream: DTLS, video,
+audio). The serial and the tokens are `state.json` in
+`/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
+spend money is ever called, and no token or reply body reaches the logs.
+
+Under it: `services/nxhttp` (HTTPS: rustls on the pure-Rust RustCrypto
+provider, Mozilla's roots, HTTP/1.1 kept open, random bytes from the
+kernel) and `services/lunacore` (requests and replies, the catalog, cover
+fitting, with no I/O; ported from the desktop client in `sources/luna`):
+
+```bash
+cargo test --manifest-path services/lunacore/Cargo.toml   # on the PC
+```
+
 ## Build, run, test
 
 Prerequisites: stable Rust with `rust-src`
@@ -352,7 +381,8 @@ user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
-services/   game catalogs (std) and nxsvc, their SDK: a demo catalog
+services/   game catalogs (std) and nxsvc, their SDK: a demo catalog, Amazon
+            Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS)
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),
