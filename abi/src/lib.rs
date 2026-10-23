@@ -2001,6 +2001,12 @@ pub mod proto {
         /// screen is released and what it held elsewhere is closed.
         /// Past `STOP_NS` the provider is killed.
         pub const STOP: u32 = 5;
+        /// An image of the state, from byte word 1, as `COVER` (a cover's
+        /// format, square): word 0 = `ART_LOGIN`, the code to scan while
+        /// `ST_LOGIN` (a QR code: black on white, no rounding, its quiet
+        /// zone in). `ENOENT`: none. A new one is a new state version.
+        pub const ART: u32 = 6;
+        pub const ART_LOGIN: u64 = 0;
 
         pub const ST_LOADING: u64 = 0;
         pub const ST_READY: u64 = 1;
@@ -2016,8 +2022,8 @@ pub mod proto {
         pub const MAX_TEXT: usize = 512;
         /// Games beyond this are not listed.
         pub const MAX_GAMES: usize = 512;
-        /// Ids are 1 to 40 of `[A-Za-z0-9._-]`.
-        pub const MAX_ID: usize = 40;
+        /// Ids are 1 to 128 of `[A-Za-z0-9._:-]`.
+        pub const MAX_ID: usize = 128;
         pub const COVER_MAX: usize = 256;
         pub const STOP_NS: u64 = 8_000_000_000;
 
@@ -2026,7 +2032,7 @@ pub mod proto {
             (1..=MAX_ID).contains(&id.len())
                 && id
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
         }
     }
     /// USB-C console (`usbcon`), published as "usbcon".
