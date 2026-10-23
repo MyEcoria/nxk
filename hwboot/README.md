@@ -1550,6 +1550,19 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+61. 24/10/2026, Erista (gauge 15 %, plugged), rebooted, Luna of
+    `9031b1e` put in `/services/luna/` over USB-C (3.1 MB in 8.4 s, after
+    L had ended the old one): **the covers show**. The `HTTP 400` of runs
+    58-60 was `nxhttp`'s `Content-Length: 0` on every GET, which Amazon's
+    image origin refuses whenever its CDN has no copy of that size. First
+    start, no library on the card: `87 new covers, first failure: none`,
+    87 `cover-*.jpg` (about 15 KB each) and a 20 KB `library.json` in
+    `/users/u1/services/luna`. Second start (L, R): `87 covers from the
+    card`, `0 new covers`, one `luna` in `ps`. The home screen shows the
+    portrait art filling each square, middle kept (the Demo catalog is gone
+    from the card). No game was started (battery). Not measured: how long
+    the covers take to show from the card.
+
 60. 23/10/2026, Erista charged (gauge 16 %), boot image with the `fs`
     readahead fix (`23cf707`), Luna of `7fb2e75` (adaptive delay, audio
     out of SPP order), PC downloads paused: **no crash**, the catalog came
