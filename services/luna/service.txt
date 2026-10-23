@@ -1,0 +1,4 @@
+title=Luna
+color=7C3AED
+description=Amazon Luna cloud games
+domain=amazon.fr

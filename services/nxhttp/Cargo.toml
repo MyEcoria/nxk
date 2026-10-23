@@ -1,0 +1,12 @@
+[package]
+name = "nxhttp"
+version = "0.1.0"
+edition = "2021"
+description = "HTTPS for nxk programs: rustls on RustCrypto, HTTP/1.1 kept open"
+
+[dependencies]
+nxk-abi = { path = "../../abi" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging"] }
+rustls-rustcrypto = "0.0.2-alpha"
+webpki-roots = "1"
+getrandom = { version = "0.2", features = ["custom"] }
