@@ -71,8 +71,8 @@ const LINK_CHECK_NS: u64 = 2_000_000_000;
 /// that does not share its connection, a Wi-Fi network without DHCP),
 /// until its carrier drops.
 const DHCP_GIVE_UP_NS: u64 = 10_000_000_000;
-/// A link that gave way is tried again after this long (a Wi-Fi chip that
-/// lost its link answers DHCP late; the carrier may not drop meanwhile).
+/// A link that gave way is tried again after this long, then twice, four
+/// times... as long, up to 16 times: each try costs the network 10 s.
 const SKIP_RETRY_NS: u64 = 60_000_000_000;
 /// A better link takes over from the one in use once its carrier has been
 /// up this long: a Wi-Fi blip would otherwise cost two switches, and each
@@ -258,6 +258,8 @@ struct Link {
     /// When it gave way for want of a DHCP address (0: it did not); cleared
     /// when the carrier drops, and tried again after `SKIP_RETRY_NS`.
     skipped_at: u64,
+    /// How many times in a row (0 once it had an address, or its carrier dropped).
+    skips: u32,
     /// When the carrier came up (ns).
     up_since: u64,
 }
@@ -928,7 +930,7 @@ impl Net {
                 };
             let carrier = carrier && down & (1 << k) == 0;
             if !carrier {
-                l.skipped_at = 0;
+                (l.skipped_at, l.skips) = (0, 0);
             } else if !l.carrier {
                 l.up_since = now;
             }
@@ -937,6 +939,7 @@ impl Net {
         if down & self.active.map_or(0, |k| 1 << k) != 0 {
             println!("[net] link down: DHCP starts over");
             self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).reset();
+            self.since = now;
         }
         // A link without an address (a PC that does not share its
         // connection, a network without DHCP) gives way to another one.
@@ -945,10 +948,14 @@ impl Net {
             if self.addr.is_none() && others && now > self.since + DHCP_GIVE_UP_NS {
                 println!("[net] {}: no DHCP answer: moving on", LINKS[k].0);
                 self.links[k].skipped_at = now;
+                self.links[k].skips += 1;
             }
         }
-        let usable =
-            |l: &Link| l.carrier && (l.skipped_at == 0 || now >= l.skipped_at + SKIP_RETRY_NS);
+        // Each failure doubles the wait, up to 16 times the first.
+        let usable = |l: &Link| {
+            let wait = SKIP_RETRY_NS << l.skips.saturating_sub(1).min(4);
+            l.carrier && (l.skipped_at == 0 || now >= l.skipped_at + wait)
+        };
         let order = if self.pref == proto::PREF_WIFI {
             ORDER_WIFI
         } else {
@@ -1033,6 +1040,9 @@ impl Net {
                         .update_servers(&[IpAddress::Ipv4(d)]);
                 }
                 self.addr = Some((cidr.address(), cidr.prefix_len()));
+                if let Some(k) = self.active {
+                    self.links[k].skips = 0;
+                }
                 self.gateway = router;
                 self.dns_server = dns_server;
                 println!(
@@ -1052,6 +1062,8 @@ impl Net {
                 self.iface.routes_mut().remove_default_ipv4_route();
                 if self.addr.take().is_some() {
                     println!("[net] DHCP: lease lost");
+                    // The link gets its time to answer again before it gives way.
+                    self.since = time::now_ns();
                 }
             }
         }
