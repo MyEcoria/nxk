@@ -12,6 +12,8 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock, RwLock, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, hint, thread};
 
+mod bigfile;
+
 type R = Result<String, String>;
 
 fn ensure(c: bool, msg: impl Into<String>) -> Result<(), String> {
@@ -609,6 +611,7 @@ fn main() {
         // Hold a resource then abort: the service
         // must release it.
         Some("readcheck") => std::process::exit(readcheck(&args[2..])),
+        Some("bigfile") => std::process::exit(bigfile::run(&args[2..])),
         Some("holdfile") => {
             let _f = fs::File::open(&args[2]).unwrap();
             std::process::abort();
@@ -656,6 +659,7 @@ fn main() {
         ("math", math),
         ("files", files),
         ("fs_cache", fs_cache),
+        ("big_file", || bigfile::selftest(4, 2)),
         ("processes", processes),
         ("pipes", pipes),
     ];

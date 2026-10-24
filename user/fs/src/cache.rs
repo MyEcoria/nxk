@@ -9,6 +9,8 @@ use libnx::abi::proto::blk;
 use libnx::ipc::{self, Msg};
 use libnx::mem::SharedMemory;
 
+use crate::clock::Clock;
+
 pub const SECTOR: usize = 512;
 /// Sectors read ahead on a cache miss.
 const READAHEAD: usize = 64;
@@ -22,9 +24,8 @@ pub struct Cache {
     data: Vec<u8>,
     tags: Vec<u64>,
     dirty: Vec<bool>,
-    used: Vec<bool>,
+    clock: Clock,
     map: BTreeMap<u64, usize>,
-    hand: usize,
 }
 
 const EMPTY: u64 = u64::MAX;
@@ -38,9 +39,8 @@ impl Cache {
             data: vec![0; slots * SECTOR],
             tags: vec![EMPTY; slots],
             dirty: vec![false; slots],
-            used: vec![false; slots],
+            clock: Clock::new(slots),
             map: BTreeMap::new(),
-            hand: 0,
         }
     }
 
@@ -56,29 +56,22 @@ impl Cache {
         Ok(())
     }
 
-    /// Free slot (clock algorithm), flushing if needed.
-    fn victim(&mut self) -> Result<usize, i64> {
-        loop {
-            let s = self.hand;
-            self.hand = (self.hand + 1) % self.tags.len();
-            if self.used[s] {
-                self.used[s] = false;
-                continue;
-            }
-            if self.dirty[s] {
-                self.flush()?;
-            }
-            if self.tags[s] != EMPTY {
-                self.map.remove(&self.tags[s]);
-                self.tags[s] = EMPTY;
-            }
-            return Ok(s);
+    /// Free slot (clock algorithm), other than `taken`, flushing if needed.
+    fn victim(&mut self, taken: &[usize]) -> Result<usize, i64> {
+        let s = self.clock.next(taken);
+        if self.dirty[s] {
+            self.flush()?;
         }
+        if self.tags[s] != EMPTY {
+            self.map.remove(&self.tags[s]);
+            self.tags[s] = EMPTY;
+        }
+        Ok(s)
     }
 
     fn slot(&mut self, lba: u64) -> Result<usize, i64> {
         if let Some(&s) = self.map.get(&lba) {
-            self.used[s] = true;
+            self.clock.set_used(s, true);
             return Ok(s);
         }
         if lba >= self.total {
@@ -95,7 +88,7 @@ impl Cache {
         // Free the slots first: a flush in `victim` reuses the I/O buffer.
         let mut slots = Vec::with_capacity(n);
         for _ in 0..n {
-            slots.push(self.victim()?);
+            slots.push(self.victim(&slots)?);
         }
         self.io(blk::READ, lba, n)?;
         for (k, &s) in slots.iter().enumerate() {
@@ -103,7 +96,7 @@ impl Cache {
             self.data[s * SECTOR..(s + 1) * SECTOR].copy_from_slice(src);
             self.tags[s] = lba + k as u64;
             self.map.insert(lba + k as u64, s);
-            self.used[s] = k == 0;
+            self.clock.set_used(s, k == 0);
         }
         let first = slots[0];
         Ok(first)
@@ -125,13 +118,13 @@ impl Cache {
         let s = match self.map.get(&lba) {
             Some(&s) => s,
             None => {
-                let s = self.victim()?;
+                let s = self.victim(&[])?;
                 self.tags[s] = lba;
                 self.map.insert(lba, s);
                 s
             }
         };
-        self.used[s] = true;
+        self.clock.set_used(s, true);
         self.dirty[s] = true;
         Ok(&mut self.data[s * SECTOR..(s + 1) * SECTOR])
     }

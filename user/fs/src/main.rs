@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod cache;
+mod clock;
 mod fat;
 
 use alloc::string::String;

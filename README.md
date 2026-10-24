@@ -351,6 +351,7 @@ Prerequisites: stable Rust with `rust-src`
 ./tools/mksd.py -o build/sd.img   # FAT32 SD card (programs in /bin)
 ./tools/run.sh                    # boots; shell on the terminal (Ctrl-A X to quit)
 ./tools/nxtest.py -c ktest -c stdtest --sd build/sd.img   # automated tests
+rustc --edition 2021 --test user/fs/src/clock.rs -o /tmp/clock && /tmp/clock   # fs cache slot choice, on the PC
 ```
 
 `nxtest.py` options: `--sd IMAGE` (SD card), `--net [REDIRECTIONS]`
