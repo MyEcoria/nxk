@@ -153,7 +153,7 @@ pub fn decode_slice(
         d.my = d.idx / d.mb_w;
         d.ly = d.my - d.row0;
         d.neighbours();
-        d.macroblock()?;
+        crate::timed!(crate::prof::MB, d.macroblock())?;
         if d.cabac.overrun() {
             return Err(Error::Truncated);
         }
@@ -717,13 +717,15 @@ impl<'a, 'p> Dec<'a, 'p> {
         } else {
             self.last_dqp_nonzero = false;
         }
-        self.residual(kind, cbp);
-        if kind.is_intra() {
-            self.recon_intra(kind, i16_mode);
-        } else {
-            self.recon_inter_residual(cbp);
-        }
-        self.recon_chroma(cbp, kind.is_intra());
+        crate::timed!(crate::prof::RESIDUAL, self.residual(kind, cbp));
+        crate::timed!(crate::prof::RECON, {
+            if kind.is_intra() {
+                self.recon_intra(kind, i16_mode);
+            } else {
+                self.recon_inter_residual(cbp);
+            }
+            self.recon_chroma(cbp, kind.is_intra());
+        });
         Ok(())
     }
 
@@ -1069,6 +1071,18 @@ impl<'a, 'p> Dec<'a, 'p> {
 
     /// Motion compensation of a partition at (bx, by) of `w` x `h` blocks (in 4x4 units).
     fn predict_block(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w: usize,
+        h: usize,
+        ref_idx: usize,
+        mv: [i16; 2],
+    ) -> Result<(), Error> {
+        crate::timed!(crate::prof::MC, self.predict_block_inner(bx, by, w, h, ref_idx, mv))
+    }
+
+    fn predict_block_inner(
         &mut self,
         bx: usize,
         by: usize,

@@ -16,8 +16,11 @@ pub mod deblock;
 pub mod inter;
 pub mod intra;
 pub mod mb;
+#[cfg(target_arch = "aarch64")]
+pub mod neon;
 pub mod params;
 pub mod pic;
+pub mod prof;
 pub mod tables;
 pub mod transform;
 

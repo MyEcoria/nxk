@@ -193,6 +193,80 @@ fn chroma_edge(d: Px, o: usize, step: usize, line: usize, bs: u8, len: usize, pr
     }
 }
 
+/// The lanes of eight lines of an edge for `neon`: `per` lines share a bS.
+#[cfg(target_arch = "aarch64")]
+fn lanes(bs: [u8; 4], first: usize, per: usize, pr: &Params, chroma: bool) -> crate::neon::Lanes {
+    let mut l = crate::neon::Lanes {
+        alpha: pr.alpha as i16,
+        beta: pr.beta as i16,
+        tc0: [0; 8],
+        active: [0; 8],
+        strong: [0; 8],
+    };
+    for lane in 0..8 {
+        let b = bs[first + lane / per];
+        if b > 0 {
+            l.active[lane] = 0xFFFF;
+        }
+        if b == 4 {
+            l.strong[lane] = 0xFFFF;
+        } else if b > 0 {
+            l.tc0[lane] = TC0[pr.index_a][b as usize - 1] as i16 + chroma as i16;
+        }
+    }
+    l
+}
+
+/// One luma edge of 16 lines: four groups of four, `bs` each. `o` is the
+/// first q0 sample, `step` crosses the edge, `line` runs along it.
+fn luma_edge16(d: Px, o: usize, step: usize, line: usize, bs: [u8; 4], pr: &Params) {
+    if bs == [0; 4] || pr.alpha == 0 || pr.beta == 0 {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for chunk in 0..2 {
+            let l = lanes(bs, chunk * 2, 4, pr, false);
+            // SAFETY: the edge has four samples on each side inside the plane (the callers
+            // filter only edges with neighbours), and sixteen lines along it.
+            unsafe {
+                if step == 1 {
+                    crate::neon::luma_v8(d.0, o + chunk * 8 * line, line, &l);
+                } else {
+                    crate::neon::luma_h8(d.0, o + chunk * 8, step, &l);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (g, &b) in bs.iter().enumerate() {
+        luma_edge(d, o + g * 4 * line, step, line, b, 4, pr);
+    }
+}
+
+/// One chroma edge of eight lines: four groups of two.
+fn chroma_edge8(d: Px, o: usize, step: usize, line: usize, bs: [u8; 4], pr: &Params) {
+    if bs == [0; 4] || pr.alpha == 0 || pr.beta == 0 {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let l = lanes(bs, 0, 2, pr, true);
+        // SAFETY: as in `luma_edge16`.
+        unsafe {
+            if step == 1 {
+                crate::neon::chroma_v8(d.0, o, line, &l);
+            } else {
+                crate::neon::chroma_h8(d.0, o, step, &l);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (g, &b) in bs.iter().enumerate() {
+        chroma_edge(d, o + g * 2 * line, step, line, b, 2, pr);
+    }
+}
+
 /// What filtering a macroblock needs of the picture.
 struct Ctx<'a> {
     y: Px,
@@ -251,34 +325,14 @@ fn deblock_mb(c: &Ctx, mx: usize, my: usize) {
         let pm = if e == 0 { left } else { Some(cur) };
         if let Some(pm) = pm {
             let pr = params(qp_of(&pm), qp_of(&cur), sf.alpha_offset, sf.beta_offset);
-            for g in 0..4 {
-                luma_edge(
-                    c.y,
-                    (y0 + g * 4) * ys + x0 + e * 4,
-                    1,
-                    ys,
-                    bs[0][e][g],
-                    4,
-                    &pr,
-                );
-            }
+            luma_edge16(c.y, y0 * ys + x0 + e * 4, 1, ys, bs[0][e], &pr);
         }
     }
     for e in 0..4 {
         let pm = if e == 0 { top } else { Some(cur) };
         if let Some(pm) = pm {
             let pr = params(qp_of(&pm), qp_of(&cur), sf.alpha_offset, sf.beta_offset);
-            for g in 0..4 {
-                luma_edge(
-                    c.y,
-                    (y0 + e * 4) * ys + x0 + g * 4,
-                    ys,
-                    1,
-                    bs[1][e][g],
-                    4,
-                    &pr,
-                );
-            }
+            luma_edge16(c.y, (y0 + e * 4) * ys + x0, ys, 1, bs[1][e], &pr);
         }
     }
     // Chroma: edges 0 and 2 of luma, each bS covering two chroma lines.
@@ -293,17 +347,7 @@ fn deblock_mb(c: &Ctx, mx: usize, my: usize) {
             if let Some(pm) = pm {
                 let pr = params(cq(&pm), cq(&cur), sf.alpha_offset, sf.beta_offset);
                 let plane = if comp == 0 { c.u } else { c.v };
-                for g in 0..4 {
-                    chroma_edge(
-                        plane,
-                        (cy0 + g * 2) * cs + cx0 + ce * 4,
-                        1,
-                        cs,
-                        bs[0][ce * 2][g],
-                        2,
-                        &pr,
-                    );
-                }
+                chroma_edge8(plane, cy0 * cs + cx0 + ce * 4, 1, cs, bs[0][ce * 2], &pr);
             }
         }
         for ce in 0..2 {
@@ -311,20 +355,55 @@ fn deblock_mb(c: &Ctx, mx: usize, my: usize) {
             if let Some(pm) = pm {
                 let pr = params(cq(&pm), cq(&cur), sf.alpha_offset, sf.beta_offset);
                 let plane = if comp == 0 { c.u } else { c.v };
-                for g in 0..4 {
-                    chroma_edge(
-                        plane,
-                        (cy0 + ce * 4) * cs + cx0 + g * 2,
-                        cs,
-                        1,
-                        bs[1][ce * 2][g],
-                        2,
-                        &pr,
-                    );
-                }
+                chroma_edge8(plane, (cy0 + ce * 4) * cs + cx0, cs, 1, bs[1][ce * 2], &pr);
             }
         }
     }
+}
+
+/// Checks the platform's edge filters (NEON on aarch64) against the
+/// per-sample ones on random planes, strengths and thresholds; the number of
+/// differing cases.
+pub fn edge_selftest() -> usize {
+    let mut seed = 4242u32;
+    let mut rnd = move |n: u32| {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) % n
+    };
+    let mut bad = 0;
+    for case in 0..4000 {
+        let stride = 48usize;
+        // Smooth-ish data so that the filters switch on, with some noise.
+        let base: Vec<u8> = (0..stride * 48)
+            .map(|i| {
+                (100 + (i % stride) as u32 / 3 + rnd(if case % 3 == 0 { 40 } else { 9 })) as u8
+            })
+            .collect();
+        let (mut a, mut b) = (base.clone(), base);
+        let qp = rnd(52) as i32;
+        let pr = params(qp, rnd(52) as i32, 0, 0);
+        let bs = [0, 1, 2, 3, 4].map(|_| rnd(5) as u8);
+        let bs = [bs[0], bs[1], bs[2], bs[3]];
+        let (pa, pb) = (Px(a.as_mut_ptr()), Px(b.as_mut_ptr()));
+        let (vertical, chroma) = (rnd(2) == 0, rnd(2) == 0);
+        let o = 16 * stride + 16;
+        let (step, line) = if vertical { (1, stride) } else { (stride, 1) };
+        if chroma {
+            chroma_edge8(pa, o, step, line, bs, &pr);
+            for (g, &s) in bs.iter().enumerate() {
+                chroma_edge(pb, o + g * 2 * line, step, line, s, 2, &pr);
+            }
+        } else {
+            luma_edge16(pa, o, step, line, bs, &pr);
+            for (g, &s) in bs.iter().enumerate() {
+                luma_edge(pb, o + g * 4 * line, step, line, s, 4, &pr);
+            }
+        }
+        if a != b {
+            bad += 1;
+        }
+    }
+    bad
 }
 
 /// Filters every macroblock of the picture. With several threads, rows of
