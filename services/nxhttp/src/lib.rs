@@ -7,7 +7,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
@@ -87,11 +87,18 @@ impl Client {
     }
 
     fn connect(&self) -> io::Result<Conn> {
+        self.connect_timed().map(|(c, _)| c)
+    }
+
+    /// A new connection, with how long its TCP and TLS handshakes took.
+    fn connect_timed(&self) -> io::Result<(Conn, (Duration, Duration))> {
         let addr = (self.host.as_str(), 443)
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| bad("no address"))?;
+        let t0 = Instant::now();
         let sock = TcpStream::connect_timeout(&addr, self.connect_timeout)?;
+        let tcp = t0.elapsed();
         sock.set_read_timeout(Some(self.io_timeout))?;
         sock.set_write_timeout(Some(self.io_timeout))?;
         let _ = sock.set_nodelay(true);
@@ -101,7 +108,44 @@ impl Client {
             .try_into()
             .map_err(|_| bad("bad host name"))?;
         let tls = ClientConnection::new(config(), name).map_err(io::Error::other)?;
-        Ok(BufReader::new(StreamOwned::new(tls, sock)))
+        let mut stream = StreamOwned::new(tls, sock);
+        let t1 = Instant::now();
+        while stream.conn.is_handshaking() {
+            stream.conn.complete_io(&mut stream.sock)?;
+        }
+        Ok((BufReader::new(stream), (tcp, t1.elapsed())))
+    }
+
+    /// A GET whose body is read as it comes, on a connection of its own
+    /// (a speed test must not wait behind another request): the head is
+    /// read, the body is left in the returned stream.
+    pub fn open(&self, path: &str, headers: &[(&str, &str)]) -> io::Result<Stream> {
+        let (mut conn, (tcp, tls)) = self.connect_timed()?;
+        let head = request_head("GET", path, &self.host, headers, 0)?;
+        let t0 = Instant::now();
+        conn.get_mut().write_all(head.as_bytes())?;
+        conn.get_mut().flush()?;
+        let (status, headers) = read_head(&mut conn)?;
+        let first_byte = t0.elapsed();
+        let header = |n: &str| {
+            headers
+                .iter()
+                .find(|(h, _)| h == n)
+                .map(|(_, v)| v.as_str())
+        };
+        if header("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+            return Err(bad("chunked body: not streamed"));
+        }
+        let left = header("content-length").and_then(|l| l.parse().ok());
+        Ok(Stream {
+            status,
+            headers,
+            tcp,
+            tls,
+            first_byte,
+            left,
+            conn,
+        })
     }
 
     /// One request; a connection that was idle and died is opened again
@@ -168,6 +212,56 @@ impl Client {
     }
 }
 
+/// A reply whose body has not been read yet (`Client::open`): `Read`
+/// gives it as it arrives, up to `Content-Length` (or to the close).
+pub struct Stream {
+    pub status: u16,
+    /// Names in lowercase.
+    pub headers: Vec<(String, String)>,
+    /// TCP connect, TLS handshake, and request to first reply byte.
+    pub tcp: Duration,
+    pub tls: Duration,
+    pub first_byte: Duration,
+    /// Body bytes still to come, when the server said.
+    left: Option<u64>,
+    conn: Conn,
+}
+
+impl Stream {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The body's length, when the server said.
+    pub fn len(&self) -> Option<u64> {
+        self.header("content-length").and_then(|l| l.parse().ok())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == Some(0)
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let cap = self.left.map_or(buf.len(), |l| buf.len().min(l as usize));
+        if cap == 0 {
+            return Ok(0);
+        }
+        let n = self.conn.read(&mut buf[..cap])?;
+        if let Some(l) = self.left.as_mut() {
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            *l -= n as u64;
+        }
+        Ok(n)
+    }
+}
+
 fn read_line(conn: &mut Conn, budget: &mut usize) -> io::Result<String> {
     let mut line = Vec::new();
     let n = conn
@@ -187,7 +281,8 @@ fn read_line(conn: &mut Conn, budget: &mut usize) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&line).trim_end().to_string())
 }
 
-fn read_response(conn: &mut Conn, head_only: bool) -> io::Result<Response> {
+/// The status and headers (names in lowercase) of a reply.
+fn read_head(conn: &mut Conn) -> io::Result<(u16, Vec<(String, String)>)> {
     let mut budget = MAX_HEAD;
     let status_line = read_line(conn, &mut budget)?;
     let status = status_line
@@ -205,6 +300,11 @@ fn read_response(conn: &mut Conn, head_only: bool) -> io::Result<Response> {
             headers.push((n.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
     }
+    Ok((status, headers))
+}
+
+fn read_response(conn: &mut Conn, head_only: bool) -> io::Result<Response> {
+    let (status, headers) = read_head(conn)?;
     let mut r = Response {
         status,
         headers,
