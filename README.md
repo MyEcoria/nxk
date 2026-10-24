@@ -312,8 +312,11 @@ sends about 29 frames a second). Measured: on the Erista a 15 Mbit/s 1080p
 motion clip decodes in 21 ms a frame on four threads at 1219 MHz (64 ms on
 one; 54 ms on four at the boot clock before the NEON code); live, Avatar's
 menus decode in 15.6 ms on average. The picture is upright and its colours
-match the desktop client's. Frames lost on the network cost a freeze until
-the server's next key frame. The serial and the tokens are `state.json` in
+match the desktop client's. The video channel is released in order, waiting
+up to 250 ms for a lost fragment (the server retransmits it about 60 ms after
+the loss): over two minutes about nine in ten lost frames come back; the
+others cost a freeze until the server's next key frame (about 2 s in 125 s).
+The FEC packets (one a group of 32) are not used yet. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 

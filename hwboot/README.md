@@ -1550,6 +1550,21 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+63. 24/10/2026, same console, `luna` of `35926ab`: **lost video frames are
+    recovered**. In the first run of the picture (run 62) every loss froze the
+    picture until the next key frame: two minutes of Avatar gave 3493 frames,
+    149 missing of which 96 "stale" (the server's retransmission, about 60 ms
+    after the loss, completing a frame after its successors, which the
+    decoder's numbering then dropped), 484 decoder errors, 134 key frames
+    asked. The video channel had been released out of order, like the audio's.
+    In order, waiting at most 120 ms for a gap: 243 frames recovered by
+    retransmission, 42 given up, 91 errors, 41 key frames asked; at 250 ms:
+    210 recovered, 25 given up, 75 errors, 31 key frames asked (about 2 s of
+    freeze in 125 s). Audio unchanged (0 underruns in 4968 packets, 7 lost),
+    decoding 14.8 ms a frame on average, 33 at most. The server did not send
+    a second retransmission of a fragment lost twice; the FEC packets are the
+    next thing to try.
+
 62. 24/10/2026, same console and image as run 61 (gauge 67-69 %, plugged),
     `nxh264` and the GPU pass in `luna`: **the stream's picture shows on the
     panel**, with its sound. First attempt: mirrored (the panel's rows run the
