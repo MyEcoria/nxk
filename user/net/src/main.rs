@@ -71,6 +71,9 @@ const LINK_CHECK_NS: u64 = 2_000_000_000;
 /// that does not share its connection, a Wi-Fi network without DHCP),
 /// until its carrier drops.
 const DHCP_GIVE_UP_NS: u64 = 10_000_000_000;
+/// A link that gave way is tried again after this long (a Wi-Fi chip that
+/// lost its link answers DHCP late; the carrier may not drop meanwhile).
+const SKIP_RETRY_NS: u64 = 60_000_000_000;
 /// A better link takes over from the one in use once its carrier has been
 /// up this long: a Wi-Fi blip would otherwise cost two switches, and each
 /// one aborts every connection.
@@ -252,8 +255,9 @@ struct Link {
     handle: u32,
     mac: [u8; 6],
     carrier: bool,
-    /// Gave way for want of a DHCP address; cleared when the carrier drops.
-    skipped: bool,
+    /// When it gave way for want of a DHCP address (0: it did not); cleared
+    /// when the carrier drops, and tried again after `SKIP_RETRY_NS`.
+    skipped_at: u64,
     /// When the carrier came up (ns).
     up_since: u64,
 }
@@ -924,7 +928,7 @@ impl Net {
                 };
             let carrier = carrier && down & (1 << k) == 0;
             if !carrier {
-                l.skipped = false;
+                l.skipped_at = 0;
             } else if !l.carrier {
                 l.up_since = now;
             }
@@ -940,10 +944,11 @@ impl Net {
             let others = (0..LINKS.len()).any(|j| j != k && self.links[j].carrier);
             if self.addr.is_none() && others && now > self.since + DHCP_GIVE_UP_NS {
                 println!("[net] {}: no DHCP answer: moving on", LINKS[k].0);
-                self.links[k].skipped = true;
+                self.links[k].skipped_at = now;
             }
         }
-        let usable = |l: &Link| l.carrier && !l.skipped;
+        let usable =
+            |l: &Link| l.carrier && (l.skipped_at == 0 || now >= l.skipped_at + SKIP_RETRY_NS);
         let order = if self.pref == proto::PREF_WIFI {
             ORDER_WIFI
         } else {
