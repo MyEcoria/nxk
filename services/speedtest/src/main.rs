@@ -33,7 +33,8 @@ const SERVERS: [Server; 1] = [Server {
 }];
 const CONNS: usize = 4;
 const SECS: u64 = 10;
-const MAX_CONNS: usize = 16;
+/// OVH answers 429 past a few connections from one address, then drops its SYNs for a while.
+const MAX_CONNS: usize = 4;
 const MAX_SECS: u64 = 60;
 /// A connection that says nothing for this long is given up on.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,8 +48,11 @@ impl Source for Https {
     fn open(&self) -> io::Result<Opened> {
         let client = nxhttp::Client::with_timeout(self.host, IO_TIMEOUT);
         let s = client.open(self.path, &[("Accept-Encoding", "identity")])?;
-        if s.status != 200 {
-            return Err(io::Error::other(format!("HTTP {}", s.status)));
+        match s.status {
+            200 => {}
+            // OVH limits the connections of one address.
+            429 => return Err(io::Error::new(io::ErrorKind::WouldBlock, "HTTP 429")),
+            n => return Err(io::Error::other(format!("HTTP {}", n))),
         }
         Ok(Opened {
             tcp: s.tcp,

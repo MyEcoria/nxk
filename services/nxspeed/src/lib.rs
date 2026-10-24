@@ -107,6 +107,8 @@ pub fn errno(e: &io::Error) -> i32 {
         ConnectionRefused => 111,
         ConnectionReset | ConnectionAborted => 104,
         NotFound => 2,
+        // The server is busy (HTTP 429): try again later.
+        WouldBlock => 11,
         InvalidData | InvalidInput => 22,
         UnexpectedEof | BrokenPipe => 32,
         _ => 5,
