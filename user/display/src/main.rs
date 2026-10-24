@@ -27,6 +27,8 @@ mod flow;
 mod font;
 mod games;
 mod home;
+mod keyboard;
+mod known;
 mod pages;
 mod panel;
 mod playtime;
@@ -42,6 +44,7 @@ mod ui;
 mod users;
 mod userspage;
 mod widgets;
+mod wifisheet;
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -240,6 +243,13 @@ enum Job {
 /// Outcome of an action run by the worker.
 enum Done {
     Scan(Result<Vec<ScanNet>, i64>),
+    /// A Wi-Fi join ended: the network's name, how, and whether it was
+    /// the boot-time one (a failure is then silent).
+    Join {
+        name: String,
+        r: Result<(), i64>,
+        auto: bool,
+    },
     Retry(Result<String, i64>),
     Leave(Result<(), i64>),
     Flight(Result<bool, i64>),
@@ -409,6 +419,52 @@ impl Launcher {
     }
 }
 
+/// Join network `raw` (its passphrase `psk`, empty if open); `wlan`
+/// replies once associated.
+fn join(raw: &[u8], psk: &[u8]) -> Result<(), i64> {
+    let mut data = raw.to_vec();
+    data.push(0);
+    data.extend_from_slice(psk);
+    WIFI.call(&ipc::pack_at(wifi::CONNECT, &[0], &data))
+        .map(|_| ())
+}
+
+/// A join in a thread of its own: `wlan` is held for seconds by it, and
+/// the worker has sleep steps to run. A network that joined is kept for
+/// the next boot.
+fn start_join(w: &Arc<Worker>, notif: u32, raw: Vec<u8>, psk: Vec<u8>, auto: bool) {
+    let name = String::from_utf8_lossy(&raw).into_owned();
+    let (w2, name2) = (w.clone(), name.clone());
+    let spawned = thread::spawn(move || {
+        let r = join(&raw, &psk);
+        if r.is_ok() && !auto {
+            let _ = known::Known { ssid: raw, psk }.save();
+        }
+        w2.done.lock().push_back(Done::Join {
+            name: name2,
+            r,
+            auto,
+        });
+        let _ = sys::notify_signal(notif, EV_DONE);
+    });
+    if spawned.is_err() {
+        w.done.lock().push_back(Done::Join {
+            name,
+            r: Err(-libnx::abi::err::EAGAIN),
+            auto,
+        });
+        let _ = sys::notify_signal(notif, EV_DONE);
+    }
+}
+
+/// The network joined last, tried again at boot until it answers (3
+/// times, then the user's to pick).
+struct Autojoin {
+    net: known::Known,
+    tries: u32,
+    at: u64,
+}
+
 struct Worker {
     jobs: Mutex<VecDeque<Job>>,
     wake: Condvar,
@@ -435,6 +491,7 @@ fn scan() -> Result<Vec<ScanNet>, i64> {
         };
         nets.push(ScanNet {
             ssid: String::from_utf8_lossy(ssid).into_owned(),
+            raw: ssid.to_vec(),
             channel: rec[1],
             signal: rec[3],
             security: rec[2],
@@ -755,7 +812,10 @@ fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Con
                 let n = ipc::unpack(&r, &mut buf);
                 String::from_utf8_lossy(&buf[..n]).into_owned()
             })),
-            Action::Leave => Done::Leave(WIFI.call(&Msg::new(wifi::DISCONNECT, 0, 0)).map(|_| ())),
+            Action::Leave => Done::Leave(
+                WIFI.call(&Msg::new(wifi::DISCONNECT, 0, 0))
+                    .map(|_| known::forget()),
+            ),
             Action::Flight(off) => Done::Flight(
                 WIFI.call(&Msg::from_words(wifi::RADIO, &[(!off) as u64]))
                     .map(|_| off),
@@ -831,6 +891,7 @@ fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Con
             | Action::UserDelete(_)
             | Action::EraseSave(..)
             | Action::Service(_)
+            | Action::Join
             | Action::Cancel => continue,
         };
         w.done.lock().push_back(done);
@@ -1402,6 +1463,7 @@ fn main() -> i32 {
         ui.cfg.brightness = b.percent();
     }
     let mut cfg_loaded = false;
+    let mut autojoin: Option<Autojoin> = None;
     let mut users_loaded = false;
     let mut play_loaded = false;
     let mut save_at: u64 = 0;
@@ -1650,6 +1712,12 @@ fn main() -> i32 {
                     drop(q);
                     worker.wake.notify_one();
                 }
+                Some(Action::Join) => {
+                    if let Some((raw, psk)) = ui.take_join() {
+                        autojoin = None;
+                        start_join(&worker, notif, raw, psk, false);
+                    }
+                }
                 Some(Action::Sleep) => {
                     enter_sleep!();
                 }
@@ -1742,6 +1810,11 @@ fn main() -> i32 {
         if !owned && game.is_none() && !sleeping {
             if !cfg_loaded && now >= next_scan && libnx::fs::read_dir("/").is_ok() {
                 cfg_loaded = true;
+                autojoin = known::Known::load().map(|net| Autojoin {
+                    net,
+                    tries: 0,
+                    at: 0,
+                });
                 if let Some(mut cfg) = config::Config::load() {
                     if cfg.brightness > 0 {
                         if let Some(b) = &bl {
@@ -1865,6 +1938,19 @@ fn main() -> i32 {
                 data.refresh();
                 next_refresh = now + REFRESH_NS;
                 dirty = true;
+            }
+            let idle = matches!(data.wifi, stats::Seen::Value(w) if w.state == wifi::ST_IDLE);
+            if let Some(a) = autojoin.as_mut().filter(|a| now >= a.at) {
+                if idle && !ui.cfg.flight && ui.wifi.joining.is_none() && !sleeping {
+                    a.tries += 1;
+                    a.at = now + 30_000_000_000;
+                    ui.wifi.joining = Some(String::from_utf8_lossy(&a.net.ssid).into_owned());
+                    let (ssid, psk) = (a.net.ssid.clone(), a.net.psk.clone());
+                    start_join(&worker, notif, ssid, psk, true);
+                    if a.tries >= 3 {
+                        autojoin = None;
+                    }
+                }
             }
             let terminal = ui.page == ui::TERMINAL;
             if now >= next_tail {
@@ -2378,6 +2464,7 @@ fn main() -> i32 {
                             | Done::Gpu(_)
                             | Done::Flight(_)
                             | Done::Audio(_)
+                            | Done::Join { .. }
                     ) {
                         ui.busy = false;
                     }
@@ -2422,16 +2509,42 @@ fn main() -> i32 {
                         },
                         Done::Flight(r) => match r {
                             Ok(true) => ui.toast("flight mode on (radio off)".into(), now),
-                            Ok(false) => ui.toast("flight mode off".into(), now),
+                            Ok(false) => {
+                                ui.toast("flight mode off".into(), now);
+                                if let Some(a) = autojoin.as_mut() {
+                                    (a.tries, a.at) = (0, now + 2_000_000_000);
+                                }
+                            }
                             Err(e) => ui.toast(format!("wifi: {}", libnx::abi::err::name(e)), now),
                         },
-                        Done::Scan(Ok(nets)) => ui.scan = Some(nets),
+                        Done::Scan(r) => {
+                            let joined = status::wifi_connected(&data);
+                            ui.wifi_scanned(r, joined.as_ref().map(|w| w.raw()));
+                        }
+                        Done::Join { name, r, auto } => {
+                            if let Err(e) = &r {
+                                println!(
+                                    "[display] wifi: join {}: {}",
+                                    name,
+                                    libnx::abi::err::name(*e)
+                                );
+                            }
+                            if let Some(t) = ui.wifi_joined(&name, &r, auto) {
+                                ui.toast(t, now);
+                            }
+                            if r.is_ok() {
+                                autojoin = None;
+                            }
+                        }
                         Done::Retry(Ok(t)) => ui.toast(format!("wlan: {}", t), now),
-                        Done::Leave(Ok(())) => ui.toast("wlan: left the network".into(), now),
+                        Done::Leave(Ok(())) => {
+                            autojoin = None;
+                            ui.toast("wlan: left the network".into(), now)
+                        }
                         Done::Power(e) => {
                             ui.toast(format!("power: {}", libnx::abi::err::name(e)), now)
                         }
-                        Done::Scan(Err(e)) | Done::Retry(Err(e)) | Done::Leave(Err(e)) => {
+                        Done::Retry(Err(e)) | Done::Leave(Err(e)) => {
                             ui.toast(format!("wifi: {}", libnx::abi::err::name(e)), now)
                         }
                     }

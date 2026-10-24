@@ -25,6 +25,7 @@ use crate::term::Term;
 use crate::theme::{self, pal};
 use crate::users::Users;
 use crate::widgets::{battery, button_glyph, icon, press, tone_color, volume_hud, Icon, Tone};
+use crate::wifisheet::WifiUi;
 use crate::Messages;
 
 /// The console's own games (`/games`), the first catalog.
@@ -101,10 +102,16 @@ pub enum Id {
     /// A tab of the Controllers page.
     CtlTab(usize),
     // Network.
-    Scan,
     Retry,
     Leave,
-    ScanBack,
+    /// The Wi-Fi sheet: its rows (by index in `WifiUi::nets`), buttons
+    /// and the passphrase field's eye.
+    WifiOpen,
+    WifiNet(usize),
+    WifiRescan,
+    WifiBack,
+    WifiJoin,
+    WifiShow,
     // Controllers.
     BtPair,
     /// A paired controller, by its index in `bt_pads`.
@@ -147,6 +154,8 @@ pub enum Id {
     KeySpace,
     KeyBack,
     KeyShift,
+    /// Letters or symbols.
+    KeyLayer,
     Glyph(usize),
     Color(usize),
     Pin(usize),
@@ -166,6 +175,8 @@ pub enum Id {
 pub enum Action {
     Power(u32),
     Scan,
+    /// Join the network `Ui::take_join` hands over.
+    Join,
     Retry,
     Leave,
     ClearLogs,
@@ -211,6 +222,7 @@ pub enum Action {
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Sheet {
+    Wifi,
     Fan,
     Cpu,
     Gpu,
@@ -237,6 +249,8 @@ pub(crate) struct Modal {
 
 pub struct ScanNet {
     pub ssid: String,
+    /// The name as the network sends it (any bytes, 32 at most).
+    pub raw: Vec<u8>,
     pub channel: u8,
     pub signal: u8,
     pub security: u8,
@@ -249,7 +263,7 @@ pub struct Ui {
     toast: Option<(String, u64)>,
     /// When the volume indicator hides (0: not shown).
     vol_hud: u64,
-    pub scan: Option<Vec<ScanNet>>,
+    pub(crate) wifi: WifiUi,
     pub busy: bool,
     pub(crate) log_scale: usize,
     pub(crate) term_scale: usize,
@@ -337,7 +351,7 @@ impl Ui {
             modal: None,
             toast: None,
             vol_hud: 0,
-            scan: None,
+            wifi: WifiUi::new(),
             busy: false,
             log_scale: 1,
             term_scale: 1,
@@ -639,7 +653,9 @@ impl Ui {
     }
 
     pub fn animating(&self) -> bool {
-        self.flow.is_some() || (self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5)
+        self.flow.is_some()
+            || (self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5)
+            || (self.sheet == Some(Sheet::Wifi) && self.wifi.busy())
     }
 
     /// Time between two frames of an animation: the flows redraw often
@@ -647,6 +663,8 @@ impl Ui {
     pub fn frame_ns(&self) -> u64 {
         if self.flow.is_some() {
             33_000_000
+        } else if self.sheet == Some(Sheet::Wifi) {
+            250_000_000
         } else {
             16_000_000
         }
@@ -797,6 +815,7 @@ impl Ui {
         match code {
             input::TOUCH_DOWN => {
                 self.pressed = hit;
+                self.wifi_touch_down(x, y);
                 if let Some(id) = hit.filter(|&id| Self::is_slider(id)) {
                     let z = self.zones.iter().find(|z| z.id == id)?;
                     let (sx, sw) = (z.x + 20, z.w.saturating_sub(40));
@@ -808,6 +827,10 @@ impl Ui {
             input::TOUCH_MOVE => {
                 if let Some((id, sx, sw)) = self.drag {
                     return self.slide(id, x, sx, sw);
+                }
+                if self.wifi_touch_move(y) {
+                    self.pressed = None;
+                    return None;
                 }
                 if self.pressed != hit {
                     self.pressed = None;
@@ -821,6 +844,10 @@ impl Ui {
                     }
                     self.pressed = None;
                     return Some(Action::Save);
+                }
+                if self.wifi_touch_up() {
+                    self.pressed = None;
+                    return None;
                 }
                 let p = self.pressed.take()?;
                 if Some(p) == hit {
@@ -838,6 +865,9 @@ impl Ui {
         let open = self.overlay();
         if self.flow.is_some() && !open {
             return self.flow_pad(code);
+        }
+        if let Some(r) = self.wifi_pad(code) {
+            return r;
         }
         if self.page == LIBRARY && !open && self.starting.is_some() {
             return match code {
@@ -887,7 +917,6 @@ impl Ui {
             BTN_B if self.modal.is_some() => return self.tap(Id::No),
             BTN_B if self.sheet.is_some() => self.sheet = None,
             BTN_B if self.quick => self.quick = false,
-            BTN_B if self.scan.is_some() => self.scan = None,
             BTN_B | BTN_HOME if self.page != LIBRARY || open => {
                 self.quick = false;
                 self.sheet = None;
@@ -939,7 +968,6 @@ impl Ui {
     pub(crate) fn go(&mut self, page: usize) {
         self.page = page;
         self.focus = None;
-        self.scan = None;
         if page == LOGS {
             self.unread = 0;
         }
@@ -967,6 +995,9 @@ impl Ui {
     }
 
     pub(crate) fn tap(&mut self, id: Id) -> Option<Action> {
+        if let Some(a) = self.wifi_tap(id) {
+            return a;
+        }
         if self.flow.is_some() {
             if let Some(a) = self.flow_tap(id) {
                 return a;
@@ -1095,24 +1126,19 @@ impl Ui {
                 self.modal = Some(Modal {
                     title: alloc::format!("Leave {}?", ssid),
                     lines: [
-                        "Rejoining needs the shell:".into(),
-                        alloc::format!("wifi connect {} PASSPHRASE", ssid),
+                        "The passphrase is forgotten: pick".into(),
+                        "it in the Wi-Fi list to join again.".into(),
                     ],
                     ok: "Leave",
                     tone: Tone::Warn,
                     action: Action::Leave,
                 })
             }
-            Id::Scan => {
-                self.busy = true;
-                return Some(Action::Scan);
-            }
+            Id::WifiOpen => return self.wifi_open(),
             Id::Retry => {
                 self.busy = true;
-                self.scan = None;
                 return Some(Action::Retry);
             }
-            Id::ScanBack => self.scan = None,
             Id::BtPair => return Some(Action::BtPair(!self.bt_pairing)),
             Id::BtForget(i) => {
                 let (addr, name) = self.bt_pads.get(i)?.clone();
@@ -1150,6 +1176,12 @@ impl Ui {
             | Id::KeySpace
             | Id::KeyBack
             | Id::KeyShift
+            | Id::KeyLayer
+            | Id::WifiNet(_)
+            | Id::WifiRescan
+            | Id::WifiBack
+            | Id::WifiJoin
+            | Id::WifiShow
             | Id::Glyph(_)
             | Id::Color(_)
             | Id::Pin(_)
@@ -1223,7 +1255,6 @@ impl Ui {
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
         }
-        self.draw_toast(s);
         if self.quick {
             self.zones.clear();
             self.quick_panel(s, d);
@@ -1231,6 +1262,7 @@ impl Ui {
         if let Some(sh) = self.sheet {
             self.zones.clear();
             match sh {
+                Sheet::Wifi => self.wifi_sheet(s, d),
                 Sheet::Fan => self.fan_sheet(s),
                 Sheet::Cpu => self.cpu_sheet(s),
                 Sheet::Gpu => self.gpu_sheet(s),
@@ -1241,6 +1273,7 @@ impl Ui {
             self.zones.clear();
             self.modal(s);
         }
+        self.draw_toast(s);
         self.draw_hud(s, now);
         // The home row shows its own selection; a sliding step has no zones yet.
         if (self.page == LIBRARY && self.flow.is_none() && !self.overlay()) || self.sliding {
@@ -1273,7 +1306,13 @@ impl Ui {
         let p = pal();
         if let Some((t, _)) = &self.toast {
             let w = font::width(Face::Body, t) + 56;
-            let (x, y) = ((W - w) / 2, RULE_Y - 64);
+            // Over a sheet or a question the toast goes above it.
+            let y = if self.sheet.is_some() || self.modal.is_some() {
+                8
+            } else {
+                RULE_Y - 64
+            };
+            let x = (W - w) / 2;
             s.shadow(x, y, w, 48, 24, theme::BLACK);
             s.fill_round(x, y, w, 48, 24, p.text);
             s.label_c(W / 2, y + 24, t, Face::Body, p.bg);

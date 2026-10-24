@@ -17,7 +17,7 @@ use crate::widgets::{bar, tone_color, Tone};
 impl Ui {
     /// A sheet of `w` x `h` centered over the dimmed page, with its title;
     /// returns its place.
-    fn frame(
+    pub(crate) fn frame(
         &mut self,
         s: &mut Screen,
         title: &str,

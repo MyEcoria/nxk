@@ -18,7 +18,7 @@ use crate::term::Term;
 use crate::theme::pal;
 use crate::ui::{Id, Ui, CB, CH, CY, HINT_Y, M, NETWORK, W};
 use crate::widgets::{
-    badge, bar, bars_for, card, fit, heading, kv, load_color, signal_bars, split_bar, titled, Tone,
+    badge, bar, bars_for, card, heading, kv, load_color, signal_bars, split_bar, titled, Tone,
 };
 use crate::Messages;
 
@@ -559,140 +559,92 @@ impl Ui {
         let adapter = matches!(d.wifi, Seen::Value(_))
             && !matches!(state, wifi::ST_DOWN | wifi::ST_RADIO_OFF);
         let busy = self.busy;
-        if let Some(nets) = &self.scan {
-            let t = format!("{} networks", nets.len());
-            s.label_r(xr + w - 36 - bw, y0 + 30, &t, Face::Small, p.dim);
-            for (i, n) in nets.iter().take(5).enumerate() {
-                let cy = y0 + 72 + i * 30;
-                let cur = connected.is_some_and(|c| c.ssid() == n.ssid);
-                let ssid = fit(Face::Small, &n.ssid, 220);
-                s.label(
-                    xr + 24,
-                    cy,
-                    &ssid,
-                    Face::Small,
-                    if cur { p.good } else { p.text },
-                );
-                let sec = match n.security {
-                    wifi::SEC_OPEN => "open",
-                    wifi::SEC_WEP => "WEP",
-                    wifi::SEC_WPA => "WPA",
-                    wifi::SEC_WPA2 => "WPA2",
-                    _ => "WPA3",
-                };
-                let t = format!("ch {:>2}   -{} dBm   {}", n.channel, n.signal, sec);
-                s.label_r(xr + w - 24, cy, &t, Face::Small, p.dim);
-            }
-            self.button(
+        if let Some(wf) = connected {
+            signal_bars(
                 s,
-                Id::ScanBack,
-                xr + 24,
-                by,
-                btw,
-                52,
-                "Back",
-                Tone::Plain,
-                true,
-            );
-            self.button(
-                s,
-                Id::Scan,
-                xr + 40 + btw,
-                by,
-                btw,
-                52,
-                "Scan",
-                Tone::Accent,
-                !busy,
-            );
-        } else {
-            if let Some(wf) = connected {
-                signal_bars(
-                    s,
-                    xr + w - 36 - bw - 36,
-                    y0 + 40,
-                    bars_for(wf.signal),
-                    p.good,
-                );
-            }
-            let (t, c) = wifi_short(d);
-            s.label(xr + 24, y0 + 72, t, Face::Small, c);
-            if let Seen::Value(wf) = d.wifi {
-                if matches!(wf.state, wifi::ST_CONNECTED | wifi::ST_CONNECTING) {
-                    s.label(xr + 24, y0 + 112, wf.ssid(), Face::TitleB, p.text);
-                    self.ssid = wf.ssid().into();
-                }
-                if wf.state == wifi::ST_CONNECTED {
-                    kv(
-                        s,
-                        xr + 24,
-                        xr + w - 24,
-                        y0 + 156,
-                        "channel",
-                        &format!("{}", wf.channel),
-                        None,
-                    );
-                    kv(
-                        s,
-                        xr + 24,
-                        xr + w - 24,
-                        y0 + 186,
-                        "signal",
-                        &format!("-{} dBm", wf.signal),
-                        None,
-                    );
-                } else if wf.state == wifi::ST_IDLE {
-                    s.label(
-                        xr + 24,
-                        y0 + 108,
-                        "join: wifi connect SSID (shell)",
-                        Face::Small,
-                        p.dim,
-                    );
-                } else if wf.state == wifi::ST_RADIO_OFF {
-                    s.label(xr + 24, y0 + 108, "Flight Mode is on", Face::Small, p.dim);
-                }
-            }
-            let joined = matches!(state, wifi::ST_CONNECTED | wifi::ST_CONNECTING);
-            let scan_ok = adapter && state != wifi::ST_SCANNING && !busy;
-            let retry_ok = !matches!(d.wifi, Seen::Missing | Seen::Unknown)
-                && state != wifi::ST_RADIO_OFF
-                && !busy;
-            self.button(
-                s,
-                Id::Scan,
-                xr + 24,
-                by,
-                btw,
-                52,
-                "Scan",
-                Tone::Accent,
-                scan_ok,
-            );
-            self.button(
-                s,
-                Id::Retry,
-                xr + 40 + btw,
-                by,
-                btw,
-                52,
-                "Retry",
-                Tone::Plain,
-                retry_ok,
-            );
-            let lx = xr + 56 + 2 * btw;
-            self.button(
-                s,
-                Id::Leave,
-                lx,
-                by,
-                btw,
-                52,
-                "Leave",
-                Tone::Warn,
-                joined && !busy,
+                xr + w - 36 - bw - 36,
+                y0 + 40,
+                bars_for(wf.signal),
+                p.good,
             );
         }
+        let (t, c) = wifi_short(d);
+        s.label(xr + 24, y0 + 72, t, Face::Small, c);
+        if let Seen::Value(wf) = d.wifi {
+            if matches!(wf.state, wifi::ST_CONNECTED | wifi::ST_CONNECTING) {
+                s.label(xr + 24, y0 + 112, wf.ssid(), Face::TitleB, p.text);
+                self.ssid = wf.ssid().into();
+            }
+            if wf.state == wifi::ST_CONNECTED {
+                kv(
+                    s,
+                    xr + 24,
+                    xr + w - 24,
+                    y0 + 156,
+                    "channel",
+                    &format!("{}", wf.channel),
+                    None,
+                );
+                kv(
+                    s,
+                    xr + 24,
+                    xr + w - 24,
+                    y0 + 186,
+                    "signal",
+                    &format!("-{} dBm", wf.signal),
+                    None,
+                );
+            } else if wf.state == wifi::ST_IDLE {
+                s.label(
+                    xr + 24,
+                    y0 + 108,
+                    "Networks lists what is in range",
+                    Face::Small,
+                    p.dim,
+                );
+            } else if wf.state == wifi::ST_RADIO_OFF {
+                s.label(xr + 24, y0 + 108, "Flight Mode is on", Face::Small, p.dim);
+            }
+        }
+        let joined = matches!(state, wifi::ST_CONNECTED | wifi::ST_CONNECTING);
+        let list_ok = adapter && !busy;
+        let retry_ok = !matches!(d.wifi, Seen::Missing | Seen::Unknown)
+            && state != wifi::ST_RADIO_OFF
+            && !busy;
+        self.button(
+            s,
+            Id::WifiOpen,
+            xr + 24,
+            by,
+            btw,
+            52,
+            "Networks",
+            Tone::Accent,
+            list_ok,
+        );
+        self.button(
+            s,
+            Id::Retry,
+            xr + 40 + btw,
+            by,
+            btw,
+            52,
+            "Retry",
+            Tone::Plain,
+            retry_ok,
+        );
+        let lx = xr + 56 + 2 * btw;
+        self.button(
+            s,
+            Id::Leave,
+            lx,
+            by,
+            btw,
+            52,
+            "Leave",
+            Tone::Warn,
+            joined && !busy,
+        );
         self.page_hints(s);
     }
 

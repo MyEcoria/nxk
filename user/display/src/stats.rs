@@ -291,6 +291,11 @@ pub struct Wifi {
 }
 
 impl Wifi {
+    /// The network's name as it is (any bytes).
+    pub fn raw(&self) -> &[u8] {
+        &self.ssid[..self.len]
+    }
+
     pub fn ssid(&self) -> &str {
         core::str::from_utf8(&self.ssid[..self.len]).unwrap_or("?")
     }

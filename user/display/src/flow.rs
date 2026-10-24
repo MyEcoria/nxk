@@ -11,6 +11,7 @@ use libnx::time;
 
 use crate::avatar::{avatar, color, ease_back, ease_out, fade, padlock, prog, sin};
 use crate::font::{self, Face};
+use crate::keyboard::Keys;
 use crate::screen::{logo_size, Screen};
 use crate::theme::{self, pal, DARK, LIGHT};
 use crate::ui::{Action, Id, Ui, H, M, W};
@@ -669,39 +670,19 @@ impl Ui {
             s.fill(tx + tw + 4, cy - 22, 3, 44, p.accent);
         }
 
-        let (kw, kh, gx, gy) = (84usize, 46usize, 10usize, 8usize);
-        let rows: [&[u8]; 4] = [b"1234567890", b"qwertyuiop", b"asdfghjkl", b"zxcvbnm"];
-        for (r, row) in rows.iter().enumerate() {
-            let y = 236 + r * (kh + gy);
-            let rw = row.len() * (kw + gx) - gx;
-            let side = if r == 3 { 130 + gx } else { 0 };
-            let mut x = (W - rw - 2 * side) / 2;
-            if r == 3 {
-                self.chip(s, Id::KeyShift, x, y, 130, kh, "Shift", shift, true);
-                x += side;
-            }
-            for &c in row.iter() {
-                let up = if shift { c.to_ascii_uppercase() } else { c };
-                let label = [up];
-                let label = core::str::from_utf8(&label).unwrap_or("?");
-                self.button(s, Id::Key(c), x, y, kw, kh, label, Tone::Plain, true);
-                x += kw + gx;
-            }
-            if r == 3 {
-                self.button(s, Id::KeyBack, x, y, 130, kh, "Delete", Tone::Plain, true);
-            }
-        }
-        self.button(
-            s,
-            Id::KeySpace,
-            (W - 420) / 2,
-            236 + 4 * (kh + gy),
-            420,
-            kh,
-            "Space",
-            Tone::Plain,
-            true,
-        );
+        let keys = Keys {
+            x: (W - 930) / 2,
+            y: 236,
+            w: 930,
+            kh: 46,
+            gx: 10,
+            gy: 8,
+            layers: false,
+            symbols: false,
+            shift,
+            on: true,
+        };
+        self.keyboard(s, &keys);
         let last = matches!(
             self.flow.as_ref().map(|f| f.purpose),
             Some(Purpose::Rename(_))
