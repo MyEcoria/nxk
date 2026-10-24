@@ -117,12 +117,7 @@ pub fn errno(e: &io::Error) -> i32 {
 
 /// kbit/s of `bytes` over `d`.
 fn kbps(bytes: u64, d: Duration) -> u64 {
-    let ms = d.as_millis() as u64;
-    if ms == 0 {
-        0
-    } else {
-        bytes * 8 / ms
-    }
+    (bytes * 8).checked_div(d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Byte counts over time: the rate over the last `window`.
@@ -161,17 +156,20 @@ impl Window {
     }
 }
 
+/// The first connection's timings (TCP, TLS, first byte), and the last
+/// error with its errno.
+type Seen = (
+    Option<(Duration, Duration, Duration)>,
+    Option<(String, i32)>,
+);
+
 struct Shared {
     bytes: AtomicU64,
     /// When the first byte came, ns since the start plus one (0: none yet).
     first: AtomicU64,
     stop: AtomicBool,
     alive: AtomicUsize,
-    /// The first connection's timings, and the last error.
-    seen: Mutex<(
-        Option<(Duration, Duration, Duration)>,
-        Option<(String, i32)>,
-    )>,
+    seen: Mutex<Seen>,
 }
 
 fn worker(src: Arc<dyn Source>, sh: Arc<Shared>, t0: Instant) {

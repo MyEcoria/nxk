@@ -1562,12 +1562,17 @@ within 5 s.
     `usb0` (10.42.0.190, the PC's share) and back within 4 s, `nxdbg` surviving
     both switches. `speedtest` to `proof.ovh.net/files/1Gb.dat` over Wi-Fi,
     8 s: one connection 13.7 Mb/s, four 18.8 to 36.4 Mb/s (best second 41.6;
-    the PC's own download to OVH ran 23 Mb/s at the time), connect 15-212 ms,
-    TLS 34-68 ms. Eight connections: HTTP 429, then OVH dropped the SYNs of
+    the PC, on another Wi-Fi network, ran 23 Mb/s to OVH at the time), connect
+    15-212 ms, TLS 34-68 ms. Whether one connection's 13.7 Mb/s is the link or
+    nxk (a 64 KiB TCP buffer, 3 KiB per `RECV`) is not determined. Eight connections: HTTP 429, then OVH dropped the SYNs of
     this address for about 20 minutes (`nettest get proof.ovh.net 80 /` timed
     out, other sites answered): four is the cap. `net` also stayed on `usb0`
-    once with Wi-Fi up (its DHCP gave way for 10 s after a chip glitch and the
-    skip stuck): a link that gave way is now tried again after 60 s. Ten
+    once with Wi-Fi up, its `wlan0` skipped for want of a DHCP answer in 10 s
+    (the cause was not seen in a log: a chip glitch, or a lease lost without
+    a switch, which now gets the same 10 s of grace). A skipped link is tried
+    again after 60 s, then 120, 240... up to 16 minutes (in the emulator, a
+    simulated Wi-Fi without DHCP made the console move to it every 70 s with
+    a fixed 60 s: three tries in 330 s with the backoff). Ten
     `luna` orphans sat in `ps` (every `--reload display` since the last reboot
     left one: the kernel on the card has no `KILL_ON_CLOSE`), and one tap on a
     game card (the library was showing after a reload) started a real Luna
