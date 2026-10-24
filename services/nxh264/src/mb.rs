@@ -6,7 +6,7 @@ use crate::cabac::{Cabac, Contexts};
 use crate::inter;
 use crate::intra::{self, Avail};
 use crate::params::{Pps, SliceHeader, SliceType, Sps};
-use crate::pic::{Kind, MbInfo, Picture};
+use crate::pic::{Band, Kind, MbInfo, Picture};
 use crate::tables::{LAST_CTX_8X8, SIG_CTX_8X8, ZIGZAG_4X4, ZIGZAG_8X8};
 use crate::transform;
 use crate::Error;
@@ -78,11 +78,23 @@ struct Dec<'a, 'p> {
     inp: &'a SliceInput<'a>,
     cabac: Cabac<'a>,
     ctx: Contexts,
-    pic: &'p mut Picture,
+    ybuf: &'p mut [u8],
+    ubuf: &'p mut [u8],
+    vbuf: &'p mut [u8],
+    mbs: &'p mut [MbInfo],
+    /// First macroblock and first macroblock row of the band.
+    mb0: usize,
+    row0: usize,
+    ys: usize,
+    cs: usize,
+    slice_map: &'a [u16],
+    cqo: [i32; 2],
     mb_w: usize,
     idx: usize,
     mx: usize,
     my: usize,
+    /// `my` within the band.
+    ly: usize,
     qp: i32,
     last_dqp_nonzero: bool,
     left: bool,
@@ -92,19 +104,38 @@ struct Dec<'a, 'p> {
     res: Box<Residual>,
 }
 
-/// Decodes the slice data of `rbsp` (from the header's end) into `pic`.
-pub fn decode_slice(inp: &SliceInput, rbsp: &[u8], pic: &mut Picture) -> Result<(), Error> {
+/// Decodes the slice data of `rbsp` (from the header's end) into `band`.
+/// `slice_map` tells the slice of each macroblock of the picture: a
+/// neighbour counts when it is in the same slice.
+pub fn decode_slice(
+    inp: &SliceInput,
+    rbsp: &[u8],
+    band: &mut Band,
+    slice_map: &[u16],
+    chroma_qp_offset: [i32; 2],
+) -> Result<(), Error> {
     let data = rbsp.get(inp.hdr.data_start..).ok_or(Error::Truncated)?;
     let init = (inp.hdr.slice_type == SliceType::P).then_some(inp.hdr.cabac_init_idc);
+    let mb_w = inp.sps.mb_width as usize;
     let mut d = Dec {
         inp,
         cabac: Cabac::new(data),
         ctx: Contexts::new(init, inp.hdr.qp),
-        mb_w: pic.mb_width,
-        pic,
+        ybuf: &mut *band.y,
+        ubuf: &mut *band.u,
+        vbuf: &mut *band.v,
+        mbs: &mut *band.mbs,
+        mb0: band.row0 * mb_w,
+        row0: band.row0,
+        ys: band.ys,
+        cs: band.cs,
+        slice_map,
+        cqo: chroma_qp_offset,
+        mb_w,
         idx: inp.hdr.first_mb as usize,
         mx: 0,
         my: 0,
+        ly: 0,
         qp: inp.hdr.qp,
         last_dqp_nonzero: false,
         left: false,
@@ -113,13 +144,14 @@ pub fn decode_slice(inp: &SliceInput, rbsp: &[u8], pic: &mut Picture) -> Result<
         top_right: false,
         res: Box::default(),
     };
-    let total = d.pic.mbs.len();
+    let end = d.mb0 + d.mbs.len();
     loop {
-        if d.idx >= total {
-            return Err(Error::Invalid("slice runs past the picture"));
+        if d.idx >= end || d.idx < d.mb0 {
+            return Err(Error::Invalid("slice runs past its band"));
         }
         d.mx = d.idx % d.mb_w;
         d.my = d.idx / d.mb_w;
+        d.ly = d.my - d.row0;
         d.neighbours();
         d.macroblock()?;
         if d.cabac.overrun() {
@@ -134,7 +166,7 @@ pub fn decode_slice(inp: &SliceInput, rbsp: &[u8], pic: &mut Picture) -> Result<
 
 impl<'a, 'p> Dec<'a, 'p> {
     fn avail(&self, idx: usize) -> bool {
-        self.pic.mbs[idx].slice == self.inp.slice_id
+        self.slice_map[idx] == self.inp.slice_id
     }
 
     fn neighbours(&mut self) {
@@ -146,20 +178,20 @@ impl<'a, 'p> Dec<'a, 'p> {
     }
 
     fn mb(&self) -> &MbInfo {
-        &self.pic.mbs[self.idx]
+        &self.mbs[self.idx - self.mb0]
     }
 
     fn mb_mut(&mut self) -> &mut MbInfo {
         let i = self.idx;
-        &mut self.pic.mbs[i]
+        &mut self.mbs[i - self.mb0]
     }
 
     fn left_mb(&self) -> Option<&MbInfo> {
-        self.left.then(|| &self.pic.mbs[self.idx - 1])
+        self.left.then(|| &self.mbs[self.idx - 1 - self.mb0])
     }
 
     fn top_mb(&self) -> Option<&MbInfo> {
-        self.top.then(|| &self.pic.mbs[self.idx - self.mb_w])
+        self.top.then(|| &self.mbs[self.idx - self.mb_w - self.mb0])
     }
 
     fn is_p(&self) -> bool {
@@ -426,16 +458,20 @@ impl<'a, 'p> Dec<'a, 'p> {
         let start = self.cabac.next_byte();
         let data = self.cabac.data();
         let bytes = data.get(start..start + 384).ok_or(Error::Truncated)?;
-        let (x, y) = (self.mx * 16, self.my * 16);
-        let pic = &mut *self.pic;
+        let (x, y) = (self.mx * 16, self.ly * 16);
         for r in 0..16 {
-            let o = (y + r) * pic.y.stride + x;
-            pic.y.data[o..o + 16].copy_from_slice(&bytes[r * 16..r * 16 + 16]);
+            let o = (y + r) * self.ys + x;
+            self.ybuf[o..o + 16].copy_from_slice(&bytes[r * 16..r * 16 + 16]);
         }
-        for (k, plane) in [&mut pic.u, &mut pic.v].into_iter().enumerate() {
+        for k in 0..2 {
+            let plane = if k == 0 {
+                &mut *self.ubuf
+            } else {
+                &mut *self.vbuf
+            };
             for r in 0..8 {
-                let o = (y / 2 + r) * plane.stride + x / 2;
-                plane.data[o..o + 8]
+                let o = (y / 2 + r) * self.cs + x / 2;
+                plane[o..o + 8]
                     .copy_from_slice(&bytes[256 + k * 64 + r * 8..256 + k * 64 + r * 8 + 8]);
             }
         }
@@ -723,15 +759,15 @@ impl<'a, 'p> Dec<'a, 'p> {
         if let Some(d) = dc {
             c[0] = d;
         }
-        let stride = self.pic.y.stride;
-        let o = (self.my * 16 + by * 4) * stride + self.mx * 16 + bx * 4;
-        transform::idct_4x4_add(&c, &mut self.pic.y.data, o, stride);
+        let stride = self.ys;
+        let o = (self.ly * 16 + by * 4) * stride + self.mx * 16 + bx * 4;
+        transform::idct_4x4_add(&c, self.ybuf, o, stride);
     }
 
     fn recon_intra(&mut self, kind: Kind, i16_mode: u8) {
-        let (x0, y0) = (self.mx * 16, self.my * 16);
+        let (x0, y0) = (self.mx * 16, self.ly * 16);
         let qp = self.qp;
-        let stride = self.pic.y.stride;
+        let stride = self.ys;
         match kind {
             Kind::I16x16 => {
                 let a = Avail {
@@ -740,7 +776,7 @@ impl<'a, 'p> Dec<'a, 'p> {
                     top_left: self.top_left,
                     top_right: false,
                 };
-                intra::predict_16x16(&mut self.pic.y.data, stride, x0, y0, i16_mode, a);
+                intra::predict_16x16(self.ybuf, stride, x0, y0, i16_mode, a);
                 let dc = transform::luma_dc(&self.res.luma_dc, qp);
                 let cbf = self.mb().cbf_luma;
                 let dc_coded = self.mb().cbf_dc & 1 != 0;
@@ -763,19 +799,12 @@ impl<'a, 'p> Dec<'a, 'p> {
                     let (bx, by) = ((b8 & 1) * 2, (b8 >> 1) * 2);
                     let a = self.avail_8x8(b8);
                     let mode = self.mb().modes[by * 4 + bx] as u8;
-                    intra::predict_8x8(
-                        &mut self.pic.y.data,
-                        stride,
-                        x0 + bx * 4,
-                        y0 + by * 4,
-                        mode,
-                        a,
-                    );
+                    intra::predict_8x8(self.ybuf, stride, x0 + bx * 4, y0 + by * 4, mode, a);
                     if (self.mb().cbp >> b8) & 1 != 0 {
                         let mut c = self.res.luma8[b8];
                         transform::scale_8x8(&mut c, qp);
                         let o = (y0 + by * 4) * stride + x0 + bx * 4;
-                        transform::idct_8x8_add(&c, &mut self.pic.y.data, o, stride);
+                        transform::idct_8x8_add(&c, self.ybuf, o, stride);
                     }
                 }
             }
@@ -784,14 +813,7 @@ impl<'a, 'p> Dec<'a, 'p> {
                     let (bx, by) = blk_xy(blk);
                     let a = self.luma_avail(bx, by);
                     let mode = self.mb().modes[by * 4 + bx] as u8;
-                    intra::predict_4x4(
-                        &mut self.pic.y.data,
-                        stride,
-                        x0 + bx * 4,
-                        y0 + by * 4,
-                        mode,
-                        a,
-                    );
+                    intra::predict_4x4(self.ybuf, stride, x0 + bx * 4, y0 + by * 4, mode, a);
                     let r = by * 4 + bx;
                     if (self.mb().cbf_luma >> r) & 1 != 0 {
                         self.add_4x4(r, qp, bx, by, None);
@@ -822,7 +844,7 @@ impl<'a, 'p> Dec<'a, 'p> {
     }
 
     fn recon_chroma(&mut self, cbp: u8, intra: bool) {
-        let (x0, y0) = (self.mx * 8, self.my * 8);
+        let (x0, y0) = (self.mx * 8, self.ly * 8);
         let mode = self.mb().chroma_mode;
         let a = Avail {
             left: self.left,
@@ -832,15 +854,15 @@ impl<'a, 'p> Dec<'a, 'p> {
         };
         let qpy = self.mb().qp as i32;
         for comp in 0..2 {
-            let qpc = chroma_qp(qpy + self.pic.chroma_qp_offset[comp]);
-            let stride = self.pic.u.stride;
+            let qpc = chroma_qp(qpy + self.cqo[comp]);
+            let stride = self.cs;
             let plane = if comp == 0 {
-                &mut self.pic.u
+                &mut *self.ubuf
             } else {
-                &mut self.pic.v
+                &mut *self.vbuf
             };
             if intra {
-                intra::predict_chroma(&mut plane.data, stride, x0, y0, mode, a);
+                intra::predict_chroma(plane, stride, x0, y0, mode, a);
             }
             if cbp >> 4 == 0 {
                 continue;
@@ -848,9 +870,9 @@ impl<'a, 'p> Dec<'a, 'p> {
             let dc = transform::chroma_dc(&self.res.chroma_dc[comp], qpc);
             let (cbf_ac, ac_present) = (
                 if comp == 0 {
-                    self.pic.mbs[self.idx].cbf_cb
+                    self.mbs[self.idx - self.mb0].cbf_cb
                 } else {
-                    self.pic.mbs[self.idx].cbf_cr
+                    self.mbs[self.idx - self.mb0].cbf_cr
                 },
                 cbp >> 4 == 2,
             );
@@ -868,19 +890,19 @@ impl<'a, 'p> Dec<'a, 'p> {
                 c[0] = dc[blk];
                 let o = (y0 + (blk >> 1) * 4) * stride + x0 + (blk & 1) * 4;
                 let plane = if comp == 0 {
-                    &mut self.pic.u
+                    &mut *self.ubuf
                 } else {
-                    &mut self.pic.v
+                    &mut *self.vbuf
                 };
-                transform::idct_4x4_add(&c, &mut plane.data, o, stride);
+                transform::idct_4x4_add(&c, plane, o, stride);
             }
         }
     }
 
     fn recon_inter_residual(&mut self, cbp: u8) {
         let qp = self.qp;
-        let (x0, y0) = (self.mx * 16, self.my * 16);
-        let stride = self.pic.y.stride;
+        let (x0, y0) = (self.mx * 16, self.ly * 16);
+        let stride = self.ys;
         for b8 in 0..4 {
             if (cbp >> b8) & 1 == 0 {
                 continue;
@@ -890,7 +912,7 @@ impl<'a, 'p> Dec<'a, 'p> {
                 let mut c = self.res.luma8[b8];
                 transform::scale_8x8(&mut c, qp);
                 let o = (y0 + by * 4) * stride + x0 + bx * 4;
-                transform::idct_8x8_add(&c, &mut self.pic.y.data, o, stride);
+                transform::idct_8x8_add(&c, self.ybuf, o, stride);
                 continue;
             }
             for k in 0..4 {
@@ -931,23 +953,23 @@ impl<'a, 'p> Dec<'a, 'p> {
             if !self.top_left {
                 return None;
             }
-            (&self.pic.mbs[self.idx - w - 1], 3, 3)
+            (&self.mbs[self.idx - w - 1 - self.mb0], 3, 3)
         } else if bx < 0 {
             if !self.left {
                 return None;
             }
-            (&self.pic.mbs[self.idx - 1], 3, by)
+            (&self.mbs[self.idx - 1 - self.mb0], 3, by)
         } else if by < 0 {
             if bx > 3 {
                 if !self.top_right {
                     return None;
                 }
-                (&self.pic.mbs[self.idx - w + 1], 0, 3)
+                (&self.mbs[self.idx - w + 1 - self.mb0], 0, 3)
             } else {
                 if !self.top {
                     return None;
                 }
-                (&self.pic.mbs[self.idx - w], bx, 3)
+                (&self.mbs[self.idx - w - self.mb0], bx, 3)
             }
         } else if bx > 3 {
             return None;
@@ -1061,11 +1083,13 @@ impl<'a, 'p> Dec<'a, 'p> {
             .get(ref_idx)
             .ok_or(Error::Invalid("reference index beyond the list"))?;
         let (x, y) = (self.mx * 16 + bx * 4, self.my * 16 + by * 4);
+        let ly = self.ly * 16 + by * 4;
         let (pw, ph) = (w * 4, h * 4);
-        let ys = self.pic.y.stride;
-        inter::luma(&r.y, x, y, pw, ph, mv, &mut self.pic.y.data, y * ys + x, ys);
-        let cs = self.pic.u.stride;
+        let ys = self.ys;
+        inter::luma(&r.y, x, y, pw, ph, mv, self.ybuf, ly * ys + x, ys);
+        let cs = self.cs;
         let (cx, cy) = (x / 2, y / 2);
+        let lcy = ly / 2;
         inter::chroma(
             &r.u,
             cx,
@@ -1073,8 +1097,8 @@ impl<'a, 'p> Dec<'a, 'p> {
             pw / 2,
             ph / 2,
             mv,
-            &mut self.pic.u.data,
-            cy * cs + cx,
+            self.ubuf,
+            lcy * cs + cx,
             cs,
         );
         inter::chroma(
@@ -1084,8 +1108,8 @@ impl<'a, 'p> Dec<'a, 'p> {
             pw / 2,
             ph / 2,
             mv,
-            &mut self.pic.v.data,
-            cy * cs + cx,
+            self.vbuf,
+            lcy * cs + cx,
             cs,
         );
         Ok(())
@@ -1097,12 +1121,12 @@ impl<'a, 'p> Dec<'a, 'p> {
             if !self.left {
                 return 0;
             }
-            (&self.pic.mbs[self.idx - 1], (by >> 1) * 2 + 1)
+            (&self.mbs[self.idx - 1 - self.mb0], (by >> 1) * 2 + 1)
         } else if by < 0 {
             if !self.top {
                 return 0;
             }
-            (&self.pic.mbs[self.idx - self.mb_w], 2 + (bx >> 1))
+            (&self.mbs[self.idx - self.mb_w - self.mb0], 2 + (bx >> 1))
         } else {
             (self.mb(), (by >> 1) * 2 + (bx >> 1))
         };
@@ -1136,12 +1160,12 @@ impl<'a, 'p> Dec<'a, 'p> {
             if !self.left {
                 return 0;
             }
-            (&self.pic.mbs[self.idx - 1], 3, by)
+            (&self.mbs[self.idx - 1 - self.mb0], 3, by)
         } else if by < 0 {
             if !self.top {
                 return 0;
             }
-            (&self.pic.mbs[self.idx - w], bx, 3)
+            (&self.mbs[self.idx - w - self.mb0], bx, 3)
         } else {
             if (done >> (by * 4 + bx)) & 1 == 0 {
                 return 0;

@@ -46,6 +46,10 @@ fn access_units(data: &[u8]) -> Vec<Vec<u8>> {
 }
 
 fn check(name: &str) {
+    check_with(name, 1);
+}
+
+fn check_with(name: &str, threads: usize) {
     let dir = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
     let data = std::fs::read(format!("{}/{}.h264", dir, name)).unwrap();
     let crcs = std::fs::read_to_string(format!("{}/{}.crc", dir, name)).unwrap();
@@ -58,6 +62,7 @@ fn check(name: &str) {
         .collect();
     let want: Vec<u32> = lines.map(|l| u32::from_str_radix(l, 16).unwrap()).collect();
     let mut dec = nxh264::Decoder::new();
+    dec.threads = threads;
     let mut got = Vec::new();
     for au in access_units(&data) {
         if let Some(p) = dec.decode(&au).unwrap() {
@@ -84,6 +89,15 @@ fn p_frames_one_slice() {
 #[test]
 fn p_frames_four_slices() {
     check("p_4slices");
+}
+
+#[test]
+fn threads_give_the_same_pictures() {
+    for threads in [2, 3, 8] {
+        check_with("p_4slices", threads);
+        check_with("p_odd_size", threads);
+        check_with("intra_2slices", threads);
+    }
 }
 
 #[test]

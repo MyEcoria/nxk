@@ -436,7 +436,7 @@ apps/       ordinary Rust (std) programs: hello-std, stdtest
 jeux/       games (std) and nxgfx, their SDK: Starlane, a cube
 services/   game catalogs (std) and nxsvc, their SDK: Amazon
             Luna (lunacore: its logic, `cargo test` on the PC), nxhttp (HTTPS),
-            nxdtls (DTLS 1.2), nxopus (Opus decoder)
+            nxdtls (DTLS 1.2), nxopus (Opus decoder), nxh264 (H.264 decoder)
 bench/      comparison against L4T: EL3 monitor, Linux measurement program, scripts
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),

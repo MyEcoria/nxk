@@ -252,7 +252,7 @@ mod tests {
         l[0] = 8;
         let d = luma_dc(&l, 36);
         assert!(d.iter().all(|&v| v == d[0]));
-        assert_eq!(d[0], (8 * 16 * 10) << 0);
+        assert_eq!(d[0], 8 * 16 * 10);
         let c = chroma_dc(&[8, 0, 0, 0], 12);
         assert!(c.iter().all(|&v| v == c[0]));
     }

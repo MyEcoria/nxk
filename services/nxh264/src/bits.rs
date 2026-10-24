@@ -106,7 +106,7 @@ impl<'a> Bits<'a> {
 
     /// The bytes from the current (aligned) position on.
     pub fn rest(&self) -> &'a [u8] {
-        &self.data[(self.pos + 7) / 8..]
+        &self.data[self.pos.div_ceil(8)..]
     }
 }
 

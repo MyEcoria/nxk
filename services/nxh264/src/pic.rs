@@ -167,3 +167,53 @@ impl Picture {
         out
     }
 }
+
+/// A range of macroblock rows of a picture, to decode on its own: the
+/// samples and macroblock records of those rows, and nothing else.
+pub struct Band<'a> {
+    /// First macroblock row.
+    pub row0: usize,
+    pub y: &'a mut [u8],
+    pub u: &'a mut [u8],
+    pub v: &'a mut [u8],
+    pub ys: usize,
+    pub cs: usize,
+    pub mbs: &'a mut [MbInfo],
+}
+
+impl Picture {
+    /// The picture cut into bands at the macroblock rows `cuts` (ascending,
+    /// each below the picture's height): `cuts.len() + 1` bands.
+    pub fn bands(&mut self, cuts: &[usize]) -> Vec<Band<'_>> {
+        let (w, h) = (self.mb_width, self.mb_height);
+        let (ys, cs) = (self.y.stride, self.u.stride);
+        let mut bounds = vec![0];
+        bounds.extend_from_slice(cuts);
+        bounds.push(h);
+        let (mut y, mut u, mut v, mut mbs) = (
+            &mut self.y.data[..],
+            &mut self.u.data[..],
+            &mut self.v.data[..],
+            &mut self.mbs[..],
+        );
+        let mut out = Vec::new();
+        for pair in bounds.windows(2) {
+            let rows = pair[1] - pair[0];
+            let (by, ry) = y.split_at_mut(rows * 16 * ys);
+            let (bu, ru) = u.split_at_mut(rows * 8 * cs);
+            let (bv, rv) = v.split_at_mut(rows * 8 * cs);
+            let (bm, rm) = mbs.split_at_mut(rows * w);
+            (y, u, v, mbs) = (ry, ru, rv, rm);
+            out.push(Band {
+                row0: pair[0],
+                y: by,
+                u: bu,
+                v: bv,
+                ys,
+                cs,
+                mbs: bm,
+            });
+        }
+        out
+    }
+}

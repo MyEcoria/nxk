@@ -13,6 +13,11 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&args[2]).expect("output"));
     let mut dec = nxh264::Decoder::new();
     dec.deblock = !args.iter().any(|a| a == "--no-deblock");
+    dec.threads = args
+        .iter()
+        .position(|a| a == "--threads")
+        .and_then(|i| args.get(i + 1)?.parse().ok())
+        .unwrap_or(1);
     let (mut aus, mut cur, mut pending): (Vec<Vec<u8>>, Vec<u8>, Vec<u8>) =
         (Vec::new(), Vec::new(), Vec::new());
     let mut has_slice = false;

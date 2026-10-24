@@ -49,7 +49,9 @@ services/   game catalogs ("services" on screen, std) and nxsvc, their SDK
             --manifest-path services/lunacore/Cargo.toml` on the PC), nxhttp,
             nxdtls (DTLS 1.2, tested against `openssl s_server` on the PC),
             nxopus (Opus/CELT decoder ported from libopus; `cargo test` on
-            the PC against libopus's vectors)
+            the PC against libopus's vectors),
+            nxh264 (H.264 decoder for Luna's stream; `cargo test` on the PC
+            against ffmpeg's frames)
 bench/      nxk vs L4T comparison (lbench, scripts, RESULTS.md)
 tools/      build.sh, mksd.py, run.sh, debug.sh, nxtest.py, mkstd.py,
             usbterm.py, tegra_qemu patches, ...

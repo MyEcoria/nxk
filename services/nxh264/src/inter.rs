@@ -13,32 +13,52 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
     a - 5 * b + 20 * c + 20 * d - 5 * e + f
 }
 
-/// The `w + 5` by `h + 5` window of `plane` whose top-left sample is
-/// `(x - 2, y - 2)`, coordinates clamped to the plane.
-fn window(plane: &Plane, x: i32, y: i32, w: usize, h: usize, out: &mut [i32]) {
+/// Where the samples of a block's neighbourhood are: in the plane itself
+/// when the whole `(w + 5) x (h + 5)` window is inside it, else in a copy
+/// with the edges repeated.
+struct Source<'a> {
+    data: &'a [u8],
+    stride: usize,
+    /// Index of the block's top-left sample.
+    base: usize,
+}
+
+const MAX_WINDOW: usize = 21 * 21;
+
+fn source<'a>(
+    plane: &'a Plane,
+    x: i32,
+    y: i32,
+    w: usize,
+    h: usize,
+    tmp: &'a mut [u8; MAX_WINDOW],
+) -> Source<'a> {
     let (pw, ph) = (plane.width as i32, plane.height as i32);
+    if x >= 2 && y >= 2 && x + w as i32 + 3 <= pw && y + h as i32 + 3 <= ph {
+        return Source {
+            data: &plane.data,
+            stride: plane.stride,
+            base: y as usize * plane.stride + x as usize,
+        };
+    }
     let ww = w + 5;
-    let inside = x >= 2 && y >= 2 && x + w as i32 + 3 <= pw && y + h as i32 + 3 <= ph;
     for r in 0..h + 5 {
-        let sy = y - 2 + r as i32;
-        if inside {
-            let o = sy as usize * plane.stride + (x - 2) as usize;
-            for c in 0..ww {
-                out[r * ww + c] = plane.data[o + c] as i32;
-            }
-        } else {
-            let o = sy.clamp(0, ph - 1) as usize * plane.stride;
-            for c in 0..ww {
-                let sx = (x - 2 + c as i32).clamp(0, pw - 1) as usize;
-                out[r * ww + c] = plane.data[o + sx] as i32;
-            }
+        let o = (y - 2 + r as i32).clamp(0, ph - 1) as usize * plane.stride;
+        for c in 0..ww {
+            tmp[r * ww + c] = plane.data[o + (x - 2 + c as i32).clamp(0, pw - 1) as usize];
         }
+    }
+    Source {
+        data: &tmp[..],
+        stride: ww,
+        base: 2 * ww + 2,
     }
 }
 
 /// Luma prediction of a `w` x `h` block (up to 16x16) whose top-left
 /// sample is at `(x, y)` in the picture, motion vector `mv` in quarter
 /// samples: written to `dst` at `o`.
+#[allow(clippy::too_many_arguments)]
 pub fn luma(
     plane: &Plane,
     x: usize,
@@ -55,79 +75,129 @@ pub fn luma(
         x as i32 + (mv[0] >> 2) as i32,
         y as i32 + (mv[1] >> 2) as i32,
     );
-    let mut win = [0i32; 21 * 21];
-    window(plane, sx, sy, w, h, &mut win);
-    let ww = w + 5;
-    // G at (cx, cy) of the block, in window coordinates.
-    let g = |cx: usize, cy: usize| win[(cy + 2) * ww + cx + 2];
-    // b: horizontal half sample right of G, unrounded and rounded.
+    let mut tmp = [0u8; MAX_WINDOW];
+    let src = source(plane, sx, sy, w, h, &mut tmp);
+    let ss = src.stride;
+    let d = src.data;
+    let at = |cx: usize, cy: usize| src.base + cy * ss + cx;
+    // Horizontal half sample right of (cx, cy), unrounded and rounded.
     let b1 = |cx: usize, cy: usize| {
-        let r = (cy + 2) * ww + cx;
+        let i = at(cx, cy);
         tap6(
-            win[r],
-            win[r + 1],
-            win[r + 2],
-            win[r + 3],
-            win[r + 4],
-            win[r + 5],
+            d[i - 2] as i32,
+            d[i - 1] as i32,
+            d[i] as i32,
+            d[i + 1] as i32,
+            d[i + 2] as i32,
+            d[i + 3] as i32,
         )
     };
-    let h1 = |cx: usize, cy: usize| {
-        let c = cx + 2;
-        tap6(
-            win[cy * ww + c],
-            win[(cy + 1) * ww + c],
-            win[(cy + 2) * ww + c],
-            win[(cy + 3) * ww + c],
-            win[(cy + 4) * ww + c],
-            win[(cy + 5) * ww + c],
+    let hh = |cx: usize, cy: usize| {
+        let i = at(cx, cy);
+        clip(
+            (tap6(
+                d[i - 2 * ss] as i32,
+                d[i - ss] as i32,
+                d[i] as i32,
+                d[i + ss] as i32,
+                d[i + 2 * ss] as i32,
+                d[i + 3 * ss] as i32,
+            ) + 16)
+                >> 5,
         )
     };
-    let b = |cx: usize, cy: usize| clip((b1(cx, cy) + 16) >> 5);
-    let hh = |cx: usize, cy: usize| clip((h1(cx, cy) + 16) >> 5);
-    // j: the center half sample, from the unrounded horizontal values of six rows.
-    let j = |cx: usize, cy: usize| {
-        let v = |dy: usize| {
-            // b1 of row cy - 2 + dy (window row cy + dy)
-            let r = (cy + dy) * ww + cx;
-            tap6(
-                win[r],
-                win[r + 1],
-                win[r + 2],
-                win[r + 3],
-                win[r + 4],
-                win[r + 5],
-            )
-        };
-        clip((tap6(v(0), v(1), v(2), v(3), v(4), v(5)) + 512) >> 10)
-    };
-    for cy in 0..h {
-        for cx in 0..w {
-            let v = match (fx, fy) {
-                (0, 0) => g(cx, cy),
-                (1, 0) => (g(cx, cy) + b(cx, cy) + 1) >> 1,
-                (2, 0) => b(cx, cy),
-                (3, 0) => (g(cx + 1, cy) + b(cx, cy) + 1) >> 1,
-                (0, 1) => (g(cx, cy) + hh(cx, cy) + 1) >> 1,
-                (0, 2) => hh(cx, cy),
-                (0, 3) => (g(cx, cy + 1) + hh(cx, cy) + 1) >> 1,
-                (1, 1) => (b(cx, cy) + hh(cx, cy) + 1) >> 1,
-                (3, 1) => (b(cx, cy) + hh(cx + 1, cy) + 1) >> 1,
-                (1, 3) => (hh(cx, cy) + b(cx, cy + 1) + 1) >> 1,
-                (3, 3) => (hh(cx + 1, cy) + b(cx, cy + 1) + 1) >> 1,
-                (2, 2) => j(cx, cy),
-                (2, 1) => (b(cx, cy) + j(cx, cy) + 1) >> 1,
-                (2, 3) => (j(cx, cy) + b(cx, cy + 1) + 1) >> 1,
-                (1, 2) => (hh(cx, cy) + j(cx, cy) + 1) >> 1,
-                _ => (j(cx, cy) + hh(cx + 1, cy) + 1) >> 1, // (3, 2)
-            };
-            dst[o + cy * stride + cx] = v as u8;
+    let out = |dst: &mut [u8], cx: usize, cy: usize, v: i32| dst[o + cy * stride + cx] = v as u8;
+    match (fx, fy) {
+        (0, 0) => {
+            for cy in 0..h {
+                let i = at(0, cy);
+                dst[o + cy * stride..o + cy * stride + w].copy_from_slice(&d[i..i + w]);
+            }
+        }
+        (_, 0) => {
+            for cy in 0..h {
+                for cx in 0..w {
+                    let b = clip((b1(cx, cy) + 16) >> 5);
+                    let v = match fx {
+                        1 => (d[at(cx, cy)] as i32 + b + 1) >> 1,
+                        2 => b,
+                        _ => (d[at(cx + 1, cy)] as i32 + b + 1) >> 1,
+                    };
+                    out(dst, cx, cy, v);
+                }
+            }
+        }
+        (0, _) => {
+            for cy in 0..h {
+                for cx in 0..w {
+                    let hv = hh(cx, cy);
+                    let v = match fy {
+                        1 => (d[at(cx, cy)] as i32 + hv + 1) >> 1,
+                        2 => hv,
+                        _ => (d[at(cx, cy + 1)] as i32 + hv + 1) >> 1,
+                    };
+                    out(dst, cx, cy, v);
+                }
+            }
+        }
+        (2, _) | (_, 2) => {
+            // The unrounded horizontal half samples of rows -2..h+3, then the vertical filter over them.
+            let mut t = [0i32; 16 * 21];
+            for r in 0..h + 5 {
+                for cx in 0..w {
+                    t[r * w + cx] = {
+                        let i = at(cx, 0) + r * ss - 2 * ss;
+                        tap6(
+                            d[i - 2] as i32,
+                            d[i - 1] as i32,
+                            d[i] as i32,
+                            d[i + 1] as i32,
+                            d[i + 2] as i32,
+                            d[i + 3] as i32,
+                        )
+                    };
+                }
+            }
+            for cy in 0..h {
+                for cx in 0..w {
+                    let j = clip(
+                        (tap6(
+                            t[cy * w + cx],
+                            t[(cy + 1) * w + cx],
+                            t[(cy + 2) * w + cx],
+                            t[(cy + 3) * w + cx],
+                            t[(cy + 4) * w + cx],
+                            t[(cy + 5) * w + cx],
+                        ) + 512)
+                            >> 10,
+                    );
+                    let v = match (fx, fy) {
+                        (2, 2) => j,
+                        (2, 1) => (clip((t[(cy + 2) * w + cx] + 16) >> 5) + j + 1) >> 1,
+                        (2, _) => (clip((t[(cy + 3) * w + cx] + 16) >> 5) + j + 1) >> 1,
+                        (1, _) => (hh(cx, cy) + j + 1) >> 1,
+                        _ => (hh(cx + 1, cy) + j + 1) >> 1,
+                    };
+                    out(dst, cx, cy, v);
+                }
+            }
+        }
+        _ => {
+            // (1|3, 1|3): the horizontal and the vertical half sample around the corner.
+            for cy in 0..h {
+                for cx in 0..w {
+                    let b = clip((b1(cx, cy + (fy == 3) as usize) + 16) >> 5);
+                    let hv = hh(cx + (fx == 3) as usize, cy);
+                    out(dst, cx, cy, (b + hv + 1) >> 1);
+                }
+            }
         }
     }
 }
 
 /// Chroma prediction of a `w` x `h` block at `(x, y)` of the chroma plane,
 /// the luma motion vector `mv` read in eighths of a chroma sample.
+#[allow(clippy::too_many_arguments)]
 pub fn chroma(
     plane: &Plane,
     x: usize,
@@ -145,6 +215,31 @@ pub fn chroma(
         y as i32 + (mv[1] >> 3) as i32,
     );
     let (pw, ph) = (plane.width as i32, plane.height as i32);
+    let (w00, w10, w01, w11) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    if sx >= 0 && sy >= 0 && sx + (w as i32) < pw && sy + (h as i32) < ph {
+        let ps = plane.stride;
+        for cy in 0..h {
+            let i = (sy as usize + cy) * ps + sx as usize;
+            let (r0, r1) = (
+                &plane.data[i..i + w + 1],
+                &plane.data[i + ps..i + ps + w + 1],
+            );
+            let d = &mut dst[o + cy * stride..o + cy * stride + w];
+            if fx == 0 && fy == 0 {
+                d.copy_from_slice(&r0[..w]);
+            } else {
+                for cx in 0..w {
+                    d[cx] = ((w00 * r0[cx] as i32
+                        + w10 * r0[cx + 1] as i32
+                        + w01 * r1[cx] as i32
+                        + w11 * r1[cx + 1] as i32
+                        + 32)
+                        >> 6) as u8;
+                }
+            }
+        }
+        return;
+    }
     let at = |cx: i32, cy: i32| {
         plane.data[cy.clamp(0, ph - 1) as usize * plane.stride + cx.clamp(0, pw - 1) as usize]
             as i32
@@ -153,12 +248,7 @@ pub fn chroma(
         for cx in 0..w as i32 {
             let (a, b) = (at(sx + cx, sy + cy), at(sx + cx + 1, sy + cy));
             let (c, d) = (at(sx + cx, sy + cy + 1), at(sx + cx + 1, sy + cy + 1));
-            let v = ((8 - fx) * (8 - fy) * a
-                + fx * (8 - fy) * b
-                + (8 - fx) * fy * c
-                + fx * fy * d
-                + 32)
-                >> 6;
+            let v = (w00 * a + w10 * b + w01 * c + w11 * d + 32) >> 6;
             dst[o + cy as usize * stride + cx as usize] = v as u8;
         }
     }
@@ -232,7 +322,7 @@ mod tests {
         luma(&p, 15, 2, 1, 1, [1, 0], &mut out, 0, 1);
         assert_eq!(
             out[0] as i32,
-            (0 + ((20 * 200 - 5 * 200 + 200 + 16) >> 5) + 1) >> 1
+            (((20 * 200 - 5 * 200 + 200 + 16) >> 5) + 1) >> 1
         );
     }
 

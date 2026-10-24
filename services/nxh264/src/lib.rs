@@ -6,6 +6,10 @@
 //! decode one after the other; the deblocking filter runs when the last
 //! one is in.
 
+// The loops index blocks and samples the way the standard's formulas do, and
+// the prediction functions take the plane, the position and the neighbours.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod bits;
 pub mod cabac;
 pub mod deblock;
@@ -78,6 +82,11 @@ pub struct Decoder {
     last_ref_frame_num: Option<u32>,
     /// The deblocking filter, on unless a test turns it off.
     pub deblock: bool,
+    /// Threads to decode the slices of a picture with (1: this one).
+    pub threads: usize,
+    /// Time spent in slices and in the deblocking filter, nanoseconds.
+    pub slice_ns: u64,
+    pub deblock_ns: u64,
 }
 
 impl Decoder {
@@ -86,6 +95,7 @@ impl Decoder {
             sps: vec![None; 32],
             pps: vec![None; 256],
             deblock: true,
+            threads: 1,
             ..Self::default()
         }
     }
@@ -110,8 +120,12 @@ impl Decoder {
 
     /// Decodes one access unit. `Ok(None)` when it holds no picture.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<Arc<Picture>>, Error> {
-        let mut cur: Option<Picture> = None;
-        let mut cur_hdr = None;
+        struct Job {
+            hdr: params::SliceHeader,
+            rbsp: Vec<u8>,
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut first = None;
         for nal in nal_units(au) {
             let (ty, ref_idc) = (nal[0] & 31, (nal[0] >> 5) & 3);
             let rbsp = bits::unescape(&nal[1..]);
@@ -133,62 +147,144 @@ impl Decoder {
                         Some((s, p))
                     };
                     let (hdr, sps, pps) = parse_slice_header(&rbsp, ty, ref_idc, lookup)?;
-                    if cur.is_none() {
-                        if hdr.idr {
-                            self.dpb.clear();
-                            self.last_ref_frame_num = Some(hdr.frame_num);
-                        } else {
-                            if self.dpb.is_empty() {
-                                return Err(Error::Gap);
-                            }
-                            let expect = self
-                                .last_ref_frame_num
-                                .map(|n| (n + 1) % sps.max_frame_num());
-                            if expect.is_some_and(|e| e != hdr.frame_num)
-                                && self.last_ref_frame_num != Some(hdr.frame_num)
-                            {
-                                self.dpb.clear();
-                                self.last_ref_frame_num = None;
-                                return Err(Error::Gap);
-                            }
-                        }
-                        let mut p = self.take_picture(&sps);
-                        p.crop = sps.crop;
-                        p.chroma_qp_offset = pps.chroma_qp_offset;
-                        p.frame_num = hdr.frame_num;
-                        self.next_id += 1;
-                        p.id = self.next_id;
-                        cur = Some(p);
+                    if first.is_none() {
+                        first = Some((hdr.clone(), sps, pps));
                     }
-                    let pic = cur.as_mut().expect("picture");
-                    pic.slices.push(SliceFilter {
-                        disable: hdr.disable_deblocking,
-                        alpha_offset: hdr.alpha_offset,
-                        beta_offset: hdr.beta_offset,
-                    });
-                    let refs: Vec<&Picture> = if hdr.slice_type == SliceType::P {
-                        self.dpb.iter().map(|a| &**a).collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let inp = mb::SliceInput {
-                        sps: &sps,
-                        pps: &pps,
-                        hdr: &hdr,
-                        refs: &refs,
-                        slice_id: pic.slices.len() as u16,
-                    };
-                    mb::decode_slice(&inp, &rbsp, pic)?;
-                    cur_hdr = Some((hdr, sps));
+                    jobs.push(Job { hdr, rbsp });
                 }
                 _ => {}
             }
         }
-        let (Some(mut pic), Some((hdr, sps))) = (cur, cur_hdr) else {
+        let Some((hdr, sps, pps)) = first else {
             return Ok(None);
         };
+        // Picture level: key frame, lost references.
+        if hdr.idr {
+            self.dpb.clear();
+            self.last_ref_frame_num = Some(hdr.frame_num);
+        } else {
+            if self.dpb.is_empty() {
+                return Err(Error::Gap);
+            }
+            let expect = self
+                .last_ref_frame_num
+                .map(|n| (n + 1) % sps.max_frame_num());
+            if expect.is_some_and(|e| e != hdr.frame_num)
+                && self.last_ref_frame_num != Some(hdr.frame_num)
+            {
+                self.dpb.clear();
+                self.last_ref_frame_num = None;
+                return Err(Error::Gap);
+            }
+        }
+        let mut pic = self.take_picture(&sps);
+        pic.crop = sps.crop;
+        pic.chroma_qp_offset = pps.chroma_qp_offset;
+        pic.frame_num = hdr.frame_num;
+        self.next_id += 1;
+        pic.id = self.next_id;
+
+        // Which macroblocks each slice has: from its first to the next slice's first.
+        let total = pic.mbs.len();
+        let mb_w = pic.mb_width;
+        let mut slice_map = vec![0u16; total];
+        let mut prev_start = 0usize;
+        for (i, j) in jobs.iter().enumerate() {
+            let start = j.hdr.first_mb as usize;
+            if start >= total || (i > 0 && start <= prev_start) {
+                return Err(Error::Invalid("slice order"));
+            }
+            let end = jobs
+                .get(i + 1)
+                .map_or(total, |n| n.hdr.first_mb as usize)
+                .min(total);
+            if end <= start {
+                return Err(Error::Invalid("slice order"));
+            }
+            slice_map[start..end].fill(i as u16 + 1);
+            prev_start = start;
+            pic.slices.push(SliceFilter {
+                disable: j.hdr.disable_deblocking,
+                alpha_offset: j.hdr.alpha_offset,
+                beta_offset: j.hdr.beta_offset,
+            });
+        }
+        // Bands: one per slice when every slice starts on a row, else the whole picture.
+        let aligned = jobs
+            .iter()
+            .all(|j| (j.hdr.first_mb as usize).is_multiple_of(mb_w));
+        let cuts: Vec<usize> = if aligned {
+            jobs.iter()
+                .skip(1)
+                .map(|j| j.hdr.first_mb as usize / mb_w)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let band_jobs: Vec<Vec<usize>> = if aligned {
+            (0..jobs.len()).map(|i| vec![i]).collect()
+        } else {
+            vec![(0..jobs.len()).collect()]
+        };
+        let refs: Vec<&Picture> = if jobs.iter().any(|j| j.hdr.slice_type == SliceType::P) {
+            self.dpb.iter().map(|a| &**a).collect()
+        } else {
+            Vec::new()
+        };
+        let cqo = pic.chroma_qp_offset;
+        let t = std::time::Instant::now();
+        let result = {
+            let bands: Vec<std::sync::Mutex<Option<pic::Band>>> = pic
+                .bands(&cuts)
+                .into_iter()
+                .map(|b| std::sync::Mutex::new(Some(b)))
+                .collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+            let (sps, pps, slice_map, refs, jobs, band_jobs) =
+                (&sps, &pps, &slice_map, &refs, &jobs, &band_jobs);
+            let work = || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= bands.len() {
+                    break;
+                }
+                let mut band = bands[i].lock().unwrap().take().expect("band taken once");
+                for &k in &band_jobs[i] {
+                    let job = &jobs[k];
+                    let inp = mb::SliceInput {
+                        sps,
+                        pps,
+                        hdr: &job.hdr,
+                        refs,
+                        slice_id: k as u16 + 1,
+                    };
+                    if let Err(e) = mb::decode_slice(&inp, &job.rbsp, &mut band, slice_map, cqo) {
+                        error.lock().unwrap().get_or_insert(e);
+                        break;
+                    }
+                }
+            };
+            let workers = self.threads.clamp(1, bands.len());
+            if workers == 1 {
+                work();
+            } else {
+                std::thread::scope(|sc| {
+                    for _ in 1..workers {
+                        sc.spawn(work);
+                    }
+                    work();
+                });
+            }
+            error.into_inner().unwrap()
+        };
+        self.slice_ns += t.elapsed().as_nanos() as u64;
+        if let Some(e) = result {
+            return Err(e);
+        }
         if self.deblock {
-            deblock::deblock_picture(&mut pic);
+            let t = std::time::Instant::now();
+            deblock::deblock_picture(&mut pic, self.threads);
+            self.deblock_ns += t.elapsed().as_nanos() as u64;
         }
         let pic = Arc::new(pic);
         if hdr.nal_ref_idc != 0 {
