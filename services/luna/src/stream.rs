@@ -38,6 +38,9 @@ const LINK_HEARTBEAT: Duration = Duration::from_secs(60);
 /// Receive rate announced when less is measured (the Android client's
 /// starting estimate).
 const NOMINAL_RATE: u32 = 10 * 1024 * 1024;
+/// How long a lost video frame is waited for (the server's retransmission
+/// comes about 60 ms after the loss).
+const VIDEO_BUDGET: Duration = Duration::from_millis(250);
 const WANTED: [&str; 5] = ["display", "display2", "audio", "input", "participant"];
 
 /// Where to connect and with what.
@@ -548,9 +551,15 @@ fn streaming(
     if let Some(a) = audio_id {
         s.link.recv.unordered(a);
     }
-    // Same for video: a late frame is dropped by the decoder's numbering.
+    // Video stays in order: a frame that lost a fragment is completed by the
+    // server's retransmission about 60 ms later, and the frames behind it
+    // wait for it (at most `ORDER_BUDGET`). Released at once, it would come
+    // after its successors, be dropped as stale, and every picture after it
+    // would be lost until the next key frame. The gap is waited for longer
+    // than the audio's: a freeze lasts until the next key frame, a late
+    // picture only a moment.
     if let Some(d) = display_id {
-        s.link.recv.unordered(d);
+        s.link.recv.set_budget(d, VIDEO_BUDGET);
     }
     let (mut link_shown, mut link_events) = (Instant::now(), u64::MAX);
     let (mut next_rtcp, mut next_sync, mut next_report) = (
@@ -683,7 +692,16 @@ fn streaming(
                 last_report = line;
             }
             if let Some(v) = video.report() {
-                println!("{}", v);
+                let c = display_id
+                    .map(|d| s.link.recv.counters(d))
+                    .unwrap_or_default();
+                println!(
+                    "{}; spp: {} recovered by retransmission, {} given up, longest hold {} ms",
+                    v,
+                    c.recovered,
+                    c.abandoned,
+                    c.longest_hold_us / 1000
+                );
             }
             next_report = now + REPORT_EVERY;
         }

@@ -75,6 +75,11 @@ struct Held<T> {
 }
 
 impl<T> OrderBuffer<T> {
+    /// # The longest an item may be held from now on (gaps already open count from their start).
+    pub fn set_budget(&mut self, budget: Duration) {
+        self.budget = budget;
+    }
+
     /// # An empty buffer.
     ///
     /// ## Arguments

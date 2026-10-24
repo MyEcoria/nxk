@@ -218,6 +218,13 @@ impl ChannelReassembly {
         self.ordering.as_ref()?.deadline()
     }
 
+    /// How long a gap is waited for from now on.
+    fn set_budget(&mut self, budget: Duration) {
+        if let Some(o) = &mut self.ordering {
+            o.set_budget(budget);
+        }
+    }
+
     /// Stops ordering: whatever waits behind a gap is released now.
     fn unordered(&mut self, out: &mut Vec<Vec<u8>>) {
         if let Some(d) = self.deadline() {
@@ -306,6 +313,13 @@ impl Reassembler {
                     ChannelReassembly::ordered(budget)
                 }
             }),
+        }
+    }
+
+    /// # How long `channel` waits for a missing message before giving up on it (default [`ORDER_BUDGET`]).
+    pub fn set_budget(&mut self, channel: u8, budget: Duration) {
+        if let Some(c) = self.channels.get_mut(channel as usize) {
+            c.set_budget(budget);
         }
     }
 
@@ -417,6 +431,11 @@ impl Receiver {
     /// # When the next gap has to be given up, if any is open.
     pub fn deadline(&self) -> Option<Instant> {
         self.reassembler.deadline()
+    }
+
+    /// # How long `channel` waits for a missing message (see [`Reassembler::set_budget`]).
+    pub fn set_budget(&mut self, channel: u8, budget: Duration) {
+        self.reassembler.set_budget(channel, budget);
     }
 
     /// # Delivers `channel` out of order from now on (see [`Reassembler::unordered`]).
@@ -641,6 +660,21 @@ mod tests {
             matches!(r.classify_at(&fragment(3, 2, 12, 1, b"c"), now), Some(Event::Message(m)) if m.bytes == b"c")
         );
         assert_eq!(r.deadline(), None);
+    }
+
+    #[test]
+    fn a_channel_can_wait_longer_than_the_others_for_a_missing_message() {
+        let now = Instant::now();
+        let mut r = Receiver::with_reassembler(Reassembler::ordered(SHORT));
+        r.set_budget(2, SHORT * 10);
+        // The same gap on channels 1 and 2: it is open until one budget, or ten, have gone.
+        assert_eq!(r.classify_at(&fragment(1, 1, 11, 1, b"b"), now), None);
+        assert_eq!(r.classify_at(&fragment(2, 1, 11, 1, b"b"), now), None);
+        r.expire(now + SHORT * 2);
+        assert!(matches!(r.pop(), Some(Event::Message(m)) if m.channel == 1));
+        assert_eq!(r.pop(), None);
+        r.expire(now + SHORT * 11);
+        assert!(matches!(r.pop(), Some(Event::Message(m)) if m.channel == 2));
     }
 
     #[test]
