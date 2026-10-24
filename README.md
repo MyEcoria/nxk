@@ -289,12 +289,24 @@ wrong, else every minute; another gives the link (longest time without a
 datagram, the stream thread's longest busy spell and send, audio packets
 lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
-the rest still runs there. The `display` channel is answered (capabilities at 1280x720 with
-a 12 Mbit/s cap, `ready`, `pong`, an ack per frame, a key frame asked after a
-gap) and its frames are counted, not decoded yet: the screen stays dark.
-The server sends 1920x1080 H.264 High (CABAC, 8x8 transform, P frames only
-and all of them references, 4 slices a frame, deblocking on) whatever the
-client announces: resolution, `dataUsage`, profile and level were tried. The serial and the tokens are `state.json` in
+the rest still runs there. The `display` channel is answered (capabilities at 1280x720 with a 12
+Mbit/s cap, `ready`, `pong`, an ack per frame, a key frame asked after a
+gap or a decoding error). The server sends 1920x1080 H.264 High (CABAC, 8x8
+transform, P frames only and all of them references, 4 slices a frame,
+deblocking on) whatever the client announces: resolution, `dataUsage`,
+profile and level were tried. `services/nxh264` decodes it (written for this
+stream: no B slices, CAVLC, weighted prediction, scaling matrices or
+long-term references; checked frame by frame against ffmpeg on 6199 frames
+of the real stream and on x264 clips, `cargo test` on the PC): the slices of
+a picture on three threads, the deblocking filter as a wavefront, the
+decoder below the stream and audio threads in priority, a queue of three in
+front of it (a late frame is dropped and a key frame asked). The newest
+picture is written as its three planes into GPU buffers and one fullscreen
+pass (`nxk_shader::stock::yuv420_fragment`: BT.709 limited range as the
+desktop client, nearest sample, the panel's quarter turn) draws it, so the
+CPU never touches the pixels. On the PC, one thread, 1080p: 15 ms a frame
+on a 15 Mbit/s motion clip, 6.5 on the idle stream (7 and 4.8 ms on four
+threads); the Erista's numbers and the picture itself are not measured yet. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 
