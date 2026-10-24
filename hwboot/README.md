@@ -1550,6 +1550,21 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+65. 25/10/2026, same console, rebooted with run 64's image, `display` reloaded:
+    **the catalogs' games are cached on the card**. A Luna tab used to open on
+    "Starting" and show its covers 1.55 s after the tap; with
+    `/users/u1/cache/luna/` (list.bin and 87 covers of 131 KB) it shows the
+    games on the first capture after the tap, the program starting behind.
+    With Intern shown, 6 s after the boot Luna runs once (up in 1.3 s, 87
+    games, 87 covers read off its own card) and ends: 88 files. A first
+    version pruned the covers when Luna's first list came empty; empty lists
+    are now ignored. TCP buffers of 2 MiB: one connection 13.7 to 34 Mb/s, four
+    44 (59-64 best second) with the CPU at 26 % and the hotspot on 2.4 GHz
+    channel 6 (the phone does 60 MB/s to OVH on its own link). A scan from the
+    Networks sheet while connected made `wlan` fail (EIO, "try Retry"), and
+    once `wlan` was killed by an SError at 0x0 (a bus error from the chip) after
+    several speed tests, `wifi retry` or `--reload wlan` brought it back.
+
 64. 25/10/2026, same console (gauge 88-97 %, plugged), `display` and `net`
     reloaded, `speedtest` put in `/bin`: **Wi-Fi first and the speed test**.
     Switching tabs: the screen was frozen 2.3 s while `luna` read its 87

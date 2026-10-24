@@ -60,6 +60,8 @@ pub const CONTROLLERS: usize = 6;
 pub const USERS: usize = 7;
 
 const TOAST_NS: u64 = 4_000_000_000;
+/// `prov_list` while the list shown is the cache's.
+pub const CACHED_LIST: u64 = 1 << 62;
 const FAN_STEP: u64 = 10;
 const PAD_STEP: u8 = 5;
 const VOL_HUD_NS: u64 = 1_800_000_000;
@@ -276,6 +278,10 @@ pub struct Ui {
     vol_hud: u64,
     pub(crate) wifi: WifiUi,
     pub(crate) speed: SpeedUi,
+    /// Covers the cache does not hold (ids): only the catalog has them.
+    pub cache_absent: Vec<String>,
+    /// Counts the catalogs shown (`show_service`).
+    pub show_gen: u64,
     pub busy: bool,
     pub(crate) log_scale: usize,
     pub(crate) term_scale: usize,
@@ -365,6 +371,8 @@ impl Ui {
             vol_hud: 0,
             wifi: WifiUi::new(),
             speed: SpeedUi::new(),
+            cache_absent: Vec::new(),
+            show_gen: 0,
             busy: false,
             log_scale: 1,
             term_scale: 1,
@@ -589,6 +597,8 @@ impl Ui {
             Vec::new()
         };
         self.service = name;
+        self.show_gen += 1;
+        self.cache_absent.clear();
         self.prov = None;
         self.prov_list = 0;
         self.covers_asked.clear();
@@ -611,9 +621,57 @@ impl Ui {
         }))
     }
 
+    /// The games the cache kept stand for the catalog's list until it
+    /// answers: no "Starting", the covers read from the card.
+    pub fn show_cached(&mut self, name: &str, games: &[crate::cache::Entry]) {
+        let v = games
+            .iter()
+            .map(|g| GameInfo {
+                name: alloc::format!("{}~{}", name, g.id),
+                title: g.title.clone(),
+                publisher: g.publisher.clone(),
+                version: g.version.clone(),
+                desc: g.desc.clone(),
+                color: g.color,
+                exe: String::new(),
+                id: g.id.clone(),
+                cover: None,
+            })
+            .collect();
+        self.set_games(v);
+        self.prov_list = CACHED_LIST;
+        self.covers_asked.clear();
+        if self.prov.is_none() {
+            self.prov = Some(View::local(
+                libnx::abi::proto::provider::ST_READY,
+                String::new(),
+            ));
+        }
+    }
+
+    /// The account is gone: what the cache showed goes too.
+    pub fn drop_cached(&mut self) {
+        if self.prov_list == CACHED_LIST {
+            self.games.clear();
+            self.prov_list = 0;
+            self.home = 0;
+            self.last_game = 0;
+        }
+    }
+
+    /// Covers the cache has not: asked of the catalog once it is up.
+    pub fn cache_missed(&mut self, list: u64, ids: Vec<String>) {
+        if list != self.prov_list {
+            return;
+        }
+        self.covers_asked.retain(|a| !ids.contains(a));
+        self.cache_absent.extend(ids);
+    }
+
     /// A catalog's covers to read now (the games near the selection), the
-    /// ones far from it dropped.
-    pub fn want_covers(&mut self) -> Option<Vec<String>> {
+    /// ones far from it dropped. `live`: the catalog is up, so the ones the
+    /// cache has not can be asked of it now.
+    pub fn want_covers(&mut self, live: bool) -> Option<Vec<String>> {
         if self.service.is_empty() || self.page != LIBRARY || self.games.is_empty() {
             return None;
         }
@@ -635,6 +693,7 @@ impl Ui {
                 g.cover.is_none()
                     && !self.covers_asked.contains(&g.id)
                     && !self.covers_absent.contains(&g.id)
+                    && (live || !self.cache_absent.contains(&g.id))
             })
             .collect();
         idx.sort_by_key(|&i| i.abs_diff(at));

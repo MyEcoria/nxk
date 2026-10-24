@@ -19,6 +19,7 @@ extern crate alloc;
 mod art;
 mod avatar;
 mod backlight;
+mod cache;
 mod catalog;
 mod config;
 mod controllers;
@@ -48,7 +49,7 @@ mod userspage;
 mod widgets;
 mod wifisheet;
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -1505,6 +1506,14 @@ fn main() -> i32 {
     let mut prov: Option<catalog::Provider> = None;
     // The speed test program, alive while its sheet is open.
     let mut speed: Option<speed::Speed> = None;
+    // What the card keeps of each catalog for each user (`cache.rs`), the
+    // catalogs refreshed since the boot, and the covers a refresh of a
+    // catalog nobody looks at still waits for.
+    let cache = cache::Cache::start(notif);
+    let mut kept: BTreeMap<(String, String), cache::Kept> = BTreeMap::new();
+    let mut refreshed: Vec<(String, String)> = Vec::new();
+    let mut hidden_need: Vec<String> = Vec::new();
+    let (mut hidden_list, mut hidden_retry) = (0u64, 0u64);
     let (mut prov_retry_at, mut prov_fails) = (0u64, 0u32);
     let mut prov_key: Option<String> = None;
     // The version of the launch's own ST_LAUNCHING (LAUNCH's reply).
@@ -1916,11 +1925,73 @@ fn main() -> i32 {
                 }
                 dirty = true;
             }
+            // What the card kept of each catalog, for the user playing.
+            let uid = ui.users.active().map(|u| u.id.clone());
+            if let Some(uid) = &uid {
+                for s in services.iter() {
+                    let k = kept.entry((uid.clone(), s.name.clone())).or_default();
+                    if !k.asked {
+                        k.asked = true;
+                        cache.post(cache::Job::LoadList(uid.clone(), s.name.clone()));
+                    }
+                }
+                // Its list stands in for the catalog's until it answers.
+                if !ui.service.is_empty() && ui.prov_list == 0 && ui.games.is_empty() {
+                    let games = kept
+                        .get(&(uid.clone(), ui.service.clone()))
+                        .and_then(|k| k.games.as_ref())
+                        .filter(|g| !g.is_empty());
+                    if let Some(g) = games {
+                        let name = ui.service.clone();
+                        ui.show_cached(&name, g);
+                        dirty = true;
+                    }
+                }
+            }
             // The catalog shown runs for the user playing; another one goes.
-            let want = (!ui.service.is_empty())
+            // With none shown, one not looked at since the boot runs to keep
+            // its list and covers up to date, once the first frames are out.
+            let visible = (!ui.service.is_empty())
                 .then(|| services.iter().find(|s| s.name == ui.service))
-                .flatten()
-                .zip(ui.users.active());
+                .flatten();
+            // A refresh nobody looks at asks again for the covers its catalog
+            // had not yet (it reads them off the card after it is up).
+            if let Some(p) = prov
+                .as_ref()
+                .filter(|p| p.pid().is_some() && p.name != ui.service)
+            {
+                if hidden_list != 0 && !hidden_need.is_empty() && now >= hidden_retry {
+                    p.covers(hidden_list, hidden_need.clone());
+                    hidden_retry = now + 2_000_000_000;
+                }
+                if hidden_list != 0 {
+                    wake = wake.min(hidden_retry);
+                }
+            }
+            // A refresh nobody looks at gives up after a minute.
+            if let Some(p) = prov.as_ref().filter(|p| p.name != ui.service) {
+                if now - p.since > 60_000_000_000 {
+                    println!("[display] refresh done: timeout");
+                    refreshed.push((p.user.clone(), p.name.clone()));
+                }
+            }
+            let hidden = visible
+                .is_none()
+                .then(|| {
+                    let uid = uid.as_ref()?;
+                    let idle = launcher.running.is_none() && game.is_none() && !sleeping;
+                    services.iter().find(|s| {
+                        let key = (uid.clone(), s.name.clone());
+                        idle && now > 6_000_000_000
+                            // Only a catalog that has been used: one with no
+                            // account would ask Amazon for a sign-in code at
+                            // every boot.
+                            && kept.get(&key).is_some_and(|k| k.games.is_some())
+                            && !refreshed.contains(&key)
+                    })
+                })
+                .flatten();
+            let want = visible.or(hidden).zip(ui.users.active());
             let same = match (&prov, want) {
                 (Some(p), Some((s, u))) => p.name == s.name && p.user == u.id,
                 (None, None) => true,
@@ -1931,6 +2002,10 @@ fn main() -> i32 {
                     ui.prov = None;
                 }
                 if let Some((s, u)) = want.filter(|_| now >= prov_retry_at) {
+                    if visible.is_none() {
+                        println!("[display] {}: refreshing its list and covers", s.name);
+                    }
+                    (hidden_need, hidden_list) = (Vec::new(), 0);
                     match catalog::Provider::start(s, u, notif) {
                         Ok(p) => prov = Some(p),
                         Err(e) => {
@@ -1944,7 +2019,12 @@ fn main() -> i32 {
                     dirty = true;
                 }
             }
-            if prov.as_ref().is_some_and(|p| p.pid().is_some()) && ui.prov_list != 0 {
+            let live = prov
+                .as_ref()
+                .is_some_and(|p| p.pid().is_some() && p.name == ui.service)
+                && ui.prov_list != 0
+                && ui.prov_list != ui::CACHED_LIST;
+            if live {
                 // Covers the catalog had not are asked again now and then
                 // too: a cover set while its ENOENT was on its way is not missed.
                 if !ui.covers_absent.is_empty() {
@@ -1954,8 +2034,25 @@ fn main() -> i32 {
                     }
                     wake = wake.min(absent_retry);
                 }
-                if let (Some(p), Some(ids)) = (&prov, ui.want_covers()) {
-                    p.covers(ui.prov_list, ids);
+            }
+            if let Some(uid) = uid.as_ref().filter(|_| ui.prov_list != 0) {
+                if let Some(ids) = ui.want_covers(live) {
+                    // The card first; what it has not goes to the catalog.
+                    let (fresh, absent): (Vec<String>, Vec<String>) = ids
+                        .into_iter()
+                        .partition(|id| !ui.cache_absent.contains(id));
+                    if !fresh.is_empty() {
+                        let job = cache::Job::LoadCovers(
+                            uid.clone(),
+                            ui.service.clone(),
+                            ui.prov_list,
+                            fresh,
+                        );
+                        cache.post(job);
+                    }
+                    if let (true, Some(p)) = (live && !absent.is_empty(), &prov) {
+                        p.covers(ui.prov_list, absent);
+                    }
                 }
             }
             if prov.is_none() && !ui.service.is_empty() && prov_retry_at > now {
@@ -2421,24 +2518,76 @@ fn main() -> i32 {
                     dirty = true;
                 }
             }
+            if ev & cache::EV_CACHE != 0 {
+                let me = ui.users.active().map(|u| u.id.clone());
+                for o in cache.take() {
+                    match o {
+                        cache::Out::List(u, s, list, have) => {
+                            println!(
+                                "[display] cache {}: {} games, {} covers",
+                                s,
+                                list.as_ref().map_or(0, |l| l.len()),
+                                have.len()
+                            );
+                            let k = kept.entry((u, s)).or_default();
+                            (k.asked, k.loaded, k.games, k.have) = (true, true, list, have);
+                        }
+                        cache::Out::Cover(u, s, list, id, c) => {
+                            if me.as_deref() == Some(u.as_str()) && s == ui.service {
+                                ui.set_cover(list, &id, catalog::cover(c));
+                                dirty = true;
+                            }
+                        }
+                        cache::Out::Absent(u, s, list, ids) => {
+                            if me.as_deref() == Some(u.as_str()) && s == ui.service {
+                                ui.cache_missed(list, ids);
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+            }
             if ev & catalog::EV_PROV != 0 {
                 let now = time::now_ns();
                 let up = prov.as_ref().map(|p| p.take()).unwrap_or_default();
-                dirty |= !up.is_quiet(ui.prov.as_ref());
+                // What it says is for the screen only if it is the catalog
+                // shown; a refresh nobody looks at only feeds the cache.
+                let shown = prov.as_ref().is_some_and(|p| p.name == ui.service);
+                let key = prov.as_ref().map(|p| (p.user.clone(), p.name.clone()));
+                dirty |= shown && !up.is_quiet(ui.prov.as_ref());
                 if up.launched.is_some() && prov_key.is_some() {
                     launch_version = up.launched;
                 }
                 if let Some(v) = up.view {
-                    if ui.prov.as_ref().is_some_and(|o| o.covers != v.covers) {
-                        ui.covers_absent.clear();
+                    // No account: what the card kept of its games goes.
+                    if let (true, Some(k)) = (v.state == provproto::ST_LOGIN, &key) {
+                        cache.post(cache::Job::Forget(k.0.clone(), k.1.clone()));
+                        if let Some(e) = kept.get_mut(k) {
+                            (e.games, e.have) = (None, Vec::new());
+                        }
+                        if shown {
+                            ui.drop_cached();
+                        }
                     }
-                    match (&prov, v.state == provproto::ST_LOGIN) {
-                        (Some(p), true) => p.login_art(),
-                        _ => ui.login_art = None,
+                    if shown {
+                        if ui.prov.as_ref().is_some_and(|o| o.covers != v.covers) {
+                            ui.covers_absent.clear();
+                        }
+                        match (&prov, v.state == provproto::ST_LOGIN) {
+                            (Some(p), true) => p.login_art(),
+                            _ => ui.login_art = None,
+                        }
+                        ui.prov = Some(v);
+                    } else if let Some(k) = &key {
+                        if matches!(v.state, provproto::ST_LOGIN | provproto::ST_ERROR)
+                            && !refreshed.contains(k)
+                        {
+                            println!("[display] refresh done: state");
+                            refreshed.push(k.clone());
+                        }
                     }
-                    ui.prov = Some(v);
                 }
-                if let Some(art) = up.login_art {
+                if let Some(art) = up.login_art.filter(|_| shown) {
                     ui.login_art = art.map(catalog::cover);
                 }
                 // The launch's own state, or a newer one: playing, or over
@@ -2468,19 +2617,102 @@ fn main() -> i32 {
                     stop_at = None;
                 }
                 for (list, id, absent) in up.covers_missed {
-                    ui.cover_missed(list, &id, absent);
+                    if shown {
+                        ui.cover_missed(list, &id, absent);
+                    } else if !absent {
+                        // Not there yet (`absent`) is asked again below.
+                        hidden_need.retain(|i| *i != id);
+                    }
                 }
-                if let (Some((list, g)), Some(p)) = (up.games, &prov) {
-                    if p.name == ui.service {
+                // An empty list is a catalog still loading, not proof that the
+                // games are gone: what the card keeps stays, and a refresh
+                // nobody looks at waits for a real one.
+                let up_games = up
+                    .games
+                    .filter(|(_, g)| !g.is_empty() || (shown && ui.prov_list != ui::CACHED_LIST));
+                if let (Some((list, g)), Some(p)) = (up_games, &prov) {
+                    let key = (p.user.clone(), p.name.clone());
+                    let entries: Vec<cache::Entry> = g
+                        .iter()
+                        .map(|x| cache::Entry {
+                            id: x.id.clone(),
+                            title: x.title.clone(),
+                            publisher: x.publisher.clone(),
+                            version: x.version.clone(),
+                            desc: x.desc.clone(),
+                            color: x.color,
+                        })
+                        .collect();
+                    let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+                    if !entries.is_empty() {
+                        cache.post(cache::Job::SaveList(
+                            key.0.clone(),
+                            key.1.clone(),
+                            entries.clone(),
+                        ));
+                        cache.post(cache::Job::Prune(key.0.clone(), key.1.clone(), ids.clone()));
+                    }
+                    let k = kept.entry(key.clone()).or_default();
+                    k.have.retain(|h| ids.contains(h));
+                    let missing: Vec<String> = ids
+                        .iter()
+                        .filter(|i| !k.have.contains(i))
+                        .cloned()
+                        .collect();
+                    if !entries.is_empty() {
+                        (k.asked, k.loaded, k.games) = (true, true, Some(entries));
+                    }
+                    if shown {
                         let mut old = ui.take_games();
                         let merged = catalog::merge(&p.name, g, &mut old);
                         ui.prov_list = list;
                         ui.covers_asked.clear();
+                        ui.cache_absent.clear();
                         ui.set_games(merged);
+                        // The list is up to date; the covers the card lacks
+                        // are fetched once nobody looks (below), so the catalog
+                        // is not asked for them behind the selection's.
+                        if missing.is_empty() && !refreshed.contains(&key) {
+                            println!("[display] refresh done: all covers kept");
+                            refreshed.push(key);
+                        }
+                    } else {
+                        // Nobody looks: the covers the card lacks are read now.
+                        if missing.is_empty() {
+                            println!("[display] refresh done: no cover missing");
+                            refreshed.push(key);
+                        } else {
+                            p.covers(list, missing.clone());
+                            (hidden_need, hidden_list) = (missing, list);
+                            hidden_retry = now + 2_000_000_000;
+                        }
                     }
                 }
                 for (list, id, c) in up.covers {
-                    ui.set_cover(list, &id, catalog::cover(c));
+                    if let Some(k) = &key {
+                        cache.post(cache::Job::SaveCover(
+                            k.0.clone(),
+                            k.1.clone(),
+                            id.clone(),
+                            c.clone(),
+                        ));
+                        let e = kept.entry(k.clone()).or_default();
+                        if !e.have.contains(&id) {
+                            e.have.push(id.clone());
+                        }
+                    }
+                    if shown {
+                        ui.set_cover(list, &id, catalog::cover(c));
+                    } else {
+                        hidden_need.retain(|i| *i != id);
+                    }
+                }
+                if hidden_list != 0 && hidden_need.is_empty() {
+                    hidden_list = 0;
+                    if let Some(k) = key.clone().filter(|_| !shown) {
+                        println!("[display] refresh done: all covers read");
+                        refreshed.push(k);
+                    }
                 }
                 for n in up.notes {
                     ui.starting = None;
@@ -2488,6 +2720,10 @@ fn main() -> i32 {
                     ui.toast(n, now);
                 }
                 if let Some(e) = up.start_failed {
+                    if let Some(k) = key.clone().filter(|_| !shown) {
+                        println!("[display] refresh done: start failed");
+                        refreshed.push(k);
+                    }
                     prov = None;
                     ui.prov = Some(catalog::View::local(
                         provproto::ST_ERROR,
@@ -2508,6 +2744,10 @@ fn main() -> i32 {
                     }
                     catalog_game_over!(now);
                     println!("[display] {} ended (code {})", p.title, code);
+                    if p.name != ui.service {
+                        println!("[display] refresh done: exited");
+                        refreshed.push((p.user.clone(), p.name.clone()));
+                    }
                     // 137: ended by us (STOP unanswered, or another catalog picked).
                     if code != 0 && code != 137 {
                         ui.toast(format!("{} stopped (code {})", p.title, code), now);
