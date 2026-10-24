@@ -1474,6 +1474,7 @@ fn main() -> i32 {
     }
     let mut cfg_loaded = false;
     let mut autojoin: Option<Autojoin> = None;
+    let mut wifi_gone = false;
     let mut users_loaded = false;
     let mut play_loaded = false;
     let mut save_at: u64 = 0;
@@ -2083,6 +2084,26 @@ fn main() -> i32 {
                 speed = None;
             }
             let idle = matches!(data.wifi, stats::Seen::Value(w) if w.state == wifi::ST_IDLE);
+            // The Wi-Fi driver went and came back (a crash, a reload): the
+            // network kept is joined again, as at the boot.
+            let gone = matches!(data.wifi, stats::Seen::Missing)
+                || matches!(data.wifi, stats::Seen::Value(w) if w.state == wifi::ST_DOWN)
+                || matches!(data.wifi, stats::Seen::Value(w) if w.state == wifi::ST_CONNECTED);
+            if gone {
+                // Connected, or the driver is out: if it is idle next, the
+                // link was lost, not left (Leave forgets the network).
+                wifi_gone = true;
+            } else if idle && wifi_gone {
+                wifi_gone = false;
+                println!("[display] Wi-Fi idle after a lost link: joining the saved network again");
+                if autojoin.is_none() && !ui.cfg.flight {
+                    autojoin = known::Known::load().map(|net| Autojoin {
+                        net,
+                        tries: 0,
+                        at: now + 2_000_000_000,
+                    });
+                }
+            }
             if let Some(a) = autojoin.as_mut().filter(|a| now >= a.at) {
                 if idle && !ui.cfg.flight && ui.wifi.joining.is_none() && !sleeping {
                     a.tries += 1;

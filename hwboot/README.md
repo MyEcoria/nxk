@@ -1564,6 +1564,14 @@ within 5 s.
     Networks sheet while connected made `wlan` fail (EIO, "try Retry"), and
     once `wlan` was killed by an SError at 0x0 (a bus error from the chip) after
     several speed tests, `wifi retry` or `--reload wlan` brought it back.
+    The scan failure was the 3 s limit of the scan, not the chip: an escan
+    takes 2.7 s with the firmware's defaults and 5 s with 200 ms a channel,
+    and while it ran `net`'s carrier probe timed out and moved the console to
+    `usb0`; the limit is 12 s, a busy driver keeps its carrier, and with 200
+    ms of listening the scan hears the Freebox on 5 GHz channel 36 (-80 dBm;
+    the firmware offers 5 GHz channels 36-165 for country US, none was ever
+    heard with the defaults). Scanned while joined it finds fewer of the
+    weak ones (2 to 6 of 6).
 
 64. 25/10/2026, same console (gauge 88-97 %, plugged), `display` and `net`
     reloaded, `speedtest` put in `/bin`: **Wi-Fi first and the speed test**.
