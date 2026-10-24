@@ -36,7 +36,7 @@ use libnx::{fs, ns, println, sys, time};
 const MAC: [u8; 6] = [0x02, 0x4E, 0x58, 0x4B, 0x57, 0x01];
 const MTU: u64 = 1500;
 /// Scan time when the caller asks for no particular one.
-const SCAN_TIMEOUT: u64 = 3_000_000_000;
+const SCAN_TIMEOUT: u64 = 12_000_000_000;
 /// Join time likewise: scan, authentication and the key handshake.
 const CONNECT_TIMEOUT: u64 = 15_000_000_000;
 /// While joined, the rings are also polled this often: the chip's

@@ -279,7 +279,42 @@ impl Dev<'_> {
         self.mb.set_var(bp, tcm, "event_msgs", &mask)?;
         self.mb.cmd_int(bp, tcm, WLC_SET_INFRA, 1)?;
         self.mb.cmd_int(bp, tcm, WLC_SET_PM, 0)?;
-        self.mb.cmd_int(bp, tcm, WLC_UP, 1)
+        self.mb.cmd_int(bp, tcm, WLC_UP, 1)?;
+        // The regulatory domain decides which 5 GHz channels are scanned.
+        if let Ok(c) = self.mb.get_var(bp, tcm, "country", 12) {
+            let abbrev = |b: &[u8]| {
+                String::from_utf8_lossy(&b[..b.iter().position(|&x| x == 0).unwrap_or(b.len())])
+                    .into_owned()
+            };
+            if c.len() >= 12 {
+                println!(
+                    "[wlan] country {:?} (rev {}), code {:?}",
+                    abbrev(&c[..4]),
+                    le32(&c, 4) as i32,
+                    abbrev(&c[8..12])
+                );
+            }
+        }
+        // And the channels the firmware offers (`brcmf_construct_chaninfo`).
+        if let Ok(l) = self.mb.get_var(bp, tcm, "chanspecs", 1536) {
+            if l.len() >= 4 {
+                let n = (le32(&l, 0) as usize).min((l.len() - 4) / 4);
+                let ch: Vec<(u16, u8)> = (0..n)
+                    .map(|i| {
+                        let c = le32(&l, 4 + 4 * i) as u16;
+                        (c & 0xc000, c as u8)
+                    })
+                    .collect();
+                let g5: Vec<u8> = ch.iter().filter(|c| c.0 == 0xc000).map(|c| c.1).collect();
+                println!(
+                    "[wlan] {} channels: {} on 2.4 GHz, 5 GHz: {:?}",
+                    n,
+                    ch.iter().filter(|c| c.0 == 0).count(),
+                    g5
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Next firmware event, waiting at most until `deadline` (ns).
@@ -308,14 +343,18 @@ impl Dev<'_> {
         req.extend_from_slice(&[0u8; 36]); // any SSID
         req.extend_from_slice(&[0xFF; 6]); // any BSSID
         req.extend_from_slice(&[BSSTYPE_ANY, 0]); // active scan
-        for _ in 0..4 {
-            req.extend_from_slice(&u32::MAX.to_le_bytes()); // firmware defaults
+                                                  // nprobes, active and passive time per channel (ms), home time: with
+                                                  // the firmware's defaults a 5 GHz network (the Freebox, channel 36) was
+                                                  // never heard; 200 ms of listening finds it, a scan takes 5 s.
+        for v in [3u32, 80, 200, u32::MAX] {
+            req.extend_from_slice(&v.to_le_bytes());
         }
         req.extend_from_slice(&0u32.to_le_bytes()); // all channels
         let (bp, tcm) = (self.bp, self.tcm);
         self.mb.set_var(bp, tcm, "escan", &req)?;
 
-        let deadline = time::now_ns() + timeout_ns;
+        let start = time::now_ns();
+        let deadline = start + timeout_ns;
         let mut out = Vec::new();
         while let Some(e) = self.event(deadline)? {
             if e.kind != E_ESCAN_RESULT {
@@ -329,6 +368,12 @@ impl Dev<'_> {
                         e.status, e.reason
                     ));
                 }
+                println!(
+                    "[wlan] scan: {} networks, {} on 5 GHz, {} ms",
+                    out.len(),
+                    out.iter().filter(|b| b.channel > 14).count(),
+                    (time::now_ns() - start) / 1_000_000
+                );
                 return Ok(out);
             }
         }
