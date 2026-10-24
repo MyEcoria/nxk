@@ -419,13 +419,18 @@ impl Launcher {
     }
 }
 
+/// How long a join may take before the sheet gives up on `wlan`.
+const JOIN_NS: u64 = 30_000_000_000;
+
 /// Join network `raw` (its passphrase `psk`, empty if open); `wlan`
 /// replies once associated.
 fn join(raw: &[u8], psk: &[u8]) -> Result<(), i64> {
     let mut data = raw.to_vec();
     data.push(0);
     data.extend_from_slice(psk);
-    WIFI.call(&ipc::pack_at(wifi::CONNECT, &[0], &data))
+    // A scan, then the join (15 s at most): a `wlan` that never answers
+    // must not leave "Joining..." on the screen.
+    WIFI.call_timeout(&ipc::pack_at(wifi::CONNECT, &[0], &data), JOIN_NS)
         .map(|_| ())
 }
 
