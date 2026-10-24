@@ -1,0 +1,7 @@
+[package]
+name = "nxspeed"
+version = "0.1.0"
+edition = "2021"
+description = "Download speed measurement with no network code of its own: parallel connections, live rate, average, peak (cargo test on the PC)"
+
+[dependencies]

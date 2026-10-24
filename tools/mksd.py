@@ -64,7 +64,7 @@ if not a.no_bin:
             put("/bin/" + prog, open(p, "rb").read())
     # std programs (apps/ dir).
     appdir = os.path.join(CACHE, "target-apps", "aarch64-unknown-nxk", "release")
-    for prog in ["hello-std", "stdtest"]:
+    for prog in ["hello-std", "stdtest", "speedtest"]:
         p = os.path.join(appdir, prog)
         if os.path.exists(p):
             put("/bin/" + prog, open(p, "rb").read())

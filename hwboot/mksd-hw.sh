@@ -49,7 +49,7 @@ for prog in hello ktest true fptest crash bench ipcbench; do
     [ -x "$bindir/$prog" ] && cp "$bindir/$prog" "$sd/bin/$prog"
 done
 appdir="$cache/target-apps/aarch64-unknown-nxk/release"
-for prog in hello-std stdtest; do
+for prog in hello-std stdtest speedtest; do
     [ -x "$appdir/$prog" ] && cp "$appdir/$prog" "$sd/bin/$prog"
 done
 # Games (jeux/): /games/NAME/NAME, its game.txt and cover, for the library.

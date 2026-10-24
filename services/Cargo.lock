@@ -550,6 +550,10 @@ name = "nxopus"
 version = "0.1.0"
 
 [[package]]
+name = "nxspeed"
+version = "0.1.0"
+
+[[package]]
 name = "nxsvc"
 version = "0.1.0"
 dependencies = [
@@ -981,6 +985,16 @@ name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+
+[[package]]
+name = "speedtest"
+version = "0.1.0"
+dependencies = [
+ "nxgfx",
+ "nxhttp",
+ "nxk-abi",
+ "nxspeed",
+]
 
 [[package]]
 name = "spin"

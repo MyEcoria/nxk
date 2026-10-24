@@ -1,0 +1,11 @@
+[package]
+name = "speedtest"
+version = "0.1.0"
+edition = "2021"
+description = "Download speed test over the network in use (HTTPS): a program to run by hand, and the service the Network page of display talks to"
+
+[dependencies]
+nxspeed = { path = "../nxspeed" }
+nxhttp = { path = "../nxhttp" }
+nxgfx = { path = "../../jeux/nxgfx" }
+nxk-abi = { path = "../../abi" }
