@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libnx::abi::err::{
     EADDRINUSE, EAGAIN, EBADF, ECONNREFUSED, ECONNRESET, EINVAL, ENETDOWN, ENETUNREACH, ENOENT,
@@ -267,15 +267,17 @@ struct Link {
     skips: u32,
     /// When the carrier came up (ns).
     up_since: u64,
+    /// Ends the receive thread of the handle held (its driver is gone).
+    rx_stop: Option<Arc<AtomicBool>>,
 }
 
 /// Receive thread of link `k`: blocks on its driver, queues frames and
 /// signals the main thread.
-fn receive(k: usize, eth: u32, q: Frames, notif: u32) {
+fn receive(k: usize, eth: u32, q: Frames, notif: u32, stop: Arc<AtomicBool>) {
     let eth = sys::handle_dup(eth, libnx::abi::rights::SEND, 0).unwrap_or(eth);
     let r = thread::spawn(move || {
         let mut frame = vec![0u8; ipc::MAX_BYTES];
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             let mut m = Msg::new(eth::RECV, 1, 0);
             m.mr[0] = 0;
             match ipc::call(eth, &m) {
@@ -295,6 +297,7 @@ fn receive(k: usize, eth: u32, q: Frames, notif: u32) {
                 _ => time::sleep_ms(10),
             }
         }
+        let _ = sys::handle_close(eth);
     });
     if r.is_err() {
         println!("[net] {}: no receive thread", LINKS[k].0);
@@ -920,9 +923,14 @@ impl Net {
         for (k, &(name, _)) in LINKS.iter().enumerate() {
             let l = &mut self.links[k];
             if l.handle == 0 {
-                let Ok(h) = ns::lookup(name) else { continue };
+                let Ok(h) = ns::lookup(name) else {
+                    (l.carrier, l.skipped_at, l.skips) = (false, 0, 0);
+                    continue;
+                };
                 l.handle = h;
-                receive(k, h, self.rxq.clone(), self.notif);
+                let stop = Arc::new(AtomicBool::new(false));
+                l.rx_stop = Some(stop.clone());
+                receive(k, h, self.rxq.clone(), self.notif, stop);
             }
             let (mac, carrier) =
                 match ipc::call_timeout(l.handle, &Msg::new(eth::INFO, 0, 0), LINK_CALL_NS) {
@@ -930,6 +938,18 @@ impl Net {
                         let mut mac = [0u8; 6];
                         mac.copy_from_slice(&m.mr[0].to_le_bytes()[..6]);
                         (mac, m.words() < 3 || m.mr[2] != 0)
+                    }
+                    // A driver busy for seconds (a Wi-Fi scan) is not a link
+                    // that went down: it keeps what it had.
+                    Err(e) if e == -ETIMEDOUT => (l.mac, l.carrier),
+                    // Its driver died (and may be back under a new endpoint):
+                    // the handle is looked up again at the next check.
+                    Err(_) => {
+                        if let Some(s) = l.rx_stop.take() {
+                            s.store(true, Ordering::Relaxed);
+                        }
+                        l.handle = 0;
+                        (l.mac, false)
                     }
                     _ => (l.mac, false),
                 };
