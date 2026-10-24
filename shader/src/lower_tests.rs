@@ -606,3 +606,64 @@ fn local_memory_round_trip() {
         assert!(r.is_ok(), "thread {tid}: {}", r.unwrap_err());
     }
 }
+
+/// The video pass (`stock::yuv420_fragment`) compiled and run on the SASS
+/// simulator gives the colours the reference machine does.
+#[test]
+fn the_video_fragment_shader_compiled_matches_the_reference() {
+    let (w, h, ys, uvs) = (64u32, 48u32, 64u32, 32u32);
+    let p = crate::stock::yuv420_fragment(w, h, ys, uvs);
+    let mut seed = 99u32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        seed
+    };
+    let planes: Vec<Vec<u32>> = vec![
+        (0..ys * h / 4).map(|_| rnd()).collect(),
+        (0..uvs * h / 2 / 4).map(|_| rnd()).collect(),
+        (0..uvs * h / 2 / 4).map(|_| rnd()).collect(),
+    ];
+    let c = compile(&p).expect("compiles");
+    for k in 0..40u32 {
+        let (u, v) = (((k * 7) % 31) as f32 / 31.0, ((k * 13) % 37) as f32 / 37.0);
+        let mut bufs: Vec<Vec<u32>> = planes.clone();
+        bufs.resize(MAX_BUFFERS, Vec::new());
+        let mut m = Machine {
+            inputs: [[0; 4]; MAX_ATTRS],
+            builtins: [0; 11],
+            uniforms: &[],
+            buffers: &mut bufs,
+            sampler: &mut NoTextures,
+        };
+        m.inputs[0][0] = u.to_bits();
+        m.inputs[0][1] = v.to_bits();
+        let want = run(&p, &mut m).colors[0];
+        let mut fake = Fake;
+        let mut s = Sim::new(&c.code, &mut fake);
+        let mut desc = Vec::new();
+        for i in 0..MAX_BUFFERS {
+            let (lo, hi, len) = match planes.get(i) {
+                Some(b) => (base_of(i) as u32, (base_of(i) >> 32) as u32, b.len() as u32),
+                None => (0, 0, 0),
+            };
+            desc.extend([lo, hi, len, 0]);
+        }
+        s.cbuf[CB_BUFFERS as usize] = desc;
+        s.cbuf[CB_TEXTURES as usize] = (0..MAX_TEXTURES as u32).collect();
+        for (i, b) in planes.iter().enumerate() {
+            s.mem.push((base_of(i), b.clone()));
+        }
+        s.attrs_in.insert(0x80, u.to_bits());
+        s.attrs_in.insert(0x84, v.to_bits());
+        s.attrs_in.insert(0x7C, 1.0f32.to_bits());
+        s.run().expect("runs");
+        for (ch, w) in want.iter().enumerate() {
+            assert!(
+                close(f32::from_bits(s.regs[ch]), *w),
+                "pixel {k} channel {ch}: {} against {}",
+                f32::from_bits(s.regs[ch]),
+                w
+            );
+        }
+    }
+}
