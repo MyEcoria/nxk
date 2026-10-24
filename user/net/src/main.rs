@@ -35,7 +35,12 @@ use smoltcp::wire::{
     IpEndpoint, Ipv4Address,
 };
 
-const TCP_BUF: usize = 64 * 1024;
+/// TCP buffers: the receive window is what a connection can have in
+/// flight, so its rate is at most window / round trip (64 KiB at 40 ms:
+/// 13 Mb/s); 2 MiB makes a few hundred Mb/s possible (window scaling is on
+/// past 64 KiB).
+const TCP_RX_BUF: usize = 2 * 1024 * 1024;
+const TCP_TX_BUF: usize = 256 * 1024;
 /// Echo request payload, and echo replies kept for the pings waiting.
 const PING_DATA: [u8; 32] = *b"nxk ping 0123456789abcdefghijklm";
 const PONGS_MAX: usize = 64;
@@ -299,8 +304,8 @@ fn receive(k: usize, eth: u32, q: Frames, notif: u32) {
 impl Net {
     fn new_tcp(&mut self) -> SocketHandle {
         let s = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_BUF]),
-            tcp::SocketBuffer::new(vec![0; TCP_BUF]),
+            tcp::SocketBuffer::new(vec![0; TCP_RX_BUF]),
+            tcp::SocketBuffer::new(vec![0; TCP_TX_BUF]),
         );
         self.sockets.add(s)
     }
