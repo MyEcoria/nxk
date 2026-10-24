@@ -1,0 +1,7 @@
+[package]
+name = "nxh264"
+version = "0.1.0"
+edition = "2021"
+description = "H.264 decoder for nxk: High profile, CABAC, 8x8 transform, I and P slices, progressive 4:2:0 (cargo test on the PC)"
+
+[dependencies]

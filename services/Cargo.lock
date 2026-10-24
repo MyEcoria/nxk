@@ -522,6 +522,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxh264"
+version = "0.1.0"
+
+[[package]]
 name = "nxhttp"
 version = "0.1.0"
 dependencies = [
