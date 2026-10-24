@@ -41,6 +41,14 @@ fn main() {
             return;
         }
     };
+    let crc = !data.iter().fold(!0u32, |c, &b| {
+        let mut c = c ^ b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        c
+    });
+    println!("h264bench: file crc32 {:08x}", crc);
     let aus = access_units(&data);
     println!(
         "h264bench: {} access units, {} KB",
@@ -52,11 +60,16 @@ fn main() {
         dec.threads = threads;
         let (mut frames, mut errors) = (0u32, 0u32);
         let t = Instant::now();
-        for au in &aus {
+        for (i, au) in aus.iter().enumerate() {
             match dec.decode(au) {
                 Ok(Some(_)) => frames += 1,
                 Ok(None) => {}
-                Err(_) => errors += 1,
+                Err(e) => {
+                    errors += 1;
+                    if errors <= 3 {
+                        println!("h264bench: access unit {}: {:?}", i, e);
+                    }
+                }
             }
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;

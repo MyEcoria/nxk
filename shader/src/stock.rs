@@ -21,7 +21,8 @@ pub fn fullscreen_vertex() -> Program {
 
 /// Fragment shader of a video pass over the panel (a 720 x 1280 target:
 /// the panel shows the landscape picture turned a quarter, so pixel
-/// `(px, py)` of the target is column `py`, row `px` of the picture).
+/// `(px, py)` of the target is column `width - 1 - py`, row `px` of the
+/// picture).
 /// Varying 0 holds the pixel's (u, v), 0..1 across columns and rows. The
 /// planes of a `src_w` x `src_h` I420 picture are bound as buffers 0 (Y,
 /// rows of `y_stride` bytes), 1 (U) and 2 (V, rows of `uv_stride` bytes),
@@ -33,7 +34,9 @@ pub fn yuv420_fragment(src_w: u32, src_h: u32, y_stride: u32, uv_stride: u32) ->
     let (u, v) = (b.input(0, 0), b.input(0, 1));
     // Picture column from the target's row fraction v, picture row from u.
     let (fw, fh) = (b.f32(src_w as f32), b.f32(src_h as f32));
-    let (cx, cy) = (b.fmul(v, fw), b.fmul(u, fh));
+    // The panel's rows run the picture's columns backwards (seen on the console).
+    let vw = b.fmul(v, fw);
+    let (cx, cy) = (b.fsub(fw, vw), b.fmul(u, fh));
     let (xi, yi) = (b.f2i(cx), b.f2i(cy));
     let (zero, wmax, hmax) = (b.i32(0), b.i32(src_w as i32 - 1), b.i32(src_h as i32 - 1));
     let (xi, yi) = (b.imax(xi, zero), b.imax(yi, zero));
@@ -240,7 +243,7 @@ mod tests {
                 m.inputs[0][0] = uu.to_bits();
                 m.inputs[0][1] = vv.to_bits();
                 let o = run(&p, &mut m);
-                let sx = ((vv * w as f32) as u32).min(w - 1);
+                let sx = (((1.0 - vv) * w as f32) as u32).min(w - 1);
                 let sy = ((uu * h as f32) as u32).min(h - 1);
                 let want = reference(
                     yp[(sy * ys + sx) as usize],

@@ -281,13 +281,14 @@ pub struct DisplayConfig {
 }
 
 impl Default for DisplayConfig {
-    /// The console's panel, and a bit rate cap below the desktop client's 20 Mbit/s: the server sends
-    /// 1080p whatever is announced, and the decoder's cost follows the bit rate.
+    /// The console's panel at 30 Hz (the decoder cannot follow 60 on the A57), and a bit rate cap
+    /// below the desktop client's 20 Mbit/s: the server sends 1080p whatever is announced, and the
+    /// decoder's cost follows the bit rate.
     fn default() -> Self {
         Self {
             width: 1280,
             height: 720,
-            refresh_rate: 60,
+            refresh_rate: 30,
             min_bits_per_second: 2_000_000,
             max_bits_per_second: 12_000_000,
             start_bits_per_second: 6_000_000,
