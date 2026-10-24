@@ -1,7 +1,8 @@
 //! net: TCP/IP stack (smoltcp) over one link at a time (`net` protocol):
-//! the PC's connection shared over USB-C ("usb0"), a USB Ethernet adapter
-//! ("eth0"), then Wi-Fi ("wlan0"), the first with a carrier. DHCP/DNS
-//! plus deferred replies for connect/accept/receive/resolve.
+//! Wi-Fi ("wlan0"), the PC's connection shared over USB-C ("usb0") and a
+//! USB Ethernet adapter ("eth0"), the first with a carrier in the order
+//! `PREFER` sets (Wi-Fi first by default). DHCP/DNS plus deferred replies
+//! for connect/accept/receive/resolve.
 
 #![no_std]
 #![no_main]
@@ -55,17 +56,25 @@ static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// may be another one once it is back.
 static LINK_DOWN: AtomicU64 = AtomicU64::new(0);
 
-/// Links in order of preference: name, `LINK_*`, wired.
-const LINKS: [(&str, u64, bool); 3] = [
-    ("usb0", proto::LINK_USB0, true),
-    ("eth0", proto::LINK_ETH0, true),
-    ("wlan0", proto::LINK_WLAN0, false),
+/// The links: name and `LINK_*`.
+const LINKS: [(&str, u64); 3] = [
+    ("usb0", proto::LINK_USB0),
+    ("eth0", proto::LINK_ETH0),
+    ("wlan0", proto::LINK_WLAN0),
 ];
+/// `LINKS` indices in order of preference, for each `PREF_*`.
+const ORDER_WIFI: [usize; 3] = [2, 0, 1];
+const ORDER_WIRED: [usize; 3] = [0, 1, 2];
 /// How often links are looked up and their carriers asked.
 const LINK_CHECK_NS: u64 = 2_000_000_000;
-/// A wired link without a DHCP address this long gives way to another
-/// (a PC that does not share its connection), until its carrier drops.
-const WIRED_DHCP_NS: u64 = 10_000_000_000;
+/// A link without a DHCP address this long gives way to another (a PC
+/// that does not share its connection, a Wi-Fi network without DHCP),
+/// until its carrier drops.
+const DHCP_GIVE_UP_NS: u64 = 10_000_000_000;
+/// A better link takes over from the one in use once its carrier has been
+/// up this long: a Wi-Fi blip would otherwise cost two switches, and each
+/// one aborts every connection.
+const SETTLE_NS: u64 = 5_000_000_000;
 /// DHCP retransmissions: a lost first DISCOVER (the port is often not
 /// open yet right after a Wi-Fi join) costs 2 s, not smoltcp's 10.
 const DHCP_RETRY: Duration = Duration::from_secs(2);
@@ -227,6 +236,11 @@ struct Net {
     /// `LINKS` index in use and since when.
     active: Option<usize>,
     since: u64,
+    /// `PREF_*`: which links come first.
+    pref: u64,
+    /// The preference just changed: take the best link now, not once it
+    /// has settled.
+    retarget: bool,
     rxq: Frames,
     notif: u32,
 }
@@ -240,6 +254,8 @@ struct Link {
     carrier: bool,
     /// Gave way for want of a DHCP address; cleared when the carrier drops.
     skipped: bool,
+    /// When the carrier came up (ns).
+    up_since: u64,
 }
 
 /// Receive thread of link `k`: blocks on its driver, queues frames and
@@ -647,8 +663,26 @@ impl Net {
                     .unwrap_or((0, 0));
                 let g = self.gateway.map(|g| u32::from(g) as u64).unwrap_or(0);
                 let d = self.dns_server.map(|d| u32::from(d) as u64).unwrap_or(0);
-                Ok(Msg::from_words(0, &[a, p, g, d]))
+                Ok(Msg::from_words(0, &[a, p, g, d, self.pref]))
             }
+            proto::PREFER => match m.mr[0] {
+                0 => Ok(Msg::from_words(0, &[self.pref])),
+                v @ (proto::PREF_WIFI | proto::PREF_WIRED) => {
+                    if v != self.pref {
+                        println!(
+                            "[net] links preferred: {}",
+                            if v == proto::PREF_WIFI {
+                                "Wi-Fi"
+                            } else {
+                                "wired"
+                            }
+                        );
+                        (self.pref, self.retarget) = (v, true);
+                    }
+                    Ok(Msg::from_words(0, &[self.pref]))
+                }
+                _ => Err(-EINVAL),
+            },
             proto::STATS => {
                 let open = self.table.iter().filter(|s| s.is_some()).count();
                 let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
@@ -872,7 +906,7 @@ impl Net {
     /// Look links up, ask their carriers, and run on the best one.
     fn check_links(&mut self, now: u64) {
         let down = LINK_DOWN.swap(0, Ordering::Relaxed);
-        for (k, &(name, _, _)) in LINKS.iter().enumerate() {
+        for (k, &(name, _)) in LINKS.iter().enumerate() {
             let l = &mut self.links[k];
             if l.handle == 0 {
                 let Ok(h) = ns::lookup(name) else { continue };
@@ -891,6 +925,8 @@ impl Net {
             let carrier = carrier && down & (1 << k) == 0;
             if !carrier {
                 l.skipped = false;
+            } else if !l.carrier {
+                l.up_since = now;
             }
             (l.mac, l.carrier) = (mac, carrier);
         }
@@ -898,19 +934,34 @@ impl Net {
             println!("[net] link down: DHCP starts over");
             self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).reset();
         }
-        // A wired link the PC does not share gives way to another one.
+        // A link without an address (a PC that does not share its
+        // connection, a network without DHCP) gives way to another one.
         if let Some(k) = self.active {
             let others = (0..LINKS.len()).any(|j| j != k && self.links[j].carrier);
-            if LINKS[k].2 && self.addr.is_none() && others && now > self.since + WIRED_DHCP_NS {
-                println!(
-                    "[net] {}: no DHCP answer, not shared: moving on",
-                    LINKS[k].0
-                );
+            if self.addr.is_none() && others && now > self.since + DHCP_GIVE_UP_NS {
+                println!("[net] {}: no DHCP answer: moving on", LINKS[k].0);
                 self.links[k].skipped = true;
             }
         }
-        let best = (0..LINKS.len()).find(|&k| self.links[k].carrier && !self.links[k].skipped);
-        if best != self.active {
+        let usable = |l: &Link| l.carrier && !l.skipped;
+        let order = if self.pref == proto::PREF_WIFI {
+            ORDER_WIFI
+        } else {
+            ORDER_WIRED
+        };
+        let best = order.into_iter().find(|&k| usable(&self.links[k]));
+        // The link in use keeps its place until a better one has settled.
+        let hold = match (self.active, best) {
+            (Some(a), Some(b)) => {
+                a != b
+                    && usable(&self.links[a])
+                    && !self.retarget
+                    && now < self.links[b].up_since + SETTLE_NS
+            }
+            _ => false,
+        };
+        self.retarget = false;
+        if !hold && best != self.active {
             self.switch(best, now);
         }
     }
@@ -1085,6 +1136,8 @@ fn main() -> i32 {
         links: Default::default(),
         active: None,
         since: 0,
+        pref: proto::PREF_WIFI,
+        retarget: false,
         rxq,
         notif,
     };
@@ -1093,7 +1146,7 @@ fn main() -> i32 {
     let mut next_check = 0;
     loop {
         let now_ns = time::now_ns();
-        if now_ns >= next_check || LINK_DOWN.load(Ordering::Relaxed) != 0 {
+        if now_ns >= next_check || net.retarget || LINK_DOWN.load(Ordering::Relaxed) != 0 {
             net.check_links(now_ns);
             next_check = now_ns + LINK_CHECK_NS;
         }
