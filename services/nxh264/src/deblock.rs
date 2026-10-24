@@ -332,7 +332,7 @@ fn deblock_mb(c: &Ctx, mx: usize, my: usize) {
 /// until row `y - 1` has filtered the macroblocks up to `x + 1` (its top
 /// edge reads and changes samples that macroblock's left edge changes
 /// too); a row's own macroblocks go in order.
-pub fn deblock_picture(pic: &mut Picture, threads: usize) {
+pub fn deblock_picture(pic: &mut Picture, threads: usize, hook: Option<fn()>) {
     let (w, h) = (pic.mb_width, pic.mb_height);
     let ctx = Ctx {
         y: Px(pic.y.data.as_mut_ptr()),
@@ -383,7 +383,12 @@ pub fn deblock_picture(pic: &mut Picture, threads: usize) {
     };
     std::thread::scope(|sc| {
         for _ in 1..workers {
-            sc.spawn(work);
+            sc.spawn(|| {
+                if let Some(h) = hook {
+                    h();
+                }
+                work()
+            });
         }
         work();
     });

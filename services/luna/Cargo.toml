@@ -9,6 +9,7 @@ lunacore = { path = "../lunacore" }
 nxhttp = { path = "../nxhttp" }
 nxdtls = { path = "../nxdtls" }
 nxopus = { path = "../nxopus" }
+nxh264 = { path = "../nxh264" }
 prost = "0.14"
 nxsvc = { path = "../nxsvc" }
 nxgfx = { path = "../../jeux/nxgfx" }

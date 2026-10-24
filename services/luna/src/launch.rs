@@ -19,18 +19,17 @@ use lunacore::stream::input::{
     GamePadConnection, GamePadEvent, GamePadKind, GamePadState, InputEvent,
 };
 use lunacore::stream::Secret;
-use nxsvc::screen::Screen;
 use nxsvc::{Catalog, State};
 use serde_json::{json, Value};
 
 use crate::api::{Api, Result};
-use crate::{pad, store, stream};
+use crate::{pad, present::Presenter, store, stream, video};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const END_TIMEOUT: Duration = Duration::from_secs(3);
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SIDE: (u32, u32) = (1280, 720);
-/// A dark screen while the picture is not decoded yet.
+/// A dark screen until the first picture is decoded.
 const WAIT_COLOR: u32 = 0x101820;
 
 /// A launch running; `stop` ends it.
@@ -218,15 +217,17 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         session_id: g.session_id.clone().ok_or("no session id")?,
         token: Secret::new(g.auth_token.clone().unwrap_or_default()),
     };
-    let mut screen = Screen::take().map_err(|e| format!("no screen ({})", e))?;
+    let mut screen = Presenter::open().map_err(|e| format!("no screen ({})", e))?;
     let _ = screen.show_color(WAIT_COLOR);
+    let shared = Arc::new(video::Shared::default());
+    let video_out = shared.clone();
     cat.set_state(State::Playing);
     let (tx, rx) = channel();
     let ended = Arc::new(AtomicBool::new(false));
     let (e2, stop_flag) = (ended.clone(), Arc::new(AtomicBool::new(false)));
     let s2 = stop_flag.clone();
     let runner = std::thread::spawn(move || {
-        let r = stream::run(&target, &rx, &s2);
+        let r = stream::run(&target, &rx, &s2, video_out);
         e2.store(true, Ordering::Relaxed);
         r
     });
@@ -240,7 +241,13 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         if stop.load(Ordering::Relaxed) {
             stop_flag.store(true, Ordering::Relaxed);
         }
-        if let Some(ev) = screen.event_words(10_000_000) {
+        // The newest picture, at the next vertical blank (this call sets the pace).
+        if let Some(pic) = shared.take_latest() {
+            if let Err(e) = screen.show(&pic) {
+                println!("luna: showing a picture: {}", e);
+            }
+        }
+        if let Some(ev) = screen.poll(2_000_000) {
             if pad::apply(&mut state, &ev) {
                 packet += 1;
                 let _ = tx.send(InputEvent::GamePad(GamePadEvent {
@@ -253,7 +260,7 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         }
     }
     let r = runner.join().map_err(|_| "the stream thread failed")?;
-    screen.release();
+    drop(screen);
     match r? {
         stream::End::Stopped | stream::End::Closed => Ok(()),
     }

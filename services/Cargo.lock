@@ -430,6 +430,7 @@ dependencies = [
  "lunacore",
  "nxdtls",
  "nxgfx",
+ "nxh264",
  "nxhttp",
  "nxk-abi",
  "nxopus",

@@ -84,6 +84,8 @@ pub struct Decoder {
     pub deblock: bool,
     /// Threads to decode the slices of a picture with (1: this one).
     pub threads: usize,
+    /// Run first by every thread the decoder starts (to set its priority).
+    pub worker_hook: Option<fn()>,
     /// Time spent in slices and in the deblocking filter, nanoseconds.
     pub slice_ns: u64,
     pub deblock_ns: u64,
@@ -96,6 +98,7 @@ impl Decoder {
             pps: vec![None; 256],
             deblock: true,
             threads: 1,
+            worker_hook: None,
             ..Self::default()
         }
     }
@@ -268,9 +271,15 @@ impl Decoder {
             if workers == 1 {
                 work();
             } else {
+                let hook = self.worker_hook;
                 std::thread::scope(|sc| {
                     for _ in 1..workers {
-                        sc.spawn(work);
+                        sc.spawn(|| {
+                            if let Some(h) = hook {
+                                h();
+                            }
+                            work()
+                        });
                     }
                     work();
                 });
@@ -283,7 +292,7 @@ impl Decoder {
         }
         if self.deblock {
             let t = std::time::Instant::now();
-            deblock::deblock_picture(&mut pic, self.threads);
+            deblock::deblock_picture(&mut pic, self.threads, self.worker_hook);
             self.deblock_ns += t.elapsed().as_nanos() as u64;
         }
         let pic = Arc::new(pic);

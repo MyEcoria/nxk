@@ -714,6 +714,16 @@ impl Graphics {
         f
     }
 
+    /// The next input event as the words `input::READ` gives (kind, code,
+    /// value, x, y, source), waiting at most `timeout_ns` (0: for good).
+    pub fn poll_words(&self, timeout_ns: u64) -> Option<[u64; 6]> {
+        let r = self
+            .link
+            .call(&Msg::from_words(display::EVENT, &[timeout_ns]))
+            .ok()?;
+        Some(r.mr)
+    }
+
     /// The next input event, waiting at most `timeout_ns` (0: for good).
     pub fn poll(&self, timeout_ns: u64) -> Option<Event> {
         let r = self

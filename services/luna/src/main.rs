@@ -1,7 +1,8 @@
+#![feature(nxk_ext)]
 //! Amazon Luna as a game catalog of nxk (`abi::proto::provider`): the
 //! sign-in by code, the games the account can play and their covers, and
-//! playing them: the cloud session, the stream, the gamepad (the picture and
-//! the sound are not decoded yet). The Amazon domain of the account is
+//! playing them: the cloud session, the stream, the gamepad, the sound and
+//! the picture (decoded by `nxh264`, shown by the GPU). The Amazon domain of the account is
 //! `domain=` in this catalog's `service.txt` (amazon.com by default).
 
 mod account;
@@ -10,6 +11,7 @@ mod audio;
 mod launch;
 mod pad;
 mod player;
+mod present;
 mod qr;
 mod store;
 mod stream;

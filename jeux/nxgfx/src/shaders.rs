@@ -40,6 +40,12 @@ impl Buffer {
         self.mem.is_empty()
     }
 
+    /// Overwrite bytes from byte `at` with one copy (the GPU must be
+    /// idle: between frames).
+    pub fn write_bytes(&self, at: usize, data: &[u8]) {
+        self.mem.write(at, data);
+    }
+
     /// Overwrite words from word `first` (the GPU must be idle: between
     /// frames).
     pub fn write_words(&self, first: usize, w: &[u32]) {

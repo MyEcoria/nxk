@@ -2,8 +2,8 @@
 //! SPP over it, the setup of `main` and of every channel the server
 //! announces, then the gamepad sent on `input` and the rest kept alive
 //! (acks, time requests, RTCP, pongs). Audio messages go to the player
-//! (`audio`); display messages are answered and counted (`video`):
-//! decoding them comes later.
+//! (`audio`); display messages are answered and their frames handed to a
+//! decoder thread (`video`).
 
 use std::collections::{HashMap, VecDeque};
 use std::net::UdpSocket;
@@ -444,7 +444,12 @@ fn main_message(frame: &Frame) -> Option<Msg> {
 
 /// Connects, sets the session up, then runs until `stop` or the server
 /// closes it; gamepad events come on `input`.
-pub fn run(t: &Target, input: &Inbox<InputEvent>, stop: &AtomicBool) -> Result<End> {
+pub fn run(
+    t: &Target,
+    input: &Inbox<InputEvent>,
+    stop: &AtomicBool,
+    video: std::sync::Arc<crate::video::Shared>,
+) -> Result<End> {
     let link = connect(t)?;
     let mut s = Session {
         link,
@@ -501,7 +506,7 @@ pub fn run(t: &Target, input: &Inbox<InputEvent>, stop: &AtomicBool) -> Result<E
     let list: Vec<&str> = s.names.values().map(String::as_str).collect();
     println!("luna: channels {:?}", list);
     let input_id = s.names.iter().find(|(_, n)| *n == "input").map(|(i, _)| *i);
-    streaming(&mut s, main, input_id, input, stop)
+    streaming(&mut s, main, input_id, input, stop, video)
 }
 
 fn pong(link: &mut Link, main: u8, ping: Option<i64>) -> Result<()> {
@@ -526,6 +531,7 @@ fn streaming(
     input_id: Option<u8>,
     input: &Inbox<InputEvent>,
     stop: &AtomicBool,
+    shared: std::sync::Arc<crate::video::Shared>,
 ) -> Result<End> {
     let mut counts: HashMap<u8, (u64, u64)> = HashMap::new();
     let audio_id = s.names.iter().find(|(_, n)| *n == "audio").map(|(i, _)| *i);
@@ -535,7 +541,7 @@ fn streaming(
         .iter()
         .find(|(_, n)| n.starts_with("display"))
         .map(|(i, _)| *i);
-    let mut video = crate::video::Video::default();
+    let mut video = crate::video::Video::new(shared);
     s.link.stats.audio_channel = audio_id;
     // The player orders audio by frame_index: SPP holding a missing
     // message would only delay every packet behind it.
