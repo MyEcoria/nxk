@@ -1565,6 +1565,20 @@ within 5 s.
     a second retransmission of a fragment lost twice; the FEC packets are the
     next thing to try.
 
+63. 24/10/2026, same console and image as run 62, `fs` replaced in place
+    (`usbterm.py --reload fs`, the fix of `388a2b7`): **a 17 MiB file reads
+    right**. The fault of run 62 was in `fs`'s cache, not the card: a
+    readahead batch could pick the same cache slot twice (the clock scan
+    wrapped when every other slot was marked used), leaving a stale tag
+    that later returned other sectors' bytes (damaged sectors 2048 apart,
+    the slot count; copies of other sectors of the file). `stdtest bigfile
+    write /bigpat.bin 17` (a pattern file, every sector unique) then
+    `verify` 6 passes with `fs::read` and 3 passes in 3 KiB reads: 0 bad
+    sectors in 9. The old `fs` was not measured on this pattern on the
+    console (the emulator: 91 bad sectors in 12 passes before, 0 after).
+    The shell's own `sync` failed with EPIPE once (its handle was the old
+    `fs`'s), the next command worked; `luna` and `display` kept running.
+
 62. 24/10/2026, same console and image as run 61 (gauge 67-69 %, plugged),
     `nxh264` and the GPU pass in `luna`: **the stream's picture shows on the
     panel**, with its sound. First attempt: mirrored (the panel's rows run the
