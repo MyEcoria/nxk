@@ -304,9 +304,16 @@ front of it (a late frame is dropped and a key frame asked). The newest
 picture is written as its three planes into GPU buffers and one fullscreen
 pass (`nxk_shader::stock::yuv420_fragment`: BT.709 limited range as the
 desktop client, nearest sample, the panel's quarter turn) draws it, so the
-CPU never touches the pixels. On the PC, one thread, 1080p: 15 ms a frame
-on a 15 Mbit/s motion clip, 6.5 on the idle stream (7 and 4.8 ms on four
-threads); the Erista's numbers and the picture itself are not measured yet. The serial and the tokens are `state.json` in
+CPU never touches the pixels. The interpolation, the deblocking filters and
+the inverse transforms are NEON (the portable code is the oracle,
+`h264bench selftest`), luna raises the CPU to the highest step `cpufreq`
+accepts for the length of a stream and announces 30 Hz (the server then
+sends about 29 frames a second). Measured: on the Erista a 15 Mbit/s 1080p
+motion clip decodes in 21 ms a frame on four threads at 1219 MHz (64 ms on
+one; 54 ms on four at the boot clock before the NEON code); live, Avatar's
+menus decode in 15.6 ms on average. The picture is upright and its colours
+match the desktop client's. Frames lost on the network cost a freeze until
+the server's next key frame. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 

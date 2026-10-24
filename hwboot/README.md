@@ -1550,6 +1550,30 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+62. 24/10/2026, same console and image as run 61 (gauge 67-69 %, plugged),
+    `nxh264` and the GPU pass in `luna`: **the stream's picture shows on the
+    panel**, with its sound. First attempt: mirrored (the panel's rows run the
+    picture's columns backwards; one subtraction in the shader), then upright
+    (Avatar's logos, title screen and menu read right, the colours match the
+    desktop client). Announced at 60 Hz the server sent about 60 frames a
+    second and the decoder (21 ms a frame with three threads at the boot
+    clock) fell behind; announced at 30 Hz it sends about 29, which it
+    honours. The CPU runs at 998 MHz (boot clock); `cores 1-3` showed "off"
+    after hours idle (with them asleep the decoder's threads gained nothing:
+    `cores f`). `h264bench` on 60 frames of a 15 Mbit/s 1080p x264 clip, ms
+    a frame: at the boot clock one thread 185 and four threads 54 (the PC:
+    17.8 and 7.5, a factor 10 and 7); with NEON luma interpolation and
+    deblocking (16x16 block: 6-21 us before, 0.14-1.4 us after) and NEON
+    inverse transforms, at 1219 MHz: one thread 64, four threads 21 (47
+    frames/s). Live with four threads, the CPU at 1224 MHz for the stream
+    and 30 Hz: 15.6 ms a frame on average, 34 at most, none dropped; what
+    remains are lost frames on the network (4 %), each followed by a freeze
+    until the next key frame. The CPU goes back to 998 MHz at the end of the
+    stream (45 C, fan 22 %). Reading a 17 MB file from the card gave different
+    bytes at every read (three CRCs, none the PC's) while a 1.5 MB file
+    read right every time: a separate fault of the card's read path, not
+    looked into.
+
 61. 24/10/2026, Erista (gauge 15 %, plugged), rebooted, Luna of
     `9031b1e` put in `/services/luna/` over USB-C (3.1 MB in 8.4 s, after
     L had ended the old one): **the covers show**. The `HTTP 400` of runs
