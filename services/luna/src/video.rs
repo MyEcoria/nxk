@@ -16,8 +16,9 @@ use nxh264::{Decoder, Picture};
 /// Frames waiting for the decoder: more than this are dropped, and the
 /// next key frame resumes.
 const QUEUE: usize = 6;
-/// Threads the decoder uses for a picture (slices, then the filter).
-const DECODER_THREADS: usize = 3;
+/// Threads the decoder uses for a picture (slices, then the filter): the
+/// four slices of a picture on the four cores, below the other threads.
+const DECODER_THREADS: usize = 4;
 /// The decoder runs below the stream and audio threads (default 16).
 const DECODER_PRIORITY: u8 = 20;
 

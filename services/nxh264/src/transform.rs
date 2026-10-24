@@ -21,8 +21,7 @@ const V8: [[i32; 6]; 6] = [
     [36, 32, 58, 34, 46, 43],
 ];
 
-#[inline]
-fn class4(i: usize) -> usize {
+const fn class4(i: usize) -> usize {
     let (r, c) = (i >> 2, i & 3);
     if r & 1 == 0 && c & 1 == 0 {
         0
@@ -33,8 +32,7 @@ fn class4(i: usize) -> usize {
     }
 }
 
-#[inline]
-fn class8(i: usize) -> usize {
+const fn class8(i: usize) -> usize {
     let (r, c) = (i >> 3, i & 7);
     if r % 4 == 0 && c % 4 == 0 {
         0
@@ -51,33 +49,78 @@ fn class8(i: usize) -> usize {
     }
 }
 
+/// `V4[m][class(i)]` for every raster position: one multiplier a position.
+static SCALE4: [[i32; 16]; 6] = {
+    let mut t = [[0; 16]; 6];
+    let mut m = 0;
+    while m < 6 {
+        let mut i = 0;
+        while i < 16 {
+            t[m][i] = V4[m][class4(i)];
+            i += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
+static SCALE8: [[i32; 64]; 6] = {
+    let mut t = [[0; 64]; 6];
+    let mut m = 0;
+    while m < 6 {
+        let mut i = 0;
+        while i < 64 {
+            t[m][i] = V8[m][class8(i)];
+            i += 1;
+        }
+        m += 1;
+    }
+    t
+};
+
 /// Scales a 4x4 block of levels (raster order) in place; with `skip_dc` the
 /// first coefficient is left alone (it was scaled with the DC transform).
 pub fn scale_4x4(c: &mut [i32; 16], qp: i32, skip_dc: bool) {
     let (m, q) = ((qp % 6) as usize, qp / 6);
-    for (i, v) in c.iter_mut().enumerate() {
-        if skip_dc && i == 0 {
-            continue;
-        }
-        *v = (*v * V4[m][class4(i)]) << q;
+    let dc = c[0];
+    let t = &SCALE4[m];
+    for i in 0..16 {
+        c[i] = (c[i] * t[i]) << q;
+    }
+    if skip_dc {
+        c[0] = dc;
     }
 }
 
 /// Scales an 8x8 block of levels (raster order) in place.
 pub fn scale_8x8(c: &mut [i32; 64], qp: i32) {
     let (m, q) = ((qp % 6) as usize, qp / 6);
-    for (i, v) in c.iter_mut().enumerate() {
-        let x = *v * V8[m][class8(i)];
-        *v = if q >= 2 {
-            x << (q - 2)
-        } else {
-            (x + (1 << (1 - q))) >> (2 - q)
-        };
+    let t = &SCALE8[m];
+    if q >= 2 {
+        for i in 0..64 {
+            c[i] = (c[i] * t[i]) << (q - 2);
+        }
+    } else {
+        for i in 0..64 {
+            c[i] = (c[i] * t[i] + (1 << (1 - q))) >> (2 - q);
+        }
     }
 }
 
 /// Inverse 4x4 transform of scaled levels, added to the samples at `o`.
 pub fn idct_4x4_add(c: &[i32; 16], dst: &mut [u8], o: usize, stride: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(o + 3 * stride + 4 <= dst.len());
+        // SAFETY: four rows of four bytes from `o` were just checked to be inside `dst`.
+        unsafe { crate::neon::idct4_add(c, dst.as_mut_ptr().add(o), stride) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    idct_4x4_add_portable(c, dst, o, stride)
+}
+
+/// The portable inverse 4x4 transform (the oracle of the NEON one).
+pub fn idct_4x4_add_portable(c: &[i32; 16], dst: &mut [u8], o: usize, stride: usize) {
     let mut t = [0i32; 16];
     for i in 0..4 {
         let r = &c[i * 4..i * 4 + 4];
@@ -136,6 +179,18 @@ fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
 
 /// Inverse 8x8 transform of scaled levels, added to the samples at `o`.
 pub fn idct_8x8_add(c: &[i32; 64], dst: &mut [u8], o: usize, stride: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(o + 7 * stride + 8 <= dst.len());
+        // SAFETY: eight rows of eight bytes from `o` were just checked to be inside `dst`.
+        unsafe { crate::neon::idct8_add(c, dst.as_mut_ptr().add(o), stride) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    idct_8x8_add_portable(c, dst, o, stride)
+}
+
+/// The portable inverse 8x8 transform (the oracle of the NEON one).
+pub fn idct_8x8_add_portable(c: &[i32; 64], dst: &mut [u8], o: usize, stride: usize) {
     let mut t = [0i32; 64];
     for i in 0..8 {
         let r: [i32; 8] = c[i * 8..i * 8 + 8].try_into().unwrap();

@@ -411,3 +411,137 @@ pub unsafe fn chroma_v8(d: *mut u8, o: usize, stride: usize, l: &Lanes) {
         *p = nq0[i];
     }
 }
+
+// ---- the inverse transforms
+
+#[inline(always)]
+unsafe fn transpose4(r: [int32x4_t; 4]) -> [int32x4_t; 4] {
+    let t0 = vtrnq_s32(r[0], r[1]);
+    let t1 = vtrnq_s32(r[2], r[3]);
+    [
+        vcombine_s32(vget_low_s32(t0.0), vget_low_s32(t1.0)),
+        vcombine_s32(vget_low_s32(t0.1), vget_low_s32(t1.1)),
+        vcombine_s32(vget_high_s32(t0.0), vget_high_s32(t1.0)),
+        vcombine_s32(vget_high_s32(t0.1), vget_high_s32(t1.1)),
+    ]
+}
+
+/// The 4-point inverse transform across four vectors (lane `j` of each is one column's input).
+#[inline(always)]
+unsafe fn butterfly4(a: [int32x4_t; 4]) -> [int32x4_t; 4] {
+    let e0 = vaddq_s32(a[0], a[2]);
+    let e1 = vsubq_s32(a[0], a[2]);
+    let e2 = vsubq_s32(vshrq_n_s32::<1>(a[1]), a[3]);
+    let e3 = vaddq_s32(a[1], vshrq_n_s32::<1>(a[3]));
+    [
+        vaddq_s32(e0, e3),
+        vaddq_s32(e1, e2),
+        vsubq_s32(e1, e2),
+        vsubq_s32(e0, e3),
+    ]
+}
+
+/// Inverse 4x4 transform of scaled levels (raster order), added to the
+/// samples at `dst`, rows `stride` apart.
+///
+/// # Safety
+/// Four rows of four bytes from `dst` are valid for reading and writing.
+pub unsafe fn idct4_add(c: &[i32; 16], dst: *mut u8, stride: usize) {
+    let r = [0, 4, 8, 12].map(|i| vld1q_s32(c.as_ptr().add(i)));
+    // Rows first (across the columns, so transposed), then the columns.
+    let rows = transpose4(butterfly4(transpose4(r)));
+    let h = butterfly4(rows);
+    for (i, v) in h.into_iter().enumerate() {
+        let p = dst.add(i * stride);
+        let res = vmovn_s32(vrshrq_n_s32::<6>(v));
+        let pred = vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(
+            (p as *const u32).read_unaligned(),
+        ))));
+        let sum = vqmovun_s16(vaddq_s16(pred, vcombine_s16(res, res)));
+        (p as *mut u32).write_unaligned(vget_lane_u32::<0>(vreinterpret_u32_u8(sum)));
+    }
+}
+
+#[inline(always)]
+unsafe fn transpose8_i32(m: [[int32x4_t; 2]; 8]) -> [[int32x4_t; 2]; 8] {
+    let a = transpose4([m[0][0], m[1][0], m[2][0], m[3][0]]);
+    let b = transpose4([m[0][1], m[1][1], m[2][1], m[3][1]]);
+    let c = transpose4([m[4][0], m[5][0], m[6][0], m[7][0]]);
+    let d = transpose4([m[4][1], m[5][1], m[6][1], m[7][1]]);
+    [
+        [a[0], c[0]],
+        [a[1], c[1]],
+        [a[2], c[2]],
+        [a[3], c[3]],
+        [b[0], d[0]],
+        [b[1], d[1]],
+        [b[2], d[2]],
+        [b[3], d[3]],
+    ]
+}
+
+/// The 8-point inverse transform across eight vectors.
+#[inline(always)]
+unsafe fn butterfly8(d: [int32x4_t; 8]) -> [int32x4_t; 8] {
+    let sh1 = |v: int32x4_t| vshrq_n_s32::<1>(v);
+    let sh2 = |v: int32x4_t| vshrq_n_s32::<2>(v);
+    let a0 = vaddq_s32(d[0], d[4]);
+    let a4 = vsubq_s32(d[0], d[4]);
+    let a2 = vsubq_s32(sh1(d[2]), d[6]);
+    let a6 = vaddq_s32(d[2], sh1(d[6]));
+    let b0 = vaddq_s32(a0, a6);
+    let b2 = vaddq_s32(a4, a2);
+    let b4 = vsubq_s32(a4, a2);
+    let b6 = vsubq_s32(a0, a6);
+    // a1 = -d3 + d5 - d7 - (d7 >> 1); a3 = d1 + d7 - d3 - (d3 >> 1);
+    // a5 = -d1 + d7 + d5 + (d5 >> 1); a7 = d3 + d5 + d1 + (d1 >> 1).
+    let a1 = vsubq_s32(vsubq_s32(vaddq_s32(vnegq_s32(d[3]), d[5]), d[7]), sh1(d[7]));
+    let a3 = vsubq_s32(vsubq_s32(vaddq_s32(d[1], d[7]), d[3]), sh1(d[3]));
+    let a5 = vaddq_s32(vaddq_s32(vaddq_s32(vnegq_s32(d[1]), d[7]), d[5]), sh1(d[5]));
+    let a7 = vaddq_s32(vaddq_s32(vaddq_s32(d[3], d[5]), d[1]), sh1(d[1]));
+    let b1 = vaddq_s32(a1, sh2(a7));
+    let b7 = vsubq_s32(a7, sh2(a1));
+    let b3 = vaddq_s32(a3, sh2(a5));
+    let b5 = vsubq_s32(sh2(a3), a5);
+    [
+        vaddq_s32(b0, b7),
+        vaddq_s32(b2, b5),
+        vaddq_s32(b4, b3),
+        vaddq_s32(b6, b1),
+        vsubq_s32(b6, b1),
+        vsubq_s32(b4, b3),
+        vsubq_s32(b2, b5),
+        vsubq_s32(b0, b7),
+    ]
+}
+
+/// Inverse 8x8 transform of scaled levels (raster order), added to the
+/// samples at `dst`, rows `stride` apart.
+///
+/// # Safety
+/// Eight rows of eight bytes from `dst` are valid for reading and writing.
+pub unsafe fn idct8_add(c: &[i32; 64], dst: *mut u8, stride: usize) {
+    let m: [[int32x4_t; 2]; 8] = core::array::from_fn(|i| {
+        [
+            vld1q_s32(c.as_ptr().add(i * 8)),
+            vld1q_s32(c.as_ptr().add(i * 8 + 4)),
+        ]
+    });
+    // Rows first: transposed, one butterfly over the eight rows of the transpose
+    // for each half of the lanes, and back; then the same for the columns.
+    let t = transpose8_i32(m);
+    let lo = butterfly8(core::array::from_fn(|i| t[i][0]));
+    let hi = butterfly8(core::array::from_fn(|i| t[i][1]));
+    let r = transpose8_i32(core::array::from_fn(|i| [lo[i], hi[i]]));
+    let lo = butterfly8(core::array::from_fn(|i| r[i][0]));
+    let hi = butterfly8(core::array::from_fn(|i| r[i][1]));
+    for i in 0..8 {
+        let p = dst.add(i * stride);
+        let res = vcombine_s16(
+            vmovn_s32(vrshrq_n_s32::<6>(lo[i])),
+            vmovn_s32(vrshrq_n_s32::<6>(hi[i])),
+        );
+        let pred = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p)));
+        vst1_u8(p, vqmovun_s16(vaddq_s16(pred, res)));
+    }
+}

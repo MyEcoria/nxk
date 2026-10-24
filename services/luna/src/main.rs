@@ -8,6 +8,7 @@
 mod account;
 mod api;
 mod audio;
+mod clocks;
 mod launch;
 mod pad;
 mod player;

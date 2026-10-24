@@ -128,6 +128,34 @@ fn selftest() -> bool {
             }
         }
     }
+    // The inverse transforms, on levels from small to far past anything conforming.
+    let mut idct_bad = 0;
+    for case in 0..3000 {
+        let range = [30i32, 600, 6000, 100_000][case % 4];
+        let mut c4 = [0i32; 16];
+        let mut c8 = [0i32; 64];
+        for v in c4.iter_mut().chain(c8.iter_mut()) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = if seed & 0x300 == 0 {
+                ((seed >> 12) as i32 % (2 * range + 1)) - range
+            } else {
+                0
+            };
+        }
+        let pred: Vec<u8> = (0..16 * 16).map(|i| (i * 7 + case) as u8).collect();
+        let (mut a, mut b) = (pred.clone(), pred.clone());
+        nxh264::transform::idct_4x4_add(&c4, &mut a, 16 + 4, 16);
+        nxh264::transform::idct_4x4_add_portable(&c4, &mut b, 16 + 4, 16);
+        idct_bad += (a != b) as usize;
+        let (mut a, mut b) = (pred.clone(), pred);
+        nxh264::transform::idct_8x8_add(&c8, &mut a, 16 + 4, 16);
+        nxh264::transform::idct_8x8_add_portable(&c8, &mut b, 16 + 4, 16);
+        idct_bad += (a != b) as usize;
+    }
+    if idct_bad != 0 {
+        println!("h264bench: inverse transforms: {} cases differ", idct_bad);
+    }
+    bad += idct_bad;
     let edges = nxh264::deblock::edge_selftest();
     if edges != 0 {
         println!("h264bench: deblocking edges: {} cases differ", edges);

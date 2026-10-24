@@ -23,7 +23,7 @@ use nxsvc::{Catalog, State};
 use serde_json::{json, Value};
 
 use crate::api::{Api, Result};
-use crate::{pad, present::Presenter, store, stream, video};
+use crate::{clocks::CpuBoost, pad, present::Presenter, store, stream, video};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const END_TIMEOUT: Duration = Duration::from_secs(3);
@@ -219,6 +219,7 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
     };
     let mut screen = Presenter::open().map_err(|e| format!("no screen ({})", e))?;
     let _ = screen.show_color(WAIT_COLOR);
+    let _boost = CpuBoost::raise();
     let shared = Arc::new(video::Shared::default());
     let video_out = shared.clone();
     cat.set_state(State::Playing);
