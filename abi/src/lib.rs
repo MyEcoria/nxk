@@ -1973,8 +1973,136 @@ pub mod proto {
         /// (`provider::KEY_ENV`), handle 0 = the endpoint (SEND). `EPERM`:
         /// not the key of the provider running, or it said hello already.
         pub const PROVIDER: u32 = 8;
+        /// A helper program `display` started (the speed test) hands over
+        /// its endpoint: word 0 = the key `display` put in its environment
+        /// (`speed::KEY_ENV`), handle 0 = the endpoint (SEND). `EPERM`: not
+        /// the key of the helper running, or it said hello already.
+        pub const HELPER: u32 = 9;
         pub const SCANOUT_BUFFERS: usize = 3;
         pub const FORMAT_RGBA8888: u64 = 1;
+    }
+    /// Speed test: `/bin/speedtest`, run by whoever shows it (the Network
+    /// page of `display`; an overlay could) with `KEY_ENV` in its
+    /// environment. It says `display::HELPER`, then serves this on its
+    /// endpoint; run by hand (no key) it prints its progress.
+    pub mod speed {
+        pub const KEY_ENV: &str = "NXK_SPEED_KEY";
+        /// words: server (an index of the program's list; 0: the first),
+        /// connections (0: its default), duration cap in ms (0: its
+        /// default). Replies once the test is under way; `EBUSY`: one runs.
+        pub const START: u32 = 1;
+        /// words: the report version known (0: none), how long to wait for
+        /// a newer one (ns, 0: answer now). Reply: word 0 = its version;
+        /// bytes = a `Report`.
+        pub const STATUS: u32 = 2;
+        /// End the test running, keeping what it measured (`ST_DONE`).
+        pub const STOP: u32 = 3;
+        pub const ST_IDLE: u64 = 0;
+        /// Connections opening (TCP, TLS, request).
+        pub const ST_CONNECTING: u64 = 1;
+        pub const ST_RUNNING: u64 = 2;
+        /// Over: the figures are the result.
+        pub const ST_DONE: u64 = 3;
+        /// Not a result: `error` says why.
+        pub const ST_FAILED: u64 = 4;
+        /// Longest wait a `STATUS` is held.
+        pub const MAX_WAIT_NS: u64 = 5_000_000_000;
+        pub const LABEL: usize = 32;
+        const WORDS: usize = 15;
+        /// A `Report`'s size in bytes.
+        pub const SIZE: usize = WORDS * 8 + LABEL;
+
+        /// What a test measured so far; rates are kbit/s, times us.
+        #[derive(Clone, Copy, Default, PartialEq, Eq)]
+        pub struct Report {
+            /// Changes with every update.
+            pub version: u64,
+            pub state: u64,
+            /// An errno when `ST_FAILED`.
+            pub error: u64,
+            /// `net::LINK_*` the test started on, and where it ended: they
+            /// differ when `net` moved to another link meanwhile.
+            pub link: u64,
+            pub link_end: u64,
+            pub conns: u64,
+            pub bytes: u64,
+            pub elapsed_ms: u64,
+            /// Over the last second.
+            pub now_kbps: u64,
+            /// Since the first byte.
+            pub avg_kbps: u64,
+            /// Best second.
+            pub peak_kbps: u64,
+            /// TCP connect, TLS handshake, request to first byte.
+            pub tcp_us: u64,
+            pub tls_us: u64,
+            pub first_byte_us: u64,
+            /// The server's index in the program's list.
+            pub server: u64,
+            /// Its name (UTF-8, zero padded).
+            pub label: [u8; LABEL],
+        }
+
+        impl Report {
+            pub fn encode(&self) -> [u8; SIZE] {
+                let w = [
+                    self.version,
+                    self.state,
+                    self.error,
+                    self.link,
+                    self.link_end,
+                    self.conns,
+                    self.bytes,
+                    self.elapsed_ms,
+                    self.now_kbps,
+                    self.avg_kbps,
+                    self.peak_kbps,
+                    self.tcp_us,
+                    self.tls_us,
+                    self.first_byte_us,
+                    self.server,
+                ];
+                let mut b = [0u8; SIZE];
+                for (i, v) in w.iter().enumerate() {
+                    b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                b[WORDS * 8..].copy_from_slice(&self.label);
+                b
+            }
+
+            pub fn decode(b: &[u8]) -> Option<Self> {
+                if b.len() < SIZE {
+                    return None;
+                }
+                let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+                let mut label = [0u8; LABEL];
+                label.copy_from_slice(&b[WORDS * 8..SIZE]);
+                Some(Self {
+                    version: w(0),
+                    state: w(1),
+                    error: w(2),
+                    link: w(3),
+                    link_end: w(4),
+                    conns: w(5),
+                    bytes: w(6),
+                    elapsed_ms: w(7),
+                    now_kbps: w(8),
+                    avg_kbps: w(9),
+                    peak_kbps: w(10),
+                    tcp_us: w(11),
+                    tls_us: w(12),
+                    first_byte_us: w(13),
+                    server: w(14),
+                    label,
+                })
+            }
+
+            /// The server's name.
+            pub fn name(&self) -> &str {
+                let n = self.label.iter().position(|&c| c == 0).unwrap_or(LABEL);
+                core::str::from_utf8(&self.label[..n]).unwrap_or("")
+            }
+        }
     }
     /// Game catalogs ("services" on screen): `/services/NAME/NAME` on the
     /// card, with `/services/NAME/service.txt` (`title=`, `color=RRGGBB`,
@@ -2209,7 +2337,8 @@ pub mod proto {
         pub const RECV_FROM: u32 = 10;
         /// bytes = hostname. Reply: word 0 = address.
         pub const RESOLVE: u32 = 11;
-        /// Reply: address, prefix length, gateway, DNS server.
+        /// Reply: address, prefix length, gateway, DNS server, link
+        /// preference (`PREF_*`).
         pub const INFO: u32 = 12;
         /// words: socket. Reply: local address and port, then remote.
         pub const ADDRS: u32 = 13;
@@ -2222,6 +2351,13 @@ pub mod proto {
         /// Reply: frames received, bytes received, frames sent, bytes
         /// sent, open sockets, link (`LINK_*`).
         pub const STATS: u32 = 16;
+        /// words: mode (`PREF_*`; 0: only ask). Reply: word 0 = the mode
+        /// now. The mode is also word 4 of `INFO`'s reply.
+        pub const PREFER: u32 = 17;
+        /// Wi-Fi first, then the USB-C network, then Ethernet (the default).
+        pub const PREF_WIFI: u64 = 1;
+        /// The USB-C network and Ethernet first, Wi-Fi last.
+        pub const PREF_WIRED: u64 = 2;
         pub const LINK_ETH0: u64 = 1;
         pub const LINK_WLAN0: u64 = 2;
         /// The USB-C port's network function (`usbcon`), shared by a PC.
