@@ -46,6 +46,16 @@ pub enum Now<T> {
     Value(T),
 }
 
+/// Ask `net` to take Wi-Fi first (`wired` false) or the wired links.
+pub fn prefer_links(wired: bool) {
+    let mode = if wired {
+        net::PREF_WIRED
+    } else {
+        net::PREF_WIFI
+    };
+    let _ = NET.call_timeout(&Msg::from_words(net::PREFER, &[mode]), CALL_NS);
+}
+
 fn ask(s: &Service, label: u32) -> Now<Msg> {
     match s.call_timeout(&Msg::new(label, 0, 0), CALL_NS) {
         Ok(m) => Now::Value(m),
@@ -322,6 +332,8 @@ pub struct Net {
     pub sockets: u64,
     /// `net::LINK_*` in use.
     pub link: u64,
+    /// `net::PREF_*` (0: net does not say).
+    pub pref: u64,
 }
 
 impl Net {
@@ -521,6 +533,7 @@ impl Data {
                     prefix: i.mr[1],
                     gateway: i.mr[2] as u32,
                     dns: i.mr[3] as u32,
+                    pref: if i.words() > 4 { i.mr[4] } else { 0 },
                     ..Net::default()
                 };
                 if let Now::Value(s) = ask(&NET, net::STATS) {

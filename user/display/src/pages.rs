@@ -447,8 +447,36 @@ impl Ui {
         let p = pal();
         let w = (W - 2 * M - GAP) / 2;
         let (xl, xr) = (M, M + w + GAP);
-        let ih = 150;
+        let ih = 198;
         titled(s, M, CY, W - 2 * M, ih, "Internet");
+        // Which links `net` takes first, and the speed test.
+        let sy = CY + 146;
+        s.label(M + 24, sy + 20, "Prefer", Face::Small, p.dim);
+        for (i, (wired, t)) in [(false, "Wi-Fi"), (true, "Wired")].into_iter().enumerate() {
+            let chosen = self.cfg.wired == wired;
+            self.chip(
+                s,
+                Id::Links(wired),
+                M + 100 + i * 112,
+                sy,
+                102,
+                40,
+                t,
+                chosen,
+                true,
+            );
+        }
+        self.button(
+            s,
+            Id::SpeedOpen,
+            W - M - 24 - 220,
+            sy,
+            220,
+            40,
+            "Speed test",
+            Tone::Accent,
+            d.active().is_some_and(|n| n.addr != 0),
+        );
         match d.active() {
             Some(n) => {
                 let t = format!(
@@ -545,7 +573,7 @@ impl Ui {
             _ => None,
         };
         for (i, t) in hint.iter().flatten().enumerate() {
-            s.label(xl + 24, y0 + 226 + i * 28, t, Face::Small, p.dim);
+            s.label(xl + 24, y0 + 206 + i * 28, t, Face::Small, p.dim);
         }
 
         titled(s, xr, y0, w, h, "Wi-Fi");
@@ -572,7 +600,7 @@ impl Ui {
         s.label(xr + 24, y0 + 72, t, Face::Small, c);
         if let Seen::Value(wf) = d.wifi {
             if matches!(wf.state, wifi::ST_CONNECTED | wifi::ST_CONNECTING) {
-                s.label(xr + 24, y0 + 112, wf.ssid(), Face::TitleB, p.text);
+                s.label(xr + 24, y0 + 108, wf.ssid(), Face::TitleB, p.text);
                 self.ssid = wf.ssid().into();
             }
             if wf.state == wifi::ST_CONNECTED {
@@ -580,7 +608,7 @@ impl Ui {
                     s,
                     xr + 24,
                     xr + w - 24,
-                    y0 + 156,
+                    y0 + 142,
                     "channel",
                     &format!("{}", wf.channel),
                     None,
@@ -589,7 +617,7 @@ impl Ui {
                     s,
                     xr + 24,
                     xr + w - 24,
-                    y0 + 186,
+                    y0 + 168,
                     "signal",
                     &format!("-{} dBm", wf.signal),
                     None,

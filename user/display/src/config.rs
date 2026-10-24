@@ -23,6 +23,8 @@ pub struct Config {
     pub flight: bool,
     /// Index in `SLEEP_MIN`.
     pub sleep: u8,
+    /// `net` takes the USB-C and Ethernet links before Wi-Fi.
+    pub wired: bool,
 }
 
 impl Config {
@@ -33,6 +35,7 @@ impl Config {
             volume: DEFAULT_VOL,
             flight: false,
             sleep: 0,
+            wired: false,
         }
     }
 
@@ -56,6 +59,7 @@ impl Config {
                 "volume" => c.volume = v.parse().unwrap_or(DEFAULT_VOL).min(100),
                 "flight" => c.flight = v == "on",
                 "sleep" => c.sleep = v.parse().unwrap_or(0).min(SLEEP_MIN.len() as u8 - 1),
+                "links" => c.wired = v == "wired",
                 _ => {}
             }
         }
@@ -67,12 +71,13 @@ impl Config {
         fs::write(
             FILE,
             format!(
-                "theme={}\nbrightness={}\nvolume={}\nflight={}\nsleep={}\n",
+                "theme={}\nbrightness={}\nvolume={}\nflight={}\nsleep={}\nlinks={}\n",
                 if self.light { "light" } else { "dark" },
                 self.brightness,
                 self.volume,
                 if self.flight { "on" } else { "off" },
-                self.sleep
+                self.sleep,
+                if self.wired { "wired" } else { "wifi" }
             )
             .as_bytes(),
         )

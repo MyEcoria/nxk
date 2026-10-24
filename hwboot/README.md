@@ -1550,6 +1550,28 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+64. 25/10/2026, same console (gauge 88-97 %, plugged), `display` and `net`
+    reloaded, `speedtest` put in `/bin`: **Wi-Fi first and the speed test**.
+    Switching tabs: the screen was frozen 2.3 s while `luna` read its 87
+    covers (each version change of its state redrew the 27 ms frame, about 74
+    times); an update that shows nothing new no longer redraws: the tab shows
+    0.06 s after the tap, the covers 1.55 s (3.8 s before), no screen capture
+    slower than 0.2 s; `luna` takes 1.3 s to say hello (0.7 s in the emulator).
+    Network: `net` now takes `wlan0` first (nxk-test, channel 6, -30 dBm):
+    the page reads `via wlan0`, 10.101.173.75, and the Wired chip moves it to
+    `usb0` (10.42.0.190, the PC's share) and back within 4 s, `nxdbg` surviving
+    both switches. `speedtest` to `proof.ovh.net/files/1Gb.dat` over Wi-Fi,
+    8 s: one connection 13.7 Mb/s, four 18.8 to 36.4 Mb/s (best second 41.6;
+    the PC's own download to OVH ran 23 Mb/s at the time), connect 15-212 ms,
+    TLS 34-68 ms. Eight connections: HTTP 429, then OVH dropped the SYNs of
+    this address for about 20 minutes (`nettest get proof.ovh.net 80 /` timed
+    out, other sites answered): four is the cap. `net` also stayed on `usb0`
+    once with Wi-Fi up (its DHCP gave way for 10 s after a chip glitch and the
+    skip stuck): a link that gave way is now tried again after 60 s. Ten
+    `luna` orphans sat in `ps` (every `--reload display` since the last reboot
+    left one: the kernel on the card has no `KILL_ON_CLOSE`), and one tap on a
+    game card (the library was showing after a reload) started a real Luna
+    session, ended by HOME ("the session could not be ended now").
 63. 24/10/2026, same console, `luna` of `35926ab`: **lost video frames are
     recovered**. In the first run of the picture (run 62) every loss froze the
     picture until the next key frame: two minutes of Avatar gave 3493 frames,

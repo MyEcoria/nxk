@@ -19,6 +19,7 @@ use crate::font::{self, Face};
 use crate::games::{Cover, GameInfo};
 use crate::playtime::Playtime;
 use crate::screen::{mix, Screen};
+use crate::speedsheet::SpeedUi;
 use crate::stats::{Cpu, Data, Fan, Gpu, Seen};
 use crate::status::{clock, gpu_mhz, wifi_connected, wifi_short};
 use crate::term::Term;
@@ -112,6 +113,11 @@ pub enum Id {
     WifiBack,
     WifiJoin,
     WifiShow,
+    /// The links `net` prefers: Wi-Fi first (false), or wired first.
+    Links(bool),
+    /// The speed test sheet: open, and start or stop the test.
+    SpeedOpen,
+    SpeedRun,
     // Controllers.
     BtPair,
     /// A paired controller, by its index in `bt_pads`.
@@ -177,6 +183,10 @@ pub enum Action {
     Scan,
     /// Join the network `Ui::take_join` hands over.
     Join,
+    /// Start a speed test (the program is started first if need be), end
+    /// the one running, or leave: the program ends.
+    SpeedStart,
+    SpeedStop,
     Retry,
     Leave,
     ClearLogs,
@@ -227,6 +237,7 @@ pub(crate) enum Sheet {
     Cpu,
     Gpu,
     Power,
+    Speed,
 }
 
 /// A place a tap or the gamepad's A acts on.
@@ -264,6 +275,7 @@ pub struct Ui {
     /// When the volume indicator hides (0: not shown).
     vol_hud: u64,
     pub(crate) wifi: WifiUi,
+    pub(crate) speed: SpeedUi,
     pub busy: bool,
     pub(crate) log_scale: usize,
     pub(crate) term_scale: usize,
@@ -352,6 +364,7 @@ impl Ui {
             toast: None,
             vol_hud: 0,
             wifi: WifiUi::new(),
+            speed: SpeedUi::new(),
             busy: false,
             log_scale: 1,
             term_scale: 1,
@@ -998,6 +1011,9 @@ impl Ui {
         if let Some(a) = self.wifi_tap(id) {
             return a;
         }
+        if let Some(a) = self.speed_tap(id) {
+            return a;
+        }
         if self.flow.is_some() {
             if let Some(a) = self.flow_tap(id) {
                 return a;
@@ -1135,6 +1151,12 @@ impl Ui {
                 })
             }
             Id::WifiOpen => return self.wifi_open(),
+            Id::Links(wired) => {
+                self.cfg.wired = wired;
+                return Some(Action::Save);
+            }
+            Id::SpeedOpen => return self.speed_open(),
+            Id::SpeedRun => {}
             Id::Retry => {
                 self.busy = true;
                 return Some(Action::Retry);
@@ -1267,6 +1289,7 @@ impl Ui {
                 Sheet::Cpu => self.cpu_sheet(s),
                 Sheet::Gpu => self.gpu_sheet(s),
                 Sheet::Power => self.power_sheet(s),
+                Sheet::Speed => self.speed_sheet(s, d),
             }
         }
         if self.modal.is_some() {

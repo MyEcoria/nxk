@@ -36,6 +36,8 @@ mod quick;
 mod screen;
 mod settings;
 mod sheets;
+mod speed;
+mod speedsheet;
 mod stats;
 mod status;
 mod term;
@@ -897,6 +899,8 @@ fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Con
             | Action::EraseSave(..)
             | Action::Service(_)
             | Action::Join
+            | Action::SpeedStart
+            | Action::SpeedStop
             | Action::Cancel => continue,
         };
         w.done.lock().push_back(done);
@@ -1499,6 +1503,8 @@ fn main() -> i32 {
     // STOP it got unanswered ends it.
     let mut services: Vec<catalog::ServiceInfo> = Vec::new();
     let mut prov: Option<catalog::Provider> = None;
+    // The speed test program, alive while its sheet is open.
+    let mut speed: Option<speed::Speed> = None;
     let (mut prov_retry_at, mut prov_fails) = (0u64, 0u32);
     let mut prov_key: Option<String> = None;
     // The version of the launch's own ST_LAUNCHING (LAUNCH's reply).
@@ -1716,6 +1722,25 @@ fn main() -> i32 {
                     q.push_back(Job::Act(Action::Flight(off)));
                     drop(q);
                     worker.wake.notify_one();
+                }
+                Some(Action::SpeedStart) => {
+                    if speed.is_none() {
+                        match speed::Speed::start(notif) {
+                            Ok(s) => speed = Some(s),
+                            Err(e) => ui.speed_gone(format!(
+                                "cannot start the test: {}",
+                                libnx::abi::err::name(e)
+                            )),
+                        }
+                    }
+                    if let Some(s) = &speed {
+                        s.begin();
+                    }
+                }
+                Some(Action::SpeedStop) => {
+                    if let Some(s) = &speed {
+                        s.end();
+                    }
                 }
                 Some(Action::Join) => {
                     if let Some((raw, psk)) = ui.take_join() {
@@ -1943,6 +1968,22 @@ fn main() -> i32 {
                 data.refresh();
                 next_refresh = now + REFRESH_NS;
                 dirty = true;
+                // `net` keeps its order of links in memory: say it again
+                // when it differs (a restart, a change from the page).
+                if let stats::Now::Value(n) = data.net {
+                    let want = if ui.cfg.wired {
+                        libnx::abi::proto::net::PREF_WIRED
+                    } else {
+                        libnx::abi::proto::net::PREF_WIFI
+                    };
+                    if n.pref != 0 && n.pref != want {
+                        stats::prefer_links(ui.cfg.wired);
+                        next_refresh = now + 300_000_000;
+                    }
+                }
+            }
+            if speed.is_some() && !ui.speed_open_now() {
+                speed = None;
             }
             let idle = matches!(data.wifi, stats::Seen::Value(w) if w.state == wifi::ST_IDLE);
             if let Some(a) = autojoin.as_mut().filter(|a| now >= a.at) {
@@ -2353,6 +2394,33 @@ fn main() -> i32 {
                     }
                 }
             }
+            if ev & speed::EV_SPEED != 0 {
+                let up = speed.as_ref().map(|s| s.take()).unwrap_or_default();
+                if let Some(r) = up.report {
+                    ui.speed_report(r);
+                    dirty = true;
+                }
+                if let Some(e) = up.start_failed {
+                    let why = if e == -libnx::abi::err::ENOENT {
+                        "speedtest is not on the card (/bin/speedtest)".into()
+                    } else {
+                        format!("cannot start the test: {}", libnx::abi::err::name(e))
+                    };
+                    ui.speed_gone(why);
+                    speed = None;
+                    dirty = true;
+                } else if let Some(e) = up.refused {
+                    ui.speed_gone(format!(
+                        "the test was refused: {}",
+                        libnx::abi::err::name(e)
+                    ));
+                    dirty = true;
+                } else if up.exit.is_some() {
+                    ui.speed_gone("the test program ended".into());
+                    speed = None;
+                    dirty = true;
+                }
+            }
             if ev & catalog::EV_PROV != 0 {
                 let now = time::now_ns();
                 let up = prov.as_ref().map(|p| p.take()).unwrap_or_default();
@@ -2657,6 +2725,24 @@ fn main() -> i32 {
                 }
             }
             proto::SCANOUT => Msg::error(-ENODEV),
+            proto::HELPER => {
+                let h = if rx.msg.handles() > 0 {
+                    ipc::received_handle(0)
+                } else {
+                    0
+                };
+                let ok = speed
+                    .as_mut()
+                    .is_some_and(|s| s.hello(rx.msg.mr[0], rx.pid, h));
+                if ok {
+                    Msg::new(0, 0, 0)
+                } else {
+                    if h != 0 {
+                        let _ = sys::handle_close(h);
+                    }
+                    Msg::error(-EPERM)
+                }
+            }
             proto::PROVIDER => {
                 let h = if rx.msg.handles() > 0 {
                     ipc::received_handle(0)
