@@ -378,7 +378,8 @@ impl Dev<'_> {
         };
         let mut sup = None;
         if security == wifi::SEC_WPA2 {
-            if !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
+            let raw_key = crypto::pmk_from_hex(psk);
+            if raw_key.is_none() && !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
                 let why = format!(
                     "passphrase of {} characters, {} to {} needed",
                     psk.len(),
@@ -388,7 +389,7 @@ impl Dev<'_> {
                 return Err((-EINVAL, why));
             }
             wpa::check_rsn(rsn).map_err(|why| (-EOPNOTSUPP, String::from(why)))?;
-            let pmk = crypto::psk(psk, ssid);
+            let pmk = raw_key.unwrap_or_else(|| crypto::psk(psk, ssid));
             sup = Some(Supplicant::new(pmk, *mac, sys::getrandom));
         }
         // Our RSN element for the association request, none for an open

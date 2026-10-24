@@ -154,6 +154,20 @@ pub fn psk(passphrase: &[u8], ssid: &[u8]) -> [u8; 32] {
     out
 }
 
+/// The 64 hexadecimal digits of a pairwise master key given as the
+/// passphrase (the form routers print it in), or `None`.
+pub fn pmk_from_hex(s: &[u8]) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (o, pair) in out.iter_mut().zip(s.chunks(2)) {
+        let digit = |c: u8| (c as char).to_digit(16);
+        *o = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Some(out)
+}
+
 /// 802.11 PRF (12.7.1.2): HMAC-SHA1(key, label || 0 || data || i) for
 /// i = 0, 1, ... until `out` is full.
 pub fn prf(key: &[u8], label: &[u8], data: &[u8], out: &mut [u8]) {
@@ -338,6 +352,19 @@ pub fn unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn raw_key_in_hex() {
+        let hex64 = b"000102030405060708090a0b0c0d0e0f101112131415161718191A1B1C1D1E1F";
+        let k = pmk_from_hex(hex64).unwrap();
+        assert_eq!(k[0], 0x00);
+        assert_eq!(k[10], 0x0a);
+        assert_eq!(k[26], 0x1a);
+        assert_eq!(k[31], 0x1f);
+        // 63 digits, a non-digit, or a passphrase of 64 letters.
+        assert!(pmk_from_hex(&hex64[1..]).is_none());
+        assert!(pmk_from_hex(&[b'g'; 64]).is_none());
+    }
 
     pub fn hex(s: &str) -> std::vec::Vec<u8> {
         (0..s.len())
