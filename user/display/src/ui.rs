@@ -288,6 +288,8 @@ pub struct Ui {
     pub(crate) focus: Option<Id>,
     focus_at: (usize, usize),
     pub(crate) games: Vec<GameInfo>,
+    /// The console's own games while a catalog is shown.
+    intern: Vec<GameInfo>,
     /// The home selection: a game (`0..games.len()`), then the round buttons.
     pub(crate) home: usize,
     /// Last selected game slot on the home row.
@@ -364,6 +366,7 @@ impl Ui {
             focus: None,
             focus_at: (W / 2, H / 2),
             games: Vec::new(),
+            intern: Vec::new(),
             home: 0,
             last_game: 0,
             scroll: 0.0,
@@ -549,8 +552,16 @@ impl Ui {
     /// Show the games of the catalog named `name` (a user's choice; it
     /// may not be on the card yet).
     pub fn show_service(&mut self, name: String) {
+        // The console's own games, covers included, wait for the way back.
+        if self.service.is_empty() {
+            self.intern = core::mem::take(&mut self.games);
+        }
+        self.games = if name.is_empty() {
+            core::mem::take(&mut self.intern)
+        } else {
+            Vec::new()
+        };
         self.service = name;
-        self.games.clear();
         self.prov = None;
         self.prov_list = 0;
         self.covers_asked.clear();

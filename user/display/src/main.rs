@@ -2328,6 +2328,14 @@ fn main() -> i32 {
                     (prov_key, launch_version) = (None, None);
                     ui.toast(n, now);
                 }
+                if let Some(e) = up.start_failed {
+                    prov = None;
+                    ui.prov = Some(catalog::View::local(
+                        provproto::ST_ERROR,
+                        format!("cannot start it: {}", libnx::abi::err::name(e)),
+                    ));
+                    prov_retry_at = now + 5_000_000_000;
+                }
                 if up.stop_failed {
                     if let Some(p) = &prov {
                         println!("[display] {}: STOP failed, ended", p.title);
@@ -2540,7 +2548,12 @@ fn main() -> i32 {
                 let said = prov.as_mut().filter(|p| p.pid().is_none()).map(|p| {
                     let ok = p.hello(rx.msg.mr[0], rx.pid, h);
                     if ok {
-                        println!("[display] {}: catalog up (pid {})", p.title, rx.pid);
+                        println!(
+                            "[display] {}: catalog up (pid {}) {} ms after its pick",
+                            p.title,
+                            rx.pid,
+                            time::now_ns().saturating_sub(p.since) / 1_000_000
+                        );
                     }
                     ok
                 });

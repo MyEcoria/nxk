@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use libnx::abi::err::{ENOENT, ESTALE, ETIMEDOUT};
 use libnx::abi::proto::provider as proto;
@@ -125,6 +126,8 @@ pub struct Update {
     pub stop_failed: bool,
     /// It ended, with this code.
     pub exit: Option<i64>,
+    /// It could not be spawned (the errno).
+    pub start_failed: Option<i64>,
 }
 
 struct Shared {
@@ -141,8 +144,9 @@ struct Link {
     sh: Mutex<Shared>,
     wake: Condvar,
     notif: u32,
-    /// The process; closed with the last user of the link.
-    proc: u32,
+    /// The process, 0 until `launch` has it; closed with the last user of
+    /// the link.
+    proc: AtomicU32,
 }
 
 impl Link {
@@ -162,7 +166,10 @@ impl Drop for Link {
         if ep != 0 {
             let _ = sys::handle_close(ep);
         }
-        let _ = sys::handle_close(self.proc);
+        let h = self.proc.load(Ordering::Acquire);
+        if h != 0 {
+            let _ = sys::handle_close(h);
+        }
     }
 }
 
@@ -193,21 +200,19 @@ pub struct Provider {
 
 impl Provider {
     /// Start catalog `s` for user `p`: its data under `/users/ID/services/NAME`.
+    /// Returns at once: the program is read from the card and spawned by a
+    /// thread of ours (init reads it whole, which holds the caller for
+    /// hundreds of ms), its failure comes back as `Update::start_failed`.
     pub fn start(s: &ServiceInfo, p: &Profile, notif: u32) -> Result<Self, i64> {
         let mut k = [0u8; 8];
         sys::getrandom(&mut k);
         let key = u64::from_le_bytes(k) >> 1;
         let dir = format!("{}/services/{}", p.dir(), s.name);
-        users::mkdirs(&dir);
         let mut env = libnx::process::current_env();
         env.push(format!("{}={}", proto::KEY_ENV, key));
         env.push(format!("{}={}", proto::DIR_ENV, dir));
         env.push(format!("NXK_USER={}", p.name));
         env.push(format!("NXK_USER_ID={}", p.id));
-        let path = exe(&s.name);
-        let h = libnx::process::spawn_with(
-            &libnx::process::Strings::new(&[&path], &env).kill_on_close(),
-        )?;
         let link = Arc::new(Link {
             sh: Mutex::new(Shared {
                 ep: 0,
@@ -218,15 +223,24 @@ impl Provider {
             }),
             wake: Condvar::new(),
             notif,
-            proc: h,
+            proc: AtomicU32::new(0),
         });
-        for f in [watch_exit, watch_state, run_cmds] {
-            let l = link.clone();
-            if thread::spawn(move || f(&l)).is_err() {
-                let _ = sys::process_kill(h);
-                link.sh.lock().quit = true;
-                return Err(-libnx::abi::err::EAGAIN);
-            }
+        let (path, l) = (exe(&s.name), link.clone());
+        let threads = [
+            thread::spawn({
+                let l = link.clone();
+                move || watch_state(&l)
+            }),
+            thread::spawn({
+                let l = link.clone();
+                move || run_cmds(&l)
+            }),
+            thread::spawn(move || launch(&l, &path, &dir, &env)),
+        ];
+        if threads.iter().any(|t| t.is_err()) {
+            link.sh.lock().quit = true;
+            link.wake.notify_all();
+            return Err(-libnx::abi::err::EAGAIN);
         }
         Ok(Self {
             name: s.name.clone(),
@@ -292,15 +306,19 @@ impl Provider {
         self.command(Cmd::Covers(list, games));
     }
 
+    /// End it; one still being spawned dies as soon as `launch` has it.
     pub fn kill(&self) {
-        let _ = sys::process_kill(self.link.proc);
+        self.link.sh.lock().quit = true;
+        self.link.wake.notify_all();
+        let h = self.link.proc.load(Ordering::Acquire);
+        if h != 0 {
+            let _ = sys::process_kill(h);
+        }
     }
 }
 
 impl Drop for Provider {
     fn drop(&mut self) {
-        self.link.sh.lock().quit = true;
-        self.link.wake.notify_all();
         self.kill();
         let mut s = SLEEPER.lock();
         if s.as_ref().is_some_and(|l| Arc::ptr_eq(l, &self.link)) {
@@ -309,8 +327,29 @@ impl Drop for Provider {
     }
 }
 
-fn watch_exit(l: &Arc<Link>) {
-    let code = libnx::process::wait(l.proc);
+/// Spawn the catalog, then wait for its end.
+fn launch(l: &Arc<Link>, path: &str, dir: &str, env: &[String]) {
+    users::mkdirs(dir);
+    let spawned = if l.quit() {
+        Err(-libnx::abi::err::EINTR)
+    } else {
+        libnx::process::spawn_with(&libnx::process::Strings::new(&[path], env).kill_on_close())
+    };
+    let h = match spawned {
+        Ok(h) => h,
+        Err(e) => {
+            l.sh.lock().quit = true;
+            l.wake.notify_all();
+            l.post(|u| u.start_failed = Some(e));
+            return;
+        }
+    };
+    l.proc.store(h, Ordering::Release);
+    // Another catalog was picked meanwhile: `kill` did not see the process.
+    if l.quit() {
+        let _ = sys::process_kill(h);
+    }
+    let code = libnx::process::wait(h);
     l.sh.lock().quit = true;
     l.wake.notify_all();
     l.post(|u| u.exit = Some(code));
