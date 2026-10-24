@@ -82,6 +82,12 @@ pub struct View {
 }
 
 impl View {
+    /// Whether it is drawn as `o` is: the version and the covers' counter
+    /// change with every cover the catalog reads, and show nowhere.
+    pub fn looks_like(&self, o: &View) -> bool {
+        (self.state, self.place, &self.text) == (o.state, o.place, &o.text)
+    }
+
     /// A state of `display`'s own (the catalog not running).
     pub fn local(state: u64, text: String) -> Self {
         Self {
@@ -128,6 +134,26 @@ pub struct Update {
     pub exit: Option<i64>,
     /// It could not be spawned (the errno).
     pub start_failed: Option<i64>,
+}
+
+impl Update {
+    /// Nothing in it changes the screen, given the view `shown`: a catalog
+    /// reading its covers moves its version a hundred times in a second.
+    pub fn is_quiet(&self, shown: Option<&View>) -> bool {
+        self.view
+            .as_ref()
+            .is_none_or(|v| shown.is_some_and(|s| v.looks_like(s)))
+            && self.games.is_none()
+            && self.covers.is_empty()
+            && self.covers_missed.is_empty()
+            && self.launched.is_none()
+            && !self.stopped
+            && self.login_art.is_none()
+            && self.notes.is_empty()
+            && !self.stop_failed
+            && self.exit.is_none()
+            && self.start_failed.is_none()
+    }
 }
 
 struct Shared {

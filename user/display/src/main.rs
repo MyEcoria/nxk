@@ -2355,8 +2355,8 @@ fn main() -> i32 {
             }
             if ev & catalog::EV_PROV != 0 {
                 let now = time::now_ns();
-                dirty = true;
                 let up = prov.as_ref().map(|p| p.take()).unwrap_or_default();
+                dirty |= !up.is_quiet(ui.prov.as_ref());
                 if up.launched.is_some() && prov_key.is_some() {
                     launch_version = up.launched;
                 }
