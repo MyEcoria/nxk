@@ -319,9 +319,10 @@ wrong, else every minute; another gives the link (longest time without a
 datagram, the stream thread's longest busy spell and send, audio packets
 lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
-the rest still runs there. The `display` channel is answered (capabilities at 1280x720 with a 12
-Mbit/s cap, `ready`, `pong`, an ack per frame, a key frame asked after a
-gap or a decoding error). The server sends 1920x1080 H.264 High (CABAC, 8x8
+the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 60 Hz and an 8
+Mbit/s cap by default, `refresh=` 30 or 60 and `max_mbit=` in the catalog's
+`service.txt` change them; `ready`, `pong`, an ack per frame, a key frame
+asked after a gap or a decoding error). The server sends 1920x1080 H.264 High (CABAC, 8x8
 transform, P frames only and all of them references, 4 slices a frame,
 deblocking on) whatever the client announces: resolution, `dataUsage`,
 profile and level were tried. `services/nxh264` decodes it (written for this
@@ -337,11 +338,21 @@ desktop client, nearest sample, the panel's quarter turn) draws it, so the
 CPU never touches the pixels. The interpolation, the deblocking filters and
 the inverse transforms are NEON (the portable code is the oracle,
 `h264bench selftest`), luna raises the CPU to the highest step `cpufreq`
-accepts for the length of a stream and announces 30 Hz (the server then
-sends about 29 frames a second). Measured: on the Erista a 15 Mbit/s 1080p
-motion clip decodes in 21 ms a frame on four threads at 1219 MHz (64 ms on
-one; 54 ms on four at the boot clock before the NEON code); live, Avatar's
-menus decode in 15.6 ms on average. The picture is upright and its colours
+accepts for the length of a stream and announces 60 Hz (the server sends
+the rate announced: 30 Hz gave about 29 frames a second, and a game
+rendered at 30 Hz adds a frame or two of delay of its own). Measured: on the
+Erista a 15 Mbit/s 1080p motion clip decodes in 21 ms a frame on four
+threads at 1219 MHz (64 ms on one; 54 ms on four at the boot clock before
+the NEON code); live, Avatar's menus decode in 15.6 ms on average. 1200
+pictures of the real 60 Hz stream (Avatar, 1.7 Mbit/s): 9.8 ms at the
+median, 11.9 at the 95th percentile, 37 at most (key frames); a 25 KB
+picture (12 Mbit/s at 60 Hz) takes 17.5 ms at the median and 27 at the
+95th, hence the 8 Mbit/s cap at 60 Hz. The gamepad is read on a thread of
+its own (`display` serves `EVENT` on a second thread, so it does not wait
+for a `FLIP`'s vertical blank) and the stream thread looks at it every 2
+ms; the report line gives the time from a complete frame to its decoded
+picture and to the panel, the `show` call, the decoder's queue and the time
+from a gamepad event read to its datagram sent. The picture is upright and its colours
 match the desktop client's. The video channel is released in order, waiting
 up to 250 ms for a lost fragment (the server retransmits it about 60 ms after
 the loss): over two minutes about nine in ten lost frames come back; the

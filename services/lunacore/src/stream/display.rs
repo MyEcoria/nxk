@@ -280,19 +280,29 @@ pub struct DisplayConfig {
     pub start_bits_per_second: u32,
 }
 
-impl Default for DisplayConfig {
-    /// The console's panel at 30 Hz (the decoder cannot follow 60 on the A57), and a bit rate cap
-    /// below the desktop client's 20 Mbit/s: the server sends 1080p whatever is announced, and the
-    /// decoder's cost follows the bit rate.
-    fn default() -> Self {
+impl DisplayConfig {
+    /// The console's panel refreshed `refresh_rate` times a second, and a bit rate cap in Mbit/s
+    /// (`None`: the cap that suits the rate). The server sends 1080p whatever is announced and
+    /// honours the rate, and the software decoder's cost follows the bit rate and the rate: one
+    /// picture every 16.6 ms at 60 Hz leaves a 12 Mbit/s stream (25 KB a picture, 18 ms to decode
+    /// on the four A57 cores at 1224 MHz) behind, 8 Mbit/s (13 ms) keeps up.
+    pub fn new(refresh_rate: u32, max_mbit: Option<u32>) -> Self {
+        let max = max_mbit.unwrap_or(if refresh_rate > 30 { 8 } else { 12 });
         Self {
             width: 1280,
             height: 720,
-            refresh_rate: 30,
+            refresh_rate,
             min_bits_per_second: 2_000_000,
-            max_bits_per_second: 12_000_000,
-            start_bits_per_second: 6_000_000,
+            max_bits_per_second: max * 1_000_000,
+            start_bits_per_second: 6_000_000.min(max * 1_000_000),
         }
+    }
+}
+
+impl Default for DisplayConfig {
+    /// 60 Hz, as the panel runs: half the delay between the game's picture and the stream's.
+    fn default() -> Self {
+        Self::new(60, None)
     }
 }
 
@@ -764,6 +774,7 @@ mod tests {
             (session.codecs[0].profile, session.codecs[0].level),
             (8, 65536)
         );
+        assert_eq!(session.display.as_ref().map(|d| d.refresh_rate), Some(60));
         assert_eq!(
             session.display.and_then(|d| d.resolution),
             Some(Resolution {
@@ -771,7 +782,19 @@ mod tests {
                 height: 720
             })
         );
-        assert_eq!(session.max_bits_per_second, 12_000_000);
+        assert_eq!(session.max_bits_per_second, 8_000_000);
+    }
+
+    #[test]
+    fn the_rate_and_the_cap_follow_the_settings() {
+        let slow = DisplayConfig::new(30, None);
+        assert_eq!(
+            (slow.refresh_rate, slow.max_bits_per_second),
+            (30, 12_000_000)
+        );
+        let capped = DisplayConfig::new(60, Some(5));
+        assert_eq!(capped.max_bits_per_second, 5_000_000);
+        assert_eq!(capped.start_bits_per_second, 5_000_000);
     }
 
     #[test]

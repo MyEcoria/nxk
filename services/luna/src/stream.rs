@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lunacore::proto::main::{
     client_message, server_message::Msg, ClientMessage, Pong, ServerMessage, TimeSyncRequest,
 };
+use lunacore::stream::display::DisplayConfig;
 use lunacore::stream::framing::Frame;
 use lunacore::stream::input::InputEvent;
 use lunacore::stream::setup::{self, ClientIdentity};
@@ -44,9 +45,15 @@ const NOMINAL_RATE: u32 = 10 * 1024 * 1024;
 const VIDEO_BUDGET: Duration = Duration::from_millis(250);
 /// A round trip longer than this is a stale echo, not a measure.
 const MAX_RTT_US: u64 = 10_000_000;
+/// The stream thread looks at the gamepad's events at least this often: a
+/// press waits that long (at most) before it is sent.
+const INPUT_EVERY: Duration = Duration::from_millis(2);
 /// The figures for the overlay are renewed this often.
 const STATS_EVERY: Duration = Duration::from_secs(1);
 const WANTED: [&str; 5] = ["display", "display2", "audio", "input", "participant"];
+
+/// A gamepad event and when it was read from the screen's input.
+pub type Timed = (Instant, InputEvent);
 
 /// Where to connect and with what.
 pub struct Target {
@@ -55,6 +62,8 @@ pub struct Target {
     pub pin: Pin,
     pub session_id: String,
     pub token: Secret,
+    /// What the display channel announces (picture rate, bit rate cap).
+    pub display: DisplayConfig,
 }
 
 /// Why the stream ended.
@@ -490,7 +499,7 @@ fn main_message(frame: &Frame) -> Option<Msg> {
 /// closes it; gamepad events come on `input`.
 pub fn run(
     t: &Target,
-    input: &Inbox<InputEvent>,
+    input: &Inbox<Timed>,
     stop: &AtomicBool,
     video: std::sync::Arc<crate::video::Shared>,
 ) -> Result<End> {
@@ -550,7 +559,15 @@ pub fn run(
     let list: Vec<&str> = s.names.values().map(String::as_str).collect();
     println!("luna: channels {:?}", list);
     let input_id = s.names.iter().find(|(_, n)| *n == "input").map(|(i, _)| *i);
-    streaming(&mut s, main, input_id, input, stop, video)
+    streaming(
+        &mut s,
+        main,
+        input_id,
+        input,
+        stop,
+        video,
+        t.display.clone(),
+    )
 }
 
 fn pong(link: &mut Link, main: u8, ping: Option<i64>) -> Result<()> {
@@ -573,9 +590,10 @@ fn streaming(
     s: &mut Session,
     main: u8,
     input_id: Option<u8>,
-    input: &Inbox<InputEvent>,
+    input: &Inbox<Timed>,
     stop: &AtomicBool,
     shared: std::sync::Arc<crate::video::Shared>,
+    display: DisplayConfig,
 ) -> Result<End> {
     let mut counts: HashMap<u8, (u64, u64)> = HashMap::new();
     let audio_id = s.names.iter().find(|(_, n)| *n == "audio").map(|(i, _)| *i);
@@ -585,7 +603,7 @@ fn streaming(
         .iter()
         .find(|(_, n)| n.starts_with("display"))
         .map(|(i, _)| *i);
-    let mut video = crate::video::Video::new(shared.clone());
+    let mut video = crate::video::Video::new(shared.clone(), display);
     let mut mark = (Instant::now(), 0u64, 0u64, 0u64);
     s.link.stats.audio_channel = audio_id;
     // The player orders audio by frame_index: SPP holding a missing
@@ -619,9 +637,7 @@ fn streaming(
         }
         let event = match held.pop_front() {
             Some(e) => Some(e),
-            None => s
-                .link
-                .pump(next_rtcp.min(Instant::now() + Duration::from_millis(10)))?,
+            None => s.link.pump(next_rtcp.min(Instant::now() + INPUT_EVERY))?,
         };
         match event {
             Some(Event::Message(m)) if m.channel == main => {
@@ -671,12 +687,13 @@ fn streaming(
             _ => {}
         }
         if let Some(id) = input_id {
-            while let Ok(ev) = input.try_recv() {
+            while let Ok((read, ev)) = input.try_recv() {
                 let f = Frame {
                     message: ev.encode(),
                     raw: Vec::new(),
                 };
                 s.link.send_frame(id, &f)?;
+                shared.input_sent(read.elapsed());
             }
         }
         if let Some(d) = display_id {

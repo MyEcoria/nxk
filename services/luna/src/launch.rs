@@ -5,7 +5,7 @@
 //! (HOME, sleep) ends the stream and the cloud session.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -30,6 +30,10 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const END_TIMEOUT: Duration = Duration::from_secs(3);
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SIDE: (u32, u32) = (1280, 720);
+/// The presenter looks at the stop flag and the figures at least this often.
+const PICTURE_WAIT: Duration = Duration::from_millis(20);
+/// The gamepad thread looks at its stop flag at least this often.
+const PAD_WAIT_NS: u64 = 20_000_000;
 /// A dark screen until the first picture is decoded.
 const WAIT_COLOR: u32 = 0x101820;
 
@@ -217,6 +221,7 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         pin,
         session_id: g.session_id.clone().ok_or("no session id")?,
         token: Secret::new(g.auth_token.clone().unwrap_or_default()),
+        display: crate::display_config(),
     };
     let mut screen = Presenter::open().map_err(|e| format!("no screen ({})", e))?;
     let _ = screen.show_color(WAIT_COLOR);
@@ -233,12 +238,10 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         e2.store(true, Ordering::Relaxed);
         r
     });
-    let _ = tx.send(InputEvent::GamePadConnection(GamePadConnection {
-        device_id: 0,
-        connected: true,
-        kind: GamePadKind::Xbox360,
-    }));
-    let (mut state, mut packet) = (GamePadState::default(), 0u32);
+    // The gamepad is read on a thread of its own: `show` waits for the vertical blank.
+    let (events, pad_done) = (screen.events(), Arc::new(AtomicBool::new(false)));
+    let (pad_flag, pad_tx) = (pad_done.clone(), tx);
+    let gamepad = std::thread::spawn(move || read_pad(&events, &pad_tx, &pad_flag));
     let mut next_stats = Instant::now();
     while !ended.load(Ordering::Relaxed) {
         if Instant::now() >= next_stats {
@@ -249,28 +252,47 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
             stop_flag.store(true, Ordering::Relaxed);
         }
         // The newest picture, at the next vertical blank (this call sets the pace).
-        if let Some(pic) = shared.take_latest() {
+        if let Some((arrived, pic)) = shared.wait_latest(PICTURE_WAIT) {
+            let t = Instant::now();
             if let Err(e) = screen.show(&pic) {
                 println!("luna: showing a picture: {}", e);
             }
-        }
-        if let Some(ev) = screen.poll(2_000_000) {
-            if pad::apply(&mut state, &ev) {
-                packet += 1;
-                let _ = tx.send(InputEvent::GamePad(GamePadEvent {
-                    device_id: 0,
-                    packet_number: packet,
-                    kind: GamePadKind::Xbox360,
-                    state,
-                }));
-            }
+            shared.on_screen(arrived, t.elapsed());
         }
     }
+    pad_done.store(true, Ordering::Relaxed);
+    let _ = gamepad.join();
     cat.set_stats(Stats::default());
     let r = runner.join().map_err(|_| "the stream thread failed")?;
     drop(screen);
     match r? {
         stream::End::Stopped | stream::End::Closed => Ok(()),
+    }
+}
+
+/// The console's controls as Luna's gamepad: every change goes to the
+/// stream thread as it is read, until `done`.
+fn read_pad(events: &nxgfx::Events, tx: &Sender<stream::Timed>, done: &AtomicBool) {
+    let timed = |ev| (Instant::now(), ev);
+    let _ = tx.send(timed(InputEvent::GamePadConnection(GamePadConnection {
+        device_id: 0,
+        connected: true,
+        kind: GamePadKind::Xbox360,
+    })));
+    let (mut state, mut packet) = (GamePadState::default(), 0u32);
+    while !done.load(Ordering::Relaxed) {
+        let Some(ev) = events.poll_words(PAD_WAIT_NS) else {
+            continue;
+        };
+        if pad::apply(&mut state, &ev) {
+            packet += 1;
+            let _ = tx.send(timed(InputEvent::GamePad(GamePadEvent {
+                device_id: 0,
+                packet_number: packet,
+                kind: GamePadKind::Xbox360,
+                state,
+            })));
+        }
     }
 }
 

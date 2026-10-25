@@ -251,9 +251,13 @@ fn main() {
         let mut dec = nxh264::Decoder::new();
         dec.threads = threads;
         let (mut frames, mut errors) = (0u32, 0u32);
+        let mut per_frame = Vec::with_capacity(aus.len());
         let t = Instant::now();
         for (i, au) in aus.iter().enumerate() {
-            match dec.decode(au) {
+            let t_au = Instant::now();
+            let decoded = dec.decode(au);
+            per_frame.push(t_au.elapsed().as_secs_f64() * 1000.0);
+            match decoded {
                 Ok(Some(_)) => frames += 1,
                 Ok(None) => {}
                 Err(e) => {
@@ -283,6 +287,16 @@ fn main() {
                 );
             }
         }
+        per_frame.sort_by(f64::total_cmp);
+        let at = |q: f64| per_frame[((per_frame.len() - 1) as f64 * q) as usize];
+        println!(
+            "h264bench: round {}: per access unit p50 {:.1}, p95 {:.1}, p99 {:.1}, max {:.1} ms",
+            round,
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            at(1.0)
+        );
         println!(
             "h264bench: round {}: {} frames, {} errors, {:.1} ms a frame, {:.1} frames/s",
             round,

@@ -3,7 +3,8 @@
 //! sign-in by code, the games the account can play and their covers, and
 //! playing them: the cloud session, the stream, the gamepad, the sound and
 //! the picture (decoded by `nxh264`, shown by the GPU). The Amazon domain of the account is
-//! `domain=` in this catalog's `service.txt` (amazon.com by default).
+//! `domain=` in this catalog's `service.txt` (amazon.com by default); `refresh=` (30 or 60)
+//! and `max_mbit=` set the picture rate and bit rate cap the stream announces.
 
 mod account;
 mod api;
@@ -22,8 +23,8 @@ use std::time::Duration;
 
 use nxsvc::{Request, State};
 
-/// `domain=` of the `service.txt` beside the program.
-fn domain() -> String {
+/// `key=` of the `service.txt` beside the program.
+fn setting(key: &str) -> Option<String> {
     let exe = std::env::args().next().unwrap_or_default();
     let dir = exe.rsplit_once('/').map_or("", |(d, _)| d).to_string();
     std::fs::read_to_string(format!("{}/service.txt", dir))
@@ -31,15 +32,30 @@ fn domain() -> String {
         .and_then(|t| {
             t.lines()
                 .filter_map(|l| l.split_once('='))
-                .find(|(k, _)| k.trim() == "domain")
+                .find(|(k, _)| k.trim() == key)
                 .map(|(_, v)| v.trim().to_string())
         })
+}
+
+fn domain() -> String {
+    setting("domain")
         .filter(|d| {
             !d.is_empty()
                 && d.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         })
         .unwrap_or_else(|| "amazon.com".into())
+}
+
+/// What the stream announces: `refresh=` (30 or 60 Hz) and `max_mbit=`
+/// (2 to 30) of `service.txt`, else 60 Hz and the cap that suits it.
+fn display_config() -> lunacore::stream::display::DisplayConfig {
+    let number = |k: &str| setting(k).and_then(|v| v.parse::<u32>().ok());
+    let refresh = number("refresh")
+        .filter(|r| matches!(r, 30 | 60))
+        .unwrap_or(60);
+    let max = number("max_mbit").filter(|m| (2..=30).contains(m));
+    lunacore::stream::display::DisplayConfig::new(refresh, max)
 }
 
 /// A stop waits this long for the cloud session to end (display's limit is 8 s).

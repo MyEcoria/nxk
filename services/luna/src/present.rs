@@ -41,9 +41,10 @@ impl Presenter {
         })
     }
 
-    /// The next input event, as `input::READ`'s words.
-    pub fn poll(&self, ns: u64) -> Option<[u64; 6]> {
-        self.gfx.poll_words(ns)
+    /// The screen's input, for a thread of its own (`show` waits for the
+    /// vertical blank; the gamepad is read meanwhile).
+    pub fn events(&self) -> nxgfx::Events {
+        self.gfx.events()
     }
 
     /// A plain color (0xRRGGBB) while there is no picture.
