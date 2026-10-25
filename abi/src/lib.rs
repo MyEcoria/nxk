@@ -2121,9 +2121,14 @@ pub mod proto {
         /// code and the URL, one per line). A new cover is a new version.
         pub const STATE: u32 = 1;
         /// Game word 0 of list version word 1. Reply: word 0 = color (RGB),
-        /// word 1 = flags (0); bytes: id, title, publisher, version,
-        /// description, each ended by a 0 byte. `ESTALE`: another list.
+        /// word 1 = flags (`GAME_*`, unknown bits ignored); bytes: id,
+        /// title, publisher, version, description, each ended by a 0 byte.
+        /// `ESTALE`: another list.
         pub const GAME: u32 = 2;
+        /// Flag of `GAME`: the game runs on a server and is streamed here
+        /// (its stats are the stream's); without it, it runs on this
+        /// console. A catalog says which, per game.
+        pub const GAME_CLOUD: u64 = 1;
         /// Cover of game word 0 of list version word 1, from byte word 2.
         /// Reply: word 0 = the cover's size, bytes: the next part of it.
         /// A cover is u16 side, u16 side (square, `COVER_MAX` at most),
@@ -2145,6 +2150,83 @@ pub mod proto {
         /// zone in). `ENOENT`: none. A new one is a new state version.
         pub const ART: u32 = 6;
         pub const ART_LOGIN: u64 = 0;
+        /// How the running game does, for the performance overlay: words
+        /// as `Stats::to_words`. Answered at once from the last values
+        /// (never waits behind `STATE`); a catalog with none, or no game
+        /// running, replies with every field absent.
+        pub const STATS: u32 = 7;
+
+        /// What a catalog tells of the game it runs; a field it does not
+        /// know is `None`. Replies are not trusted: `clamped` bounds them.
+        #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+        pub struct Stats {
+            /// Round trip to the server (µs) and its variation.
+            pub rtt_us: Option<u32>,
+            pub jitter_us: Option<u32>,
+            /// Pictures received per second, times 10.
+            pub fps_x10: Option<u16>,
+            /// Rate received (kbit/s).
+            pub kbps: Option<u32>,
+            /// Pictures lost, in 1/1000.
+            pub loss_pm: Option<u16>,
+            /// Size of the stream's picture.
+            pub size: Option<(u16, u16)>,
+        }
+
+        impl Stats {
+            const RTT: u64 = 1;
+            const JITTER: u64 = 2;
+            const FPS: u64 = 4;
+            const KBPS: u64 = 8;
+            const LOSS: u64 = 16;
+            const SIZE: u64 = 32;
+
+            /// Word 0 = the fields present (bits), then rtt, jitter,
+            /// fps, kbps, and loss | width << 16 | height << 32.
+            pub fn to_words(&self) -> [u64; 6] {
+                let (w, h) = self.size.unwrap_or((0, 0));
+                let mut mask = 0;
+                let mut put = |bit: u64, on: bool| {
+                    if on {
+                        mask |= bit;
+                    }
+                };
+                put(Self::RTT, self.rtt_us.is_some());
+                put(Self::JITTER, self.jitter_us.is_some());
+                put(Self::FPS, self.fps_x10.is_some());
+                put(Self::KBPS, self.kbps.is_some());
+                put(Self::LOSS, self.loss_pm.is_some());
+                put(Self::SIZE, self.size.is_some());
+                [
+                    mask,
+                    self.rtt_us.unwrap_or(0) as u64,
+                    self.jitter_us.unwrap_or(0) as u64,
+                    self.fps_x10.unwrap_or(0) as u64,
+                    self.kbps.unwrap_or(0) as u64,
+                    self.loss_pm.unwrap_or(0) as u64 | (w as u64) << 16 | (h as u64) << 32,
+                ]
+            }
+
+            /// The reply's words, every value bounded to what a real
+            /// stream can have (10 s, 1000 pictures/s, 1 Gbit/s, 8K).
+            pub fn from_words(w: &[u64; 6]) -> Self {
+                let has = |bit: u64| w[0] & bit != 0;
+                let cap = |v: u64, max: u64| v.min(max) as u32;
+                Self {
+                    rtt_us: has(Self::RTT).then(|| cap(w[1], 10_000_000)),
+                    jitter_us: has(Self::JITTER).then(|| cap(w[2], 10_000_000)),
+                    fps_x10: has(Self::FPS).then(|| cap(w[3], 10_000) as u16),
+                    kbps: has(Self::KBPS).then(|| cap(w[4], 1_000_000)),
+                    loss_pm: has(Self::LOSS).then(|| cap(w[5] & 0xFFFF, 1000) as u16),
+                    size: has(Self::SIZE).then(|| {
+                        (
+                            ((w[5] >> 16) & 0xFFFF).min(8192) as u16,
+                            ((w[5] >> 32) & 0xFFFF).min(8192) as u16,
+                        )
+                    }),
+                }
+            }
+        }
 
         pub const ST_LOADING: u64 = 0;
         pub const ST_READY: u64 = 1;

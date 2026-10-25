@@ -1,5 +1,5 @@
 //! The settings the screen remembers, in `/config/display.cfg` on the SD
-//! card (`key=value` lines): theme, brightness, flight mode, auto-sleep.
+//! card (`key=value` lines): theme, brightness, flight mode, auto-sleep, performance overlay.
 
 use alloc::format;
 use alloc::string::String;
@@ -25,6 +25,9 @@ pub struct Config {
     pub sleep: u8,
     /// `net` takes the USB-C and Ethernet links before Wi-Fi.
     pub wired: bool,
+    /// The performance overlay over a game (fps, load, and the stream's
+    /// ping and rate for a cloud game).
+    pub perf: bool,
 }
 
 impl Config {
@@ -36,6 +39,7 @@ impl Config {
             flight: false,
             sleep: 0,
             wired: false,
+            perf: false,
         }
     }
 
@@ -60,6 +64,7 @@ impl Config {
                 "flight" => c.flight = v == "on",
                 "sleep" => c.sleep = v.parse().unwrap_or(0).min(SLEEP_MIN.len() as u8 - 1),
                 "links" => c.wired = v == "wired",
+                "overlay" => c.perf = v == "on",
                 _ => {}
             }
         }
@@ -71,13 +76,14 @@ impl Config {
         fs::write(
             FILE,
             format!(
-                "theme={}\nbrightness={}\nvolume={}\nflight={}\nsleep={}\nlinks={}\n",
+                "theme={}\nbrightness={}\nvolume={}\nflight={}\nsleep={}\nlinks={}\noverlay={}\n",
                 if self.light { "light" } else { "dark" },
                 self.brightness,
                 self.volume,
                 if self.flight { "on" } else { "off" },
                 self.sleep,
-                if self.wired { "wired" } else { "wifi" }
+                if self.wired { "wired" } else { "wifi" },
+                if self.perf { "on" } else { "off" }
             )
             .as_bytes(),
         )

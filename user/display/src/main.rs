@@ -32,6 +32,7 @@ mod keyboard;
 mod known;
 mod pages;
 mod panel;
+mod perf;
 mod playtime;
 mod quick;
 mod screen;
@@ -54,6 +55,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::mem::take;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use libnx::abi::err::{EINVAL, EIO, ENODEV, EPERM};
@@ -1129,6 +1131,9 @@ struct Link {
     last: u64,
     gap: u64,
     late: u64,
+    /// The same since the overlay's last second (`perf`).
+    hud_gap: u64,
+    hud_late: u64,
     /// The console sleeps: the game's next `FLIP` waits for the wake.
     asleep: bool,
     /// Since when, and the time slept while this game had the screen
@@ -1196,8 +1201,11 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>, awake: &Condvar) -> ! {
                 s.shown = k;
             }
             if s.flips > 0 {
+                let late = t - s.last > perf::LATE_NS;
                 s.gap = s.gap.max(t - s.last);
-                s.late += (t - s.last > 25_000_000) as u64;
+                s.late += late as u64;
+                s.hud_gap = s.hud_gap.max(t - s.last);
+                s.hud_late += late as u64;
             }
             (s.flips, s.last) = (s.flips + 1, t);
             Msg::from_words(0, &[s.slept])
@@ -1435,6 +1443,8 @@ fn main() -> i32 {
         last: 0,
         gap: 0,
         late: 0,
+        hud_gap: 0,
+        hud_late: 0,
         asleep: false,
         asleep_since: 0,
         slept: 0,
@@ -1529,6 +1539,11 @@ fn main() -> i32 {
     let mut ov_shown: Option<(usize, usize, usize, usize)> = None;
     let mut ov_finger: Option<u64> = None;
     let mut ov_stats: Option<Frames> = None;
+    // The performance overlay: its second's clock and when the next
+    // sample is due; whether the catalog game running streams from a server.
+    let mut perf_clock: Option<perf::Clock> = None;
+    let mut next_perf = 0u64;
+    let mut prov_cloud = false;
     // The game goes: the UI comes back, the GPU forgets its buffers.
     macro_rules! release_game {
         () => {{
@@ -1545,6 +1560,10 @@ fn main() -> i32 {
             ov_shown = None;
             ov_finger = None;
             ov_stats = None;
+            (perf_clock, ui.perf, next_perf) = (None, None, 0);
+            if let Some(p) = &prov {
+                p.want_stats(false);
+            }
             ui.in_game = false;
             ui.quick = false;
             scr.set_overlay(false);
@@ -1577,6 +1596,7 @@ fn main() -> i32 {
                 }
             }
             prov_key = None;
+            prov_cloud = false;
             launch_version = None;
             ui.starting = None;
             stop_at = None;
@@ -1655,13 +1675,14 @@ fn main() -> i32 {
                         }
                         (Some(p), Some(g)) => {
                             p.launch(&g.id);
-                            let (key, title, cover) =
-                                (g.name.clone(), g.title.clone(), g.cover.clone());
+                            let (key, title, cover, cloud) =
+                                (g.name.clone(), g.title.clone(), g.cover.clone(), g.cloud);
                             ui.starting = Some((title, cover, now));
                             ui.play.started(&key);
                             let games = ui.take_games();
                             ui.set_games(games);
                             (prov_key, launch_version, prov_play) = (Some(key), None, None);
+                            prov_cloud = cloud;
                             if let Some(path) = play_path(&ui).filter(|_| play_loaded) {
                                 worker
                                     .jobs
@@ -2219,6 +2240,37 @@ fn main() -> i32 {
                     wake = wake.min(d);
                 }
             }
+            if ui.cfg.perf && ov_win.is_some() {
+                wake = wake.min(next_perf);
+                if now >= next_perf {
+                    next_perf = now + perf::EVERY_NS;
+                    let (flips, hud) = {
+                        let mut s = link.lock();
+                        (s.flips, (take(&mut s.hud_gap), take(&mut s.hud_late)))
+                    };
+                    let stream = prov.as_ref().filter(|_| prov_cloud).and_then(|p| p.stats());
+                    ui.perf = Some(match perf_clock.as_mut() {
+                        Some(c) => c.sample(now, flips, hud, &mut data, prov_cloud, stream),
+                        None => {
+                            perf_clock = Some(perf::Clock::new(now, flips));
+                            perf::Sample {
+                                cloud: prov_cloud,
+                                ..Default::default()
+                            }
+                        }
+                    });
+                    dirty = true;
+                }
+                if let Some(p) = &prov {
+                    p.want_stats(prov_cloud);
+                }
+            } else if perf_clock.is_some() || ui.perf.is_some() {
+                (perf_clock, ui.perf, next_perf) = (None, None, 0);
+                if let Some(p) = &prov {
+                    p.want_stats(false);
+                }
+                dirty = true;
+            }
             if dirty {
                 dirty = false;
                 let t0 = time::now_ns();
@@ -2662,6 +2714,7 @@ fn main() -> i32 {
                             version: x.version.clone(),
                             desc: x.desc.clone(),
                             color: x.color,
+                            cloud: x.cloud,
                         })
                         .collect();
                     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();

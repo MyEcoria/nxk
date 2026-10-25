@@ -19,8 +19,18 @@ pub use nxk_abi::proto::provider::valid_id;
 
 pub type Result<T> = core::result::Result<T, i64>;
 
+/// Where a game runs; every game declares it (the icon on the home screen
+/// and the performance overlay's figures follow).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    /// On this console.
+    Local,
+    /// On a server, streamed here.
+    Cloud,
+}
+
 /// A game of the catalog.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Game {
     /// `[A-Za-z0-9._-]`, 1 to 40 bytes (`valid_id`).
     pub id: String,
@@ -30,6 +40,7 @@ pub struct Game {
     pub description: String,
     /// RGB, the card's color while it has no cover.
     pub color: u32,
+    pub kind: Kind,
 }
 
 /// A square cover: RGB565 pixels, rows from the top.
@@ -144,6 +155,8 @@ struct Shared {
     covers_version: u64,
     /// The sign-in code to scan (`ART_LOGIN`).
     login_art: Option<Arc<Vec<u8>>>,
+    /// The running game's figures (`STATS`).
+    stats: proto::Stats,
     /// `STATE` callers waiting for a new version: token, its deadline.
     waiters: Vec<(u64, u64)>,
 }
@@ -199,6 +212,12 @@ impl Catalog {
         s.login_art = c.map(|c| Arc::new(c.encode()));
         s.version += 1;
         answer_waiters(&mut s, u64::MAX);
+    }
+
+    /// How the running game does, as `display`'s overlay shows it; kept
+    /// until replaced (`Stats::default()` once the game ends).
+    pub fn set_stats(&self, stats: proto::Stats) {
+        self.shared.lock().unwrap().stats = stats;
     }
 
     pub fn game(&self, id: &str) -> Option<Game> {
@@ -276,6 +295,7 @@ pub fn connect() -> Result<(Catalog, Receiver<Request>)> {
             covers: HashMap::new(),
             covers_version: 0,
             login_art: None,
+            stats: proto::Stats::default(),
             waiters: Vec::new(),
         })),
     };
@@ -316,6 +336,10 @@ fn serve(ep: Endpoint, cat: Catalog, tx: Sender<Request>) {
             proto::GAME => Some(game_msg(&cat, m)),
             proto::COVER => Some(cover_msg(&cat, m)),
             proto::ART => Some(art_msg(&cat, m)),
+            proto::STATS => Some(Msg::from_words(
+                0,
+                &cat.shared.lock().unwrap().stats.to_words(),
+            )),
             proto::LAUNCH => Some(launch(&cat, m, &tx)),
             proto::STOP => send(&tx, Request::Stop(Done(rx.token))),
             nxk_abi::proto::SUSPEND => send(&tx, Request::Suspend(Done(rx.token))),
@@ -356,7 +380,11 @@ fn game_msg(cat: &Catalog, m: &Msg) -> Msg {
         b.extend_from_slice(&f.as_bytes()[..floor_char(&f, 400)]);
         b.push(0);
     }
-    user::pack_at(0, &[g.color as u64 & 0xFF_FFFF, 0], &b).0
+    let flags = match g.kind {
+        Kind::Local => 0,
+        Kind::Cloud => proto::GAME_CLOUD,
+    };
+    user::pack_at(0, &[g.color as u64 & 0xFF_FFFF, flags], &b).0
 }
 
 /// Part of an image blob from byte `off`, its size in word 0.

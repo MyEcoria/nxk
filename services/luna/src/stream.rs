@@ -23,6 +23,7 @@ use lunacore::stream::spp::{
 };
 use lunacore::stream::Secret;
 use nxdtls::{Client as Dtls, Pin, Secrets};
+use nxk_abi::proto::provider::Stats;
 use prost::Message as _;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -41,6 +42,10 @@ const NOMINAL_RATE: u32 = 10 * 1024 * 1024;
 /// How long a lost video frame is waited for (the server's retransmission
 /// comes about 60 ms after the loss).
 const VIDEO_BUDGET: Duration = Duration::from_millis(250);
+/// A round trip longer than this is a stale echo, not a measure.
+const MAX_RTT_US: u64 = 10_000_000;
+/// The figures for the overlay are renewed this often.
+const STATS_EVERY: Duration = Duration::from_secs(1);
 const WANTED: [&str; 5] = ["display", "display2", "audio", "input", "participant"];
 
 /// Where to connect and with what.
@@ -93,6 +98,10 @@ struct LinkStats {
     audio_seq_gaps: u64,
     audio_last_seq: Option<u16>,
     audio_channel: Option<u8>,
+    /// Round trip to the server (µs), smoothed, and its variation: for the
+    /// overlay (`provider::STATS`), never reset.
+    rtt_us: Option<u64>,
+    jitter_us: u64,
 }
 
 impl LinkStats {
@@ -111,6 +120,19 @@ impl LinkStats {
             }
         }
         self.audio_last_seq = Some(seq);
+    }
+
+    /// One round trip measured: smoothed over about four samples; the
+    /// variation is the mean gap between a sample and the average.
+    fn rtt_sample(&mut self, us: u64) {
+        let (rtt, jitter) = match self.rtt_us {
+            Some(old) => (
+                (old * 3 + us) / 4,
+                (self.jitter_us * 3 + old.abs_diff(us)) / 4,
+            ),
+            None => (us, 0),
+        };
+        (self.rtt_us, self.jitter_us) = (Some(rtt), jitter);
     }
 
     /// The period's line, its maxima then reset.
@@ -141,6 +163,15 @@ fn random<const N: usize>() -> [u8; N] {
 impl Link {
     fn now_us(&self) -> u64 {
         self.started.elapsed().as_micros() as u64
+    }
+
+    /// A reply came back to something sent at `sent_us` (our clock): an
+    /// echo that is not in the past, or older than `MAX_RTT_US`, is not one.
+    fn round_trip(&mut self, sent_us: u64) {
+        let us = self.now_us().checked_sub(sent_us);
+        if let Some(us) = us.filter(|&us| us > 0 && us <= MAX_RTT_US) {
+            self.stats.rtt_sample(us);
+        }
     }
 
     fn send(&mut self, channel: u8, kind: u8, msg: &[u8], max: usize) -> Result<()> {
@@ -234,6 +265,16 @@ impl Link {
             ack[..2].copy_from_slice(&u16::from(h.channel).to_le_bytes());
             ack[2..].copy_from_slice(&h.packet_seq.to_le_bytes());
             self.send(0, pt::ACK, &ack, CONTROL_PAYLOAD)?;
+        }
+        if h.payload_type == pt::TIME_REPLY_64 {
+            // The answer to our request repeats its id and echo bytes (our clock).
+            let echo = p
+                .single_fragment_message()
+                .and_then(|m| m.get(2..10))
+                .and_then(|e| <[u8; 8]>::try_from(e).ok());
+            if let Some(e) = echo {
+                self.round_trip(u64::from_le_bytes(e));
+            }
         }
         if matches!(h.payload_type, pt::TIME_REQUEST_32 | pt::TIME_REQUEST_64) {
             let clocks = Clocks {
@@ -544,7 +585,8 @@ fn streaming(
         .iter()
         .find(|(_, n)| n.starts_with("display"))
         .map(|(i, _)| *i);
-    let mut video = crate::video::Video::new(shared);
+    let mut video = crate::video::Video::new(shared.clone());
+    let mut mark = (Instant::now(), 0u64, 0u64, 0u64);
     s.link.stats.audio_channel = audio_id;
     // The player orders audio by frame_index: SPP holding a missing
     // message would only delay every packet behind it.
@@ -589,6 +631,11 @@ fn streaming(
                         Some(Msg::ConnectionClose(c)) => {
                             println!("luna: the server ends the session (reason {:?})", c.reason);
                             break End::Closed;
+                        }
+                        Some(Msg::TimesyncReply(r)) => {
+                            if let Some(t) = r.client_timestamp {
+                                s.link.round_trip(t);
+                            }
                         }
                         _ => {}
                     }
@@ -662,6 +709,21 @@ fn streaming(
                 },
             )?;
             next_sync = now + TIMESYNC_EVERY;
+        }
+        if now >= mark.0 + STATS_EVERY {
+            let (frames, missing, size) = video.counts();
+            let secs = (now - mark.0).as_secs_f64().max(0.001);
+            let (got, lost) = (frames - mark.1, missing - mark.2);
+            let stats = &s.link.stats;
+            shared.publish(Stats {
+                rtt_us: stats.rtt_us.map(|u| u as u32),
+                jitter_us: stats.rtt_us.map(|_| stats.jitter_us as u32),
+                fps_x10: Some((got as f64 / secs * 10.0).round() as u16),
+                kbps: Some(((s.link.bytes - mark.3) as f64 * 8.0 / 1000.0 / secs) as u32),
+                loss_pm: Some((lost * 1000 / (got + lost).max(1)) as u16),
+                size,
+            });
+            mark = (now, frames, missing, s.link.bytes);
         }
         if now >= next_report {
             let mut line = String::from("luna: received");

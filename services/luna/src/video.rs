@@ -12,6 +12,7 @@ use lunacore::proto::display::ClientMessage;
 use lunacore::stream::display::{nal_types, Channel, DisplayConfig, EncodedFrame};
 use lunacore::stream::framing::Frame;
 use nxh264::{Decoder, Picture};
+use nxk_abi::proto::provider::Stats;
 
 /// Frames waiting for the decoder: more than this are dropped, and the
 /// next key frame resumes.
@@ -34,9 +35,21 @@ pub struct Shared {
     decode_us: AtomicU64,
     decode_max_us: AtomicU64,
     shown: AtomicU64,
+    /// The figures the overlay shows, renewed by the stream thread.
+    stats: Mutex<Stats>,
 }
 
 impl Shared {
+    pub fn publish(&self, s: Stats) {
+        if let Ok(mut l) = self.stats.lock() {
+            *l = s;
+        }
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.stats.lock().map(|s| *s).unwrap_or_default()
+    }
+
     /// The newest picture not shown yet.
     pub fn take_latest(&self) -> Option<Arc<Picture>> {
         let p = self.latest.lock().ok()?.take();
@@ -90,6 +103,8 @@ pub struct Video {
     first: bool,
     shown: u64,
     last_line: (u64, u64),
+    /// The stream's picture size, once a frame said it.
+    size: Option<(u16, u16)>,
 }
 
 impl Video {
@@ -113,6 +128,7 @@ impl Video {
             first: true,
             shown: 0,
             last_line: (0, 0),
+            size: None,
         }
     }
 
@@ -125,7 +141,19 @@ impl Video {
         step.replies
     }
 
+    /// Pictures received and lost so far, and the stream's size.
+    pub fn counts(&self) -> (u64, u64, Option<(u16, u16)>) {
+        let s = &self.channel.stats;
+        (s.frames, s.missing, self.size)
+    }
+
     fn on_video(&mut self, f: EncodedFrame) {
+        if let Some(r) = &f.stream_resolution {
+            self.size = Some((
+                r.width.min(u16::MAX as u32) as u16,
+                r.height.min(u16::MAX as u32) as u16,
+            ));
+        }
         if self.first {
             self.first = false;
             println!(

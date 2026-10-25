@@ -77,7 +77,20 @@ impl Ui {
         self.zone(Id::QFlight, L, fy - 30, R - L, 126, 6);
 
         let sy = 584;
-        if !self.in_game {
+        if self.in_game {
+            if self.pressed == Some(Id::QPerf) {
+                s.fill_round(L, sy - 26, R - L, 52, 6, p.raised);
+            }
+            icon(s, Icon::Gauge, IX, sy, p.text, p.surface);
+            s.label(SX, sy, "Performance Overlay", Face::Body, p.text);
+            let (t, c) = if self.cfg.perf {
+                ("On", p.good)
+            } else {
+                ("Off", p.dim)
+            };
+            s.label_r(R - 24, sy, t, Face::Body, c);
+            self.zone(Id::QPerf, L, sy - 26, R - L, 52, 6);
+        } else {
             if self.pressed == Some(Id::QSettings) {
                 s.fill_round(L, sy - 26, R - L, 52, 6, p.raised);
             }

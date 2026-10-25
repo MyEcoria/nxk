@@ -4,8 +4,9 @@
 //! own reads and writes them (the card is slow, and a Wi-Fi scan holds the
 //! worker for seconds); the main loop only posts jobs and takes results.
 //!
-//! `list.bin`: `NXC1`, the count, then per game five strings (u16 length,
-//! bytes: id, title, publisher, version, description) and the color.
+//! `list.bin`: `NXC2`, the count, then per game five strings (u16 length,
+//! bytes: id, title, publisher, version, description), the color and a
+//! flags byte (1: cloud). `NXC1` (no flags byte) is read as local games.
 //! `cHASH.bin`: a cover: u16 id length, the id (the hash of it names the
 //! file, since FAT refuses some characters of an id), then the catalog's
 //! cover bytes as `display` received them (RGB565, no decoding).
@@ -24,7 +25,9 @@ use crate::users;
 
 /// The cache thread's notification bit for `display`.
 pub const EV_CACHE: u64 = 32;
-const MAGIC: &[u8; 4] = b"NXC1";
+const MAGIC: &[u8; 4] = b"NXC2";
+const MAGIC_V1: &[u8; 4] = b"NXC1";
+const FLAG_CLOUD: u8 = 1;
 const COVER_BYTES: usize = 4 + 2 * proto::COVER_MAX * proto::COVER_MAX;
 
 /// A game as kept: what the catalog said, without the cover.
@@ -36,6 +39,7 @@ pub struct Entry {
     pub version: String,
     pub desc: String,
     pub color: u32,
+    pub cloud: bool,
 }
 
 /// The directory of user `user`'s cache of catalog `service`.
@@ -68,6 +72,7 @@ pub fn encode_list(games: &[Entry]) -> Vec<u8> {
             put_str(&mut b, s);
         }
         b.extend_from_slice(&g.color.to_le_bytes());
+        b.push(if g.cloud { FLAG_CLOUD } else { 0 });
     }
     b
 }
@@ -82,6 +87,10 @@ impl Reader<'_> {
         Some(a)
     }
 
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
@@ -94,9 +103,11 @@ impl Reader<'_> {
 
 pub fn decode_list(b: &[u8]) -> Option<Vec<Entry>> {
     let mut r = Reader(b);
-    if r.take(4)? != MAGIC {
-        return None;
-    }
+    let v1 = match r.take(4)? {
+        m if m == MAGIC => false,
+        m if m == MAGIC_V1 => true,
+        _ => return None,
+    };
     let n = r.u32()? as usize;
     if n > proto::MAX_GAMES {
         return None;
@@ -110,6 +121,7 @@ pub fn decode_list(b: &[u8]) -> Option<Vec<Entry>> {
             version: r.str()?,
             desc: r.str()?,
             color: r.u32()?,
+            cloud: !v1 && r.u8()? & FLAG_CLOUD != 0,
         };
         if !proto::valid_id(&g.id) || out.iter().any(|o: &Entry| o.id == g.id) {
             return None;

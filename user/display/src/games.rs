@@ -25,6 +25,9 @@ pub struct GameInfo {
     pub exe: String,
     /// A catalog's game: its id there (`exe` is empty).
     pub id: String,
+    /// Streamed from a server (`GAME_CLOUD`); the console's own games and
+    /// a catalog's local ones run here.
+    pub cloud: bool,
     pub cover: Option<Cover>,
 }
 
@@ -76,6 +79,7 @@ pub fn scan(mut old: Vec<GameInfo>) -> Vec<GameInfo> {
             color: 0xFFF8_A824,
             exe,
             id: String::new(),
+            cloud: false,
             cover,
         };
         if let Ok(text) = fs::read(&format!("{}/{}/game.txt", DIR, e.name)) {

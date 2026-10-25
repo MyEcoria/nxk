@@ -19,6 +19,7 @@ use lunacore::stream::input::{
     GamePadConnection, GamePadEvent, GamePadKind, GamePadState, InputEvent,
 };
 use lunacore::stream::Secret;
+use nxk_abi::proto::provider::Stats;
 use nxsvc::{Catalog, State};
 use serde_json::{json, Value};
 
@@ -238,7 +239,12 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
         kind: GamePadKind::Xbox360,
     }));
     let (mut state, mut packet) = (GamePadState::default(), 0u32);
+    let mut next_stats = Instant::now();
     while !ended.load(Ordering::Relaxed) {
+        if Instant::now() >= next_stats {
+            cat.set_stats(shared.stats());
+            next_stats += Duration::from_secs(1);
+        }
         if stop.load(Ordering::Relaxed) {
             stop_flag.store(true, Ordering::Relaxed);
         }
@@ -260,6 +266,7 @@ fn stream_it(cat: &Catalog, g: &GameSession, stop: &AtomicBool) -> Result<()> {
             }
         }
     }
+    cat.set_stats(Stats::default());
     let r = runner.join().map_err(|_| "the stream thread failed")?;
     drop(screen);
     match r? {

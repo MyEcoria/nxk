@@ -215,6 +215,10 @@ pub enum Icon {
     Wifi,
     Handheld,
     GameCard,
+    /// A game streamed from a server.
+    Cloud,
+    /// The performance overlay: three bars.
+    Gauge,
 }
 
 /// An icon centered on (cx, cy) in `c`, on `bg`.
@@ -277,6 +281,17 @@ pub fn icon(s: &mut Screen, k: Icon, cx: usize, cy: usize, c: u32, bg: u32) {
         Icon::GameCard => {
             s.fill_round(cx - 10, cy - 13, 20, 26, 4, c);
             s.fill_round(cx - 5, cy - 4, 10, 11, 2, bg);
+        }
+        Icon::Cloud => {
+            s.fill_round(cx - 13, cy, 26, 10, 5, c);
+            s.disc(cx - 6, cy + 1, 6, c);
+            s.disc(cx + 1, cy - 3, 8, c);
+            s.disc(cx + 8, cy + 3, 6, c);
+        }
+        Icon::Gauge => {
+            s.fill_round(cx - 11, cy + 1, 6, 10, 1, c);
+            s.fill_round(cx - 3, cy - 5, 6, 16, 1, c);
+            s.fill_round(cx + 5, cy - 11, 6, 22, 1, c);
         }
     }
 }

@@ -164,6 +164,10 @@ struct Shared {
     up: Update,
     /// The list last read: its version and ids, in the catalog's order.
     ids: (u64, Vec<String>),
+    /// The overlay wants the running game's figures: asked every second
+    /// (`STATS`), kept here for the UI's own sampling.
+    stats_on: bool,
+    stats: Option<proto::Stats>,
 }
 
 struct Link {
@@ -246,6 +250,8 @@ impl Provider {
                 cmds: VecDeque::new(),
                 up: Update::default(),
                 ids: (0, Vec::new()),
+                stats_on: false,
+                stats: None,
             }),
             wake: Condvar::new(),
             notif,
@@ -253,6 +259,10 @@ impl Provider {
         });
         let (path, l) = (exe(&s.name), link.clone());
         let threads = [
+            thread::spawn({
+                let l = link.clone();
+                move || watch_stats(&l)
+            }),
             thread::spawn({
                 let l = link.clone();
                 move || watch_state(&l)
@@ -309,6 +319,22 @@ impl Provider {
         s.cmds.push_back(c);
         drop(s);
         self.link.wake.notify_all();
+    }
+
+    /// Whether the overlay wants the game's figures (`STATS`, once a second).
+    pub fn want_stats(&self, on: bool) {
+        let mut s = self.link.sh.lock();
+        if s.stats_on != on {
+            s.stats_on = on;
+            drop(s);
+            self.link.wake.notify_all();
+        }
+    }
+
+    /// The game's figures as the catalog last said; none while not asked,
+    /// or if it has none.
+    pub fn stats(&self) -> Option<proto::Stats> {
+        self.link.sh.lock().stats
     }
 
     pub fn launch(&self, id: &str) {
@@ -395,6 +421,41 @@ fn endpoint(l: &Link) -> Option<u32> {
     }
 }
 
+/// How long the catalog may take to answer `STATS`; its own thread, so
+/// a slow one only leaves the figures old.
+const STATS_CALL_NS: u64 = 300_000_000;
+const STATS_EVERY_NS: u64 = 1_000_000_000;
+
+/// The running game's figures, once a second while the overlay asks.
+fn watch_stats(l: &Arc<Link>) {
+    let Some(ep) = endpoint(l) else {
+        return;
+    };
+    loop {
+        {
+            let mut s = l.sh.lock();
+            while !s.stats_on {
+                if s.quit {
+                    return;
+                }
+                s.stats = None;
+                s = l.wake.wait(s);
+            }
+        }
+        let m = Msg::new(proto::STATS, 0, 0);
+        let got = ipc::call_timeout(ep, &m, STATS_CALL_NS)
+            .and_then(ipc::checked)
+            .ok()
+            .map(|r| proto::Stats::from_words(&core::array::from_fn(|i| ipc::header(&r, i))));
+        let mut s = l.sh.lock();
+        if s.quit {
+            return;
+        }
+        s.stats = got;
+        drop(l.wake.wait_timeout(s, STATS_EVERY_NS));
+    }
+}
+
 /// The state, waiting for news; the list read again when it changed.
 fn watch_state(l: &Arc<Link>) {
     let Some(ep) = endpoint(l) else {
@@ -448,6 +509,7 @@ fn read_list(ep: u32, list: u64, count: usize) -> Option<Vec<GameInfo>> {
             Err(_) => continue,
         };
         let color = ipc::header(&r, 0) as u32 & 0xFF_FFFF;
+        let cloud = ipc::header(&r, 1) & proto::GAME_CLOUD != 0;
         let n = ipc::unpack_at(&r, 2, &mut buf);
         let f: Vec<String> = buf[..n]
             .split(|&b| b == 0)
@@ -472,6 +534,7 @@ fn read_list(ep: u32, list: u64, count: usize) -> Option<Vec<GameInfo>> {
             color: crate::theme::rgb(color),
             exe: String::new(),
             id,
+            cloud,
             cover: None,
         });
     }

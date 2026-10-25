@@ -456,10 +456,29 @@ impl Data {
     /// New sample of everything.
     pub fn refresh(&mut self) {
         let now = time::now_ns();
-        self.up_s = now / 1_000_000_000;
         let (n, force) = (self.refreshes, core::mem::take(&mut self.force));
         self.refreshes += 1;
+        self.kernel_sample(now);
+        self.services_refresh(n, force);
+    }
 
+    /// What costs no call to a service, for the overlay over a game: the
+    /// kernel's counters and the GPU's stats page.
+    pub fn refresh_light(&mut self) {
+        self.kernel_sample(time::now_ns());
+        self.gpu_sample();
+    }
+
+    /// The GPU from its stats page, if it was mapped by a full refresh.
+    fn gpu_sample(&mut self) {
+        if let Some(g) = self.gpu_page.as_mut().and_then(GpuPage::sample) {
+            self.gpu = Seen::Value(g);
+        }
+    }
+
+    /// Per-core load, rates and memory from the kernel's tables.
+    fn kernel_sample(&mut self, now: u64) {
+        self.up_s = now / 1_000_000_000;
         let (cpus, ncpu) = sysinfo::<CpuInfo, CPUS>(info::CPUS);
         let (t0, before) = self.prev.unwrap_or((0, [CpuInfo::default(); CPUS]));
         self.prev = Some((now, cpus));
@@ -487,7 +506,10 @@ impl Data {
         self.procs = sys::sysinfo(info::PROCESSES, &mut []).unwrap_or(0);
         let (m, k) = sysinfo::<MemInfo, 1>(info::MEMORY);
         self.mem = (k == 1).then_some(m[0]);
+    }
 
+    /// The services' answers (slow ones every `SLOW` refreshes, or `force`).
+    fn services_refresh(&mut self, n: u64, force: bool) {
         self.temps.poll(&POWER, power::TEMPERATURE, n, force, |m| {
             (m.mr[0] as i64, m.mr[1] as i64)
         });
@@ -626,9 +648,7 @@ impl Data {
                 }
             }
         }
-        if let Some(g) = self.gpu_page.as_mut().and_then(GpuPage::sample) {
-            self.gpu = Seen::Value(g);
-        }
+        self.gpu_sample();
     }
 
     /// The wired link: the PC's connection over USB-C (usbcon's network

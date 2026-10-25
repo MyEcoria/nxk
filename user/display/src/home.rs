@@ -196,6 +196,7 @@ impl Ui {
                 let x = X0 + i * (ICON + GAP);
                 if i < n {
                     game_icon(s, &self.games[i], x, ICON_Y);
+                    kind_badge(s, x, ICON_Y, self.games[i].cloud);
                     if i == last_idx {
                         game_badge(
                             s,
@@ -237,7 +238,8 @@ impl Ui {
             let play = self.play.label(&g.name, self.wall);
             let pw = font::width(Face::CapB, &play);
             let sx = (sel_x as i32 - off).clamp(64, W as i32 - 360) as usize;
-            icon(s, Icon::GameCard, sx + 10, TITLE_Y, p.accent, p.bg);
+            let kind = if g.cloud { Icon::Cloud } else { Icon::GameCard };
+            icon(s, kind, sx + 10, TITLE_Y, p.accent, p.bg);
             let max_tw = (W - 64 - pw - 28).saturating_sub(sx + 30);
             let title = fit(Face::Title, &g.title, max_tw);
             let tw = s.label(sx + 30, TITLE_Y, &title, Face::Title, p.accent);
@@ -487,6 +489,15 @@ fn game_icon(s: &mut Screen, g: &GameInfo, x: usize, y: usize) {
             s.label_c(x + ICON / 2, y + ICON / 2, &t, Face::TitleB, WHITE);
         }
     }
+}
+
+/// Where the game runs, top right of its icon: a cloud (streamed from a
+/// server) or a game card (on this console).
+fn kind_badge(s: &mut Screen, x: usize, y: usize, cloud: bool) {
+    let (bx, by) = (x + ICON - 58, y + 14);
+    s.round_a(bx, by, 44, 44, 22, BLACK, 190);
+    let kind = if cloud { Icon::Cloud } else { Icon::GameCard };
+    icon(s, kind, bx + 22, by + 22, WHITE, BLACK);
 }
 
 /// Switch 2 bottom-left avatar and black status pill on the last-played game card.

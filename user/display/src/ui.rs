@@ -86,6 +86,8 @@ pub enum Id {
     QVolume,
     QFlight,
     QSettings,
+    /// The performance overlay's switch (over a game).
+    QPerf,
     // Settings.
     Cat(usize),
     Theme(bool),
@@ -359,6 +361,8 @@ pub struct Ui {
     pub covers_absent: Vec<String>,
     /// The catalog's sign-in code to scan, while it asks for an account.
     pub login_art: Option<Cover>,
+    /// The overlay over a game: what the last second showed.
+    pub perf: Option<crate::perf::Sample>,
 }
 
 impl Ui {
@@ -425,6 +429,7 @@ impl Ui {
             covers_asked: Vec::new(),
             covers_absent: Vec::new(),
             login_art: None,
+            perf: None,
         }
     }
 
@@ -635,6 +640,7 @@ impl Ui {
                 color: g.color,
                 exe: String::new(),
                 id: g.id.clone(),
+                cloud: g.cloud,
                 cover: None,
             })
             .collect();
@@ -1114,6 +1120,13 @@ impl Ui {
                 self.quick = false;
                 self.go(SETTINGS);
             }
+            Id::QPerf => {
+                self.cfg.perf = !self.cfg.perf;
+                if !self.cfg.perf {
+                    self.perf = None;
+                }
+                return Some(Action::Save);
+            }
             Id::QBright | Id::Bright | Id::QVolume | Id::Volume | Id::Hud | Id::HudVolume => {}
             Id::Mute => {
                 let next = if self.cfg.volume == 0 {
@@ -1373,6 +1386,7 @@ impl Ui {
         if matches!(&self.toast, Some((_, end)) if now >= *end) {
             self.toast = None;
         }
+        self.perf_panel(s);
         self.draw_toast(s);
         if self.quick {
             self.zones.clear();

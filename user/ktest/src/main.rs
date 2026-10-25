@@ -68,6 +68,10 @@ fn main() -> i32 {
         ("faults: RO write, no access, W^X", t_faults),
         ("debug: BRK, registers, single step, memory", t_debug),
         ("debug: remote stop, KILL", t_debug_stop),
+        (
+            "provider STATS: words, absent fields, bounds",
+            t_provider_stats,
+        ),
     ];
     let mut failed = 0;
     for (name, f) in tests {
@@ -126,6 +130,39 @@ fn t_klog() -> R {
             line.len(),
             best / 1000
         ));
+    }
+    Ok(())
+}
+
+fn t_provider_stats() -> R {
+    use libnx::abi::proto::provider::Stats;
+    let full = Stats {
+        rtt_us: Some(31_500),
+        jitter_us: Some(2_000),
+        fps_x10: Some(599),
+        kbps: Some(8_400),
+        loss_pm: Some(3),
+        size: Some((1280, 720)),
+    };
+    if Stats::from_words(&full.to_words()) != full {
+        return Err("a full reply does not survive its words".into());
+    }
+    let some = Stats {
+        rtt_us: Some(0),
+        ..Stats::default()
+    };
+    if Stats::from_words(&some.to_words()) != some || Stats::from_words(&[0; 6]) != Stats::default()
+    {
+        return Err("an absent field came back present".into());
+    }
+    let wild = Stats::from_words(&[63, u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX]);
+    let bounded = wild.rtt_us == Some(10_000_000)
+        && wild.fps_x10 == Some(10_000)
+        && wild.kbps == Some(1_000_000)
+        && wild.loss_pm == Some(1000)
+        && wild.size == Some((8192, 8192));
+    if !bounded {
+        return Err(format!("values not bounded: {:?}", wild));
     }
     Ok(())
 }

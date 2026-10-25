@@ -233,6 +233,7 @@ fn list(cat: &Catalog, lib: &Library) {
             version: String::new(),
             description: e.genres.join(", "),
             color: 0x232F3E,
+            kind: nxsvc::Kind::Cloud,
         })
         .collect();
     cat.set_games(games);
