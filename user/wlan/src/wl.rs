@@ -23,6 +23,7 @@ const WLC_DOWN: u32 = 3;
 const WLC_SET_INFRA: u32 = 20;
 const WLC_GET_CHANNEL: u32 = 29;
 const WLC_DISASSOC: u32 = 52;
+const WLC_GET_PM: u32 = 85;
 const WLC_SET_PM: u32 = 86;
 const WLC_GET_RSSI: u32 = 127;
 
@@ -532,6 +533,19 @@ impl Dev<'_> {
                 }
             }
             if associated && link && keyed {
+                // The firmware may turn power saving back on when it
+                // associates: the access point would then hold what it has for
+                // us until the next beacon (pings of 100-170 ms).
+                let pm = self
+                    .mb
+                    .ioctl(bp, tcm, WLC_GET_PM, &[0u8; 4], 4)
+                    .ok()
+                    .filter(|r| r.data.len() >= 4)
+                    .map(|r| le32(&r.data, 0));
+                println!("[wlan] power save mode {:?} after the join", pm);
+                if pm != Some(0) {
+                    let _ = self.mb.cmd_int(bp, tcm, WLC_SET_PM, 0);
+                }
                 return Ok(sup);
             }
             if time::now_ns() > deadline {

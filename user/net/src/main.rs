@@ -60,6 +60,8 @@ static TX_BYTES: AtomicU64 = AtomicU64::new(0);
 /// `LINKS` entry: DHCP starts over on the one in use, since the network
 /// may be another one once it is back.
 static LINK_DOWN: AtomicU64 = AtomicU64::new(0);
+/// Frames dropped because the main loop did not take them in time.
+static RX_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// The links: name and `LINK_*`.
 const LINKS: [(&str, u64); 3] = [
@@ -286,6 +288,8 @@ fn receive(k: usize, eth: u32, q: Frames, notif: u32, stop: Arc<AtomicBool>) {
                     let mut g = q.lock();
                     if g.len() < 256 {
                         g.push_back((k, frame[..n].to_vec()));
+                    } else if RX_DROPS.fetch_add(1, Ordering::Relaxed).is_multiple_of(256) {
+                        println!("[net] receive queue full: frames dropped");
                     }
                     drop(g);
                     let _ = sys::notify_signal(notif, 1);

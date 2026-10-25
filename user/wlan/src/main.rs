@@ -73,6 +73,8 @@ struct Hw {
     joined: Option<Joined>,
     /// Frames for `wlan0` readers, oldest first.
     rx: VecDeque<Vec<u8>>,
+    /// Frames dropped for want of a reader.
+    rx_dropped: u64,
     /// Chip interrupts taken, deep sleep requests among them, the last
     /// mailbox data, and PCIe errors (count, last AFI code): counted,
     /// not printed, since a failing chip raises them in bursts.
@@ -251,6 +253,13 @@ impl Hw {
         let r = self.dev(|d| d.housekeeping(j.sup.as_mut(), &mut rx));
         while rx.len() > RX_QUEUE {
             rx.pop_front();
+            self.rx_dropped += 1;
+            if self.rx_dropped % 256 == 1 {
+                println!(
+                    "[wlan] receive queue full: {} frames dropped",
+                    self.rx_dropped
+                );
+            }
         }
         self.rx = rx;
         match r {
@@ -710,6 +719,7 @@ fn hardware() -> Result<(Hw, Irq, String), String> {
             seen: Vec::new(),
             joined: None,
             rx: VecDeque::new(),
+            rx_dropped: 0,
             irqs: 0,
             deep_sleeps: 0,
             mb_data: 0,
