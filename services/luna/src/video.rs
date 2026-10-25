@@ -15,8 +15,10 @@ use nxh264::{Decoder, Picture};
 use nxk_abi::proto::provider::Stats;
 
 /// Frames waiting for the decoder: more than this are dropped, and the
-/// next key frame resumes.
-const QUEUE: usize = 6;
+/// next key frame resumes. A run of busy pictures at 60 Hz (a decoder a
+/// little slower than the stream) fills it slowly; dropping costs a
+/// freeze until the next key frame, waiting only some delay.
+const QUEUE: usize = 10;
 /// Threads the decoder uses for a picture (slices, then the filter): the
 /// four slices of a picture on the four cores, below the other threads.
 const DECODER_THREADS: usize = 4;
@@ -108,6 +110,11 @@ impl Shared {
             self.shown.fetch_add(1, Relaxed);
         }
         p
+    }
+
+    /// Pictures put on the panel so far.
+    pub fn shown(&self) -> u64 {
+        self.shown.load(Relaxed)
     }
 
     /// A picture shown: `arrived` is when its frame was complete, `show`

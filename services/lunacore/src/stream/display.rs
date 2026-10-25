@@ -283,9 +283,9 @@ pub struct DisplayConfig {
 impl DisplayConfig {
     /// The console's panel refreshed `refresh_rate` times a second, and a bit rate cap in Mbit/s
     /// (`None`: the cap that suits the rate). The server sends 1080p whatever is announced and
-    /// honours the rate, and the software decoder's cost follows the bit rate and the rate: one
-    /// picture every 16.6 ms at 60 Hz leaves a 12 Mbit/s stream (25 KB a picture, 18 ms to decode
-    /// on the four A57 cores at 1224 MHz) behind, 8 Mbit/s (13 ms) keeps up.
+    /// honours the rate. The software decoder's cost follows the motion more than the bits (a fast
+    /// 1080p clip: 16.5 ms a picture at 8 Mbit/s, 17.5 at 12, on four A57 cores at 1224 MHz), but
+    /// the residual parse and the link do follow them: 8 Mbit/s at 60 Hz, 12 at 30.
     pub fn new(refresh_rate: u32, max_mbit: Option<u32>) -> Self {
         let max = max_mbit.unwrap_or(if refresh_rate > 30 { 8 } else { 12 });
         Self {

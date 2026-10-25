@@ -34,6 +34,8 @@ const SIDE: (u32, u32) = (1280, 720);
 const PICTURE_WAIT: Duration = Duration::from_millis(20);
 /// The gamepad thread looks at its stop flag at least this often.
 const PAD_WAIT_NS: u64 = 20_000_000;
+/// A failed read of the input is tried again after this long.
+const PAD_RETRY: Duration = Duration::from_millis(5);
 /// A dark screen until the first picture is decoded.
 const WAIT_COLOR: u32 = 0x101820;
 
@@ -281,7 +283,12 @@ fn read_pad(events: &nxgfx::Events, tx: &Sender<stream::Timed>, done: &AtomicBoo
     })));
     let (mut state, mut packet) = (GamePadState::default(), 0u32);
     while !done.load(Ordering::Relaxed) {
+        let t = Instant::now();
         let Some(ev) = events.poll_words(PAD_WAIT_NS) else {
+            // A refusal that comes at once (the screen is gone) must not spin above the decoder.
+            if t.elapsed() < PAD_RETRY {
+                sleep(PAD_RETRY);
+            }
             continue;
         };
         if pad::apply(&mut state, &ev) {

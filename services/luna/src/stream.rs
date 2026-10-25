@@ -604,7 +604,7 @@ fn streaming(
         .find(|(_, n)| n.starts_with("display"))
         .map(|(i, _)| *i);
     let mut video = crate::video::Video::new(shared.clone(), display);
-    let mut mark = (Instant::now(), 0u64, 0u64, 0u64);
+    let mut mark = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
     s.link.stats.audio_channel = audio_id;
     // The player orders audio by frame_index: SPP holding a missing
     // message would only delay every packet behind it.
@@ -731,16 +731,19 @@ fn streaming(
             let (frames, missing, size) = video.counts();
             let secs = (now - mark.0).as_secs_f64().max(0.001);
             let (got, lost) = (frames - mark.1, missing - mark.2);
+            // The pictures on the panel, not the frames received: a decoder or a
+            // presenter that falls behind shows in the overlay.
+            let shown = shared.shown();
             let stats = &s.link.stats;
             shared.publish(Stats {
                 rtt_us: stats.rtt_us.map(|u| u as u32),
                 jitter_us: stats.rtt_us.map(|_| stats.jitter_us as u32),
-                fps_x10: Some((got as f64 / secs * 10.0).round() as u16),
+                fps_x10: Some(((shown - mark.4) as f64 / secs * 10.0).round() as u16),
                 kbps: Some(((s.link.bytes - mark.3) as f64 * 8.0 / 1000.0 / secs) as u32),
                 loss_pm: Some((lost * 1000 / (got + lost).max(1)) as u16),
                 size,
             });
-            mark = (now, frames, missing, s.link.bytes);
+            mark = (now, frames, missing, s.link.bytes, shown);
         }
         if now >= next_report {
             let mut line = String::from("luna: received");

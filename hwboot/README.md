@@ -1550,6 +1550,21 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+66. 25/10/2026, same console (gauge 49 %, plugged), `display` and `luna`
+    replaced in place (the old `luna` ended by the Intern tab first): **the
+    decoder's real margin at 60 Hz, and a second thread for the game's
+    `EVENT`**. `h264bench` at 1224 MHz on four threads, ms a picture
+    (median / 95th / 99th / max): 1200 pictures of the real 60 Hz stream
+    (Avatar, 1.7 Mbit/s) 9.8 / 11.9 / 16 / 37; a fast 1080p x264 clip in the
+    server's shape (P frames, 16 refs, 4 slices, 400 pictures) at 8 Mbit/s
+    16.5 / 20.5 / 26 / 43, and the 25 KB-a-picture clip 17.5 / 27 / 31 / 44.
+    Its profile on one thread (55 ms a picture): motion compensation 17 ms,
+    residual parse 7.5, reconstruction 5, the filter 16; the cost hardly
+    follows the bit rate (the PC: 7.4 / 8.9 / 9.0 ms at 4 / 6 / 8 Mbit/s). So
+    60 Hz is within reach on calm scenes and at the limit on fast ones.
+    `display` serves the game's endpoint on two threads: Starlane from the
+    library answered LEFT held (the ship moved) at 60 fps, HOME ended it
+    (`ps`: no game left). No Luna session was opened.
 65. 25/10/2026, same console, rebooted with run 64's image, `display` reloaded:
     **the catalogs' games are cached on the card**. A Luna tab used to open on
     "Starting" and show its covers 1.55 s after the tap; with
