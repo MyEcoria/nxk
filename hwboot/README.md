@@ -1550,6 +1550,16 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+71. 25/10/2026, same console (gauge 17 % then lower, plugged), the phone's
+    hotspot, `luna` of `a4170a8`, `refresh=45`, volume 10 % (`wlan` found dead
+    again before, restarted with `display` and `net`): **45 Hz holds** (the 28th
+    Luna session, about 7 minutes of Shadow of the Tomb Raider). The server
+    honours 45 Hz (45 pictures a second received). Over 19556 pictures: decoding
+    13.7 ms of the 22 between pictures (34 at most, 3 key frames then 7), 3
+    dropped, 35 skipped to a key frame (5421 at 60 Hz), 19379 shown (99 %),
+    gamepad to socket 1.0 ms, the delay from a complete frame to its decoded
+    picture 9 to 37 ms with a few peaks at 87 ms after a loss (queue 8), the
+    rate 3.3 Mbit/s on average.
 70. 25/10/2026, same console (gauge 27 %, plugged), the phone's hotspot
     (nxk-test, 5 GHz channel 155, -38 dBm, pings 103 ms on average, 0 % lost),
     `luna` of `2657559` with `notify_resolution=1280x720`, 60 Hz, volume 10 %:

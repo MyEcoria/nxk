@@ -319,7 +319,7 @@ wrong, else every minute; another gives the link (longest time without a
 datagram, the stream thread's longest busy spell and send, audio packets
 lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
-the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 60 Hz and an 8
+the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 45 Hz and an 8
 Mbit/s cap by default, `refresh=` (24 to 60) and `max_mbit=` in the catalog's
 `service.txt` change them; experiments, off unless set there: `notify_resolution=1280x720`,
 `max_display=1280x720`, `min_quality=`, `max_quality=` and `bitrate_kbps=` (the protocol's
@@ -342,8 +342,8 @@ desktop client, nearest sample, the panel's quarter turn) draws it, so the
 CPU never touches the pixels. The interpolation, the deblocking filters and
 the inverse transforms are NEON (the portable code is the oracle,
 `h264bench selftest`), luna raises the CPU to the highest step `cpufreq`
-accepts for the length of a stream and announces 60 Hz by default (the
-server sends the rate announced: 30 Hz gave about 29 frames a second; a
+accepts for the length of a stream and announces 45 Hz by default (the
+server sends the rate announced: 30 Hz gave about 29 frames a second, 45 Hz 45; a
 game rendered at 30 Hz should add a frame or two of delay of its own, not
 measured). Measured: on the Erista a 15 Mbit/s 1080p motion clip decodes
 in 21 ms a frame on four threads at 1219 MHz (64 ms on one; 54 ms on four
@@ -356,7 +356,7 @@ frames). A 1080p x264 clip of fast motion in the server's shape (P frames,
 7.4 ms at 4 Mbit/s, 8.9 at 6, 9.0 at 8), the motion compensation (45 % of
 the work), the filter and the parsing do. 60 Hz therefore holds on calm
 scenes and is at the limit on fast ones (16.6 ms between pictures, the
-other threads included); `refresh=30` in `service.txt` is the safe rate.
+other threads included); on Tomb Raider at 60 Hz the decoder took 17.8 ms a picture and a fifth of the pictures were skipped, at 45 Hz 13.7 ms of 22 and 1 dropped in 19556: `refresh=` in `service.txt` sets it (30 is the safe rate).
 The gamepad is read on a thread of its own (`display` serves `EVENT` on a
 second thread, so it does not wait for a `FLIP`'s vertical blank) and the
 stream thread looks at it every 2 ms; the report line gives the time from

@@ -361,9 +361,11 @@ impl DisplayConfig {
 }
 
 impl Default for DisplayConfig {
-    /// 60 Hz, as the panel runs: half the delay between the game's picture and the stream's.
+    /// 45 Hz: the server honours the rate, and on the console's four A57 cores the decoder keeps up with it
+    /// (13.7 ms a picture of 22 on a busy game, 1 picture dropped in 19556) where 60 Hz does not (17.8 ms of 16.6,
+    /// a fifth of the pictures skipped).
     fn default() -> Self {
-        Self::new(60, None)
+        Self::new(45, None)
     }
 }
 
@@ -890,7 +892,7 @@ mod tests {
             (session.codecs[0].profile, session.codecs[0].level),
             (8, 65536)
         );
-        assert_eq!(session.display.as_ref().map(|d| d.refresh_rate), Some(60));
+        assert_eq!(session.display.as_ref().map(|d| d.refresh_rate), Some(45));
         assert_eq!(
             session.display.and_then(|d| d.resolution),
             Some(Resolution {
