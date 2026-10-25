@@ -1574,7 +1574,11 @@ within 5 s.
     first sample) did not kill `wlan` either; cause still open. `init` supervises
     `wlan` now (starts it again from `/bin/wlan` or the boot image when it exits,
     tried in the emulator with `wifi poke die`), which needs the boot image on the
-    card to be rebuilt.
+    card to be rebuilt: done afterwards over USB-C (`bl33.bin` 4317184 bytes and its
+    `bl31.bin` 14384 bytes, built from `63b8ddc`, `--put` to `.new` names with the
+    CRC checked then `rm` and `mv`; the pair before kept as `bl33.pre-supervise` and
+    `bl31.pre-supervise`; `build/nxk.bin` must be refreshed before `mkbl31.py`, which
+    bakes the kernel's size in; `test-bl31.sh` OK). Not rebooted yet.
 71. 25/10/2026, same console (gauge 17 % then lower, plugged), the phone's
     hotspot, `luna` of `a4170a8`, `refresh=45`, volume 10 % (`wlan` found dead
     again before, restarted with `display` and `net`): **45 Hz holds** (the 28th
