@@ -5,6 +5,7 @@
 //! message that lost a fragment completes late. Messages of the application channels are held for at most
 //! [`ORDER_BUDGET`] while a predecessor is missing, then the gap is abandoned (`reliability::OrderBuffer`).
 
+use super::fec::Fec;
 use super::header::{pt, Packet, MAX_CHANNEL, MAX_RX_PAYLOAD};
 use crate::stream::reliability::{MessageCounters, OrderBuffer};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -400,6 +401,9 @@ impl Reassembler {
 pub struct Receiver {
     reassembler: Reassembler,
     queue: VecDeque<Event>,
+    fec: Fec,
+    /// Packets rebuilt from parity, to be acknowledged (channel, packet number).
+    acks: Vec<(u8, u16)>,
 }
 
 impl Default for Receiver {
@@ -415,7 +419,24 @@ impl Receiver {
         Self {
             reassembler,
             queue: VecDeque::new(),
+            fec: Fec::default(),
+            acks: Vec::new(),
         }
+    }
+
+    /// # The parity's counters and its lags, as one log line.
+    pub fn fec_line(&self) -> String {
+        self.fec.line()
+    }
+
+    /// # Notes to print once: what a parity that did not match looked like.
+    pub fn fec_notes(&mut self) -> Vec<String> {
+        self.fec.take_notes()
+    }
+
+    /// # The packets rebuilt from parity since the last call, for the caller to acknowledge (channel, packet number).
+    pub fn take_rebuilt(&mut self) -> Vec<(u8, u16)> {
+        std::mem::take(&mut self.acks)
     }
 
     /// # Counters of the messages of `channel` so far.
@@ -461,7 +482,24 @@ impl Receiver {
     }
 
     /// # [`Receiver::classify`] at a given time.
+    ///
+    /// The parity packets feed the FEC: a packet it rebuilds is handled as if it had arrived (and is listed for
+    /// [`Receiver::take_rebuilt`]).
     pub fn classify_at(&mut self, packet: &Packet, now: Instant) -> Option<Event> {
+        let rebuilt = match packet.header.payload_type {
+            pt::FEC => self.fec.on_parity(packet, now),
+            _ => self.fec.on_data(packet, now),
+        };
+        self.handle(packet, now);
+        if let Some(rebuilt) = rebuilt {
+            self.acks
+                .push((rebuilt.header.channel, rebuilt.header.packet_seq));
+            self.handle(&rebuilt, now);
+        }
+        self.queue.pop_front()
+    }
+
+    fn handle(&mut self, packet: &Packet, now: Instant) {
         let header = &packet.header;
         match header.payload_type {
             pt::DATA => {
@@ -470,7 +508,9 @@ impl Receiver {
                 self.queue.extend(released.into_iter().map(Event::Message));
             }
             pt::CHANNEL_CONFIRM => {
-                let flags = *packet.single_fragment_message()?.first()?;
+                let Some(flags) = packet.single_fragment_message().and_then(|m| m.first()) else {
+                    return;
+                };
                 self.queue.push_back(Event::ChannelConfirmed {
                     channel: header.channel,
                     in_order: flags & 1 != 0,
@@ -478,15 +518,22 @@ impl Receiver {
             }
             pt::CONN_CLOSE => self.queue.push_back(Event::Closed),
             pt::RTCP => {
-                let body = packet.single_fragment_message()?;
-                let rate = u32::from_le_bytes(body.get(..4)?.try_into().ok()?);
-                let timestamp = u32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
-                self.queue
-                    .push_back(Event::TargetBitrate { rate, timestamp });
+                let Some(body) = packet.single_fragment_message() else {
+                    return;
+                };
+                let (Some(rate), Some(timestamp)) = (
+                    body.get(..4).and_then(|b| b.try_into().ok()),
+                    body.get(4..8).and_then(|b| b.try_into().ok()),
+                ) else {
+                    return;
+                };
+                self.queue.push_back(Event::TargetBitrate {
+                    rate: u32::from_le_bytes(rate),
+                    timestamp: u32::from_le_bytes(timestamp),
+                });
             }
             _ => {}
         }
-        self.queue.pop_front()
     }
 }
 

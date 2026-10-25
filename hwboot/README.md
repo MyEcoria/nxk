@@ -1550,6 +1550,21 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+67. 25/10/2026, same console (gauge 48 to 39 %, plugged), `luna` of
+    `d980315`, 60 Hz announced, volume 10 %: **Shadow of the Tomb Raider for
+    13 minutes** (the 24th Luna session). The PC's link was good (pings 8 to
+    14 ms). The stream came at 60 pictures a second, 98 % of them shown;
+    decoding 10.7 to 12 ms a picture (35 at most) at 3 Mbit/s; the gamepad
+    reached the socket in 0.7 to 1 ms (2.2 at most). About 1.5 holds a second
+    (lost packets recovered by the server's retransmission, 56 to 62 ms after
+    the loss): the pictures behind them came in bursts, the queue reached 5 to
+    6 and the delay from a complete frame to its decoded picture went from 8 ms
+    to 58, then 88 and 127 ms after a longer stall (137 ms without a datagram,
+    audio p95 120 ms): the queue overflowed (21 dropped, 100 decoder errors,
+    13 key frames asked, the picture frozen). The decoder's 5 ms of margin a
+    picture drains a burst slowly. Nothing was rebuilt: the parity packets
+    were still ignored. Next: the parity (shadowed until it matches) and
+    skipping to the next key frame after a gap.
 66. 25/10/2026, same console (gauge 49 %, plugged), `display` and `luna`
     replaced in place (the old `luna` ended by the Intern tab first): **the
     decoder's real margin at 60 Hz, and a second thread for the game's

@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use lunacore::proto::display::ClientMessage;
-use lunacore::stream::display::{nal_types, Channel, DisplayConfig, EncodedFrame};
+use lunacore::stream::display::{is_key_frame, nal_types, Channel, DisplayConfig, EncodedFrame};
 use lunacore::stream::framing::Frame;
 use nxh264::{Decoder, Picture};
 use nxk_abi::proto::provider::Stats;
@@ -77,6 +77,10 @@ pub struct Shared {
     input: Spans,
     /// The decoder lost its references: a key frame is needed.
     want_key: AtomicBool,
+    /// Frames are thrown away, undecoded, until the next key frame: a picture that
+    /// cannot be decoded only costs time while the queue grows.
+    skip_to_key: AtomicBool,
+    skipped: AtomicU64,
     decoded: AtomicU64,
     errors: AtomicU64,
     dropped: AtomicU64,
@@ -142,6 +146,13 @@ fn decode_loop(rx: std::sync::mpsc::Receiver<(Instant, EncodedFrame)>, shared: A
     let mut last_error = String::new();
     while let Ok((arrived, f)) = rx.recv() {
         shared.queued.fetch_sub(1, Relaxed);
+        if shared.skip_to_key.load(Relaxed) {
+            if !is_key_frame(&f.data) {
+                shared.skipped.fetch_add(1, Relaxed);
+                continue;
+            }
+            shared.skip_to_key.store(false, Relaxed);
+        }
         let t = Instant::now();
         match dec.decode(&f.data) {
             Ok(Some(p)) => {
@@ -159,6 +170,7 @@ fn decode_loop(rx: std::sync::mpsc::Receiver<(Instant, EncodedFrame)>, shared: A
             Err(e) => {
                 shared.errors.fetch_add(1, Relaxed);
                 shared.want_key.store(true, Relaxed);
+                shared.skip_to_key.store(true, Relaxed);
                 let text = format!("{:?}", e);
                 if text != last_error {
                     println!("luna: video decoder: {}", text);
@@ -207,7 +219,12 @@ impl Video {
 
     /// A frame of the display channel: what to send back.
     pub fn on_frame(&mut self, frame: Frame) -> Vec<ClientMessage> {
+        let missing = self.channel.stats.missing;
         let step = self.channel.on_frame(frame, Instant::now());
+        // Frames that never came break the references of those behind them.
+        if self.channel.stats.missing > missing {
+            self.shared.skip_to_key.store(true, Relaxed);
+        }
         if let Some(f) = step.video {
             self.on_video(f);
         }
@@ -244,6 +261,7 @@ impl Video {
         match tx.try_send((Instant::now(), f)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                self.shared.skip_to_key.store(true, Relaxed);
                 self.shared.queued.fetch_sub(1, Relaxed);
                 // A dropped frame breaks the references: start again from a key frame.
                 self.shared.dropped.fetch_add(1, Relaxed);
@@ -261,6 +279,10 @@ impl Video {
     pub fn on_tick(&mut self) -> Vec<ClientMessage> {
         let now = Instant::now();
         let mut out = self.channel.on_tick(now);
+        // Skipping until a key frame: it is asked for again until it comes.
+        if self.shared.skip_to_key.load(Relaxed) {
+            self.shared.want_key.store(true, Relaxed);
+        }
         if self.shared.want_key.load(Relaxed) {
             if let Some(m) = self.channel.keyframe_request(now) {
                 self.shared.want_key.store(false, Relaxed);
@@ -283,7 +305,7 @@ impl Video {
         let n = decoded.max(1);
         Some(format!(
             "luna: video {} frames {} KB, {} key, {} missing, {} stale, {} rejected, {} key frames asked; \
-             decoded {} ({:.1} ms a frame, {:.1} at most), {} errors, {} dropped, {} shown; \
+             decoded {} ({:.1} ms a frame, {:.1} at most), {} errors, {} dropped, {} skipped to a key frame, {} shown; \
              ms avg/max: complete to decoded {}, to the panel {}, show {}, gamepad to socket {}, queue {} at most",
             s.frames,
             s.bytes / 1024,
@@ -297,6 +319,7 @@ impl Video {
             sh.decode_max_us.swap(0, Relaxed) as f64 / 1000.0,
             sh.errors.load(Relaxed),
             sh.dropped.load(Relaxed),
+            sh.skipped.load(Relaxed),
             shown,
             sh.decode_wait.take(),
             sh.on_screen.take(),

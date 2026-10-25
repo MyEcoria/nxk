@@ -259,21 +259,30 @@ impl Link {
                 self.last_ts = p.header.timestamp;
                 self.stats.packet(&p);
                 self.service(&p)?;
-                if let Some(e) = self.recv.classify(&p) {
+                let event = self.recv.classify(&p);
+                // A packet rebuilt from the parity is acknowledged as if it had come.
+                for (channel, seq) in self.recv.take_rebuilt() {
+                    self.send_ack(channel, seq)?;
+                }
+                if let Some(e) = event {
                     return Ok(Some(e));
                 }
             }
         }
     }
 
+    fn send_ack(&mut self, channel: u8, packet_seq: u16) -> Result<()> {
+        let mut ack = [0u8; 4];
+        ack[..2].copy_from_slice(&u16::from(channel).to_le_bytes());
+        ack[2..].copy_from_slice(&packet_seq.to_le_bytes());
+        self.send(0, pt::ACK, &ack, CONTROL_PAYLOAD)
+    }
+
     /// What a packet asks of us: an ack, a time reply.
     fn service(&mut self, p: &Packet) -> Result<()> {
         let h = &p.header;
         if h.force_ack && h.payload_type != pt::FEC {
-            let mut ack = [0u8; 4];
-            ack[..2].copy_from_slice(&u16::from(h.channel).to_le_bytes());
-            ack[2..].copy_from_slice(&h.packet_seq.to_le_bytes());
-            self.send(0, pt::ACK, &ack, CONTROL_PAYLOAD)?;
+            self.send_ack(h.channel, h.packet_seq)?;
         }
         if h.payload_type == pt::TIME_REPLY_64 {
             // The answer to our request repeats its id and echo bytes (our clock).
@@ -629,6 +638,7 @@ fn streaming(
     );
     let mut sync_id = 0u32;
     let mut last_report = String::new();
+    let mut last_fec = String::new();
     // Read while the channels were set up, in arrival order.
     let mut held: VecDeque<Event> = s.link.held.drain(..).collect();
     let end = loop {
@@ -772,6 +782,14 @@ fn streaming(
             if line != last_report {
                 println!("{}", line);
                 last_report = line;
+            }
+            let fec = s.link.recv.fec_line();
+            for note in s.link.recv.fec_notes() {
+                println!("{}", note);
+            }
+            if fec != last_fec {
+                println!("{}", fec);
+                last_fec = fec;
             }
             if let Some(v) = video.report() {
                 let c = display_id

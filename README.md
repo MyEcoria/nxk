@@ -363,7 +363,15 @@ match the desktop client's. The video channel is released in order, waiting
 up to 250 ms for a lost fragment (the server retransmits it about 60 ms after
 the loss): over two minutes about nine in ten lost frames come back; the
 others cost a freeze until the server's next key frame (about 2 s in 125 s).
-The FEC packets (one a group of 32) are not used yet. The serial and the tokens are `state.json` in
+The server's parity packets (one XOR packet a group of 32 per channel,
+`services/lunacore/src/stream/spp/fec.rs`) rebuild a group's one lost packet
+without waiting for the retransmission, but only after a channel's first three
+complete groups matched the parity (payload and the 8 header bytes, a layout
+read from the decompiled client and not yet checked against real packets);
+before that, and for good after a mismatch, a rebuilt packet is only compared
+with the retransmitted copy. A frame the decoder cannot follow (a gap, an
+error, a full queue) makes it skip every picture up to the next key frame,
+asked for every half second, instead of decoding pictures that cannot be right. The serial and the tokens are `state.json` in
 `/users/ID/services/luna`: FAT keeps no permissions. Nothing that could
 spend money is ever called, and no token or reply body reaches the logs.
 

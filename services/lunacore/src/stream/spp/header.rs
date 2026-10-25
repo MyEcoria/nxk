@@ -67,7 +67,7 @@ impl std::fmt::Display for SppError {
 
 /// # Decoded SPP header. Multi-byte fields are big-endian on the wire.
 ///
-/// Byte 1 (a copy of the payload type), byte 18 (reserved, always 0) and the low bits of byte 19 are not stored.
+/// Byte 1 (a copy of the payload type) and byte 18 (reserved, always 0) are not stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Header {
     /// Bytes 2-3: counts every datagram sent on the connection.
@@ -86,6 +86,8 @@ pub struct Header {
     pub packet_seq: u16,
     /// Byte 19, bit 7: the receiver must answer with a [`pt::ACK`].
     pub force_ack: bool,
+    /// Byte 19, bits 6-0: zero for data packets, header parity for FEC packets.
+    pub spare_flags: u8,
     /// Bytes 20-21: per-channel message number, shared by all fragments of a message.
     pub message_seq: u16,
     /// Bytes 22-25: length of the whole message before fragmentation.
@@ -116,7 +118,8 @@ impl Header {
         out[14] = self.payload_type;
         out[15] = self.channel;
         out[16..18].copy_from_slice(&self.packet_seq.to_be_bytes());
-        out[19] = if self.force_ack { FORCE_ACK_BIT } else { 0 };
+        out[19] =
+            if self.force_ack { FORCE_ACK_BIT } else { 0 } | (self.spare_flags & !FORCE_ACK_BIT);
         out[20..22].copy_from_slice(&self.message_seq.to_be_bytes());
         out[22..26].copy_from_slice(&self.message_len.to_be_bytes());
         out[26..32].copy_from_slice(&self.parity);
@@ -153,6 +156,7 @@ impl Header {
             channel,
             packet_seq: u16::from_be_bytes([bytes[16], bytes[17]]),
             force_ack: bytes[19] & FORCE_ACK_BIT != 0,
+            spare_flags: bytes[19] & !FORCE_ACK_BIT,
             message_seq: u16::from_be_bytes([bytes[20], bytes[21]]),
             message_len: u32::from_be_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]),
             parity: [
@@ -249,6 +253,7 @@ mod tests {
             channel: 7,
             packet_seq: 0xFFFE,
             force_ack: true,
+            spare_flags: 0x2a,
             message_seq: 0x1234,
             message_len: 0x00AB_CDEF,
             parity: [1, 2, 3, 4, 5, 6],
@@ -264,7 +269,9 @@ mod tests {
         assert_eq!(header.encode()[19], 0x80);
         let mut bytes = header.encode();
         bytes[19] = 0x7f;
-        assert!(!Header::decode(&bytes).unwrap().force_ack);
+        let decoded = Header::decode(&bytes).unwrap();
+        assert!(!decoded.force_ack);
+        assert_eq!(decoded.spare_flags, 0x7f);
     }
 
     #[test]
