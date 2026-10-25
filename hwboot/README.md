@@ -1550,6 +1550,25 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+74. 25/10/2026, same console (gauge 45 %), `luna` at 45 Hz, volume 10 %, the
+    capture armed, `init`'s supervision in place (the 30th Luna session, 16
+    minutes of Shadow of the Tomb Raider): the stream was steady for the whole
+    time (41855 pictures received, decoded in 14.0 ms, 1 dropped, 158 skipped to
+    a key frame, 98.6 % shown; FEC: 1596 parity packets, 1483 complete groups
+    matched, 6 packets rebuilt and used, 5 compared identical; audio 46740 packets,
+    28 lost, 4 underruns). Then `wlan` took a second SError, at another place
+    (`pc +0x535c`, the first was `+0x5610`: both in the chip's interrupt path), and
+    `init` started it again at once (`[init] wlan exited (code 139): starting it
+    again`). The same freeze followed as in run 72: `luna`'s presenter was blocked 42.1 s in
+    `show` (the maximum of its report: 42122 ms), `luna` ended with `nothing from the
+    server for 42 s`, the new `wlan`'s start-up messages came only when the player
+    left, and `net` had gone to `usb0`. 42 s both times. The root port's completion
+    timeout is not the cause: its register reads 0 (range A, 50 us to 50 ms) and a
+    read of a missing chip returns after 47.8 ms. A hang that stops the other services
+    too (display, sound, the other drivers) fits a core stuck on a device access
+    while the others wait for it (TLB or cache maintenance broadcast, the kernel's big
+    lock); not shown. Open: what the chip's interrupt path touches at that moment, and
+    why the access takes 42 s to end in an SError.
 73. 25/10/2026, same console, rebooted with run 72's image (`init` of `63b8ddc`):
     **`wlan` comes back by itself**. `wifi poke die` made the driver exit (code
     139): `init` started it again from `/bin/wlan` within a few seconds, `net` went to
