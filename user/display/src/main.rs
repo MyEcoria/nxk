@@ -1134,6 +1134,8 @@ struct Link {
     /// The same since the overlay's last second (`perf`).
     hud_gap: u64,
     hud_late: u64,
+    /// `slept` as the last flip saw it: a flip held by a sleep is no gap.
+    hud_slept: u64,
     /// The console sleeps: the game's next `FLIP` waits for the wake.
     asleep: bool,
     /// Since when, and the time slept while this game had the screen
@@ -1204,9 +1206,12 @@ fn game_thread(dc: Mmio, ep: u32, link: &Mutex<Link>, awake: &Condvar) -> ! {
                 let late = t - s.last > perf::LATE_NS;
                 s.gap = s.gap.max(t - s.last);
                 s.late += late as u64;
-                s.hud_gap = s.hud_gap.max(t - s.last);
-                s.hud_late += late as u64;
+                if s.slept == s.hud_slept {
+                    s.hud_gap = s.hud_gap.max(t - s.last);
+                    s.hud_late += late as u64;
+                }
             }
+            s.hud_slept = s.slept;
             (s.flips, s.last) = (s.flips + 1, t);
             Msg::from_words(0, &[s.slept])
         } else {
@@ -1445,6 +1450,7 @@ fn main() -> i32 {
         late: 0,
         hud_gap: 0,
         hud_late: 0,
+        hud_slept: 0,
         asleep: false,
         asleep_since: 0,
         slept: 0,
@@ -1637,6 +1643,8 @@ fn main() -> i32 {
         ($now:expr) => {{
             if sleeping {
                 sleeping = false;
+                // The overlay's second spans the sleep: start it again.
+                perf_clock = None;
                 let since = link.lock().asleep_since;
                 println!(
                     "[display] wake after {} s",
@@ -3013,7 +3021,7 @@ fn main() -> i32 {
                     Ok((mut g, pas)) => {
                         (s.pas, s.shown, s.badge) = (pas, 0, link_gen);
                         (s.waiter, s.events) = (None, VecDeque::new());
-                        s.slept = 0;
+                        (s.slept, s.hud_slept) = (0, 0);
                         drop(s);
                         g.owner = rx.pid;
                         next_live = time::now_ns() + LIVE_NS;
