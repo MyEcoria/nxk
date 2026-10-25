@@ -1,6 +1,8 @@
 //! Forward error correction of the server's packets (`docs/PROTOCOL.md` §2.3): after every 32 data packets of a
 //! channel the server sends one parity packet (type 16), the XOR of their payloads padded with zeros and of 8 bytes
 //! of their headers. A group that lost exactly one packet can rebuild it without waiting for the retransmission.
+//! The parity's payload is only as long as the group's *last* packet (seen live: 1080 bytes for a group of 1384-byte
+//! fragments), so it covers that prefix of every packet: a lost packet longer than the parity cannot be rebuilt.
 //!
 //! The wire format is known from the decompiled client only, never checked against real packets, so a recovery is
 //! *shadowed* until the parity of complete groups has matched: the payload and the 8 header bytes of at least
@@ -99,6 +101,8 @@ pub struct FecCounters {
     pub complete_bad: u64,
     /// Groups left alone because a packet came behind a later one.
     pub late: u64,
+    /// Groups that lost one packet longer than the parity, which cannot be rebuilt.
+    pub too_long: u64,
     /// Groups short of one packet, or of more, when the parity came.
     pub one_lost: u64,
     pub many_lost: u64,
@@ -183,10 +187,11 @@ impl Group {
         }
     }
 
-    /// The parity's payload equals the XOR of the group's payloads.
+    /// The parity's payload equals the first bytes of the XOR of the group's payloads (it is as long as the last
+    /// packet of the group, not as the longest).
     fn payload_matches(&self, parity: &Packet) -> bool {
         let n = parity.payload.len().min(self.xor.len());
-        parity.payload[..n] == self.xor[..n] && self.xor[n..].iter().all(|b| *b == 0)
+        parity.payload[..n] == self.xor[..n]
     }
 }
 
@@ -240,13 +245,14 @@ impl Fec {
             .map(|(i, s)| format!("ch{} {}{}", i, s.verified, if s.off { " OFF" } else { "" }))
             .collect();
         format!(
-            "luna: fec {} parity, complete {} ok {} bad, {} left alone (copies), {} lost one {} more, {} filled first, rebuilt {} (used {}), \
+            "luna: fec {} parity, complete {} ok {} bad, {} left alone (copies), {} lost one ({} too long for the parity) {} more, {} filled first, rebuilt {} (used {}), \
              compared {} ok {} bad; ms avg/max hole to parity {}, hole to retransmission {}; groups verified [{}]",
             c.parity,
             c.complete_ok,
             c.complete_bad,
             c.late,
             c.one_lost,
+            c.too_long,
             c.many_lost,
             c.filled_first,
             c.shadowed + c.injected,
@@ -400,6 +406,7 @@ impl Fec {
         }
         self.counters.one_lost += 1;
         if !fits {
+            self.counters.too_long += 1;
             return None;
         }
         if let Some(lag) = lag {
@@ -524,12 +531,8 @@ mod tests {
 
     /// The parity packet of group `key` as the server builds it (the layout of `docs/PROTOCOL.md` §2.3).
     fn parity(channel: u8, key: u16, group: &[Packet]) -> Packet {
-        let size = group
-            .iter()
-            .map(|p| p.payload.len())
-            .max()
-            .unwrap()
-            .next_multiple_of(8);
+        // As long as the group's last packet (rounded to 8), covering that prefix of every payload.
+        let size = group.last().unwrap().payload.len().next_multiple_of(8);
         let mut payload = vec![0u8; size];
         let mut x = [0u8; 8];
         for p in group {
@@ -555,6 +558,18 @@ mod tests {
             },
             payload,
         }
+    }
+
+    /// How many bytes of a packet the group's parity covers.
+    fn fits(group: &[Packet]) -> usize {
+        group.last().unwrap().payload.len().next_multiple_of(8)
+    }
+
+    /// The first packet of the group of `count` packets from `start` that the parity covers, outside its edges.
+    fn coverable(group: &[Packet]) -> usize {
+        (1..GROUP - 1)
+            .find(|&i| group[i].payload.len() <= fits(group))
+            .expect("one")
     }
 
     fn feed(fec: &mut Fec, ps: &[Packet], t: Instant) -> Vec<Packet> {
@@ -592,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn every_position_is_rebuilt_exactly() {
+    fn every_position_that_fits_the_parity_is_rebuilt_exactly() {
         for lost in 0..GROUP {
             let (mut fec, t) = (Fec::default(), Instant::now());
             trusted(&mut fec, t);
@@ -605,14 +620,20 @@ mod tests {
                 .map(|(_, p)| p)
                 .collect();
             assert!(feed(&mut fec, &rest, t).is_empty());
-            let built = fec.on_parity(&parity(1, 3, &g), t).expect("rebuilt");
-            assert!(
-                same(&built, &g[lost]),
-                "position {lost}: {:?} vs {:?}",
-                built.header,
-                g[lost].header
-            );
-            assert_eq!(fec.counters().injected, 1);
+            let built = fec.on_parity(&parity(1, 3, &g), t);
+            if g[lost].payload.len() <= fits(&g) {
+                let built = built.expect("rebuilt");
+                assert!(
+                    same(&built, &g[lost]),
+                    "position {lost}: {:?} vs {:?}",
+                    built.header,
+                    g[lost].header
+                );
+                assert_eq!(fec.counters().injected, 1);
+            } else {
+                assert!(built.is_none(), "position {lost} is longer than the parity");
+                assert_eq!(fec.counters().too_long, 1);
+            }
         }
     }
 
@@ -736,10 +757,11 @@ mod tests {
         assert!(fec.trusted(2));
         let g = &all[3 * GROUP..4 * GROUP];
         assert_eq!(g[0].header.packet_seq, 0);
-        let rest: Vec<Packet> = g[..11].iter().chain(&g[12..]).cloned().collect();
+        let lost = coverable(g);
+        let rest: Vec<Packet> = g[..lost].iter().chain(&g[lost + 1..]).cloned().collect();
         feed(&mut fec, &rest, t);
         let built = fec.on_parity(&parity(2, 0, g), t).expect("rebuilt");
-        assert!(same(&built, &g[11]));
+        assert!(same(&built, &g[lost]));
     }
 
     #[test]
@@ -797,7 +819,7 @@ mod tests {
     #[test]
     fn the_receiver_completes_a_message_whose_fragment_was_rebuilt() {
         let (mut rx, t) = (Receiver::default(), Instant::now());
-        let all = packets(1, 0, GROUP * 4, 0);
+        let all = packets(1, 0, GROUP * 9, 0);
         for (k, g) in all.chunks(GROUP).enumerate().take(3) {
             for p in g {
                 rx.classify_at(p, t);
@@ -805,7 +827,24 @@ mod tests {
             rx.classify_at(&parity(1, k as u16, g), t);
         }
         while rx.pop().is_some() {}
-        let g = &all[3 * GROUP..];
+        // A group with a fragment in the middle of a message that the parity covers.
+        let (key, g) = (3..9)
+            .map(|k| (k, &all[k * GROUP..(k + 1) * GROUP]))
+            .find(|(_, g)| {
+                (1..GROUP - 1).any(|i| {
+                    g[i].header.message_seq == g[i - 1].header.message_seq
+                        && g[i].header.message_seq == g[i + 1].header.message_seq
+                        && g[i].payload.len() <= fits(g)
+                })
+            })
+            .expect("such a group");
+        // The groups before it arrive whole, so its messages are next in order.
+        for k in 3..key {
+            for p in &all[k * GROUP..(k + 1) * GROUP] {
+                rx.classify_at(p, t);
+            }
+        }
+        while rx.pop().is_some() {}
         // Lose a fragment in the middle of a multi-fragment message.
         let lost = (0..GROUP)
             .find(|&i| {
@@ -813,6 +852,7 @@ mod tests {
                     && i + 1 < GROUP
                     && g[i].header.message_seq == g[i - 1].header.message_seq
                     && g[i].header.message_seq == g[i + 1].header.message_seq
+                    && g[i].payload.len() <= fits(g)
             })
             .expect("such a fragment");
         let msg = g[lost].header.message_seq;
@@ -822,7 +862,7 @@ mod tests {
                 rx.classify_at(p, t);
             }
         }
-        rx.classify_at(&parity(1, 3, g), t);
+        rx.classify_at(&parity(1, key as u16, g), t);
         while let Some(e) = rx.pop() {
             got.push(e);
         }

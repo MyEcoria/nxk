@@ -1550,6 +1550,19 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+69. 25/10/2026, same console (gauge 36 %, plugged), `luna` of `6cf0ba7`, phone
+    on Wi-Fi throughout, volume 10 %: **the parity's length** (the 26th Luna
+    session, ended after under a minute: the log slices missed why, the Wi-Fi
+    icon was grey afterwards). On the display channel 14 groups matched and the
+    15th (complete, no copy in it) matched on the header and on every payload
+    byte of the parity, which is only 1080 bytes for a group whose packets are
+    up to 1384: the parity is as long as the group's last packet and covers that
+    prefix only (`spp_send_buffer_push` sets the length at the last packet).
+    The same cause as the mismatch of run 68 (1280 bytes). The check compares the
+    covered prefix now, and a lost packet longer than the parity is counted as
+    too long to rebuild (it cannot be). Audio: 13 groups verified, no loss;
+    hole to retransmission 63 ms (70 at most); 342 pictures decoded in 7.7 ms,
+    none dropped, delay from complete to decoded 8.5 ms.
 68. 25/10/2026, same console (gauge 39 %, plugged), `luna` of `48c4c13`, 60 Hz,
     volume 10 %: **the parity packets, the first time on the real stream**
     (the 25th Luna session, ended by HOME after about two minutes). The parity
