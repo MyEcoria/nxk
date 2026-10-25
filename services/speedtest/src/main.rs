@@ -63,6 +63,74 @@ impl Source for Https {
     }
 }
 
+/// A file on plain HTTP (`-u http://HOST:PORT/PATH`): the network and the
+/// TCP stack alone, with no TLS, for a server on the local network.
+struct Plain {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl Plain {
+    fn parse(url: &str) -> Option<Self> {
+        let rest = url.strip_prefix("http://")?;
+        let (hp, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let (host, port) = match hp.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse().ok()?),
+            None => (hp, 80),
+        };
+        (!host.is_empty()).then(|| Self {
+            host: host.into(),
+            port,
+            path: if path.is_empty() {
+                "/".into()
+            } else {
+                path.into()
+            },
+        })
+    }
+}
+
+impl Source for Plain {
+    fn open(&self) -> io::Result<Opened> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpStream, ToSocketAddrs};
+        let addr = (self.host.as_str(), self.port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other("no address"))?;
+        let t0 = std::time::Instant::now();
+        let mut sock = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
+        let tcp = t0.elapsed();
+        sock.set_read_timeout(Some(IO_TIMEOUT))?;
+        let _ = sock.set_nodelay(true);
+        let t1 = std::time::Instant::now();
+        write!(
+            sock,
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            self.path, self.host
+        )?;
+        let mut r = BufReader::with_capacity(64 * 1024, sock);
+        let mut line = String::new();
+        r.read_line(&mut line)?;
+        if !line.contains(" 200 ") {
+            return Err(io::Error::other(format!("reply {:?}", line.trim())));
+        }
+        loop {
+            line.clear();
+            if r.read_line(&mut line)? == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        Ok(Opened {
+            tcp,
+            tls: Duration::ZERO,
+            first_byte: t1.elapsed(),
+            body: Box::new(r),
+        })
+    }
+}
+
 fn source(server: usize) -> Arc<dyn Source> {
     let s = &SERVERS[server];
     Arc::new(Https {
@@ -257,8 +325,17 @@ fn mbps(kbps: u64) -> String {
 
 fn cli() -> i32 {
     let (mut server, mut conns, mut secs) = (0usize, CONNS, SECS);
+    let mut url: Option<Plain> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
+        if a == "-u" {
+            url = args.next().and_then(|u| Plain::parse(&u));
+            if url.is_none() {
+                eprintln!("usage: -u http://HOST[:PORT]/PATH");
+                return 2;
+            }
+            continue;
+        }
         let v = args.next().and_then(|v| v.parse::<u64>().ok());
         match (a.as_str(), v) {
             ("-s", Some(v)) if (v as usize) < SERVERS.len() => server = v as usize,
@@ -266,7 +343,7 @@ fn cli() -> i32 {
             ("-t", Some(v)) if (1..=MAX_SECS).contains(&v) => secs = v,
             _ => {
                 eprintln!(
-                    "usage: speedtest [-s SERVER 0..{}] [-c CONNECTIONS 1..{}] [-t SECONDS 1..{}]",
+                    "usage: speedtest [-s SERVER 0..{}] [-u http://HOST[:PORT]/PATH] [-c CONNECTIONS 1..{}] [-t SECONDS 1..{}]",
                     SERVERS.len() - 1,
                     MAX_CONNS,
                     MAX_SECS
@@ -291,22 +368,21 @@ fn cli() -> i32 {
         tick: Duration::from_millis(1000),
         ..Settings::default()
     };
-    let r = run(
-        source(server),
-        &settings,
-        &AtomicBool::new(false),
-        &mut |s| {
-            if s.phase == Phase::Running {
-                println!(
-                    "{:5.1} s {:9} KiB  now {}  avg {}",
-                    s.elapsed.as_secs_f32(),
-                    s.bytes / 1024,
-                    mbps(s.now_kbps),
-                    mbps(s.avg_kbps)
-                );
-            }
-        },
-    );
+    let src: Arc<dyn Source> = match url {
+        Some(u) => Arc::new(u),
+        None => source(server),
+    };
+    let r = run(src, &settings, &AtomicBool::new(false), &mut |s| {
+        if s.phase == Phase::Running {
+            println!(
+                "{:5.1} s {:9} KiB  now {}  avg {}",
+                s.elapsed.as_secs_f32(),
+                s.bytes / 1024,
+                mbps(s.now_kbps),
+                mbps(s.avg_kbps)
+            );
+        }
+    });
     if r.phase == Phase::Failed {
         println!(
             "failed: {} (errno {})",
