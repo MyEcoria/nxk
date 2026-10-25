@@ -1196,6 +1196,9 @@ pub mod proto {
         /// old instance is killed and its services unpublished. Only from
         /// the shell init started (console user): a development path.
         pub const RESTART: u32 = 7;
+        /// Init to itself, every two seconds: a supervised boot driver
+        /// that exited (a fault killed it) is started again.
+        pub const SUPERVISE: u32 = 8;
         /// Badges of the manager endpoint: applications, services.
         pub const BADGE_APP: u64 = 1;
         pub const BADGE_SERVICE: u64 = 2;
@@ -2319,6 +2322,12 @@ pub mod proto {
         /// joined by itself). Kept across a chip recovery. Reply: word 0 =
         /// 1 if the radio is on.
         pub const RADIO: u32 = 7;
+        /// Development: take the module down and read the chip's BAR0
+        /// three times, then recover; the reply says how long each read
+        /// took (what a chip that vanished does to the CPU).
+        pub const POKE: u32 = 8;
+        /// Development, with POKE: word 0 = 1 makes the driver exit (code
+        /// 139) at once, to try its supervision.
         /// The radio is off (`RADIO`).
         pub const ST_RADIO_OFF: u64 = 5;
         /// No adapter: no PCIe device, or its firmware is missing.

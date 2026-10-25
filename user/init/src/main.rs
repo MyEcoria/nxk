@@ -322,7 +322,18 @@ struct State {
     drivers: Vec<(&'static str, u32)>,
     /// The console shell, the one caller allowed to replace a driver.
     shell_pid: u32,
+    /// Supervised drivers started again after a fault: how many times,
+    /// and when last (ns).
+    respawns: u32,
+    last_respawn: u64,
 }
+
+/// Boot drivers started again when they exit: a fault killed them (the
+/// Wi-Fi chip's bus errors do) and nothing else would bring them back.
+const SUPERVISED: [&str; 1] = ["wlan"];
+/// At least this long between two restarts, and no more than this many.
+const RESPAWN_GAP_NS: u64 = 10_000_000_000;
+const RESPAWN_MAX: u32 = 50;
 
 libnx::entry!(main);
 
@@ -399,6 +410,8 @@ fn main() -> i32 {
         waiting: Vec::new(),
         drivers: Vec::new(),
         shell_pid: 0,
+        respawns: 0,
+        last_respawn: 0,
     };
 
     for d in DRIVERS {
@@ -515,6 +528,12 @@ fn restart(st: &mut State, name: &str, path: &str) -> Result<(), i64> {
         return Err(-EINVAL);
     }
     let elf = load(st, path)?;
+    restart_elf(st, d, &elf, path)
+}
+
+/// `restart` with the program in hand.
+fn restart_elf(st: &mut State, d: &'static Driver, elf: &[u8], path: &str) -> Result<(), i64> {
+    let name = d.name;
     if let Some(k) = st.drivers.iter().position(|(n, _)| *n == name) {
         let (_, h) = st.drivers.swap_remove(k);
         let pid = sys::getpid(h).unwrap_or(0);
@@ -530,10 +549,48 @@ fn restart(st: &mut State, name: &str, path: &str) -> Result<(), i64> {
             keep
         });
     }
-    let h = start_driver(st, d, &elf)?;
+    let h = start_driver(st, d, elf)?;
     st.drivers.push((d.name, h));
     println!("[init] {} restarted from {}", name, path);
     Ok(())
+}
+
+/// A supervised driver that exited is started again, from `/bin/NAME` if
+/// the card has one (the newer build), else from the boot image.
+fn supervise(st: &mut State) {
+    let now = libnx::time::now_ns();
+    for name in SUPERVISED {
+        let Some(&(_, h)) = st.drivers.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        // Still running: the wait times out.
+        let Ok(code) = sys::process_wait_timeout(h, 1_000) else {
+            continue;
+        };
+        if st.respawns >= RESPAWN_MAX || now < st.last_respawn + RESPAWN_GAP_NS {
+            continue;
+        }
+        st.respawns += 1;
+        st.last_respawn = now;
+        println!("[init] {} exited (code {}): starting it again", name, code);
+        let Some(d) = DRIVERS.iter().find(|d| d.name == name) else {
+            continue;
+        };
+        let card = alloc::format!("/bin/{}", name);
+        let (elf, from) = match load(st, &card) {
+            Ok(e) => (e, card),
+            Err(_) => match load(st, name) {
+                Ok(e) => (e, String::from(name)),
+                Err(e) => {
+                    println!("[init] {}: no program to start ({})", name, e);
+                    continue;
+                }
+            },
+        };
+        if let Err(e) = restart_elf(st, d, &elf, &from) {
+            println!("[init] {} did not start again: error {}", name, e);
+        }
+    }
 }
 
 /// Program executable: boot image, otherwise filesystem
@@ -659,6 +716,12 @@ fn reply_handle(h: u32) -> Msg {
 }
 
 fn serve(st: &mut State, ep: u32) -> ! {
+    // A timer thread asks, every two seconds, for the supervised drivers
+    // to be looked at (the loop below only wakes for requests).
+    let _ = libnx::thread::spawn(move || loop {
+        libnx::time::sleep_ms(2_000);
+        let _ = ipc::call(ep, &Msg::new(pm::SUPERVISE, 0, 0));
+    });
     let mut rx = ipc::recv(ep).expect("pm recv");
     let mut buf = alloc::vec![0u8; ipc::MAX_BYTES];
     loop {
@@ -772,6 +835,12 @@ fn serve(st: &mut State, ep: u32) -> ! {
                     names.extend_from_slice(s.name.as_bytes());
                 }
                 ipc::pack(0, &names)
+            }
+            // Only init's own timer thread asks for it.
+            pm::SUPERVISE if sys::getpid(0).is_ok_and(|p| p != rx.pid) => Msg::error(-EPERM),
+            pm::SUPERVISE => {
+                supervise(st);
+                Msg::new(0, 0, 0)
             }
             pm::RESTART if rx.pid != st.shell_pid || st.shell_pid == 0 => Msg::error(-EPERM),
             pm::RESTART => {

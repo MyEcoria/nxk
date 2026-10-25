@@ -318,6 +318,55 @@ impl Hw {
         }
     }
 
+    /// Development: the module taken down under the driver, then three reads of BAR0 timed. What a chip
+    /// that vanished does to the CPU (a stall, an all-ones read, an SError that kills this process).
+    fn poke(&mut self) -> String {
+        let timed = |bar: &Mmio| {
+            let t = time::now_ns();
+            let v = bar.r32(0);
+            (v, (time::now_ns() - t) / 1000)
+        };
+        let (v, us) = timed(&self.bar0);
+        let mut out = format!("read {:#010x} in {} us", v, us);
+        // The endpoint answering with Unsupported Request: its memory decode off, as after a reset of the
+        // chip behind our back (its BARs back to zero).
+        self.rc.ep_cfg_write(0x04, 0);
+        for i in 1..=3 {
+            let (v, us) = timed(&self.bar0);
+            let line = format!("; ur read {} {:#010x} in {} us", i, v, us);
+            println!("[wlan] poke{}", line);
+            out.push_str(&line);
+        }
+        out.push_str("; module down");
+        println!("[wlan] poke: {}", out);
+        self.rc.module_off();
+        for i in 1..=3 {
+            let (v, us) = timed(&self.bar0);
+            let line = format!("; read {} {:#010x} in {} us", i, v, us);
+            println!("[wlan] poke{}", line);
+            out.push_str(&line);
+        }
+        // Writes to the vanished chip, which the interconnect only acknowledges: a posted write that the
+        // root complex answers with an error comes back as an SError, at a later instruction.
+        let t = time::now_ns();
+        self.rc.ep_cfg_write(chip::CFG_BAR0_WINDOW, 0x1800_0000);
+        for i in 0..3u32 {
+            self.bar0.w32(0x3830, i);
+        }
+        let us = (time::now_ns() - t) / 1000;
+        println!("[wlan] poke: writes done in {} us", us);
+        out.push_str(&format!("; writes in {} us", us));
+        for i in 4..=6 {
+            let (v, us) = timed(&self.bar0);
+            let line = format!("; read {} {:#010x} in {} us", i, v, us);
+            println!("[wlan] poke{}", line);
+            out.push_str(&line);
+        }
+        let joined = self.joined.is_some();
+        self.lost("poke test", joined);
+        out
+    }
+
     /// The chip stopped: a report of what was seen (printed, and kept for
     /// `wifi status`), the link down, a recovery due shortly.
     fn lost(&mut self, why: &str, joined: bool) {
@@ -1089,6 +1138,17 @@ fn main() -> i32 {
                             }
                         }
                         Some(ipc::pack(0, diag.as_bytes()))
+                    }
+                    (wifi::BADGE_CTRL, wifi::POKE) => {
+                        if rx.msg.mr[0] == 1 {
+                            println!("[wlan] exiting on request (wifi poke die)");
+                            libnx::process::exit(139);
+                        }
+                        let text = match &mut backend {
+                            Backend::Chip(hw) if !hw.asleep && !hw.gone => hw.poke(),
+                            _ => String::from("no chip up"),
+                        };
+                        Some(ipc::pack(0, text.as_bytes()))
                     }
                     (wifi::BADGE_CTRL, wifi::RADIO) => {
                         let on = rx.msg.mr[0] != 0;
