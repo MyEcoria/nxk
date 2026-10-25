@@ -321,7 +321,11 @@ lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
 the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 60 Hz and an 8
 Mbit/s cap by default, `refresh=` 30 or 60 and `max_mbit=` in the catalog's
-`service.txt` change them; `ready`, `pong`, an ack per frame, a key frame
+`service.txt` change them; experiments, off unless set there: `notify_resolution=1280x720`,
+`max_display=1280x720`, `min_quality=`, `max_quality=` and `bitrate_kbps=` (the protocol's
+`notify_resolution_change`, `settings` and `bitrate_adjustment`, sent once with the first picture),
+`frame_stats=1` (an acknowledgement with a picture's arrival and decoding times twice a second);
+`ready`, `pong`, an ack per frame, a key frame
 asked after a gap or a decoding error). The server sends 1920x1080 H.264 High (CABAC, 8x8
 transform, P frames only and all of them references, 4 slices a frame,
 deblocking on) whatever the client announces: resolution, `dataUsage`,

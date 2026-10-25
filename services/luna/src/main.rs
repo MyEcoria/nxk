@@ -47,15 +47,31 @@ fn domain() -> String {
         .unwrap_or_else(|| "amazon.com".into())
 }
 
-/// What the stream announces: `refresh=` (30 or 60 Hz) and `max_mbit=`
-/// (2 to 30) of `service.txt`, else 60 Hz and the cap that suits it.
+/// `WIDTHxHEIGHT`.
+fn size(text: &str) -> Option<(u32, u32)> {
+    let (w, h) = text.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// What the stream announces: `refresh=` (30 or 60 Hz) and `max_mbit=` (2 to 30) of `service.txt`, else 60 Hz
+/// and the cap that suits it. Experiments, all off unless set: `notify_resolution=1280x720`,
+/// `max_display=1280x720`, `min_quality=N`, `max_quality=N`, `bitrate_kbps=N`, `frame_stats=1`.
 fn display_config() -> lunacore::stream::display::DisplayConfig {
     let number = |k: &str| setting(k).and_then(|v| v.parse::<u32>().ok());
     let refresh = number("refresh")
         .filter(|r| matches!(r, 30 | 60))
         .unwrap_or(60);
     let max = number("max_mbit").filter(|m| (2..=30).contains(m));
-    lunacore::stream::display::DisplayConfig::new(refresh, max)
+    let mut config = lunacore::stream::display::DisplayConfig::new(refresh, max);
+    config.tuning = lunacore::stream::display::Tuning {
+        notify_resolution: setting("notify_resolution").and_then(|v| size(&v)),
+        max_display: setting("max_display").and_then(|v| size(&v)),
+        min_quality: number("min_quality"),
+        max_quality: number("max_quality"),
+        bitrate_kbps: number("bitrate_kbps"),
+        frame_stats: number("frame_stats") == Some(1),
+    };
+    config
 }
 
 /// A stop waits this long for the cloud session to end (display's limit is 8 s).

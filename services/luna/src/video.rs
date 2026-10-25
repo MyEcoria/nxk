@@ -9,7 +9,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use lunacore::proto::display::ClientMessage;
-use lunacore::stream::display::{is_key_frame, nal_types, Channel, DisplayConfig, EncodedFrame};
+use lunacore::stream::display::{
+    is_key_frame, nal_types, Channel, DisplayConfig, EncodedFrame, FrameTimes, Tuning,
+};
 use lunacore::stream::framing::Frame;
 use nxh264::{Decoder, Picture};
 use nxk_abi::proto::provider::Stats;
@@ -22,6 +24,8 @@ const QUEUE: usize = 10;
 /// Threads the decoder uses for a picture (slices, then the filter): the
 /// four slices of a picture on the four cores, below the other threads.
 const DECODER_THREADS: usize = 4;
+/// The acknowledgement with a picture's times goes out this often (`frame_stats=1`).
+const STATS_ACK_EVERY: Duration = Duration::from_millis(500);
 /// The decoder runs below the stream and audio threads (default 16).
 const DECODER_PRIORITY: u8 = 20;
 
@@ -81,6 +85,8 @@ pub struct Shared {
     /// cannot be decoded only costs time while the queue grows.
     skip_to_key: AtomicBool,
     skipped: AtomicU64,
+    /// The times of the last decoded picture (stream, frame, times), for the stats acknowledgement.
+    sample: Mutex<Option<(u32, u64, FrameTimes)>>,
     decoded: AtomicU64,
     errors: AtomicU64,
     dropped: AtomicU64,
@@ -138,7 +144,11 @@ fn lower_priority() {
     let _ = std::os::nxk::thread::set_priority(DECODER_PRIORITY);
 }
 
-fn decode_loop(rx: std::sync::mpsc::Receiver<(Instant, EncodedFrame)>, shared: Arc<Shared>) {
+fn decode_loop(
+    rx: std::sync::mpsc::Receiver<(Instant, EncodedFrame)>,
+    shared: Arc<Shared>,
+    origin: Instant,
+) {
     lower_priority();
     let mut dec = Decoder::new();
     dec.threads = DECODER_THREADS;
@@ -161,6 +171,18 @@ fn decode_loop(rx: std::sync::mpsc::Receiver<(Instant, EncodedFrame)>, shared: A
                 shared.decode_us.fetch_add(us, Relaxed);
                 shared.decode_max_us.fetch_max(us, Relaxed);
                 shared.decode_wait.add(arrived.elapsed());
+                let us = |t: Instant| t.saturating_duration_since(origin).as_micros() as u64;
+                if let Ok(mut l) = shared.sample.lock() {
+                    *l = Some((
+                        f.stream_id,
+                        f.frame_index,
+                        FrameTimes {
+                            received: us(arrived),
+                            decode_start: us(t),
+                            decode_end: us(Instant::now()),
+                        },
+                    ));
+                }
                 if let Ok(mut l) = shared.latest.lock() {
                     *l = Some((arrived, p));
                 }
@@ -190,15 +212,19 @@ pub struct Video {
     last_line: (u64, u64),
     /// The stream's picture size, once a frame said it.
     size: Option<(u16, u16)>,
+    tuning: Tuning,
+    tuning_logged: bool,
+    last_stats: Option<Instant>,
 }
 
 impl Video {
     pub fn new(shared: Arc<Shared>, config: DisplayConfig) -> Self {
         let (tx, rx) = sync_channel(QUEUE);
         let s2 = shared.clone();
+        let origin = Instant::now();
         let tx = match std::thread::Builder::new()
             .name("h264".into())
-            .spawn(move || decode_loop(rx, s2))
+            .spawn(move || decode_loop(rx, s2, origin))
         {
             Ok(_) => Some(tx),
             Err(e) => {
@@ -207,13 +233,16 @@ impl Video {
             }
         };
         Self {
-            channel: Channel::new(config, Instant::now()),
+            tuning: config.tuning.clone(),
+            channel: Channel::new(config, origin),
             tx,
             shared,
             first: true,
             shown: 0,
             last_line: (0, 0),
             size: None,
+            tuning_logged: false,
+            last_stats: None,
         }
     }
 
@@ -224,6 +253,12 @@ impl Video {
         // Frames that never came break the references of those behind them.
         if self.channel.stats.missing > missing {
             self.shared.skip_to_key.store(true, Relaxed);
+        }
+        if self.channel.stats.tuning_sent && !self.tuning_logged {
+            self.tuning_logged = true;
+            if self.tuning.is_on() {
+                println!("luna: asked the server: {}", self.tuning.describe());
+            }
         }
         if let Some(f) = step.video {
             self.on_video(f);
@@ -247,9 +282,10 @@ impl Video {
         if self.first {
             self.first = false;
             println!(
-                "luna: first video frame {} bytes, stream {:?}, NAL types {:?}",
+                "luna: first video frame {} bytes, stream {:?}, captured at {:?}, NAL types {:?}",
                 f.data.len(),
                 f.stream_resolution.map(|r| (r.width, r.height)),
+                f.capture_resolution.map(|r| (r.width, r.height)),
                 nal_types(&f.data)
             );
         }
@@ -279,6 +315,18 @@ impl Video {
     pub fn on_tick(&mut self) -> Vec<ClientMessage> {
         let now = Instant::now();
         let mut out = self.channel.on_tick(now);
+        // The times of a picture twice a second, when asked for.
+        if self.tuning.frame_stats
+            && self
+                .last_stats
+                .is_none_or(|t| t.elapsed() >= STATS_ACK_EVERY)
+        {
+            let sample = self.shared.sample.lock().ok().and_then(|mut s| s.take());
+            if let Some((stream, frame, times)) = sample {
+                self.last_stats = Some(now);
+                out.push(self.channel.frame_stats(stream, frame, times, now));
+            }
+        }
         // Skipping until a key frame: it is asked for again until it comes.
         if self.shared.skip_to_key.load(Relaxed) {
             self.shared.want_key.store(true, Relaxed);
@@ -306,7 +354,8 @@ impl Video {
         Some(format!(
             "luna: video {} frames {} KB, {} key, {} missing, {} stale, {} rejected, {} key frames asked; \
              decoded {} ({:.1} ms a frame, {:.1} at most), {} errors, {} dropped, {} skipped to a key frame, {} shown; \
-             ms avg/max: complete to decoded {}, to the panel {}, show {}, gamepad to socket {}, queue {} at most",
+             ms avg/max: complete to decoded {}, to the panel {}, show {}, gamepad to socket {}, queue {} at most; \
+             {} probes (last {:?}), captured at {:?}, stream {:?}",
             s.frames,
             s.bytes / 1024,
             s.key_frames,
@@ -325,7 +374,11 @@ impl Video {
             sh.on_screen.take(),
             sh.show.take(),
             sh.input.take(),
-            sh.queue_max.swap(0, Relaxed)
+            sh.queue_max.swap(0, Relaxed),
+            s.probes,
+            s.last_probe,
+            s.captured,
+            self.size
         ))
     }
 }

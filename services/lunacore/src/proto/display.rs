@@ -182,6 +182,47 @@ pub struct Ack2 {
     pub force_i_frame: bool,
     #[prost(uint64, tag = "42")]
     pub current_stream_id: u64,
+    /// The times of one picture on the client's clock (µs): arrival, decoding, display.
+    #[prost(bool, tag = "70")]
+    pub frame_stats: bool,
+    #[prost(uint64, tag = "71")]
+    pub network_recv_usec: u64,
+    #[prost(uint64, tag = "72")]
+    pub decode_start_usec: u64,
+    #[prost(uint64, tag = "73")]
+    pub decode_end_usec: u64,
+    #[prost(uint64, tag = "74")]
+    pub render_start_usec: u64,
+    #[prost(uint64, tag = "75")]
+    pub render_end_usec: u64,
+}
+
+/// `Settings`: the quality range the client accepts and the largest picture it shows (meaning of the
+/// numbers not established).
+#[derive(Clone, PartialEq, Message)]
+pub struct Settings {
+    #[prost(uint32, tag = "1")]
+    pub min_quality: u32,
+    #[prost(uint32, tag = "2")]
+    pub max_quality: u32,
+    #[prost(uint32, tag = "10")]
+    pub max_display_width: u32,
+    #[prost(uint32, tag = "11")]
+    pub max_display_height: u32,
+}
+
+/// `NotifyResolutionChange`: the size the client now shows.
+#[derive(Clone, PartialEq, Message)]
+pub struct NotifyResolutionChange {
+    #[prost(message, optional, tag = "1")]
+    pub resolution: Option<Resolution>,
+}
+
+/// `BitrateAdjustment`: a bandwidth (unit not established; bytes a second is assumed).
+#[derive(Clone, PartialEq, Message)]
+pub struct BitrateAdjustment {
+    #[prost(double, tag = "10")]
+    pub bandwidth_per_sec: f64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -198,16 +239,22 @@ pub enum ClientBody {
     Ready(Ready),
     #[prost(message, tag = "41")]
     Acks(BatchedAck2),
+    #[prost(message, tag = "50")]
+    Settings(Settings),
     #[prost(message, tag = "60")]
     Pong(Pong),
+    #[prost(message, tag = "80")]
+    BitrateAdjustment(BitrateAdjustment),
     #[prost(message, tag = "81")]
     DisplaySession(DisplaySessionConfiguration),
+    #[prost(message, tag = "82")]
+    NotifyResolutionChange(NotifyResolutionChange),
 }
 
 /// `dcv.display.ClientMessage`.
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientMessage {
-    #[prost(oneof = "ClientBody", tags = "30, 41, 60, 81")]
+    #[prost(oneof = "ClientBody", tags = "30, 41, 50, 60, 80, 81, 82")]
     pub msg: Option<ClientBody>,
 }
 

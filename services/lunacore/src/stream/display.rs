@@ -5,9 +5,10 @@
 //! payload. Everything the server sends is untrusted and checked here.
 
 use crate::proto::display::{
-    Ack2, BatchedAck2, ClientBody, ClientMessage, Codec, Display, DisplaySessionConfiguration,
-    HandshakeStart, Ping, Pong, Probe, Ready, Resolution, ServerBody, ServerMessage, StreamEnd,
-    StreamStart, TileUpdate, VideoCodec,
+    Ack2, BatchedAck2, BitrateAdjustment, ClientBody, ClientMessage, Codec, Display,
+    DisplaySessionConfiguration, HandshakeStart, NotifyResolutionChange, Ping, Pong, Probe, Ready,
+    Resolution, ServerBody, ServerMessage, Settings, StreamEnd, StreamStart, TileUpdate,
+    VideoCodec,
 };
 use crate::stream::framing::Frame;
 use prost::Message;
@@ -278,6 +279,65 @@ pub struct DisplayConfig {
     pub min_bits_per_second: u32,
     pub max_bits_per_second: u32,
     pub start_bits_per_second: u32,
+    /// What is asked of the server besides the capabilities (an experiment, off by default).
+    pub tuning: Tuning,
+}
+
+/// # Messages the Android client can send to steer the stream, none of them sent by default.
+///
+/// The server sends 1080p High whatever `display_session` announces; these are the other ways the protocol has
+/// to say what the client shows and can decode. What the server does with them is to be measured.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tuning {
+    /// `notify_resolution_change`: the size the client shows.
+    pub notify_resolution: Option<(u32, u32)>,
+    /// `settings`: the largest picture, and the quality range (numbers of an unknown scale).
+    pub max_display: Option<(u32, u32)>,
+    pub min_quality: Option<u32>,
+    pub max_quality: Option<u32>,
+    /// `bitrate_adjustment`: a bandwidth in kbit/s, sent as bytes a second.
+    pub bitrate_kbps: Option<u32>,
+    /// Acknowledgements carrying the times of a picture (arrival, decoding) now and then.
+    pub frame_stats: bool,
+}
+
+impl Tuning {
+    /// Whether anything is asked.
+    pub fn is_on(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// The messages sent once, when the first picture has come.
+    pub fn messages(&self) -> Vec<ClientMessage> {
+        let mut out = Vec::new();
+        if let Some((width, height)) = self.notify_resolution {
+            out.push(client(ClientBody::NotifyResolutionChange(
+                NotifyResolutionChange {
+                    resolution: Some(Resolution { width, height }),
+                },
+            )));
+        }
+        let (w, h) = self.max_display.unwrap_or_default();
+        if self.max_display.is_some() || self.min_quality.is_some() || self.max_quality.is_some() {
+            out.push(client(ClientBody::Settings(Settings {
+                min_quality: self.min_quality.unwrap_or_default(),
+                max_quality: self.max_quality.unwrap_or_default(),
+                max_display_width: w,
+                max_display_height: h,
+            })));
+        }
+        if let Some(kbps) = self.bitrate_kbps {
+            out.push(client(ClientBody::BitrateAdjustment(BitrateAdjustment {
+                bandwidth_per_sec: f64::from(kbps) * 125.0,
+            })));
+        }
+        out
+    }
+
+    /// For the log.
+    pub fn describe(&self) -> String {
+        format!("{:?}", self)
+    }
 }
 
 impl DisplayConfig {
@@ -295,6 +355,7 @@ impl DisplayConfig {
             min_bits_per_second: 2_000_000,
             max_bits_per_second: max * 1_000_000,
             start_bits_per_second: 6_000_000.min(max * 1_000_000),
+            tuning: Tuning::default(),
         }
     }
 }
@@ -362,6 +423,7 @@ pub fn frame_ack(stream_id: u32, frame_index: u64, received_usec: u64) -> Client
             frame_ack: true,
             force_i_frame: false,
             current_stream_id: u64::from(stream_id),
+            ..Ack2::default()
         },
     )
 }
@@ -378,6 +440,7 @@ pub fn keyframe_request(stream_id: u32, frame_index: u64, now_usec: u64) -> Clie
             frame_ack: true,
             force_i_frame: true,
             current_stream_id: u64::from(stream_id),
+            ..Ack2::default()
         },
     )
 }
@@ -434,6 +497,21 @@ pub struct Stats {
     /// Messages that did not decode or contradicted their payload.
     pub rejected: u64,
     pub keyframe_requests: u64,
+    /// `probe` messages the server sent, the last one (index, next probe size, bytes of raw payload).
+    pub probes: u64,
+    pub last_probe: Option<(u64, u64, usize)>,
+    /// The size the server says the picture is captured at, and sent at, in the last frame.
+    pub captured: Option<(u32, u32)>,
+    /// The tuning messages went out.
+    pub tuning_sent: bool,
+}
+
+/// When a picture arrived and was decoded, in µs on the channel's clock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameTimes {
+    pub received: u64,
+    pub decode_start: u64,
+    pub decode_end: u64,
 }
 
 /// What a frame of the channel leads to.
@@ -478,6 +556,7 @@ impl Channel {
 
     /// A frame of the channel: the answers, and the video for the decoder.
     pub fn on_frame(&mut self, frame: Frame, now: Instant) -> Step {
+        let raw_len = frame.raw.len();
         let message = match self.unpacker.unpack(frame) {
             Ok(m) => m,
             Err(_) => {
@@ -494,6 +573,10 @@ impl Channel {
             | DisplayMessage::StreamStart(_)
             | DisplayMessage::Video(_) => self.ready_at = None,
             DisplayMessage::Stale { .. } => self.stats.stale += 1,
+            DisplayMessage::Probe(p) => {
+                self.stats.probes += 1;
+                self.stats.last_probe = Some((p.index, p.next_probe_size, raw_len));
+            }
             _ => {}
         }
         let mut step = Step {
@@ -513,6 +596,11 @@ impl Channel {
                 _ => 0,
             };
             self.newest = Some((f.stream_id, f.frame_index));
+            self.stats.captured = f.capture_resolution.map(|r| (r.width, r.height));
+            if !self.stats.tuning_sent {
+                self.stats.tuning_sent = true;
+                step.replies.extend(self.config.tuning.messages());
+            }
             if gap > 0 {
                 self.stats.missing += gap;
                 step.replies.extend(self.keyframe_request(now));
@@ -520,6 +608,34 @@ impl Channel {
             step.video = Some(f);
         }
         step
+    }
+
+    /// An acknowledgement with the times of picture `frame_index` of `stream_id` (µs on this channel's clock).
+    pub fn frame_stats(
+        &self,
+        stream_id: u32,
+        frame_index: u64,
+        times: FrameTimes,
+        now: Instant,
+    ) -> ClientMessage {
+        ack_batch(
+            self.now_usec(now),
+            Ack2 {
+                stream_id: u64::from(stream_id),
+                frame_index,
+                frame_stats: true,
+                network_recv_usec: times.received,
+                decode_start_usec: times.decode_start,
+                decode_end_usec: times.decode_end,
+                current_stream_id: u64::from(stream_id),
+                ..Ack2::default()
+            },
+        )
+    }
+
+    /// This channel's clock origin, for the decoding thread's times.
+    pub fn origin(&self) -> Instant {
+        self.started
     }
 
     /// `ready`, once the server stayed silent after our capabilities.
@@ -1001,6 +1117,126 @@ mod tests {
         ch.on_frame(start, t0);
         ch.on_frame(video_frame(1, 1, &[1]), t0 + Duration::from_millis(500));
         assert!(ch.on_tick(t0 + Duration::from_secs(3)).is_empty());
+    }
+
+    fn full_tuning() -> Tuning {
+        Tuning {
+            notify_resolution: Some((1280, 720)),
+            max_display: Some((1280, 720)),
+            min_quality: Some(10),
+            max_quality: Some(60),
+            bitrate_kbps: Some(4000),
+            frame_stats: true,
+        }
+    }
+
+    #[test]
+    fn nothing_is_sent_by_default_but_the_acknowledgement() {
+        let t0 = Instant::now();
+        let mut ch = Channel::new(DisplayConfig::default(), t0);
+        assert!(!DisplayConfig::default().tuning.is_on());
+        let step = ch.on_frame(video_frame(1, 1, &[1]), t0);
+        assert_eq!(step.replies.len(), 1);
+    }
+
+    #[test]
+    fn the_tuning_goes_out_once_with_the_first_picture() {
+        let t0 = Instant::now();
+        let config = DisplayConfig {
+            tuning: full_tuning(),
+            ..DisplayConfig::default()
+        };
+        let mut ch = Channel::new(config, t0);
+        let step = ch.on_frame(video_frame(1, 1, &[1]), t0);
+        // The acknowledgement, then resolution, settings and bit rate.
+        assert_eq!(step.replies.len(), 4);
+        let bodies: Vec<_> = step.replies.iter().map(|m| round_trip(m).msg).collect();
+        assert!(matches!(
+            &bodies[1],
+            Some(ClientBody::NotifyResolutionChange(NotifyResolutionChange {
+                resolution: Some(Resolution {
+                    width: 1280,
+                    height: 720
+                })
+            }))
+        ));
+        assert_eq!(
+            bodies[2],
+            Some(ClientBody::Settings(Settings {
+                min_quality: 10,
+                max_quality: 60,
+                max_display_width: 1280,
+                max_display_height: 720
+            }))
+        );
+        assert_eq!(
+            bodies[3],
+            Some(ClientBody::BitrateAdjustment(BitrateAdjustment {
+                bandwidth_per_sec: 500_000.0
+            }))
+        );
+        let again = ch.on_frame(video_frame(1, 2, &[1]), t0);
+        assert_eq!(again.replies.len(), 1);
+        assert!(ch.stats.tuning_sent);
+    }
+
+    #[test]
+    fn only_what_is_asked_is_sent() {
+        let t = Tuning {
+            max_quality: Some(30),
+            ..Tuning::default()
+        };
+        let messages = t.messages();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            round_trip(&messages[0]).msg,
+            Some(ClientBody::Settings(Settings {
+                max_quality: 30,
+                max_display_width: 0,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn probes_are_counted_with_their_last_values() {
+        let t0 = Instant::now();
+        let mut ch = Channel::new(DisplayConfig::default(), t0);
+        let probe = framed(
+            ServerBody::Probe(Probe {
+                index: 4,
+                stream_id: 1,
+                next_probe_size: 9000,
+            }),
+            &[0; 1200],
+        );
+        ch.on_frame(probe, t0);
+        assert_eq!(
+            (ch.stats.probes, ch.stats.last_probe),
+            (1, Some((4, 9000, 1200)))
+        );
+    }
+
+    #[test]
+    fn a_frame_stats_acknowledgement_carries_the_times() {
+        let t0 = Instant::now();
+        let ch = Channel::new(DisplayConfig::default(), t0);
+        let times = FrameTimes {
+            received: 100,
+            decode_start: 150,
+            decode_end: 9150,
+        };
+        let m = ch.frame_stats(2, 77, times, t0);
+        let Some(ClientBody::Acks(batch)) = round_trip(&m).msg else {
+            panic!("not an ack batch")
+        };
+        let a = &batch.acks[0];
+        assert_eq!((a.stream_id, a.frame_index, a.frame_stats), (2, 77, true));
+        assert_eq!(
+            (a.network_recv_usec, a.decode_start_usec, a.decode_end_usec),
+            (100, 150, 9150)
+        );
+        assert!(!a.frame_ack && !a.message_ack);
     }
 
     #[test]
