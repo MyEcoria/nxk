@@ -1571,7 +1571,15 @@ within 5 s.
     ms of listening the scan hears the Freebox on 5 GHz channel 36 (-80 dBm;
     the firmware offers 5 GHz channels 36-165 for country US, none was ever
     heard with the defaults). Scanned while joined it finds fewer of the
-    weak ones (2 to 6 of 6).
+    weak ones (2 to 6 of 6). Rate on 5 GHz (channel 155, -47 dBm, the phone's
+    hotspot): 33 to 44 Mb/s over four connections, the same as on 2.4 GHz, so
+    the radio is not the limit. The stack is not either: plain TCP from the PC
+    over usb0 (`speedtest -u`, 1 ms) gives 195 Mb/s with one connection or
+    four, and the CPU stays under a third of a core in `wlan`. Pings to the
+    hotspot alternate 3-5 ms and 50-170 ms, with the power saving at 0 after
+    the join and no frame dropped in `wlan` or `net`: the delay is in the
+    air or the phone's access point (the cause is not found); a PC on the
+    same hotspot would tell.
 
 64. 25/10/2026, same console (gauge 88-97 %, plugged), `display` and `net`
     reloaded, `speedtest` put in `/bin`: **Wi-Fi first and the speed test**.
