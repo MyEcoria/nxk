@@ -1550,6 +1550,21 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+70. 25/10/2026, same console (gauge 27 %, plugged), the phone's hotspot
+    (nxk-test, 5 GHz channel 155, -38 dBm, pings 103 ms on average, 0 % lost),
+    `luna` of `2657559` with `notify_resolution=1280x720`, 60 Hz, volume 10 %:
+    **the server ignores the resolution notification** (the 27th Luna session,
+    about 7 minutes of Shadow of the Tomb Raider). Stream and capture stay 1920x1080
+    after the message (sent with the first picture). The server sends about two
+    `probe` messages a picture, 1399-1400 bytes of payload each and a next size of
+    0: path probing of the packet size, not a bandwidth test. At 6 Mbit/s the decoder
+    takes 17.8 ms a picture (34 at most): over 26712 pictures 312 were dropped, 5421
+    skipped to a key frame (614 asked), 20776 shown (47 a second), the delay
+    from a complete frame to its decoded picture about 100 ms. The 60 Hz does not
+    hold on this game. Before it, on the Freebox (-67 dBm) 20 pings gave 15 % lost with
+    timeouts in a row, the cause of the speed tests' zeros: the console had stayed on
+    `usb0` after the boot (`net` skipped `wlan0` for no DHCP answer; `restart net`
+    brought it back) and `wifi status` showed 39610 late items.
 69. 25/10/2026, same console (gauge 36 %, plugged), `luna` of `6cf0ba7`, phone
     on Wi-Fi throughout, volume 10 %: **the parity's length** (the 26th Luna
     session, ended after under a minute: the log slices missed why, the Wi-Fi

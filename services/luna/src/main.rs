@@ -3,7 +3,7 @@
 //! sign-in by code, the games the account can play and their covers, and
 //! playing them: the cloud session, the stream, the gamepad, the sound and
 //! the picture (decoded by `nxh264`, shown by the GPU). The Amazon domain of the account is
-//! `domain=` in this catalog's `service.txt` (amazon.com by default); `refresh=` (30 or 60)
+//! `domain=` in this catalog's `service.txt` (amazon.com by default); `refresh=` (24 to 60)
 //! and `max_mbit=` set the picture rate and bit rate cap the stream announces.
 
 mod account;
@@ -53,13 +53,13 @@ fn size(text: &str) -> Option<(u32, u32)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
-/// What the stream announces: `refresh=` (30 or 60 Hz) and `max_mbit=` (2 to 30) of `service.txt`, else 60 Hz
+/// What the stream announces: `refresh=` (24 to 60 Hz) and `max_mbit=` (2 to 30) of `service.txt`, else 60 Hz
 /// and the cap that suits it. Experiments, all off unless set: `notify_resolution=1280x720`,
 /// `max_display=1280x720`, `min_quality=N`, `max_quality=N`, `bitrate_kbps=N`, `frame_stats=1`.
 fn display_config() -> lunacore::stream::display::DisplayConfig {
     let number = |k: &str| setting(k).and_then(|v| v.parse::<u32>().ok());
     let refresh = number("refresh")
-        .filter(|r| matches!(r, 30 | 60))
+        .filter(|r| (24..=60).contains(r))
         .unwrap_or(60);
     let max = number("max_mbit").filter(|m| (2..=30).contains(m));
     let mut config = lunacore::stream::display::DisplayConfig::new(refresh, max);

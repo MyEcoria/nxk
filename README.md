@@ -320,7 +320,7 @@ datagram, the stream thread's longest busy spell and send, audio packets
 lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
 the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 60 Hz and an 8
-Mbit/s cap by default, `refresh=` 30 or 60 and `max_mbit=` in the catalog's
+Mbit/s cap by default, `refresh=` (24 to 60) and `max_mbit=` in the catalog's
 `service.txt` change them; experiments, off unless set there: `notify_resolution=1280x720`,
 `max_display=1280x720`, `min_quality=`, `max_quality=` and `bitrate_kbps=` (the protocol's
 `notify_resolution_change`, `settings` and `bitrate_adjustment`, sent once with the first picture),
