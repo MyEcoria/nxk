@@ -1,7 +1,9 @@
 //! The console's controls as the Xbox 360 pad Luna's servers expect, by
-//! position: Nintendo's B (bottom) is Xbox's A, its A (right) is B, X
-//! (top) is Y, Y (left) is X; ZL and ZR are full triggers; `+` is Start,
-//! `-` is Back. Sticks come dead-zoned from the driver.
+//! label: the button marked A is the game's A, B is B, X is X, Y is Y (a
+//! mapping by position would put Nintendo's A, on the right, on Xbox's B,
+//! and the player reads the prompt "A" on the button marked A); ZL and ZR
+//! are full triggers; `+` is Start, `-` is Back. Sticks come dead-zoned
+//! from the driver.
 
 use lunacore::stream::input::{GamePadButtons as B, GamePadState, Stick};
 use nxk_abi::proto::input as inp;
@@ -47,10 +49,10 @@ pub fn apply(pad: &mut GamePadState, ev: &[u64; 6]) -> bool {
 
 fn button(code: u64) -> Option<B> {
     Some(match code {
-        inp::BTN_B => B::A,
-        inp::BTN_A => B::B,
-        inp::BTN_Y => B::X,
-        inp::BTN_X => B::Y,
+        inp::BTN_A => B::A,
+        inp::BTN_B => B::B,
+        inp::BTN_X => B::X,
+        inp::BTN_Y => B::Y,
         inp::BTN_L => B::LEFT_SHOULDER,
         inp::BTN_R => B::RIGHT_SHOULDER,
         inp::BTN_PLUS => B::START,

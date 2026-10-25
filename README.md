@@ -265,8 +265,9 @@ certificate pinned as the session names it), SPP over it (connect, acks,
 time replies, RTCP every 100 ms, messages reassembled and kept in order),
 `main` set up with the session's token, then every channel the server
 announces (`display`, `audio`, `input`, `participant`). The console's
-controls go to `input` as an Xbox 360 pad, by position (Nintendo's B is
-Xbox's A); `main`'s pings are answered. HOME or sleep end the stream and
+controls go to `input` as an Xbox 360 pad, by label (the button marked A is
+the game's A; by position Nintendo's A, on the right, would be Xbox's B);
+`main`'s pings are answered. HOME or sleep end the stream and
 `terminateGameSession` ends the cloud session (checked with
 `getPlayingGameSession`). The sound plays: `audio`'s Opus packets (CELT
 only, 20 ms, stereo, 96 to 160 kb/s) are put back in `frame_index` order,
