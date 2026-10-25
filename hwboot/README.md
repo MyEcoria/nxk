@@ -1550,6 +1550,26 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+68. 25/10/2026, same console (gauge 39 %, plugged), `luna` of `48c4c13`, 60 Hz,
+    volume 10 %: **the parity packets, the first time on the real stream**
+    (the 25th Luna session, ended by HOME after about two minutes). The parity
+    layout of the decompiled client is right: on the audio channel 20 complete
+    groups matched (payload and the 8 header bytes) and 3 lost packets were
+    rebuilt, acknowledged and fed to the player (2 compared with the
+    retransmitted copy: identical); on the display channel 24 groups matched,
+    then one complete group (the 25th, in the first second, with a 422 ms gap
+    in the datagrams) matched on all 8 header bytes but not on the payload and
+    switched that channel's recovery off. Lags from a hole noticed to the
+    parity 54 ms (100 at most), to the retransmission 62 ms (151 at most): the
+    parity wins only about as often as it loses. The decoder skipped 81 pictures
+    to the next key frame over 9 losses given up (0 decoder errors, 11 key frames
+    asked, delay from complete frame to decoded 23 ms, 77 at most). Then the
+    stream stopped: the console's Wi-Fi chip had left the PCIe bus (`wifi
+    status`: chip lost 2 times, config id 0xffffffff, 2 recovered), no datagram
+    for minutes, the picture frozen on Tomb Raider's menu; HOME ended the
+    cloud session. The payload mismatch is probably a retransmitted copy that
+    differs from the original; groups with a packet that came behind a later one
+    are left alone now, and a mismatch dumps the offsets that differ.
 67. 25/10/2026, same console (gauge 48 to 39 %, plugged), `luna` of
     `d980315`, 60 Hz announced, volume 10 %: **Shadow of the Tomb Raider for
     13 minutes** (the 24th Luna session). The PC's link was good (pings 8 to

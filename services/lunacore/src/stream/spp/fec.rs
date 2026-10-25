@@ -97,6 +97,8 @@ pub struct FecCounters {
     /// Groups whose 32 packets were all there when the parity came, and whether it matched.
     pub complete_ok: u64,
     pub complete_bad: u64,
+    /// Groups left alone because a packet came behind a later one.
+    pub late: u64,
     /// Groups short of one packet, or of more, when the parity came.
     pub one_lost: u64,
     pub many_lost: u64,
@@ -126,6 +128,12 @@ struct Group {
     rebuilt: Option<(usize, Packet)>,
     /// Settled: complete and checked, or rebuilt.
     done: bool,
+    /// The highest index seen, and whether a packet came behind it (a retransmitted copy, or a reordered one): a copy
+    /// may differ from the original the parity was made from, so such a group is neither checked nor rebuilt.
+    max_seen: Option<usize>,
+    late: bool,
+    /// Payload length of each packet held.
+    lens: [u16; GROUP],
     /// Counted as a group that lost more than one packet.
     many: bool,
 }
@@ -143,6 +151,9 @@ impl Group {
             hole: None,
             rebuilt: None,
             done: false,
+            max_seen: None,
+            late: false,
+            lens: [0; GROUP],
             many: false,
         }
     }
@@ -158,6 +169,9 @@ impl Group {
     fn add(&mut self, i: usize, p: &Packet) {
         self.present |= 1 << i;
         self.count += 1;
+        self.lens[i] = p.header.payload_len;
+        self.late |= self.max_seen.is_some_and(|m| i < m);
+        self.max_seen = self.max_seen.max(Some(i));
         for (x, b) in self.xor.iter_mut().zip(&p.payload) {
             *x ^= b;
         }
@@ -226,11 +240,12 @@ impl Fec {
             .map(|(i, s)| format!("ch{} {}{}", i, s.verified, if s.off { " OFF" } else { "" }))
             .collect();
         format!(
-            "luna: fec {} parity, complete {} ok {} bad, {} lost one {} more, {} filled first, rebuilt {} (used {}), \
+            "luna: fec {} parity, complete {} ok {} bad, {} left alone (copies), {} lost one {} more, {} filled first, rebuilt {} (used {}), \
              compared {} ok {} bad; ms avg/max hole to parity {}, hole to retransmission {}; groups verified [{}]",
             c.parity,
             c.complete_ok,
             c.complete_bad,
+            c.late,
             c.one_lost,
             c.many_lost,
             c.filled_first,
@@ -341,6 +356,11 @@ impl Fec {
             return None;
         }
         let want = parity_of(&parity.header);
+        if group.late && (group.count == GROUP || group.count + 1 == GROUP) {
+            group.done = true;
+            self.counters.late += 1;
+            return None;
+        }
         if group.count == GROUP {
             group.done = true;
             let ok = group.src == want && group.payload_matches(&parity);
@@ -411,13 +431,24 @@ impl Fec {
         if let Some(g) = state.groups.iter().find(|g| g.key == key) {
             let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
             let fec = g.parity.as_ref().map_or([0; 32], |p| p.header.encode());
+            let pay = g
+                .parity
+                .as_ref()
+                .map(|p| p.payload.as_slice())
+                .unwrap_or_default();
+            let diff: Vec<usize> = (0..pay.len()).filter(|&o| pay[o] != g.xor[o]).collect();
             self.notes.push(format!(
-                "luna: fec: ch{} group {} does not match: parity header {} xor of the 32 headers {} (payload {} bytes)",
+                "luna: fec: ch{} group {} does not match: parity header {} xor of the 32 headers {} (payload {} bytes, \
+                 {} differ from offset {:?} to {:?}), lengths {:?}",
                 channel,
                 key,
                 hex(&fec[12..]),
                 hex(&g.hdr[12..]),
-                g.parity.as_ref().map_or(0, |p| p.payload.len())
+                pay.len(),
+                diff.len(),
+                diff.first(),
+                diff.last(),
+                g.lens
             ));
         }
     }
@@ -645,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn two_lost_packets_are_not_rebuilt_but_a_retransmission_makes_it_one() {
+    fn two_lost_packets_are_not_rebuilt_and_a_late_copy_leaves_the_group_alone() {
         let (mut fec, t) = (Fec::default(), Instant::now());
         trusted(&mut fec, t);
         let g = packets(1, 96, GROUP, 40);
@@ -658,12 +689,13 @@ mod tests {
         feed(&mut fec, &rest, t);
         assert!(fec.on_parity(&parity(1, 3, &g), t).is_none());
         assert_eq!(fec.counters().many_lost, 1);
-        let built = fec.on_data(&g[4], t).expect("one left, rebuilt");
-        assert!(same(&built, &g[20]));
+        // The retransmitted copy of 4 comes behind later ones: the group is not trusted any more.
+        assert!(fec.on_data(&g[4], t).is_none());
+        assert_eq!((fec.counters().late, fec.counters().injected), (1, 0));
     }
 
     #[test]
-    fn a_parity_that_comes_before_the_last_packet_still_rebuilds_the_missing_one() {
+    fn a_parity_that_comes_before_the_last_packet_waits_for_a_packet_in_order() {
         let (mut fec, t) = (Fec::default(), Instant::now());
         trusted(&mut fec, t);
         let g = packets(1, 96, GROUP, 40);
@@ -675,10 +707,9 @@ mod tests {
             .collect();
         feed(&mut fec, &before, t);
         assert!(fec.on_parity(&parity(1, 3, &g), t).is_none());
-        let built = fec
-            .on_data(&g[30], t)
-            .expect("rebuilt when the 31st arrives");
-        assert!(same(&built, &g[20]));
+        // 30 comes behind 31: a copy or a reordering, the group is left alone.
+        assert!(fec.on_data(&g[30], t).is_none());
+        assert_eq!(fec.counters().late, 1);
     }
 
     #[test]
@@ -742,6 +773,25 @@ mod tests {
         assert!(feed(&mut fec, &g, t).is_empty());
         assert!(fec.on_parity(&parity(0, 0, &g), t).is_none());
         assert_eq!(fec.counters().parity, 0);
+    }
+
+    #[test]
+    fn a_group_with_a_packet_behind_a_later_one_is_left_alone() {
+        let (mut fec, t) = (Fec::default(), Instant::now());
+        trusted(&mut fec, t);
+        let g = packets(1, 96, GROUP, 40);
+        // Packet 9 comes after 10 (a copy, or reordered), packet 20 is lost.
+        let order: Vec<Packet> = g[..9]
+            .iter()
+            .chain([&g[10], &g[9]])
+            .chain(&g[11..20])
+            .chain(&g[21..])
+            .cloned()
+            .collect();
+        assert!(feed(&mut fec, &order, t).is_empty());
+        assert!(fec.on_parity(&parity(1, 3, &g), t).is_none());
+        let c = fec.counters();
+        assert_eq!((c.late, c.one_lost, c.injected), (1, 0, 0));
     }
 
     #[test]
