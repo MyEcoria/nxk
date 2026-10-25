@@ -1550,6 +1550,31 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+72. 25/10/2026, same console (gauge 71 %, plugged), the phone's hotspot, `luna`
+    at 45 Hz, volume 10 %, a continuous capture of the console's log: **wlan's
+    death caught** (the 29th Luna session, about 7 minutes of Shadow of the Tomb
+    Raider). Stream healthy until then (FEC: 739 parity packets, 591 complete
+    groups matched, 3 packets rebuilt and 3 retransmitted copies compared, all
+    identical). The kernel logged `'wlan' ... system error (SError) at 0x0,
+    pc +0x5610 -> process killed`: the code there is the chip's mailbox interrupt
+    status read-and-clear after a window write, the load being the instruction
+    the error is attributed to. `net` moved to `usb0` (the PC's public address, so
+    the server fell silent), the picture froze, and the user heard a harsh tone
+    until HOME; `luna` ended 42 s after the last datagram and "the session could not
+    be ended now" (the network was on the other address). The tone is not explained
+    (the audio service silences the ring behind the filled periods only below
+    its full depth; in the games' mode a pump held up more than 85 ms replays the
+    ring). `wifi poke` (new, development) takes the module down and times reads of
+    BAR0: the first read of the vanished chip takes 47.8 ms (a completion timeout)
+    and returns all ones, the next ones at once; with the memory decode off (as
+    after a reset behind our back) reads return ones in 4 us, three posted writes
+    return at once and no SError follows: a read of a missing chip does not
+    produce the SError. 9 sleep and wake cycles, 12 clock switches during pings and
+    9 speed tests (23 to 38 Mb/s over 2 to 3 connections, none with a zero after the
+    first sample) did not kill `wlan` either; cause still open. `init` supervises
+    `wlan` now (starts it again from `/bin/wlan` or the boot image when it exits,
+    tried in the emulator with `wifi poke die`), which needs the boot image on the
+    card to be rebuilt.
 71. 25/10/2026, same console (gauge 17 % then lower, plugged), the phone's
     hotspot, `luna` of `a4170a8`, `refresh=45`, volume 10 % (`wlan` found dead
     again before, restarted with `display` and `net`): **45 Hz holds** (the 28th
