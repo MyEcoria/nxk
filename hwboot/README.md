@@ -1550,6 +1550,15 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+73. 25/10/2026, same console, rebooted with run 72's image (`init` of `63b8ddc`):
+    **`wlan` comes back by itself**. `wifi poke die` made the driver exit (code
+    139): `init` started it again from `/bin/wlan` within a few seconds, `net` went to
+    `usb0`, `display`'s first join found the old handle (EPIPE) and tried again 3 s
+    later (it waited 30 s before), the network `nxk-test` was joined and `net` was
+    back on `wlan0` (10.101.173.75) inside 30 s. The volume is back to 100 % at every
+    boot: set it before any sound. `/bin/wifi` and `/bin/wlan` on the card are the
+    builds with `poke die` (a `wlan` restarted by `init` from an older `/bin/wlan`
+    has no `die`).
 72. 25/10/2026, same console (gauge 71 %, plugged), the phone's hotspot, `luna`
     at 45 Hz, volume 10 %, a continuous capture of the console's log: **wlan's
     death caught** (the 29th Luna session, about 7 minutes of Shadow of the Tomb

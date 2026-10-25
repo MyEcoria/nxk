@@ -469,10 +469,16 @@ fn start_join(w: &Arc<Worker>, notif: u32, raw: Vec<u8>, psk: Vec<u8>, auto: boo
 
 /// The network joined last, tried again at boot until it answers (3
 /// times, then the user's to pick).
+/// How many joins that found no driver are tried again at once.
+const EARLY_JOINS: u32 = 6;
+
 struct Autojoin {
     net: known::Known,
     tries: u32,
     at: u64,
+    /// Attempts that failed because the driver was not there yet (or its
+    /// handle was the dead one's): they do not count, and come again soon.
+    early: u32,
 }
 
 struct Worker {
@@ -734,7 +740,11 @@ fn sleep_steps(
                 "[display] output CRC before sleep {:#x}, after wake {:x?}: {}",
                 before,
                 after,
-                if after == Some(before) { "same" } else { "DIFFERENT" }
+                if after == Some(before) {
+                    "same"
+                } else {
+                    "DIFFERENT"
+                }
             );
         } else if sv.as_ref().is_some_and(|s| s.crc.is_some()) {
             println!("[display] output CRC before sleep: none stable, not compared");
@@ -1884,6 +1894,7 @@ fn main() -> i32 {
                     net,
                     tries: 0,
                     at: 0,
+                    early: 0,
                 });
                 if let Some(mut cfg) = config::Config::load() {
                     if cfg.brightness > 0 {
@@ -2131,6 +2142,7 @@ fn main() -> i32 {
                         net,
                         tries: 0,
                         at: now + 2_000_000_000,
+                        early: 0,
                     });
                 }
             }
@@ -2924,6 +2936,20 @@ fn main() -> i32 {
                                     name,
                                     libnx::abi::err::name(*e)
                                 );
+                            }
+                            // The driver restarted under us: its name is looked up again
+                            // by the next call, so try again in a moment, not in 30 s.
+                            let not_there = [
+                                libnx::abi::err::EPIPE,
+                                libnx::abi::err::ENOENT,
+                                libnx::abi::err::ENOSYS,
+                            ];
+                            if let (Err(e), true, Some(a)) = (&r, auto, autojoin.as_mut()) {
+                                if not_there.iter().any(|n| *e == -n) && a.early < EARLY_JOINS {
+                                    a.early += 1;
+                                    a.tries = a.tries.saturating_sub(1);
+                                    a.at = now + 3_000_000_000;
+                                }
                             }
                             if let Some(t) = ui.wifi_joined(&name, &r, auto) {
                                 ui.toast(t, now);
