@@ -724,6 +724,14 @@ impl Graphics {
         Some(r.mr)
     }
 
+    /// The screen's input for a thread of its own: it keeps reading while
+    /// another waits in `present` (valid until this `Graphics` is dropped).
+    pub fn events(&self) -> Events {
+        Events {
+            link: Service::from_handle(self.link.raw()),
+        }
+    }
+
     /// The next input event, waiting at most `timeout_ns` (0: for good).
     pub fn poll(&self, timeout_ns: u64) -> Option<Event> {
         let r = self
@@ -779,6 +787,22 @@ impl Graphics {
             let _ = self.display.call(&Msg::new(display::RELEASE, 0, 0));
             let _ = self.gpu.call(&Msg::new(gpu::RESET, 0, 0));
         }
+    }
+}
+
+/// The input of a `Graphics`, readable from another thread.
+pub struct Events {
+    link: Service,
+}
+
+impl Events {
+    /// As `Graphics::poll_words`.
+    pub fn poll_words(&self, timeout_ns: u64) -> Option<[u64; 6]> {
+        let r = self
+            .link
+            .call(&Msg::from_words(display::EVENT, &[timeout_ns]))
+            .ok()?;
+        Some(r.mr)
     }
 }
 

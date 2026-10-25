@@ -1474,7 +1474,8 @@ fn main() -> i32 {
         thread::spawn(move || work(&w2, notif, hw, &l2, &a2)).expect("display: worker thread");
     }
     let game_ep = sys::endpoint_create().expect("display: game endpoint");
-    {
+    // Two receivers: an `EVENT` is served while the other waits in a `FLIP`'s vertical blank.
+    for _ in 0..2 {
         let (s2, a2) = (link.clone(), awake.clone());
         thread::spawn(move || game_thread(dc, game_ep, &s2, &a2)).expect("display: game thread");
     }

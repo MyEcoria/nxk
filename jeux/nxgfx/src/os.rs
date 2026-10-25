@@ -142,6 +142,11 @@ impl Service {
         Self { ep }
     }
 
+    /// The handle, to build another `Service` on the same endpoint.
+    pub fn raw(&self) -> u32 {
+        self.ep
+    }
+
     pub fn call(&self, m: &Msg) -> Result<Msg> {
         checked(user::call(self.ep, m, 0)?)
     }
