@@ -1564,12 +1564,16 @@ within 5 s.
     parity wins only about as often as it loses. The decoder skipped 81 pictures
     to the next key frame over 9 losses given up (0 decoder errors, 11 key frames
     asked, delay from complete frame to decoded 23 ms, 77 at most). Then the
-    stream stopped: the console's Wi-Fi chip had left the PCIe bus (`wifi
-    status`: chip lost 2 times, config id 0xffffffff, 2 recovered), no datagram
-    for minutes, the picture frozen on Tomb Raider's menu; HOME ended the
-    cloud session. The payload mismatch is probably a retransmitted copy that
-    differs from the original; groups with a packet that came behind a later one
-    are left alone now, and a mismatch dumps the offsets that differ.
+    stream stopped: no datagram for minutes, the picture frozen on Tomb
+    Raider's menu, the cloud session ended by HOME. The user's phone, the
+    console's access point, had moved from Wi-Fi to 5G during the test: the
+    public address changed and the server, which answers one address, went
+    silent (`wifi status` counts 2 chip losses since the boot, not shown to be
+    in this run). `luna` ends a stream that heard nothing for 15 s now
+    ("connection lost", the session ended). The payload mismatch is probably a
+    retransmitted copy that differs from the original; groups with a packet that
+    came behind a later one are left alone now, and a mismatch dumps the offsets
+    that differ.
 67. 25/10/2026, same console (gauge 48 to 39 %, plugged), `luna` of
     `d980315`, 60 Hz announced, volume 10 %: **Shadow of the Tomb Raider for
     13 minutes** (the 24th Luna session). The PC's link was good (pings 8 to

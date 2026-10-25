@@ -50,6 +50,9 @@ const MAX_RTT_US: u64 = 10_000_000;
 const INPUT_EVERY: Duration = Duration::from_millis(2);
 /// The figures for the overlay are renewed this often.
 const STATS_EVERY: Duration = Duration::from_secs(1);
+/// A stream that has heard nothing from the server for this long is over: the network went down, or changed
+/// (the server answers one address only), and no packet will come back.
+const DEAD_AFTER: Duration = Duration::from_secs(15);
 const WANTED: [&str; 5] = ["display", "display2", "audio", "input", "participant"];
 
 /// A gamepad event and when it was read from the screen's input.
@@ -644,6 +647,15 @@ fn streaming(
     let end = loop {
         if stop.load(Ordering::Relaxed) {
             break End::Stopped;
+        }
+        if let Some(last) = s.link.stats.last_datagram {
+            let silent = last.elapsed();
+            if silent > DEAD_AFTER {
+                return Err(format!(
+                    "connection lost: nothing from the server for {} s",
+                    silent.as_secs()
+                ));
+            }
         }
         let event = match held.pop_front() {
             Some(e) => Some(e),
