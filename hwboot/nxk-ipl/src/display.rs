@@ -300,7 +300,9 @@ pub fn backlight_pwm_init() {
     if panel_id() == PANEL_SAM_AMS699VC01 {
         return;
     }
+    soc::bpmp_clk_rate_relaxed(true);
     clock::enable(&PWM_CLK);
+    soc::bpmp_clk_rate_relaxed(false);
     wr(PWM_BASE + PWM_CONTROLLER_PWM_CSR_0, PWM_CSR_EN);
     pinmux(PINMUX_AUX_LCD_BL_PWM, pinmux_rd(PINMUX_AUX_LCD_BL_PWM) & !PINMUX_FUNC_MASK | 1);
     usleep(2);

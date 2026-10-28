@@ -263,3 +263,48 @@ pub fn bpmp_mmu_disable() {
     bpmp_mmu_maintenance(MAINT_CLN_INV_WAY, false);
     set_cache(CACHE_CONFIG, 0);
 }
+
+/// BPMP clock levels (hekate `bpmp_freq_t`) and their PLLC dividers.
+pub const BPMP_CLK_NORMAL: u32 = 0; // 408 MHz from PLLP
+pub const BPMP_CLK_SUPER_BOOST: u32 = 3; // 576 MHz, hekate's T210 default
+pub const BPMP_CLK_HYPER_BOOST: u32 = 4; // 589 MHz, its T210B01 default
+const PLL_DIVN: [u32; 5] = [0, 85, 88, 90, 92];
+static mut BPMP_FID: u32 = BPMP_CLK_NORMAL;
+
+fn bpmp_fid() -> u32 {
+    unsafe { core::ptr::addr_of!(BPMP_FID).read() }
+}
+
+/// `bpmp_clk_rate_relaxed`: SCLK on PLLP_OUT (true) while a bus device is
+/// set up, then back on PLLC_OUT1 (false) once the BPMP is boosted.
+pub fn bpmp_clk_rate_relaxed(enable: bool) {
+    if enable {
+        set_car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY, 0x2000_3330);
+        let _ = car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY);
+        crate::timer::usleep(100);
+        set_car(CLK_RST_CONTROLLER_CLK_SYSTEM_RATE, 2); // S1:H1:P3
+        let _ = car(CLK_RST_CONTROLLER_CLK_SYSTEM_RATE);
+    } else if bpmp_fid() != BPMP_CLK_NORMAL {
+        set_car(CLK_RST_CONTROLLER_CLK_SYSTEM_RATE, 3); // S1:H1:P4
+        set_car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY, 0x2000_3310);
+        let _ = car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY);
+        crate::timer::usleep(100);
+    }
+}
+
+/// `bpmp_clk_rate_set`: the BPMP (and SCLK) on PLLC at level `fid`, or
+/// back on PLLP with PLLC off for `BPMP_CLK_NORMAL`.
+pub fn bpmp_clk_rate_set(fid: u32) {
+    let fid = fid.min(PLL_DIVN.len() as u32 - 1);
+    if bpmp_fid() == fid {
+        return;
+    }
+    unsafe { core::ptr::addr_of_mut!(BPMP_FID).write(fid) };
+    bpmp_clk_rate_relaxed(true);
+    if fid != BPMP_CLK_NORMAL {
+        crate::clock::enable_pllc(PLL_DIVN[fid as usize]);
+        bpmp_clk_rate_relaxed(false);
+    } else {
+        crate::clock::disable_pllc();
+    }
+}

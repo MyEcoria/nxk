@@ -80,6 +80,8 @@ extern "C" fn ipl_main() -> ! {
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
     // The panel and the boot screen first, as hekate's logo.
     display::init();
+    // The BPMP overclocked as hekate does it (back to 408 MHz at the launch).
+    soc::bpmp_clk_rate_set(if soc::is_t210() { soc::BPMP_CLK_SUPER_BOOST } else { soc::BPMP_CLK_HYPER_BOOST });
     display::window_a();
     display::splash(nxk_bootsplash::AT_IPL, true);
     display::backlight_pwm_init();

@@ -81,20 +81,11 @@ const I2C5_CLK: ClkRst = ClkRst {
     clk_div: 0,
 };
 
-/// `bpmp_clk_rate_relaxed(true)`: SCLK back on PLLP_OUT while a bus device
-/// is set up (the restore is a no-op until the BPMP is overclocked).
-fn bpmp_clk_relaxed() {
-    set_car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY, 0x2000_3330);
-    let _ = car(CLK_RST_CONTROLLER_SCLK_BURST_POLICY);
-    usleep(100);
-    set_car(CLK_RST_CONTROLLER_CLK_SYSTEM_RATE, 2);
-    let _ = car(CLK_RST_CONTROLLER_CLK_SYSTEM_RATE);
-}
-
 /// `clock_enable_i2c`.
 fn enable_i2c_clock(c: &ClkRst) {
-    bpmp_clk_relaxed();
+    soc::bpmp_clk_rate_relaxed(true);
     clock::enable(c);
+    soc::bpmp_clk_rate_relaxed(false);
 }
 
 /// `_config_oscillators`: CLK_M 19.2 MHz from the 38.4 MHz crystal, the

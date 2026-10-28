@@ -63,3 +63,51 @@ pub const UARTA: ClkRst = ClkRst {
     clk_src: 0,
     clk_div: src_div(2),
 };
+
+/// `_clock_pll_wait_lock`.
+fn pll_wait_lock(base: u32, max_us: u32) {
+    for _ in 0..max_us {
+        if car(base) & PLL_BASE_LOCK != 0 {
+            break;
+        }
+        usleep(1);
+    }
+    usleep(2);
+}
+
+/// `clock_enable_pllc`: PLLC at 38.4 MHz / 6 * `divn`, PLLC_OUT1 on.
+pub fn enable_pllc(divn: u32) {
+    let base = car(CLK_RST_CONTROLLER_PLLC_BASE);
+    let enabled = base & PLL_BASE_ENABLE != 0;
+    if enabled && (base >> 10) & 0xFF == divn {
+        return;
+    }
+    // Disabled first, against an HPLL overshoot.
+    if enabled {
+        disable_pllc();
+    }
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC, 0x8000 << 4);
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC_2, car(CLK_RST_CONTROLLER_PLLC_MISC_2) | 0xF << 8);
+    set_car(CLK_RST_CONTROLLER_PLLC_BASE, car(CLK_RST_CONTROLLER_PLLC_BASE) & !PLL_BASE_ENABLE);
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC_1, car(CLK_RST_CONTROLLER_PLLC_MISC_1) & !PLLC_MISC1_IDDQ);
+    usleep(10);
+    set_car(CLK_RST_CONTROLLER_PLLC_BASE, divn << 10 | 6);
+    set_car(CLK_RST_CONTROLLER_PLLC_BASE, car(CLK_RST_CONTROLLER_PLLC_BASE) | PLL_BASE_ENABLE);
+    pll_wait_lock(CLK_RST_CONTROLLER_PLLC_BASE, 300);
+    set_car(CLK_RST_CONTROLLER_PLLC_OUT, 0);
+    set_car(
+        CLK_RST_CONTROLLER_PLLC_OUT,
+        car(CLK_RST_CONTROLLER_PLLC_OUT) | PLLC_OUT1_CLKEN | PLLC_OUT1_RSTN_CLR,
+    );
+    crate::timer::msleep(1);
+}
+
+/// `clock_disable_pllc`.
+pub fn disable_pllc() {
+    set_car(CLK_RST_CONTROLLER_PLLC_OUT, car(CLK_RST_CONTROLLER_PLLC_OUT) & !PLLC_OUT1_RSTN_CLR);
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC, PLLC_MISC_RESET);
+    set_car(CLK_RST_CONTROLLER_PLLC_BASE, car(CLK_RST_CONTROLLER_PLLC_BASE) & !PLL_BASE_ENABLE);
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC_1, car(CLK_RST_CONTROLLER_PLLC_MISC_1) | PLLC_MISC1_IDDQ);
+    set_car(CLK_RST_CONTROLLER_PLLC_MISC_2, car(CLK_RST_CONTROLLER_PLLC_MISC_2) & !(0xFF << 8));
+    usleep(10);
+}

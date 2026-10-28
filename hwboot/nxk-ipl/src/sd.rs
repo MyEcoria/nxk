@@ -134,10 +134,13 @@ pub fn open() -> Result<(SdCard, SdBoard)> {
     board.power_off(&Host);
     timer::msleep(239);
     board.power_on(&Host)?;
+    // SCLK relaxed while SDMMC1's clock changes, against APB stress.
+    soc::bpmp_clk_rate_relaxed(true);
     if clock::car(CLK_RST_CONTROLLER_CLK_OUT_ENB_Y) & 1 << CLK_Y_SDMMC_LEGACY_TM == 0 {
         clock::enable(&LEGACY_TM_CLK);
     }
     clock::enable(&SDMMC1_CLK);
+    soc::bpmp_clk_rate_relaxed(false);
     card.init(&board, false, true)?;
     nxk_sdcard::recover(&mut card, &board)?;
     Ok((card, board))

@@ -32,7 +32,9 @@ pub fn init_debug() {
     wr(PINMUX_AUX + 0xE8, PINMUX_INPUT_ENABLE | PINMUX_TRISTATE);
     wr(PINMUX_AUX + 0xEC, 0);
     wr(PINMUX_AUX + 0xF0, PINMUX_INPUT_ENABLE | PINMUX_TRISTATE);
+    crate::soc::bpmp_clk_rate_relaxed(true);
     clock::enable(&clock::UARTA);
+    crate::soc::bpmp_clk_rate_relaxed(false);
 
     wait_xfer(UART_TX_IDLE);
     // clock_uart_use_src_div: not 1 or 3 Mbaud, so the plain divider.

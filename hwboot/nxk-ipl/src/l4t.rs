@@ -171,9 +171,10 @@ fn config_carveouts(t210b01: bool) {
     }
 }
 
-/// `hw_deinit(true)` without the display or Minerva parts nxk-ipl does
-/// not have yet: BPMP cache off, arbiter reset, APE clocks back on (T210).
+/// `hw_deinit(true)`: BPMP back to 408 MHz, cache off, arbiter reset, APE
+/// clocks back on (T210). Minerva's part is a no-op after its L4T prep.
 fn hw_deinit() {
+    soc::bpmp_clk_rate_set(soc::BPMP_CLK_NORMAL);
     soc::bpmp_mmu_disable();
     hw::config_arbiter(true);
     if soc::is_t210() {
