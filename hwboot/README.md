@@ -159,24 +159,29 @@ NXTEST_QEMU_ARGS="-device loader,file=hwboot/dl/bl31-test.bin,addr=0xFFF00000,fo
 ## Screen: what to expect
 
 Without a UART adapter, the screen is the only output: hekate leaves it
-on when launching an L4T entry, and the monitor then the kernel write to
-it (white text on black, portrait like the hekate text menu: hold the
-console vertically) until the `display` service turns it landscape. In
-order:
+on when launching an L4T entry, and the monitor then the kernel draw on
+it until the `display` service takes it over. By default that is the
+**boot screen** (`bootsplash/`, the same picture at every stage): the
+nxk logo and a progress bar on the dark theme's background, landscape
+(hold the console normally). Hold **Vol+** while nxk starts to get the
+logs as text instead (white on black, portrait like the hekate text
+menu: hold the console vertically). In order:
 
 1. hekate logo, then one **line** filling up at the bottom of the
    screen: the hekate countdown (`bootwait`), cleared just before the
    jump to `bl31.bin`. Normal.
-2. Black screen, `[nxk-bl31] ...` lines: the monitor is running.
-3. `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ... launching
-   init` lines: the kernel is running. A kernel panic or fault shows up
-   here too.
-4. The `display` service takes over the screen, in landscape (hold the
-   console normally): midnight-blue background, a header with the nxk
-   logo, the USB, ETH, WI-FI, SD and FAN states, the temperature and
-   the uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
-   LOGS) and the HOME tiles: CPU, MEMORY, STORAGE (SD card free space),
-   NETWORK and TERMINAL, refreshed every second. User space is alive.
+2. Boot screen, bar at 15 %: the monitor is running (with Vol+: a
+   black screen and `[nxk-bl31] ...` lines).
+3. Bar at 30 %, then 45 % when init starts: the kernel is running (with
+   Vol+: the `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ...
+   launching init` lines). A kernel panic, a monitor error or a program
+   killed on a fault before `display` is up turns the boot screen into
+   text: the messages so far, the failure last.
+4. The `display` service takes over the screen: the same boot screen,
+   its bar going on from 60 % until the users are read from the card
+   (15 s at most without one; buttons and taps are dropped meanwhile),
+   then the library (HOME), or the first-start setup on a new card:
+   user space is alive.
    Logs (the kernel's, the services' such as `[usbcon]` or `[sd]`
    lines, and `fbecho`) go to the LOGS page, whose tab counts the
    unread ones; the TERMINAL page shows the shell's session only, the
@@ -192,9 +197,10 @@ order:
    interrupt stuck low, polling instead` means the line never went back
    high (then taps still work, up to 0.5 s late).
 
-Photograph the screen wherever it stops: the last line locates the
-failure. If the logo stays on after the line clears (1 without 2), the
-monitor did not run or did not find the screen.
+Photograph the screen wherever it stops: the bar's length (or with
+Vol+, the last line) locates the failure. If hekate's logo stays on
+after its line clears (1 without 2), the monitor did not run or did not
+find the screen.
 
 ## Shell over USB-C (usbcon)
 
