@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Minimal EL3 monitor to start nxk through hekate's L4T entry (no ATF)"
 
+[dependencies]
+nxk-bootsplash = { path = "../../bootsplash" }
+
 [profile.release]
 opt-level = "s"
 panic = "abort"

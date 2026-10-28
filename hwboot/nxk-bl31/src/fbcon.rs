@@ -1,7 +1,11 @@
-//! Hekate-lit screen: only output without UART. Monitor clears the boot logo, mirrors logs
-//! (8x16 font, portrait), leaves nxk the resume row in the last two pixels. MMU off: direct DRAM writes.
+//! Hekate-lit screen: only output without UART. The monitor draws the boot
+//! screen over hekate's logo (`nxk-bootsplash`), or mirrors its logs (8x16
+//! font, portrait) when Vol+ is held; the last two pixels tell nxk which,
+//! and where to go on. MMU off: direct DRAM writes.
 
 use core::ptr::{read_volatile, write_volatile};
+
+use nxk_bootsplash::{self as splash, Format, Splash};
 
 const CAR: usize = 0x6000_6000;
 const RST_DEVICES_L: usize = CAR + 0x004;
@@ -9,7 +13,7 @@ const CLK_OUT_ENB_L: usize = CAR + 0x010;
 /// DISP1 + HOST1X clocks on and out of reset required (else bus hangs).
 const DISP1_HOST1X: u32 = (1 << 27) | (1 << 28);
 
-// Controleur d'affichage A (indices de mots de 32 bits).
+// Display controller A (32-bit word indices).
 const DC: usize = 0x5420_0000;
 const CMD_DISPLAY_WINDOW_HEADER: usize = 0x42;
 const WIN_OPTIONS: usize = 0x700;
@@ -19,13 +23,19 @@ const WIN_LINE_STRIDE: usize = 0x70A;
 const WINBUF_START_ADDR: usize = 0x800;
 const WINDOW_A_SELECT: u32 = 1 << 4;
 const WIN_ENABLE: u32 = 1 << 30;
-/// B8G8R8A8 (hekate) and R8G8B8A8.
-const DEPTH_32BPP: [u32; 2] = [12, 13];
+
+/// GPIO_IN of port X (bank 5, port 3): Vol+ on pin 6, Vol- on pin 7, low
+/// when pressed (hekate `btn_read_vol`, which leaves them GPIO inputs).
+const GPIO_IN_X: usize = 0x6000_D53C;
+const VOL_UP: u32 = 1 << 6;
+const VOL_DOWN: u32 = 1 << 7;
 
 /// Same colors in both formats (equal components).
 const BG: u32 = 0xFF00_0000;
 const FG: u32 = 0xFFD8_D8D8;
-const HANDOFF_MAGIC: u32 = 0x304B_584E; // "NXK0"
+/// Last two pixels: magic, then the next text row (text) or the progress (splash).
+const TEXT_MAGIC: u32 = 0x304B_584E; // "NXK0"
+const SPLASH_MAGIC: u32 = 0x314B_584E; // "NXK1"
 
 const FONT: &[u8; 4096] = include_bytes!("../../../build/font.bin");
 const GW: usize = 8;
@@ -37,6 +47,9 @@ struct Fb {
     h: usize,
     /// One row stride, in pixels.
     stride: usize,
+    fmt: Format,
+    /// The boot screen is shown: log lines are not drawn.
+    splash: bool,
     col: usize,
     row: usize,
 }
@@ -59,17 +72,16 @@ fn dc(i: usize) -> usize {
 }
 
 /// Window A lit on a 32-bit DRAM image: (base, width, height, stride in
-/// pixels).
-fn probe() -> Option<(usize, usize, usize, usize)> {
+/// pixels, format).
+fn probe() -> Option<(usize, usize, usize, usize, Format)> {
     if rd(CLK_OUT_ENB_L) & DISP1_HOST1X != DISP1_HOST1X || rd(RST_DEVICES_L) & DISP1_HOST1X != 0 {
         return None;
     }
     wr(dc(CMD_DISPLAY_WINDOW_HEADER), WINDOW_A_SELECT);
-    if rd(dc(WIN_OPTIONS)) & WIN_ENABLE == 0
-        || !DEPTH_32BPP.contains(&(rd(dc(WIN_COLOR_DEPTH)) & 0x7F))
-    {
+    if rd(dc(WIN_OPTIONS)) & WIN_ENABLE == 0 {
         return None;
     }
+    let fmt = Format::from_depth(rd(dc(WIN_COLOR_DEPTH)))?;
     let size = rd(dc(WIN_SIZE));
     let (w, h) = ((size & 0x1FFF) as usize, ((size >> 16) & 0x1FFF) as usize);
     let pitch = (rd(dc(WIN_LINE_STRIDE)) & 0xFFFF) as usize;
@@ -81,30 +93,55 @@ fn probe() -> Option<(usize, usize, usize, usize)> {
         && base.is_multiple_of(4)
         && base >= 0x8000_0000
         && base + pitch * h <= 0x1_0000_0000;
-    sane.then_some((base, w, h, pitch / 4))
+    sane.then_some((base, w, h, pitch / 4, fmt))
 }
 
-/// Clear the screen if on (logo vanishes: visible proof of life).
+/// Vol+ alone held: logs as text. Both read pressed on an unwired port
+/// (the emulator's GPIO_IN is 0), which keeps the boot screen.
+fn verbose() -> bool {
+    rd(GPIO_IN_X) & (VOL_UP | VOL_DOWN) == VOL_DOWN
+}
+
+/// Take over the screen if on: the boot screen, or a cleared text console.
 pub fn init() {
-    let Some((base, w, h, stride)) = probe() else {
+    let Some((base, w, h, stride, fmt)) = probe() else {
         return;
     };
-    let f = Fb {
+    let mut f = Fb {
         base,
         w,
         h,
         stride,
+        fmt,
+        splash: !verbose(),
         col: 0,
         row: 0,
     };
-    for r in 0..h / GH {
-        f.clear_row(r);
+    if f.splash {
+        f.splash(splash::AT_MONITOR);
+    } else {
+        f.clear();
     }
     unsafe { *core::ptr::addr_of_mut!(FB) = Some(f) };
 }
 
+/// Boot screen shown (else text, or no screen).
+pub fn splash_shown() -> bool {
+    fb().is_some_and(|f| f.splash)
+}
+
+/// Something went wrong: back to text over the boot screen, so it can be read.
+pub fn alert() {
+    if let Some(f) = fb().filter(|f| f.splash) {
+        f.splash = false;
+        f.clear();
+    }
+}
+
 pub fn write_str(s: &str) {
-    let Some(f) = fb() else { return };
+    let Some(f) = fb().filter(|f| !f.splash) else {
+        return;
+    };
     for b in s.bytes() {
         match b {
             b'\n' => f.newline(),
@@ -115,15 +152,20 @@ pub fn write_str(s: &str) {
     }
 }
 
-/// Leave nxk the row to continue on (just before the jump).
+/// Tell nxk how to go on (just before the jump).
 pub fn handoff() {
     let Some(f) = fb() else { return };
-    let next = if f.col == 0 {
-        f.row
+    let (magic, next) = if f.splash {
+        (SPLASH_MAGIC, splash::AT_KERNEL as usize)
+    } else if f.col == 0 {
+        (TEXT_MAGIC, f.row)
     } else {
-        (f.row + 1) % (f.h / GH)
+        (TEXT_MAGIC, (f.row + 1) % (f.h / GH))
     };
-    wr(f.addr(f.w - 2, f.h - 1), HANDOFF_MAGIC);
+    if f.splash {
+        f.splash_bar(splash::AT_KERNEL);
+    }
+    wr(f.addr(f.w - 2, f.h - 1), magic);
     wr(f.addr(f.w - 1, f.h - 1), next as u32);
 }
 
@@ -132,13 +174,49 @@ impl Fb {
         self.base + (y * self.stride + x) * 4
     }
 
-    fn clear_row(&self, row: usize) {
-        for y in row * GH..(row + 1) * GH {
-            let line = self.addr(0, y);
-            for x in 0..self.w {
-                wr(line + x * 4, BG);
+    /// Image rectangle in color `c` (A B G R).
+    fn fill(&self, x: usize, y: usize, w: usize, h: usize, c: u32) {
+        let v = self.fmt.pixel(c);
+        for row in y..(y + h).min(self.h) {
+            let line = self.addr(0, row);
+            for col in x..(x + w).min(self.w) {
+                wr(line + col * 4, v);
             }
         }
+    }
+
+    /// Landscape rectangle of the boot screen, turned on a portrait panel.
+    fn fill_view(&self, x: u32, y: u32, w: u32, h: u32, c: u32) {
+        let (x, y, w, h) = if self.h > self.w {
+            splash::turn(x, y, w, h, self.h as u32)
+        } else {
+            (x, y, w, h)
+        };
+        self.fill(x as usize, y as usize, w as usize, h as usize, c);
+    }
+
+    fn view(&self) -> Splash {
+        let (w, h) = (self.w.max(self.h) as u32, self.w.min(self.h) as u32);
+        Splash::new(w, h)
+    }
+
+    fn splash(&self, p: u32) {
+        self.view()
+            .draw(p, &mut |x, y, w, h, c| self.fill_view(x, y, w, h, c));
+    }
+
+    fn splash_bar(&self, p: u32) {
+        self.view()
+            .bar(p, &mut |x, y, w, h, c| self.fill_view(x, y, w, h, c));
+    }
+
+    fn clear(&mut self) {
+        self.fill(0, 0, self.w, self.h, BG);
+        (self.col, self.row) = (0, 0);
+    }
+
+    fn clear_row(&self, row: usize) {
+        self.fill(0, row * GH, self.w, GH, BG);
     }
 
     fn put(&mut self, c: u8) {

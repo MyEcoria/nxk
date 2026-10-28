@@ -1,0 +1,8 @@
+[package]
+name = "nxk-bootsplash"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "nxk's boot screen (logo and progress bar), drawn alike by every boot stage"
+
+[dependencies]

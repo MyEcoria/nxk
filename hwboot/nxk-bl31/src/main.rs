@@ -161,6 +161,9 @@ extern "C" fn bl31_main() -> ! {
     uart_init();
     fbcon::init();
     puts("\n[nxk-bl31] EL3 monitor (hekate L4T entry)\n");
+    if fbcon::splash_shown() {
+        puts("[nxk-bl31] screen: boot screen (hold Vol+ for the logs)\n");
+    }
 
     // No-op if already running; stopped, CNTPCT_EL0 would stay frozen and
     // every bounded nxk wait would last forever.
@@ -187,6 +190,7 @@ extern "C" fn bl31_main() -> ! {
 
     let size = bl33_size();
     if size == 0 || size > 8 << 20 {
+        fbcon::alert();
         puts("[nxk-bl31] ERROR: bad bl33 size (NXK_BL33_SIZE)\n");
         park();
     }
@@ -223,6 +227,7 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
         core::arch::asm!("mrs {}, esr_el3", out(reg) esr);
         core::arch::asm!("mrs {}, elr_el3", out(reg) elr);
     }
+    fbcon::alert();
     puts("\n[nxk-bl31] unexpected EL3 trap, ESR=");
     puthex(esr);
     puts(" ELR=");
@@ -234,6 +239,7 @@ extern "C" fn el3_unexpected(regs: &mut [u64; 31]) {
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    fbcon::alert();
     puts("\n[nxk-bl31] panic\n");
     park()
 }

@@ -7,7 +7,7 @@
 
 `amorce` mimics what hekate's L4T entry leaves behind (seamless display):
 DISP1/HOST1X clocks on, DC-A window A lit on 0xF5A00000 in 720x1280 B8G8R8A8,
-then jump to nxk-bl31 (0xFFF00000). QEMU loaders cannot write registers,
+the volume buttons' pins in GPIO mode, then jump to nxk-bl31 (0xFFF00000). QEMU loaders cannot write registers,
 hence these few instructions (movz/movk/str/br). `lire` recognizes nxk 8x16
 font glyphs (build/font.bin) in light grey on black, and counts pixels of any
 other color (logo leftovers).
@@ -51,6 +51,7 @@ def amorce(path):
         dc(0x32, 1 << 5),            # DISPLAY_COMMAND: continuous
         dc(0x41, 0x300),             # STATE_CONTROL: UPDATE then ACT_REQ
         dc(0x41, 0x3),
+        (0x6000_D50C, 0xC0),         # GPIO_CNF port X: Vol+ / Vol- inputs (hw_init)
     ]
     code = []
     for a, v in regs:
