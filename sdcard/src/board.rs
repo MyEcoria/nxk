@@ -1,11 +1,10 @@
 //! Switch SDMMC1 slot: card detect, pads, PMC I/O power, card and I/O rails.
-//! Sequences from hekate bdk/storage/sdmmc_driver.c (`_sdmmc_config_sdmmc1`, `sdmmc1_disable_power`): hekate powers the slot off before the L4T jump.
+//! Sequences from hekate bdk/storage/sdmmc_driver.c (`_sdmmc_config_sdmmc1`,
+//! `sdmmc1_disable_power`): hekate powers the slot off before the L4T jump.
 
-use libnx::abi::err::ENODEV;
-use libnx::abi::proto::power;
-use libnx::drv::Mmio;
-use libnx::ipc::{self, Msg};
-use libnx::{ns, println, time};
+use core::fmt::{self, Write};
+
+use crate::{Host, Regs, Result};
 
 pub const APB_MISC: u64 = 0x7000_0000;
 pub const PINMUX: u64 = 0x7000_3000;
@@ -47,20 +46,29 @@ const GPIO_OE: usize = 0x10;
 const GPIO_OUT: usize = 0x20;
 const GPIO_IN: usize = 0x30;
 
-pub struct Board {
-    misc: Mmio,
-    pinmux: Mmio,
-    gpio: Mmio,
-    pmc: Mmio,
-    power: Option<u32>,
+/// The card's I/O rail (MAX77620 LDO2), reached differently by each user.
+pub trait Power {
+    /// LDO2 on at 3.3 V, or off.
+    fn sd_rail(&self, on: bool) -> Result<()>;
+    /// LDO2 at 1.8 V (normal mode, 0.8 V + 20 x 50 mV).
+    fn ldo2_1v8(&self) -> Result<()>;
+}
+
+pub struct Board<B: Regs, P: Power> {
+    misc: B,
+    pinmux: B,
+    gpio: B,
+    pmc: B,
+    power: P,
     /// T210B01 (Mariko): other pad values, no slew override.
     pub mariko: bool,
 }
 
-impl Board {
-    pub fn new(misc: Mmio, pinmux: Mmio, gpio: Mmio, pmc: Mmio) -> Self {
+impl<B: Regs, P: Power> Board<B, P> {
+    /// `misc`: APB_MISC page, `pinmux`: PINMUX_AUX page, `gpio`: GPIO page,
+    /// `pmc`: the RTC/PMC page (`PMC_PAGE`).
+    pub fn new(misc: B, pinmux: B, gpio: B, pmc: B, power: P) -> Self {
         let mariko = (misc.r32(GP_HIDREV) >> 4) & 0xF >= HIDREV_MAJOR_T210B01;
-        let power = ns::wait_for_timeout("power", 2_000_000_000).ok();
         Board {
             misc,
             pinmux,
@@ -85,28 +93,28 @@ impl Board {
 
     /// Card-detect switch on PZ1, low with a card in. Only a hint: a card
     /// that answers wins over it, so print the registers behind a miss.
-    pub fn card_present(&self) -> bool {
+    pub fn card_present(&self, h: &dyn Host) -> bool {
         self.pinmux
             .w32(PIN_GPIO_PZ1, INPUT_ENABLE | PULL_UP | FUNC_GPIO);
         self.misc.w32(GP_VGPIO_GPIO_MUX_SEL, 0);
         self.gpio_set(GPIO_CNF, PORT_Z, 1 << 1, 1 << 1);
         self.gpio_set(GPIO_OE, PORT_Z, 1 << 1, 0);
-        time::sleep_us(100);
+        h.sleep_us(100);
         if self.gpio_reg(GPIO_IN, PORT_Z) & 2 == 0 {
             return true;
         }
-        println!(
-            "[sd] card detect high: pinmux {:#x}, cnf {:#x}, oe {:#x}, in {:#x}",
+        h.log(format_args!(
+            "[sd] card detect high: pinmux {:#x}, cnf {:#x}, oe {:#x}, in {:#x}\n",
             self.pinmux.r32(PIN_GPIO_PZ1),
             self.gpio_reg(GPIO_CNF, PORT_Z),
             self.gpio_reg(GPIO_OE, PORT_Z),
             self.gpio_reg(GPIO_IN, PORT_Z)
-        );
+        ));
         false
     }
 
     /// Pads, controller I/O power, card power, then I/O rail at 3.3 V.
-    pub fn power_on(&self) -> Result<(), i64> {
+    pub fn power_on(&self, h: &dyn Host) -> Result<()> {
         // A power-off leaves the pads driven high to discharge them.
         self.pads_gpio(false);
         // Deep loopback on the CLK pad: without it reads fail.
@@ -128,7 +136,7 @@ impl Board {
         }
 
         self.pmc.modify(PMC_NO_IOPOWER, 0, PMC_SDMMC1);
-        time::sleep_ms(1);
+        h.sleep_us(1000);
         self.pmc.modify(PMC_NO_IOPOWER, PMC_SDMMC1, 0);
         let _ = self.pmc.r32(PMC_NO_IOPOWER);
 
@@ -137,32 +145,32 @@ impl Board {
         self.gpio_set(GPIO_CNF, PORT_E, 1 << 4, 1 << 4);
         self.gpio_set(GPIO_OUT, PORT_E, 1 << 4, 1 << 4);
         self.gpio_set(GPIO_OE, PORT_E, 1 << 4, 1 << 4);
-        time::sleep_ms(10);
+        h.sleep_us(10_000);
 
         // Pads told the I/O voltage is 3.3 V before the rail rises.
         self.pmc.modify(PMC_PWR_DET_VAL, 0, PMC_SDMMC1);
         let _ = self.pmc.r32(PMC_PWR_DET_VAL);
-        self.io_rail(true)?;
+        self.power.sd_rail(true)?;
 
         if !self.mariko {
             // Slew codes for a clean clock.
             self.misc
                 .modify(GP_SDMMC1_PAD_CFGPADCTRL, 0xF000_0000, 0x5000_0000);
             let _ = self.misc.r32(GP_SDMMC1_PAD_CFGPADCTRL);
-            time::sleep_ms(1);
+            h.sleep_us(1000);
         }
         Ok(())
     }
 
     /// Reverse order, pads discharged meanwhile; at least 1 ms off before
     /// a new power-up.
-    pub fn power_off(&self) {
+    pub fn power_off(&self, h: &dyn Host) {
         self.pinmux.modify(PIN_SDMMC1_CLK, PULL_MASK, 0);
         self.pads_gpio(true);
-        let _ = self.io_rail(false);
-        time::sleep_ms(4);
+        let _ = self.power.sd_rail(false);
+        h.sleep_us(4000);
         self.gpio_set(GPIO_OUT, PORT_E, 1 << 4, 0);
-        time::sleep_ms(10);
+        h.sleep_us(10_000);
         self.pmc.modify(PMC_NO_IOPOWER, 0, PMC_SDMMC1);
         self.pmc.modify(PMC_PWR_DET_VAL, 0, PMC_SDMMC1);
         let _ = self.pmc.r32(PMC_PWR_DET_VAL);
@@ -178,12 +186,12 @@ impl Board {
         self.gpio_set(GPIO_OE, PORT_M, PADS, v);
     }
 
-    /// Standard 50-ohm drive when pad auto-calibration times out (3.3 V).
     /// Slot state for a failure report: PMC I/O power and voltage, the
     /// card power switch (E4), the pad GPIOs (M) and pinmux.
-    pub fn describe(&self) -> alloc::string::String {
+    pub fn describe(&self, out: &mut dyn Write) -> fmt::Result {
         let g = |reg, port| self.gpio_reg(reg, port);
-        alloc::format!(
+        write!(
+            out,
             "PMC no_iopower {:#x} pwr_det {:#x}; E4 cnf/oe/out/in {:#x}/{:#x}/{:#x}/{:#x}; M cnf/oe/out {:#x}/{:#x}/{:#x}; pinmux clk {:#x} cmd {:#x}; pad cfg {:#x} lpbk {:#x}",
             self.pmc.r32(PMC_NO_IOPOWER),
             self.pmc.r32(PMC_PWR_DET_VAL),
@@ -203,11 +211,9 @@ impl Board {
 
     /// Card I/O at 1.8 V, hekate's order (`sdmmc_enable_low_voltage`):
     /// LDO2 lowered first, then the pads told, Schmitt triggers on.
-    pub fn io_1v8(&self) -> Result<(), i64> {
-        let i2c = libnx::i2c::I2c::connect()?;
-        // MAX77620 LDO2: normal mode, 0.8 V + 20 x 50 mV.
-        i2c.write_reg(5, 0x3C, 0x27, 0xC0 | 20)?;
-        time::sleep_us(150);
+    pub fn io_1v8(&self, h: &dyn Host) -> Result<()> {
+        self.power.ldo2_1v8()?;
+        h.sleep_us(150);
         self.pmc.modify(PMC_PWR_DET_VAL, PMC_SDMMC1, 0);
         let _ = self.pmc.r32(PMC_PWR_DET_VAL);
         for pin in [PIN_SDMMC1_CLK].into_iter().chain(PIN_SDMMC1_CMD_DAT) {
@@ -216,17 +222,11 @@ impl Board {
         Ok(())
     }
 
+    /// Standard 50-ohm drive when pad auto-calibration times out (3.3 V).
     pub fn pad_fallback(&self) {
         let code = if self.mariko { 0x808 } else { 0xC0C };
         self.misc
             .modify(GP_SDMMC1_PAD_CFGPADCTRL, 0x07F7_F000, code << 12);
         let _ = self.misc.r32(GP_SDMMC1_PAD_CFGPADCTRL);
-    }
-
-    fn io_rail(&self, on: bool) -> Result<(), i64> {
-        let ep = self.power.ok_or(-ENODEV)?;
-        let mut m = Msg::new(power::SD_POWER, 1, 0);
-        m.mr[0] = on as u64;
-        ipc::checked(ipc::call(ep, &m)?).map(|_| ())
     }
 }

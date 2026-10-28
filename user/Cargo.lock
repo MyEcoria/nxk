@@ -268,6 +268,10 @@ name = "nxk-emc"
 version = "0.1.0"
 
 [[package]]
+name = "nxk-sdcard"
+version = "0.1.0"
+
+[[package]]
 name = "nxk-shader"
 version = "0.1.0"
 
@@ -308,6 +312,7 @@ name = "sd"
 version = "0.1.0"
 dependencies = [
  "libnx",
+ "nxk-sdcard",
 ]
 
 [[package]]
