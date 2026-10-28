@@ -185,7 +185,7 @@ extern "C" fn bl31_main() -> ! {
     if rd(PMC_SCRATCH110) == IRAM_MAGIC {
         puts("[nxk-bl31] hekate params present (IRAM)\n");
     } else {
-        puts("[nxk-bl31] no IRAM magic: test launch (emulator)\n");
+        puts("[nxk-bl31] launched by nxk-ipl or a test (no hekate params)\n");
     }
 
     let size = bl33_size();
