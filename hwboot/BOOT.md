@@ -2,8 +2,8 @@
 
 Goal: nxk starts the console itself (hardware init, load, hand-off), with no
 third-party bootloader, and shows a boot screen from the first moment.
-Status: plan only. Step 1 (boot screen) is the only one that touches no
-clock, voltage or DRAM code.
+Status: in progress, see "Steps and status"; the console still boots
+through hekate.
 
 ## What cannot go away
 
