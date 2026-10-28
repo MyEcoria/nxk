@@ -77,15 +77,30 @@ modules:
    nxk reaches its shell from nxk-ipl in the emulator, Erista and Mariko.
 7. Panel and boot screen: **done** in stage 1 (every panel; DC, DSI,
    PWM, MIPI CAL, GPIO and pinmux state equal to hekate's); the screen
-   shows 1 s after injection. 40 KiB of IRAM used: no stage 2 so far.
-8. Minerva port (next): training in `emc/` (`nxk-emc`, whose switch
-   path is already checked against hekate's C), its tables (one 34.5 KiB
-   table per DRAM id, read from the card or built in), then the table at
-   `0xFFE80000`. Until then the DRAM stays at its boot rate, `emc` sees no
-   table (nxk-ipl zeroes the place) and the hekate chain stays the
-   console's boot path. Mariko: hekate's init rate boost, and what NVIDIA's
-   `bpmpfw_b01.bin` does after the CPU starts (EMC DVFS) to decide.
-9. LP0 parameters in PMC scratch (SC7), low-battery check, watchdog.
+   shows 1 s after injection. 83 KiB of IRAM used with Minerva: no
+   stage 2 so far.
+8. Minerva port: **done** for the Erista. `nxk-emc` trains as hekate's
+   `minerva_init` and `minerva_prep_boot_l4t` (its C run on the PC as an
+   oracle: 54 training cases equal, register traces and table words),
+   from `nxk/mtc_{0,2,7}.bin` (hekate's ODINX02 tables by DRAM id,
+   `tools/mkemctab.py`, installed by `mksd-hw.sh`). nxk boots at 800 MHz
+   with the table at `0xFFE80000` byte-identical to hekate's for the 8
+   Erista DRAM ids, including the three PTSA rates NVIDIA's T210
+   `bpmpfw.bin` rewrites in every entry before the CPU starts (found with
+   a watchpoint over the emulator's gdb stub; nxk-ipl does not run
+   bpmpfw). MC and EMC state at the CPU's start equal hekate's. With it
+   come hekate's BPMP overclock (576 MHz, 589 on a Mariko; back to 408
+   at the launch) and its watchdog: WDT4 for 2.5 s around training, whose
+   FIQ restarts nxk-ipl without training (tested by writing a hang into
+   training over the gdb stub). Mariko: no training, as hekate's
+   table-less boost path and `bpmpfw_b01.bin`'s DVFS are not ported.
+9. LP0 parameters in PMC scratch (SC7) and hekate's bl31 parameters
+   (`SECURE_SCRATCH108`-`114`): not written. Nothing in nxk reads them
+   today (nxk-bl31 only logs whether hekate's magic is there); SC7 will
+   need the LP0 block. Low-battery check: not ported yet.
+   State at the CPU's start otherwise equal to hekate's, but for the eMMC
+   clock source and pad (hekate's eMMC init), UART-A (nxk-ipl's log) and
+   the BPMP exception vectors.
 10. Console run, with Pierric's go: Erista first.
 
 ## Notes
