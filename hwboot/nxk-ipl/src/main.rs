@@ -9,6 +9,8 @@
 
 mod ccplex;
 mod clock;
+mod di_tables;
+mod display;
 mod fat;
 mod hdr;
 mod hw;
@@ -75,9 +77,16 @@ extern "C" fn ipl_main() -> ! {
     hw::init();
     uart::init_debug();
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
+    // The panel and the boot screen first, as hekate's logo.
+    display::init();
+    display::window_a();
+    display::splash(nxk_bootsplash::AT_IPL, true);
+    display::backlight_pwm_init();
+    display::brightness(100, 1000);
     match load() {
         Some((bl31, bl33)) => {
             println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes: starting the CPU", bl31, bl33);
+            display::splash(nxk_bootsplash::AT_LOADED, false);
             l4t::launch()
         }
         None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),

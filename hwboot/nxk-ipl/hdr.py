@@ -67,6 +67,7 @@ def clean(expr, known):
             return None
         e = re.sub(rf"\b{w}\b", f"({known[w]})", e)
     e = e.replace("&&", " and ").replace("||", " or ")
+    e = re.sub(r"(?<![/*])/(?![/*])", "//", e)  # C integer division
     try:
         v = eval(e, {"__builtins__": {}}, {"_BIT": lambda n: 1 << n})
     except Exception:

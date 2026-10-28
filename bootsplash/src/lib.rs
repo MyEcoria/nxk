@@ -20,6 +20,8 @@ pub const TRACK: u32 = exact(rgb(0x444444));
 pub const FILL: u32 = exact(rgb(0x3BC3E3));
 
 /// Progress, in thousandths, each stage starts at.
+pub const AT_IPL: u32 = 50;
+pub const AT_LOADED: u32 = 100;
 pub const AT_MONITOR: u32 = 150;
 pub const AT_KERNEL: u32 = 300;
 pub const AT_INIT: u32 = 450;
