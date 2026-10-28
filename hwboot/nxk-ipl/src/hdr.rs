@@ -4072,6 +4072,15 @@ pub const LPDDR4X_4GB_HYNIX_H9HCNNNBKMMLXR_NEE: u32 = 0x7;
 pub const LPDDR4X_4GB_HYNIX_H54G46CYRBX267: u32 = 0x8;
 pub const LPDDR4X_4GB_MICRON_MT53E512M32D1NP_046_WTB: u32 = 0x9;
 
+// bdk/mem/sdram_param_t210.h
+pub const MEMORY_TYPE_NONE: u32 = 0x0;
+pub const MEMORY_TYPE_DDR: u32 = 0x0;
+pub const MEMORY_TYPE_LPDDR: u32 = 0x0;
+pub const MEMORY_TYPE_DDR2: u32 = 0x0;
+pub const MEMORY_TYPE_LPDDR2: u32 = 0x1;
+pub const MEMORY_TYPE_DDR3L: u32 = 0x2;
+pub const MEMORY_TYPE_LPDDR4: u32 = 0x3;
+
 // bdk/display/di.h
 pub const DSI_VIDEO_DISABLED: u32 = 0x0;
 pub const DSI_VIDEO_ENABLED: u32 = 0x1;

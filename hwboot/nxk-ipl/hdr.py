@@ -38,6 +38,8 @@ HEADERS = [
     "bdk/mem/mc_t210.h",
     "bdk/mem/emc_t210.h",
     "bdk/mem/sdram.h",
+    "bdk/mem/sdram_param_t210.h",
+    "bdk/mem/sdram_param_t210b01.h",
     "bdk/display/di.h",
     "bdk/display/vic.h",
     "bdk/storage/sdmmc_t210.h",

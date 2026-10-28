@@ -14,6 +14,8 @@ mod i2c;
 mod pmic;
 mod reg;
 mod sdram;
+mod sdram_seq;
+mod sdram_tables;
 mod soc;
 mod timer;
 mod uart;
