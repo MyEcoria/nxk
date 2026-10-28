@@ -88,5 +88,6 @@ pub fn user_fault(ti: u16, esr: u64, far: u64) {
         t.frame.sp,
         t.frame.x[30].wrapping_sub(base)
     );
+    crate::console::screen_alert();
     process::kill(pi, EXIT_FAULT);
 }

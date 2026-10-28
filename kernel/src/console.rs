@@ -123,9 +123,7 @@ pub fn write_bytes(b: &[u8]) {
                 }
                 c.uart.put(x);
             }
-            if let Ok(s) = core::str::from_utf8(b) {
-                fbcon::write_str(s);
-            }
+            fbcon::write_bytes(b);
         }
     });
 }
@@ -140,6 +138,21 @@ pub fn bind(notif: u16, notif_gen: u16, bits: u64) -> u64 {
         c.signaled = false;
         c.head - c.tail
     })
+}
+
+/// A fault before user space has the screen: the boot screen gives way
+/// to the messages kept so far, the fault's included.
+pub fn screen_alert() {
+    with(|c| {
+        if !fbcon::alert() {
+            return;
+        }
+        let from = c.head.saturating_sub(RING as u64);
+        for i in from..c.head {
+            let b = c.ring[i as usize % RING];
+            fbcon::write_bytes(&[b]);
+        }
+    });
 }
 
 /// Unread bytes into `out` (`klog_read`); returns the count.
@@ -166,6 +179,7 @@ pub fn _print(args: fmt::Arguments) {
 /// nothing (panic, fatal exception).
 pub fn emergency_str(s: &str) {
     Uart::new(UART_A).write_str(s);
+    fbcon::alert();
     fbcon::write_str(s);
 }
 

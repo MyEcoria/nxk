@@ -290,6 +290,7 @@ fn start_init() {
         bootfs::count(),
         img.len() / 1024
     );
+    fbcon::progress(nxk_bootsplash::AT_INIT);
 }
 
 fn banner(core: usize) {
