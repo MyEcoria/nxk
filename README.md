@@ -20,23 +20,42 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 
 ## Features
 
-| Area | Done | Remaining |
+| Feature | Status | Details |
 |---|---|---|
-| Console | game library (touch and gamepad, HOME), users with avatars and PIN, dark and light themes, quick settings, system, network and terminal pages, sleep with the GPU rail off | |
-| Games | SDK `nxgfx` (GPU command streams, meshes, 2D canvas, input, audio), 3D engine with shaders and depth, ray queries in compute shaders; games Cube, Lumen, Starlane | |
-| Cloud games | Amazon Luna as a catalog: sign-in by code, the account's games, H.264 video and Opus audio stream, performance overlay | 60 Hz stream (45 Hz by default: the decoder misses frames at 60) |
-| Boot | 4 cores, EL3 or EL2 + PSCI, Erista and Mariko, DRAM detection; real Erista via hekate + nxk-bl31 (4 cores, shell over USB-C) | Mariko hardware |
-| Memory | on demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas | |
-| Threads | priorities, affinity, migration, balancing, tickless, futex | deep sleep states |
-| IPC | synchronous, timeouts, handles, notifications, pipes, sender identity | wait on several objects (`poll`) |
-| Programs | static-PIE ELF, arguments, environment, TLS, load from SD card | dynamic linking (ruled out) |
-| Rust | `no_std` (libnx) and **`std`** (see [What `std` provides](DEV.md#what-std-provides)) | panic unwinding, backtraces |
-| Storage | SD, FAT32, file API | eMMC, ext4 |
-| Network | USB-Ethernet, Wi-Fi (BCM4356: scans, open and WPA2 joins, traffic on `wlan0`), TCP/IP, sockets | IPv6 |
-| Bluetooth | BCM4356 on UART-D (patch RAM, 3 Mbaud), pairing (SSP), HID host for Joy-Cons and Pro Controllers, reconnection on a button press (a Pro Controller on an Erista) | Joy-Cons on hardware, rumble, motion sensors, players, Bluetooth audio, BLE |
-| Hardware | UART, I2C, PMIC, RTC, temperatures, fan, CPU clock on PLLX, screen, touchscreen, USB host, USB device (serial console, Ethernet), speakers (codec, audio hub), GPU (secure boot, 2D engine, compute kernels, 3D engine with shaders, depth and textures, sys-clk's clock steps 76.8 to 921.6 MHz) | GPU mipmaps and float render targets (written, not yet run on the console), audio quality in games, the right Joy-Con (not detected on the Erista tried), Joy-Con charging, rumble, the Power and volume buttons (read, not yet checked by hand), CPU DFLL and other clocks (DVFS), battery |
-| Security | capabilities, revocation, Spectre v2, isolation | |
-| Tools | build, SD card, tests (`ktest` 31, `stdtest` 19, `wlan` crypto and WPA2 on the PC, an emulated Bluetooth controller), debugger (gdb), L4T comparison, USB-C terminal | |
+| Game library | ✅ Complete | `/games` library with touch and gamepad, HOME to leave a game, cover art |
+| User management | ✅ Complete | First-start setup, avatar, theme and PIN per user, Users page, saves and play time per user |
+| Settings and system pages | ✅ Complete | Quick settings, System Settings, System, Network, Terminal and Logs pages; dark and light themes |
+| Sleep mode | ✅ Complete | Screen and GPU rail off, services suspended; sleep and wake with the Power button, validated on the Erista |
+| SDK `nxgfx` | ✅ Complete | GPU command streams, meshes, 2D canvas, input, audio |
+| 3D engine and shaders | 🟡 Partial | Shader compiler, depth, textures and compute ray queries; instanced and fullscreen draws not yet run on the console |
+| GPU | 🟡 Partial | Secure boot, 2D, compute and 3D; clock steps from 76.8 to 921.6 MHz run on the Erista; mipmaps not yet run on the console |
+| Games | ✅ Complete | Cube, Lumen and Starlane; Lumen (ray-traced shadows) and Starlane run on the Erista at 60 fps; Cube is a small demo |
+| Audio | 🟡 Partial | 16-bit stereo 48 kHz on the speakers; clean sound while a game runs, headphones, capture and mixing to do |
+| Amazon Luna | 🟡 Partial | Sign-in by code, the account's games, H.264 video and Opus audio, performance overlay; 60 Hz not reached (45 Hz by default) |
+| Boot on Erista | ✅ Complete | Via hekate and `nxk-bl31`: 4 cores, PSCI, DRAM detection, shell over USB-C, SD card |
+| Boot on Mariko | ⏳ To do | Emulated (`tegrax1plus`); not yet tested on a Mariko, and no USB-C console there (its OTG port belongs to XUSB) |
+| Memory | ✅ Complete | On demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas |
+| Threads and scheduling | 🟡 Partial | Priorities, affinity, migration, balancing, tickless, futex; deep sleep states to do |
+| IPC | 🟡 Partial | Synchronous, timeouts, handles, notifications, pipes, sender identity; waiting on several objects (`poll`) to do |
+| Programs | ✅ Complete | Static-PIE ELF, arguments, environment, TLS, loading from the SD card; dynamic linking ruled out |
+| Rust (`no_std` and `std`) | 🟡 Partial | `std` covers FAT32 files, threads, synchronization, IPv4 TCP and UDP, processes; panic unwinding, backtraces, IPv6 and some file APIs to do |
+| Security | ✅ Complete | Capabilities, revocation, Spectre v2 mitigation, isolation |
+| Tools | ✅ Complete | Build, SD card image, tests, gdb, L4T comparison, USB-C terminal |
+| Base drivers | ✅ Complete | UART, I2C, PMIC, RTC, temperatures |
+| Screen | ✅ Complete | InnoLux 720x1280 panel taken over from hekate, backlight and sleep; JDI and AUO power-down tables untested |
+| Touchscreen | ✅ Complete | FTM3BD56, read on its interrupt line, polled as a fallback |
+| Fan | ✅ Complete | Temperature curve as in Nyx, speed read from the tachometer |
+| Joy-Con | 🟡 Partial | Left Joy-Con works on the Erista; right one not detected; charging and rumble to do |
+| Power and volume buttons | 🟡 Partial | Power sleep and wake validated on the Erista; volume buttons not yet checked by hand |
+| Battery | 🟡 Partial | Gauge (charge, voltage, health) and charger read on the Erista; the charge still falls under nxk on a PC's USB-C port |
+| CPU clock | 🟡 Partial | PLLX steps up to about 1224 MHz on the Erista; faster steps need the DFLL, not written yet |
+| DRAM clock | 🟡 Partial | Switches between 204, 408 and 800 MHz validated on the Erista; 1331 and 1600 MHz need periodic training, not ported |
+| USB device | ✅ Complete | Serial console and terminal over USB-C; `usb0` network shared by the PC, validated on the Erista |
+| USB host | 🟡 Partial | Keyboard and USB Ethernet adapter work in the emulator; on the Erista hekate's L4T path leaves the xHCI unpowered, and it needs NVIDIA firmware |
+| Storage | 🟡 Partial | SD card (64 GB read and written on the Erista), FAT32, file API; eMMC and ext4 to do |
+| Network | 🟡 Partial | TCP, UDP, DNS, DHCP, sockets, switching between links; IPv6 to do |
+| Wi-Fi | 🟡 Partial | Scans, open and WPA2-Personal joins, traffic on `wlan0`; the chip still resets itself at times (cause unknown), and `wlan` brings it back; WPA (TKIP), WPA3 and mixed WPA/WPA2 refused |
+| Bluetooth | 🟡 Partial | Pro Controller pairs, reconnects and streams on the Erista; Joy-Cons, rumble, motion sensors, one gamepad per player, Bluetooth audio and BLE to do |
 
 ## Screenshots
 
