@@ -32,46 +32,62 @@ clock, voltage or DRAM code.
 | SD slot powered off before the jump | `sd` | already handled (`sd/board.rs`) |
 | IRAM / `PMC_SCRATCH110` magic | `nxk-bl31` | IPL |
 
-## Steps
+## Decisions (Pierric, 2026-10-28)
 
-1. **Boot screen on the current chain** (no new power code). `nxk-bl31`
-   draws the nxk logo and a progress bar instead of text; the kernel console
-   leaves it alone; `display` continues from the same frame with an
-   animation until HOME. Text diagnostics (panic, fatal error) still draw
-   over it. Needs `./hwboot/test-bl31.sh` and a console reboot to confirm.
-2. **Fewer hekate seconds.** `autoboot` to the nxk entry with a minimal
-   `bootwait` (keys to check against hekate's own docs; `mksd-hw.sh` keeps
-   the ini already on the card, so a repo edit alone does not reach it).
-3. **IPL "top half", run as a hekate `payload=`.** DRAM is already up. Develop
-   the SD reader, cluster boot and the bl31 hand-off with a visible screen.
-   Check whether hekate leaves the display lit for payloads.
-4. **IPL "bottom half", started by RCM directly.** BPMP clocks, PMIC, then
-   `sdram_init` for the Erista RAM ids, then panel bring-up. Factor
-   `display/panel` and `sd/board.rs` into shared `no_std` crates. Debug
-   channel before DRAM: a PMC scratch progress code read after a return to
-   RCM (a 720x1280 framebuffer does not fit in IRAM, UART pads are internal).
-5. **Minerva port** (training), so the DRAM clock keeps its tables; without
-   it the DRAM stays at one rate and frame rate suffers.
-6. **Drivers stop assuming hekate's leftovers** (fuses, UART-B, xHCI...).
-7. **Mariko**, only if in scope (different PMIC, SDRAM, no fuse visibility
-   quirks; RCM through a modchip).
+Copy hekate's system, for the Erista and the Mariko as hekate does; an
+injector at every cold boot is fine; dark boot screen; measured risks,
+everything checked first. hekate v6.5.4 is the reference (`refs/hekate`,
+`hwboot/fetch.sh`).
 
-## Feasibility
+## How it is checked
 
-- Hekate's source is on disk (`../SwitchMcp/nxk/refs/hekate`); this
-  checkout's `refs/` is missing and must be restored before porting.
-- Rust targets for the BPMP's ARM7TDMI exist (`armv4t-none-eabi`,
-  `thumbv4t-none-eabi`, tier 3: `-Z build-std`, already needed by `apps/`).
-- IRAM budget for the payload is under about 196 KiB: DRAM tables only for
-  the Erista ids.
-- The emulator cannot validate steps 3-5 (no BPMP payload, no real DRAM
-  training). Register-trace tests against hekate's C (the method `emc/`
-  uses) cover the sequences; the rest is checked on the console.
-- Power-unsafe code (PMIC, DRAM voltage) is hardware-risky: safe defaults,
-  hekate's exact values, a console run only with Pierric's go.
+`hwboot/oracle.sh` runs the real chain in the emulator from the RCM
+payload on the emulated BPMP (hekate autobooting its L4T entry, retail
+fuses with a chosen DRAM id) to nxk's shell, and can trace every register
+access. `hwboot/tracecmp.py` compares the BPMP's accesses of hekate's run
+and nxk-ipl's. Where the order legitimately differs (another SD driver,
+the CPU started by nxk-ipl rather than NVIDIA's `bpmpfw.bin`), the check
+becomes the registers' state at the CPU's start.
 
-## Decisions pending (Pierric)
+## Design: two stages
 
-Erista only or Mariko too, an injector at every boot or a dongle, permission
-to inject experimental IPLs, splash style (white as the Switch, or the dark
-theme). Listed in the thread.
+The payload must fit hekate's 128 KiB of IRAM; Minerva's tables alone are
+103 KiB (three 7-entry tables of 4928 bytes), so, as hekate splits off its
+modules:
+
+- **Stage 1, `nxk-ipl.bin`** (RCM payload, IRAM): hw_init, DRAM, SD card,
+  FAT32; loads stage 2, `nxk/bl31.bin` and `nxk/bl33.bin` into DRAM.
+- **Stage 2, `nxk/ipl2.bin`** (DRAM, BPMP): panel and boot screen,
+  Minerva training and its table at `0xFFE80000`, carveouts and the L4T
+  state nxk-bl31 expects, then the CPU cluster (hekate's
+  `ccplex_boot_cpu0`, its own path for HOS and Mariko L4T).
+
+## Steps and status
+
+1. Boot screen on the current chain: **done** (`bootsplash/`, branch
+   `feat/boot-screen`), not yet seen on the console.
+2. The oracle and the trace comparison: **done**.
+3. Stage 1 skeleton (relocation, UART-A, hekate's register names): **done**.
+4. hw_init and DRAM init: **done**, identical to hekate's accesses for the
+   8 Erista DRAM ids and the 10 Mariko DRAM codes.
+5. SD card and FAT32 in stage 1: `user/sd`'s card logic (Rust, run on the
+   Erista) moved into a shared `no_std` crate; 3.3 V default speed first
+   (about 0.4 s per boot), faster modes later for both users. The BPMP
+   cache must be invalidated after each DMA read (the emulator does not
+   model it).
+6. Stage 2: CPU start and the state at handoff compared with hekate's.
+   First milestone: nxk's shell from nxk-ipl in the emulator.
+7. Panel bring-up and the boot screen from stage 2 (`display/panel`
+   moved into a shared crate).
+8. Minerva port. Until then the DRAM stays at its boot rate: the hekate
+   chain stays the console's boot path, and `emc` must refuse a missing
+   table at `0xFFE80000`.
+9. LP0 parameters (sleep), low-battery check, watchdog, as hekate.
+10. Console run, with Pierric's go: Erista first.
+
+## Notes
+
+- Rust targets for the BPMP's ARM7TDMI: `thumbv4t-none-eabi`, tier 3
+  (`-Z build-std` under `RUSTC_BOOTSTRAP`, as `apps/`).
+- Power-unsafe code (PMIC, DRAM voltage) uses hekate's exact values and
+  order; a console run only with Pierric's go.
