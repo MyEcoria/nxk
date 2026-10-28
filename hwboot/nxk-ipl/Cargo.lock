@@ -11,4 +11,9 @@ name = "nxk-ipl"
 version = "0.1.0"
 dependencies = [
  "nxk-bootsplash",
+ "nxk-sdcard",
 ]
+
+[[package]]
+name = "nxk-sdcard"
+version = "0.1.0"

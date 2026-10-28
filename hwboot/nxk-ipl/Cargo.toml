@@ -7,6 +7,7 @@ description = "nxk's own RCM payload (BPMP): hardware, DRAM and CPU bring-up aft
 
 [dependencies]
 nxk-bootsplash = { path = "../../bootsplash" }
+nxk-sdcard = { path = "../../sdcard" }
 
 [profile.release]
 opt-level = "s"

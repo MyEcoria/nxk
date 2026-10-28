@@ -8,11 +8,13 @@
 #![no_main]
 
 mod clock;
+mod fat;
 mod hdr;
 mod hw;
 mod i2c;
 mod pmic;
 mod reg;
+mod sd;
 mod sdram;
 mod sdram_seq;
 mod sdram_tables;
@@ -70,8 +72,37 @@ _real_start:
 extern "C" fn ipl_main() -> ! {
     hw::init();
     uart::init_debug();
-    uart::puts("\n[nxk-ipl] hardware up\n");
+    println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
+    match load() {
+        Some((bl31, bl33)) => println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes", bl31, bl33),
+        None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),
+    }
     halt()
+}
+
+/// Where nxk-bl31 and nxk go (hekate's L4T layout): bl31 in TZDRAM,
+/// bl33 where bl31 copies it from.
+const TZDRAM_BASE: u32 = 0xFFF0_0000;
+const BL33_LOAD_BASE: u32 = 0xAA00_0000;
+
+/// The card, its FAT32 volume, then the two stages of nxk.
+fn load() -> Option<(u32, u32)> {
+    let (card, board) = match sd::open() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("[nxk-ipl] SD card: {}", nxk_sdcard::err_name(e));
+            return None;
+        }
+    };
+    println!("[nxk-ipl] SD card: {} MiB, {}-bit bus", card.blocks / 2048, card.bus_width());
+    let r = (|| {
+        let vol = fat::Volume::open(&card)?;
+        let bl31 = vol.lookup(&card, "nxk/bl31.bin")?;
+        let bl33 = vol.lookup(&card, "nxk/bl33.bin")?;
+        Some((vol.read(&card, &bl31, TZDRAM_BASE)?, vol.read(&card, &bl33, BL33_LOAD_BASE)?))
+    })();
+    sd::close(&card, &board);
+    r
 }
 
 /// The BPMP stops for good (hekate `bpmp_halt`).

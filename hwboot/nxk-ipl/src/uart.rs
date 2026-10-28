@@ -81,6 +81,26 @@ pub fn puts(s: &str) {
     }
 }
 
+struct Out;
+
+impl core::fmt::Write for Out {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        puts(s);
+        Ok(())
+    }
+}
+
+pub fn print(args: core::fmt::Arguments) {
+    let _ = core::fmt::Write::write_fmt(&mut Out, args);
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        $crate::uart::print(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 pub fn puthex(v: u32) {
     puts("0x");
     for i in (0..8).rev() {
