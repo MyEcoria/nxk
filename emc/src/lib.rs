@@ -1,15 +1,15 @@
-//! EMC (LPDDR4) frequency switch for the Tegra X1, from the tables hekate's
-//! Minerva trained.
+//! EMC (LPDDR4) training and frequency switch for the Tegra X1.
 //!
-//! A port of the switch path (`OP_SWITCH`, no training, no periodic
-//! compensation) of Minerva Training Cell (hekate `modules/
+//! A port of Minerva Training Cell (hekate `modules/
 //! hekate_libsys_minerva/sys_sdrammtc.c`, (c) 2018-2025 CTCaer, GPL-2,
 //! itself derived from NVIDIA's DVFS sequence, Linux `tegra210-emc-cc-
 //! r21021.c`). The sequence is generic over `Hw`, so the PC tests run it
 //! against a recording bus and compare the register trace with the C code's.
 //!
-//! Training (`OP_TRAIN`, `OP_TRAIN_SWITCH`), the periodic-training
-//! entries and periodic compensation are ported too (`Mtc`, `train.rs`).
+//! `switch` is the switch path (`OP_SWITCH`) on read-only tables, as the
+//! `emc` service uses it; `Mtc` adds training (`OP_TRAIN`,
+//! `OP_TRAIN_SWITCH`), periodic-training entries and periodic
+//! compensation, for nxk-ipl (`train.rs`).
 //!
 //! The tables are `emc_table_t` revision 7 (4928 bytes, 1232 words): hekate
 //! copies them to DRAM at 0xFFE80000 before the L4T launch.

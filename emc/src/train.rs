@@ -26,9 +26,16 @@ const TRAINING_PT1: u32 = 12;
 const TRAINING_UPDATE: u32 = 13;
 const PERIODIC_TRAINING_UPDATE: u32 = 14;
 
-/// C's `a / b` as hekate's ARM build computes it: 0 for a zero divisor.
+/// C's `a / b` as hekate's ARM build computes it (libgcc's EABI
+/// `__aeabi_uidiv`): a zero divisor gives 0xFFFFFFFF, or 0 for 0 / 0.
+/// The clock tree code divides by oscillator counts read back as 0 when
+/// no training ran (the emulator; a dead read on a console).
 fn div(a: u32, b: u32) -> u32 {
-    a.checked_div(b).unwrap_or(0)
+    match a.checked_div(b) {
+        Some(q) => q,
+        None if a != 0 => u32::MAX,
+        None => 0,
+    }
 }
 
 /// `_actual_osc_clocks`.
