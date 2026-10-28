@@ -363,6 +363,17 @@ pub fn brightness(level: u32, step_us: u32) {
     }
 }
 
+/// A rectangle of the landscape view in `rgb` (0xRRGGBB), on window A.
+pub fn rect(x: u32, y: u32, w: u32, h: u32, rgb: u32) {
+    let (x, y, w, h) = splash::turn(x, y, w, h, FB_H);
+    let v = Format::Bgra.pixel(nxk_bootsplash::rgb(rgb));
+    for row in y..y + h {
+        for col in x..x + w {
+            wr(FB + (row * FB_W + col) * 4, v);
+        }
+    }
+}
+
 /// The boot screen at `p` thousandths into the framebuffer (window A).
 pub fn splash(p: u32, full: bool) {
     let view = Splash::new(FB_H, FB_W);

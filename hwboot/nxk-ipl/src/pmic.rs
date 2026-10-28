@@ -229,6 +229,11 @@ pub fn max77621_config_default(id: u32, por: bool) {
     let _ = i2c::send_byte(I2C_5, addr, MAX77621_REG_CONTROL2, c2 as u8);
 }
 
+/// `max77620_rtc_prep_read`: the RTC's read buffers updated (T210B01 R2C).
+pub fn rtc_prep_read() {
+    let _ = i2c::send_byte(I2C_5, MAX77620_RTC_I2C_ADDR, MAX77620_RTC_UPDATE0_REG, MAX77620_RTC_READ_UPDATE as u8);
+}
+
 /// `max77620_low_battery_monitor_config`.
 pub fn low_battery_monitor(enable: bool) {
     set_reg(

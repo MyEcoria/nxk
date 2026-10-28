@@ -34,6 +34,7 @@ HEADERS = [
     "bdk/power/max77812.h",
     "bdk/power/max17050.h",
     "bdk/power/bq24193.h",
+    "bdk/rtc/max77620-rtc.h",
     "bdk/mem/mc.h",
     "bdk/mem/mc_t210.h",
     "bdk/mem/emc_t210.h",

@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 
+mod battery;
 mod ccplex;
 mod clock;
 mod di_tables;
@@ -122,8 +123,12 @@ extern "C" fn ipl_main() -> ! {
     hw::init();
     uart::init_debug();
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
-    // The panel and the boot screen first, as hekate's logo.
-    display::init();
+    // The battery before the panel, as hekate checks it.
+    let lit = battery::check();
+    pmic::rtc_prep_read();
+    if !lit {
+        display::init();
+    }
     // The BPMP overclocked as hekate does it (back to 408 MHz at the launch).
     soc::bpmp_clk_rate_set(if soc::is_t210() { soc::BPMP_CLK_SUPER_BOOST } else { soc::BPMP_CLK_HYPER_BOOST });
     display::window_a();
