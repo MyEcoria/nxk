@@ -2,10 +2,11 @@
 # The whole boot chain in the emulator, from the RCM payload on the BPMP:
 # PAYLOAD (default hekate, autobooting its [nxk] L4T entry) -> nxk-bl31 ->
 # nxk -> shell. hekate's run is the reference nxk-ipl is compared with.
-# Usage: oracle.sh [-m tegrax1|tegrax1plus] [-p PAYLOAD] [-r DRAMID] [-t TRACE] [-s SECS] [-d SHOT.ppm]
+# Usage: oracle.sh [-m tegrax1|tegrax1plus] [-p PAYLOAD] [-r DRAMID] [-t TRACE] [-s SECS]
+#                  [-d SHOT.ppm] [-u UART.log]
 #   -r: the DRAM id in the emulated fuses (hekate fuse_read_dramid, default 0).
 #   -t: every BPMP and CPU register access (QEMU memory_region_ops) to TRACE.
-#   -d: the screen at the end.
+#   -d: the screen at the end. -u: UART-A's whole output.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -16,9 +17,10 @@ machine=tegrax1
 payload="$here/dl/hekate_ctcaer_6.5.4.bin"
 trace=""
 shot=""
+ulog=""
 secs=120
 dramid=0
-while getopts "m:p:r:t:s:d:" o; do
+while getopts "m:p:r:t:s:d:u:" o; do
     case "$o" in
     m) machine="$OPTARG" ;;
     p) payload="$OPTARG" ;;
@@ -26,6 +28,7 @@ while getopts "m:p:r:t:s:d:" o; do
     s) secs="$OPTARG" ;;
     r) dramid="$OPTARG" ;;
     d) shot="$(realpath -m "$OPTARG")" ;;
+    u) ulog="$(realpath -m "$OPTARG")" ;;
     *) sed -n 2,6p "$0" >&2; exit 2 ;;
     esac
 done
@@ -101,6 +104,7 @@ m.sendall(f"screendump {sys.argv[2]}\n".encode())
 time.sleep(2)
 PY
 fi
+[ -z "$ulog" ] || tr -d '\r' <"$tmp/uart.log" >"$ulog"
 tr -d '\r' <"$tmp/uart.log" | grep -E "nxk-bl31\] (EL3|jumping)|entered in EL|cores online|nxk> " | head -8 || true
 if grep -q "nxk> " "$tmp/uart.log"; then
     echo "ORACLE OK: shell after $(($(date +%s) - start)) s ($machine, $(basename "$payload"))"

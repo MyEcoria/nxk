@@ -95,6 +95,10 @@ fn config_carveouts(t210b01: bool) {
     mc(MC_SEC_CARVEOUT_REG_CTRL, 0);
 
     let mut base = GEN_CARVEOUT_TOP;
+    // Minerva's table place (MTCTABLE_BASE, 256 KiB): zero until nxk-ipl
+    // trains the DRAM, so `emc` finds no table (revision 0) rather than
+    // whatever DRAM held at power-on.
+    unsafe { core::ptr::write_bytes((GEN_CARVEOUT_TOP + (512 << 10)) as *mut u8, 0, 256 << 10) };
     soc::bpmp_mmu_maintenance(18, false); // BPMP_MMU_MAINT_INVALID_WAY
     carveout(
         1,
