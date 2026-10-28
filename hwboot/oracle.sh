@@ -106,6 +106,9 @@ if grep -q "nxk> " "$tmp/uart.log"; then
     echo "ORACLE OK: shell after $(($(date +%s) - start)) s ($machine, $(basename "$payload"))"
 else
     echo "ORACLE FAIL: no shell after ${secs} s ($machine, $(basename "$payload"))"
-    tail -5 "$tmp/qemu.log"
+    echo "-- UART-A:"
+    tr -d '\r' <"$tmp/uart.log" | tail -20
+    echo "-- QEMU:"
+    grep -v "No secret with id" "$tmp/qemu.log" | tail -5
     exit 1
 fi

@@ -1,0 +1,19 @@
+[package]
+name = "nxk-ipl"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "nxk's own RCM payload (BPMP): hardware, DRAM and CPU bring-up after hekate's bdk"
+
+[dependencies]
+nxk-bootsplash = { path = "../../bootsplash" }
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.dev]
+panic = "abort"
