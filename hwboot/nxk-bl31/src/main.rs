@@ -47,6 +47,10 @@ const SYSCTR0_CNTCR: usize = 0x700F_0000;
 const PMC_BASE: usize = 0x7000_E400;
 const PMC_SCRATCH110: usize = PMC_BASE + 0xB10;
 const IRAM_MAGIC: u32 = 0x4D41_5249; // "IRAM": hekate params present
+/// nxk-ipl's record (hwboot/nxk-ipl/src/report.rs): "NIPL", DRAM id, trained
+/// entries, training ms, flags, EMC MHz, battery mV.
+const IPL_REPORT: usize = 0x4003_FF40;
+const IPL_MAGIC: u32 = 0x4C50_494E;
 
 const fn parse_u64(s: &str) -> u64 {
     let b = s.as_bytes();
@@ -112,6 +116,54 @@ fn puts(s: &str) {
     }
     fbcon::write_str(s);
 }
+fn putdec(mut v: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    puts(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
+}
+
+/// nxk-ipl's record, on the screen too in text mode (Vol+ at injection).
+fn ipl_report() {
+    let w = |i: usize| rd(IPL_REPORT + i * 4);
+    puts("[nxk-bl31] nxk-ipl: DRAM id ");
+    putdec(w(1));
+    puts(", EMC ");
+    match w(5) {
+        0 => puts("at its boot rate"),
+        mhz => {
+            putdec(mhz);
+            puts(" MHz, ");
+            putdec(w(2));
+            puts(" trained entries in ");
+            putdec(w(3));
+            puts(" ms");
+        }
+    }
+    puts(", battery ");
+    putdec(w(6));
+    puts(" mV");
+    let flags = w(4);
+    for (bit, what) in [
+        (1, ", the watchdog fired in training"),
+        (2, ", no table on the card"),
+        (4, ", training failed"),
+        (8, ", boot-rate prep failed"),
+    ] {
+        if flags & bit != 0 {
+            puts(what);
+        }
+    }
+    puts("\n");
+}
+
 fn puthex(v: u64) {
     let mut buf = *b"0x0000000000000000";
     for i in 0..16 {
@@ -184,8 +236,10 @@ extern "C" fn bl31_main() -> ! {
 
     if rd(PMC_SCRATCH110) == IRAM_MAGIC {
         puts("[nxk-bl31] hekate params present (IRAM)\n");
+    } else if rd(IPL_REPORT) == IPL_MAGIC {
+        ipl_report();
     } else {
-        puts("[nxk-bl31] launched by nxk-ipl or a test (no hekate params)\n");
+        puts("[nxk-bl31] no loader params: test launch\n");
     }
 
     let size = bl33_size();
