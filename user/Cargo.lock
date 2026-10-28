@@ -119,6 +119,7 @@ name = "display"
 version = "0.1.0"
 dependencies = [
  "libnx",
+ "nxk-bootsplash",
 ]
 
 [[package]]
@@ -256,6 +257,10 @@ dependencies = [
 
 [[package]]
 name = "nxk-abi"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-bootsplash"
 version = "0.1.0"
 
 [[package]]
