@@ -103,6 +103,17 @@ const SDMMC1_CLK: ClkRst = ClkRst {
     clk_div: 15,
 };
 
+/// The SDMMC data timeout clock, 12 MHz from PLLP (hekate's
+/// `_clock_sdmmc_legacy_tm`): enabled once, left on for the next stages.
+const LEGACY_TM_CLK: ClkRst = ClkRst {
+    reset: CLK_RST_CONTROLLER_RST_DEV_Y_SET,
+    enable: CLK_RST_CONTROLLER_CLK_ENB_Y_SET,
+    source: CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC_LEGACY_TM,
+    index: CLK_Y_SDMMC_LEGACY_TM,
+    clk_src: 4,
+    clk_div: clock::src_div(34),
+};
+
 pub type SdCard = Card<Page, Host>;
 pub type SdBoard = Board<Page, Rail>;
 
@@ -123,15 +134,21 @@ pub fn open() -> Result<(SdCard, SdBoard)> {
     board.power_off(&Host);
     timer::msleep(239);
     board.power_on(&Host)?;
+    if clock::car(CLK_RST_CONTROLLER_CLK_OUT_ENB_Y) & 1 << CLK_Y_SDMMC_LEGACY_TM == 0 {
+        clock::enable(&LEGACY_TM_CLK);
+    }
     clock::enable(&SDMMC1_CLK);
     card.init(&board, false, true)?;
     nxk_sdcard::recover(&mut card, &board)?;
     Ok((card, board))
 }
 
-/// SD clock and the slot off: the next stage starts from a cold slot.
+/// SD clock and the slot off, the controller held in reset (hekate's
+/// `sdmmc_end`): the next stage starts from a cold slot.
 pub fn close(card: &SdCard, board: &SdBoard) {
     card.stop();
     board.power_off(&Host);
+    clock::disable(&SDMMC1_CLK);
+    let _ = clock::car(SDMMC1_CLK.reset);
     soc::bpmp_mmu_maintenance(MAINT_CLN_INV_WAY, false);
 }
