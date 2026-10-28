@@ -59,7 +59,8 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 
 ## Screenshots
 
-Taken in the `tegra_qemu` emulator (`tools/nxtest.py --dbg "... shot"`).
+Taken in the `tegra_qemu` emulator (`tools/nxtest.py --dbg "... shot"`), except the two Luna
+ones, taken on a physical Erista Switch over the USB-C console (`tools/nxdbg.py shot`).
 
 | | |
 |---|---|
@@ -71,6 +72,8 @@ Taken in the `tegra_qemu` emulator (`tools/nxtest.py --dbg "... shot"`).
 | System | Network |
 | ![Terminal](docs/screenshots/terminal.png) | ![System Settings](docs/screenshots/settings.png) |
 | USB-C terminal mirror | System Settings |
+| ![Luna catalog](docs/screenshots/luna.png) | ![Shadow of the Tomb Raider streamed by Luna](docs/screenshots/luna-tomb-raider.png) |
+| Luna catalog (physical Switch) | Shadow of the Tomb Raider, streamed (physical Switch) |
 
 ## License
 
