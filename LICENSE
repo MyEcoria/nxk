@@ -1,0 +1,32 @@
+nxk is licensed under either of
+
+  * Apache License, Version 2.0 (LICENSE-APACHE)
+  * MIT license (LICENSE-MIT)
+
+at your option, except for the parts below, which keep the license of the
+code they derive from.
+
+  * emc/ and user/emc/: a port of hekate's Minerva Training Cell
+    (modules/hekate_libsys_minerva, (c) 2018-2025 CTCaer / NVIDIA), and
+    user/display/src/panel/tables.rs: hekate's display_init tables
+    (bdk/display/di.inl, (c) CTCaer). GNU GPL version 2 only
+    (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html); the `emc`
+    and `display` programs built from them are distributed under it.
+  * services/nxopus/: a port of libopus 1.6.1, BSD 3-clause
+    (services/nxopus/LICENSE).
+  * services/nxh264/src/tables.rs: data tables of Cisco's OpenH264,
+    BSD 2-clause (services/nxh264/LICENSE).
+  * hwboot/fusee-nano/: vendored fusee-nano, MIT, (c) 2018 David Buchanan
+    (hwboot/fusee-nano/LICENSE.upstream-MIT).
+  * std/library/: overlay files of the Rust standard library, MIT OR
+    Apache-2.0, (c) the Rust project developers.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in nxk by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
+
+nxk is not affiliated with, endorsed by or sponsored by Nintendo, NVIDIA
+or Amazon. Nintendo Switch and Joy-Con are trademarks of Nintendo; Tegra
+is a trademark of NVIDIA; Amazon Luna is a trademark of Amazon.com, Inc.
+or its affiliates.

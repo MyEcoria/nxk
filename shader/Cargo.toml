@@ -2,6 +2,7 @@
 name = "nxk-shader"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Shader IR of nxk: builder, wire format, validator, CPU reference interpreter, Maxwell SASS lowering"
 
 [dependencies]

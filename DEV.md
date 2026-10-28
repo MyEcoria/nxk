@@ -858,6 +858,14 @@ with libnx), versus 836 µs with pthread on L4T.
 
 ## Licenses
 
+nxk is MIT OR Apache-2.0; [LICENSE](LICENSE) lists the parts that keep
+the license of the code they derive from. `emc/`, `user/emc` and
+`user/display/src/panel/tables.rs` come from hekate (GPL-2.0), so the
+`emc` and `display` programs are GPL-2.0-only: keep code copied from
+hekate, Atmosphère or Linux in those crates, or mark the crate it lands
+in. `services/nxh264/src/tables.rs` comes from OpenH264, BSD 2-clause:
+`services/nxh264/LICENSE`.
+
 The screen font comes from Terminus (Dimitar Zhekov, SIL Open Font
 License 1.1), converted at build time from the host system console font.
 

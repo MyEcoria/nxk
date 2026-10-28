@@ -2,6 +2,7 @@
 name    = "nxk"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "AArch64 microkernel for Tegra X1 (Nintendo Switch), no host OS"
 
 [features]

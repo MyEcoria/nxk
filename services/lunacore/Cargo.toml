@@ -2,6 +2,7 @@
 name = "lunacore"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Amazon Luna for nxk, the part with no I/O: requests, replies, the catalog, covers (cargo test on the PC)"
 
 [dependencies]

@@ -52,3 +52,14 @@ Taken in the `tegra_qemu` emulator (`tools/nxtest.py --dbg "... shot"`).
 | System | Network |
 | ![Terminal](docs/screenshots/terminal.png) | ![System Settings](docs/screenshots/settings.png) |
 | USB-C terminal mirror | System Settings |
+
+## License
+
+MIT OR Apache-2.0, at your option, except a few parts derived from
+other projects (hekate's EMC and display code under GPL-2.0, libopus,
+OpenH264, fusee-nano): see [LICENSE](LICENSE).
+
+nxk is not affiliated with, endorsed by or sponsored by Nintendo, NVIDIA
+or Amazon. Nintendo Switch and Joy-Con are trademarks of Nintendo; Tegra
+is a trademark of NVIDIA; Amazon Luna is a trademark of Amazon.com, Inc.
+or its affiliates.

@@ -2,6 +2,7 @@
 name = "bluetooth"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Bluetooth controllers: the BCM4356 on UART-D, Joy-Cons and Pro Controllers"
 
 [dependencies]

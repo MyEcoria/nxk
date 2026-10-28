@@ -2,6 +2,7 @@
 name = "l4tboot"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Minimal EL3 monitor to boot the L4T kernel on the emulated Tegra X1 (PSCI)"
 
 [profile.release]

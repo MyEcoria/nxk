@@ -2,6 +2,7 @@
 name = "emc"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-2.0-only"
 description = "DRAM clock: EMC switches between the rates hekate's Minerva trained"
 
 [dependencies]

@@ -2,6 +2,7 @@
 name = "nxdtls"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "DTLS 1.2 client with no I/O: ECDHE-RSA-CHACHA20-POLY1305, a pinned server certificate (cargo test on the PC)"
 
 [dependencies]

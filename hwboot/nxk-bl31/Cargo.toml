@@ -2,6 +2,7 @@
 name = "nxk-bl31"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Minimal EL3 monitor to start nxk through hekate's L4T entry (no ATF)"
 
 [profile.release]

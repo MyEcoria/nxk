@@ -2,6 +2,7 @@
 name = "luna"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 description = "Amazon Luna as an nxk game catalog: sign-in, the games an account can play, their covers"
 
 [dependencies]
