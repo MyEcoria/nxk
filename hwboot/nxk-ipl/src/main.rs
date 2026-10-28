@@ -60,6 +60,8 @@ _reloc:
     bne     _reloc
     bx      r3
 _real_start:
+    // SYS mode, IRQ masked, FIQ open for the DRAM training's watchdog.
+    msr     cpsr_c, #0x9F
     ldr     sp, =0x4003FF00
     ldr     r0, =__bss_start
     ldr     r1, =__bss_end
@@ -69,12 +71,54 @@ _real_start:
     blo     2b
     ldr     r0, =ipl_main
     bx      r0
+
+// WDT4's FIQ (hekate's watchdog_handle and BDK_RESTART_BL_ON_WDT): the
+// watchdog off, its magic left above the stack, nxk-ipl started again.
+// Banked r8-r12 only, no stack.
+.global _fiq_handler
+_fiq_handler:
+    ldr     r8, =0x60005000
+    mov     r9, #0
+    str     r9, [r8, #0x80]
+    ldr     r9, =0xC45A
+    str     r9, [r8, #0x18C]
+    mov     r9, #1
+    str     r9, [r8, #0x188]
+    mov     r9, #2
+    str     r9, [r8, #0x188]
+    mov     r9, #0x40000000
+    str     r9, [r8, #0x8C]
+    ldr     r8, =0x4003FF18
+    ldr     r9, =0x544457
+    str     r9, [r8]
+    msr     cpsr_c, #0xDF
+    b       _real_start
 .pool
 "#
 );
 
+/// hekate's `EXCP_TYPE_ADDR` and its watchdog value ("WDT"), set by
+/// `_fiq_handler` above the stack and the cleared BSS.
+const EXCP_TYPE_ADDR: u32 = 0x4003_FF18;
+const EXCP_TYPE_WDT: u32 = 0x54_4457;
+
+extern "C" {
+    fn _fiq_handler();
+}
+
+/// `watchdog_fired`, read once and cleared, so that a later injection
+/// trains again.
+fn watchdog_fired() -> bool {
+    let p = EXCP_TYPE_ADDR as *mut u32;
+    let fired = unsafe { p.read_volatile() } == EXCP_TYPE_WDT;
+    unsafe { p.write_volatile(0) };
+    fired
+}
+
 #[no_mangle]
 extern "C" fn ipl_main() -> ! {
+    let wdt_fired = watchdog_fired();
+    reg::wr(hdr::EXCP_VEC_BASE + hdr::EVP_COP_FIQ_VECTOR, _fiq_handler as usize as u32);
     hw::init();
     uart::init_debug();
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
@@ -90,7 +134,12 @@ extern "C" fn ipl_main() -> ! {
         Some((bl31, bl33, mtc_entries)) => {
             println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes", bl31, bl33);
             display::splash(nxk_bootsplash::AT_LOADED, false);
-            let mtc = train(mtc_entries);
+            let mtc = if wdt_fired {
+                println!("[nxk-ipl] the watchdog fired in DRAM training: no training this time");
+                None
+            } else {
+                train(mtc_entries)
+            };
             l4t::launch(mtc)
         }
         None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),
@@ -109,9 +158,15 @@ fn train(entries: usize) -> Option<nxk_emc::Mtc<'static>> {
     if entries == 0 {
         return None;
     }
-    match minerva::init(entries) {
+    // hekate's watchdog (5 s): a hang restarts nxk-ipl, which then skips it.
+    let start = timer::now_us();
+    timer::watchdog_start(5_000_000 / 2);
+    let r = minerva::init(entries);
+    timer::watchdog_end();
+    let ms = timer::now_us().wrapping_sub(start) / 1000;
+    match r {
         Ok(m) => {
-            println!("[nxk-ipl] DRAM trained, {} MHz", minerva::rate_mhz(&m));
+            println!("[nxk-ipl] DRAM trained in {} ms, {} MHz", ms, minerva::rate_mhz(&m));
             Some(m)
         }
         Err(e) => {

@@ -56,3 +56,23 @@ pub fn bpmp_msleep(mut ms: u32) {
         wr(FLOW_CTLR_HALT_COP_EVENTS, HALT_MODE_WAITEVENT | HALT_MSEC | d);
     }
 }
+
+/// `watchdog_start(us, TIMER_FIQENABL_EN)`: WDT4, the BPMP's, on timer 9;
+/// it raises a FIQ when it expires (main.rs `_fiq_handler`).
+pub fn watchdog_start(us: u32) {
+    use crate::hdr::*;
+    wr(TMR + TIMER_WDT4_UNLOCK_PATTERN, TIMER_MAGIC_PTRN);
+    wr(TMR + TIMER_TMR9_TMR_PTV, TIMER_EN | TIMER_PER_EN | us);
+    wr(TMR + TIMER_WDT4_CONFIG, 9 | 1 << 4 | TIMER_FIQENABL_EN); // TIMER_SRC(9) | TIMER_PER(1)
+    wr(TMR + TIMER_WDT4_COMMAND, TIMER_START_CNT);
+}
+
+/// `watchdog_end` (the FIQ handler repeats it in assembly).
+pub fn watchdog_end() {
+    use crate::hdr::*;
+    wr(TMR + TIMER_TMR9_TMR_PTV, 0);
+    wr(TMR + TIMER_WDT4_UNLOCK_PATTERN, TIMER_MAGIC_PTRN);
+    wr(TMR + TIMER_WDT4_COMMAND, TIMER_START_CNT); // re-armed to clear its interrupts
+    wr(TMR + TIMER_WDT4_COMMAND, TIMER_CNT_DISABLE);
+    wr(TMR + TIMER_TMR9_TMR_PCR, TIMER_INTR_CLR);
+}
