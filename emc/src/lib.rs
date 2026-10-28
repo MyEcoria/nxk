@@ -8,18 +8,23 @@
 //! r21021.c`). The sequence is generic over `Hw`, so the PC tests run it
 //! against a recording bus and compare the register trace with the C code's.
 //!
+//! Training (`OP_TRAIN`, `OP_TRAIN_SWITCH`), the periodic-training
+//! entries and periodic compensation are ported too (`Mtc`, `train.rs`).
+//!
 //! The tables are `emc_table_t` revision 7 (4928 bytes, 1232 words): hekate
 //! copies them to DRAM at 0xFFE80000 before the L4T launch.
 
 #![no_std]
 
 pub mod layout;
+pub mod patterns;
 pub mod regs;
 mod seq;
 mod train;
 pub mod warm;
 
 pub use seq::{check_lpddr4, current_rate_khz, mc_mismatches, switch, switch_entries};
+pub use train::{periodic_compensation, Mtc, Op};
 
 /// Size of one table entry in words.
 pub const TABLE_WORDS: usize = layout::TABLE_WORDS;

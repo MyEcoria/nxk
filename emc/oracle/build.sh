@@ -43,6 +43,15 @@ s = re.sub(r"static void _usleep\(u32 microseconds\)\n\{.*?\n\}",
            s, count=1, flags=re.S)
 s = re.sub(r"\(void\)(EMC|MC|CLOCK)\(", r"(void)(u32)\1(", s)
 s = s.replace("#include <module.h>", '#include "bdkp.h"')
+# Divisions by zero give 0 as hekate's ARM build does (libgcc's __div0
+# path), instead of the PC's trap: the clock tree code divides by
+# oscillator counts that only training reads.
+s = s.replace('#include "bdkp.h"', '#include "bdkp.h"\nstatic inline unsigned _udiv(unsigned a, unsigned b) { return b ? a / b : 0; }', 1)
+s = re.sub(r"cval = tval / \((.*?)\);", r"cval = _udiv(tval, \1);", s)
+s = re.sub(r"(dst_emc_entry->ptfv_list\.ptfv_dqsosc_movavg_\w+) / (dst_emc_entry->ptfv_list\.ptfv_(?:dvfs|write)_samples);",
+           r"_udiv(\1, \2);", s)
+s = re.sub(r"\(100 \* cval \+ (.*?)\)\s*/ \((dst_emc_entry->ptfv_list\.ptfv_movavg_weight \+ 1)\)",
+           r"_udiv(100 * cval + \1, \2)", s, flags=re.S)
 open(p, "w").write(s)
 PY
 g++ -std=gnu++17 -O1 -fpermissive -w -I"$tmp" -x c++ "$tmp/oracle.cpp" -o "$out"

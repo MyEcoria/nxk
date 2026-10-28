@@ -27,7 +27,6 @@ const SPIN_LIMIT: u32 = 200_000;
 /// Minerva's `EMC_STATUS_UPDATE_TIMEOUT`, in 1 us polls.
 const STATUS_LIMIT: u32 = 2000;
 
-const BURST: usize = L::BURST_REGS_EMC_RC;
 const BURST_PER_CH: usize = L::BURST_REG_PER_CH_EMC0_MRW10;
 const TRIM: usize = L::TRIM_REGS_EMC_PMACRO_IB_DDLL_LONG_DQS_RANK0_0;
 const TRIM_PER_CH: usize = L::TRIM_PERCH_REGS_EMC_CMD_BRLSHFT_0;
@@ -92,7 +91,7 @@ fn c_rmw<H: Hw>(h: &mut H, off: u32, f: impl FnOnce(u32) -> u32) {
 }
 
 /// Poll until `done` (bounded, no delay between reads).
-fn spin<H: Hw>(
+pub(crate) fn spin<H: Hw>(
     h: &mut H,
     what: &'static str,
     mut done: impl FnMut(&mut H) -> bool,
@@ -125,7 +124,13 @@ pub(crate) fn ccfifo<H: Hw>(h: &mut H, addr: u32, data: u32, delay: u32) {
 }
 
 /// `true` on timeout, as Minerva's `_wait_emc_status`.
-pub(crate) fn wait_emc_status<H: Hw>(h: &mut H, off: u32, mask: u32, state: bool, channel: u32) -> bool {
+pub(crate) fn wait_emc_status<H: Hw>(
+    h: &mut H,
+    off: u32,
+    mask: u32,
+    state: bool,
+    channel: u32,
+) -> bool {
     for _ in 0..STATUS_LIMIT {
         let r = match channel {
             0 => e_rd(h, off),
@@ -165,7 +170,7 @@ fn dll_wait_en<H: Hw>(h: &mut H, dual: bool, en: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn digital_dll_disable<H: Hw>(h: &mut H) -> Result<(), Error> {
+pub(crate) fn digital_dll_disable<H: Hw>(h: &mut H) -> Result<(), Error> {
     let dual = dual_channel(h);
     e_rmw(h, EMC_CFG_DIG_DLL, |v| v & 0xFFFF_FFFE);
     timing_update(h, dual);
@@ -404,6 +409,7 @@ fn ramp_up<H: Hw>(
 /// Minerva's `_minerva_change_clock`: a frequency switch (`needs_training`
 /// 0) or a training pass at `dst`'s rate (its `NEEDS_TRAINING_*` bits),
 /// whose results go into `dst`.
+#[allow(clippy::needless_late_init)]
 pub(crate) fn change_clock<H: Hw>(
     h: &mut H,
     src: &Table,
@@ -455,7 +461,11 @@ pub(crate) fn change_clock<H: Hw>(
     digital_dll_disable(h)?;
 
     // Step 1.2 - Disable AUTOCAL temporarily.
-    e_wr(h, EMC_AUTO_CAL_CONFIG, (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FF) | 0x600);
+    e_wr(
+        h,
+        EMC_AUTO_CAL_CONFIG,
+        (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FF) | 0x600,
+    );
     e_rd(h, EMC_AUTO_CAL_CONFIG);
 
     // Step 1.3 - Disable other power features.
@@ -466,7 +476,11 @@ pub(crate) fn change_clock<H: Hw>(
 
     let mut compensate_trimmer = false;
     if !in_training && dst.w(L::PERIODIC_TRAINING) != 0 {
-        let pd = if dev_num == TWO_RANK { IN_POWERDOWN_BOTH_MASK } else { IN_POWERDOWN_1DEV_MASK };
+        let pd = if dev_num == TWO_RANK {
+            IN_POWERDOWN_BOTH_MASK
+        } else {
+            IN_POWERDOWN_1DEV_MASK
+        };
         wait_emc_status(h, EMC_EMC_STATUS, pd, false, 0);
         if ch1 {
             wait_emc_status(h, EMC_EMC_STATUS, pd, false, 1);
@@ -477,7 +491,10 @@ pub(crate) fn change_clock<H: Hw>(
         }
         // Reset clock tree delays.
         for k in 0..8 {
-            dst.set(L::CURRENT_DRAM_CLKTREE_C0D0U0 + k, dst.w(L::TRAINED_DRAM_CLKTREE_C0D0U0 + k));
+            dst.set(
+                L::CURRENT_DRAM_CLKTREE_C0D0U0 + k,
+                dst.w(L::TRAINED_DRAM_CLKTREE_C0D0U0 + k),
+            );
         }
         let adelta = train::periodic_compensation_handler(h, src, dst, dev_num, ch1, Comp::Dvfs);
         let rate_mhz = dst.rate_khz() / 1000;
@@ -491,7 +508,11 @@ pub(crate) fn change_clock<H: Hw>(
     e_wr(h, EMC_CFG, emc_cfg);
     e_wr(h, EMC_SEL_DPD_CTRL, sel_dpd);
     e_wr(h, EMC_CFG_PIPE_CLK, pipe_clk_o | 1);
-    e_wr(h, EMC_FDPD_CTRL_CMD_NO_RAMP, dst.w(L::EMC_FDPD_CTRL_CMD_NO_RAMP) & 0xFFFF_FFFE);
+    e_wr(
+        h,
+        EMC_FDPD_CTRL_CMD_NO_RAMP,
+        dst.w(L::EMC_FDPD_CTRL_CMD_NO_RAMP) & 0xFFFF_FFFE,
+    );
 
     let src_bg = src.w(L::BURST_REGS_EMC_PMACRO_BG_BIAS_CTRL_0);
     let dst_bg = dst.w(L::BURST_REGS_EMC_PMACRO_BG_BIAS_CTRL_0);
@@ -528,7 +549,11 @@ pub(crate) fn change_clock<H: Hw>(
     }
 
     // Step 3 - Prepare autocal for the clock change.
-    e_wr(h, EMC_AUTO_CAL_CONFIG, (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FF) | 0x600);
+    e_wr(
+        h,
+        EMC_AUTO_CAL_CONFIG,
+        (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FF) | 0x600,
+    );
     e_wr(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_MUX_ACTIVE);
     for (k, reg) in [
         EMC_AUTO_CAL_CONFIG2,
@@ -545,7 +570,11 @@ pub(crate) fn change_clock<H: Hw>(
         e_wr(h, reg, dst.w(L::EMC_AUTO_CAL_CONFIG2 + k));
     }
     e_wr(h, EMC_DBG, dbg_o);
-    e_wr(h, EMC_AUTO_CAL_CONFIG, (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FE) | 0x601);
+    e_wr(
+        h,
+        EMC_AUTO_CAL_CONFIG,
+        (dst.w(L::EMC_AUTO_CAL_CONFIG) & 0x7FFF_F9FE) | 0x601,
+    );
 
     // Step 4 - Update EMC_CFG.
     if src_period <= 50_000 {
@@ -602,7 +631,11 @@ pub(crate) fn change_clock<H: Hw>(
         if r2p_war > 63 {
             rp_war = t_rtm.wrapping_sub(63);
             r2p_war = 63;
-            trpab_war = if s_trpab < t_rtm.wrapping_sub(63) { t_rtm.wrapping_sub(63) } else { s_trpab };
+            trpab_war = if s_trpab < t_rtm.wrapping_sub(63) {
+                t_rtm.wrapping_sub(63)
+            } else {
+                s_trpab
+            };
         }
     }
     let mut w2p_war;
@@ -674,7 +707,11 @@ pub(crate) fn change_clock<H: Hw>(
         None
     };
     if let Some(base) = burst_base {
-        for (i, &addr) in BURST_REGS_EMC_ADDR_TABLE.iter().enumerate().take(dst.w(L::NUM_BURST) as usize) {
+        for (i, &addr) in BURST_REGS_EMC_ADDR_TABLE
+            .iter()
+            .enumerate()
+            .take(dst.w(L::NUM_BURST) as usize)
+        {
             let mut val = dst.w(base + i);
             match addr {
                 EMC_CFG => val &= 0x0FFF_FFFF,
@@ -690,7 +727,11 @@ pub(crate) fn change_clock<H: Hw>(
             e_wr(h, addr, val);
         }
     }
-    let run_clocks = if in_training { src.w(L::RUN_CLOCKS) } else { dst.w(L::RUN_CLOCKS) };
+    let run_clocks = if in_training {
+        src.w(L::RUN_CLOCKS)
+    } else {
+        dst.w(L::RUN_CLOCKS)
+    };
     e_wr(h, EMC_MRW, (run_clocks & 0xFF) | 0x17_0000);
 
     let n = dst.w(L::NUM_BURST_PER_CH) as usize;
@@ -699,33 +740,50 @@ pub(crate) fn change_clock<H: Hw>(
             e_wr(h, addr, dst.w(BURST_PER_CH + i));
         }
     }
-    for (i, &addr) in VREF_PERCH_REGS_EMC01_ADDR_TABLE.iter().enumerate().take(dst.w(L::VREF_NUM) as usize) {
+    for (i, &addr) in VREF_PERCH_REGS_EMC01_ADDR_TABLE
+        .iter()
+        .enumerate()
+        .take(dst.w(L::VREF_NUM) as usize)
+    {
         if addr != 0 && (ch1 || addr.wrapping_sub(0x4000) > 0xFFF) {
             e_wr(h, addr, dst.w(VREF + i));
         }
     }
     if in_training {
         let n = dst.w(L::TRAINING_MOD_NUM) as usize;
-        for (i, &addr) in TRAINING_MOD_REGS_EMC01_ADDR_TABLE.iter().enumerate().take(n) {
+        for (i, &addr) in TRAINING_MOD_REGS_EMC01_ADDR_TABLE
+            .iter()
+            .enumerate()
+            .take(n)
+        {
             if addr != 0 && (ch1 || addr.wrapping_sub(0x4000) > 0xFFF) {
                 e_wr(h, addr, dst.w(L::TRAINING_MOD_REGS + i));
             }
         }
     }
-    for (i, &addr) in TRIM_REGS_EMC_ADDR_TABLE.iter().enumerate().take(dst.w(L::NUM_TRIM) as usize) {
+    for (i, &addr) in TRIM_REGS_EMC_ADDR_TABLE
+        .iter()
+        .enumerate()
+        .take(dst.w(L::NUM_TRIM) as usize)
+    {
         if addr != 0 {
             let comp = (addr & 0xFFFF_FFF0 == EMC_PMACRO_OB_DDLL_LONG_DQ_RANK1_0
                 || addr & 0xFFFF_FFF0 == EMC_PMACRO_OB_DDLL_LONG_DQ_RANK0_0
                 || addr & 0xFFFF_FFF8 == EMC_DATA_BRLSHFT_0)
                 && compensate_trimmer;
-            let v = if comp { train::apply_periodic_compensation_trimmer(dst, addr) } else { dst.w(TRIM + i) };
+            let v = if comp {
+                train::apply_periodic_compensation_trimmer(dst, addr)
+            } else {
+                dst.w(TRIM + i)
+            };
             e_wr(h, addr, v);
         }
     }
     let n = dst.w(L::NUM_TRIM_PER_CH) as usize;
     for (i, &addr) in TRIM_PERCH_REGS_EMC01_ADDR_TABLE.iter().enumerate().take(n) {
         if addr != 0 && (ch1 || addr.wrapping_sub(0x4000) > 0xFFF) {
-            let comp = (addr & 0xFFFF_FFF8 == EMC0_DATA_BRLSHFT_0 || addr & 0xFFFF_FFF8 == EMC1_DATA_BRLSHFT_0)
+            let comp = (addr & 0xFFFF_FFF8 == EMC0_DATA_BRLSHFT_0
+                || addr & 0xFFFF_FFF8 == EMC1_DATA_BRLSHFT_0)
                 && compensate_trimmer;
             let v = if comp {
                 train::apply_periodic_compensation_trimmer(dst, addr & 0xFFF)
@@ -741,7 +799,11 @@ pub(crate) fn change_clock<H: Hw>(
             train::periodic_compensation_handler(h, src, dst, dev_num, ch1, Comp::WriteTraining);
         }
     } else {
-        for (i, &addr) in BURST_MC_REGS_ADDR_TABLE.iter().enumerate().take(dst.w(L::NUM_MC_REGS) as usize) {
+        for (i, &addr) in BURST_MC_REGS_ADDR_TABLE
+            .iter()
+            .enumerate()
+            .take(dst.w(L::NUM_MC_REGS) as usize)
+        {
             m_wr(h, addr, dst.w(L::BURST_MC_REGS + i));
         }
         if dst.rate_khz() < src.rate_khz() {
@@ -753,10 +815,26 @@ pub(crate) fn change_clock<H: Hw>(
     }
 
     // Step 9 - LPDDR4.
-    e_wr(h, EMC_ZCAL_INTERVAL, src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL) & 0xFF00_0000);
-    e_wr(h, EMC_ZCAL_WAIT_CNT, dst.w(L::BURST_REGS_EMC_ZCAL_WAIT_CNT) & 0xFFFF_F800);
-    e_wr(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE);
-    e_wr(h, EMC_ZCAL_INTERVAL, src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL) & 0xFF00_0000);
+    e_wr(
+        h,
+        EMC_ZCAL_INTERVAL,
+        src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL) & 0xFF00_0000,
+    );
+    e_wr(
+        h,
+        EMC_ZCAL_WAIT_CNT,
+        dst.w(L::BURST_REGS_EMC_ZCAL_WAIT_CNT) & 0xFFFF_F800,
+    );
+    e_wr(
+        h,
+        EMC_DBG,
+        dbg_o | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE,
+    );
+    e_wr(
+        h,
+        EMC_ZCAL_INTERVAL,
+        src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL) & 0xFF00_0000,
+    );
     e_wr(h, EMC_DBG, dbg_o);
     if in_training {
         e_wr(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_MUX_ACTIVE);
@@ -766,13 +844,22 @@ pub(crate) fn change_clock<H: Hw>(
             dst.w(L::BURST_REGS_EMC_PMACRO_AUTOCAL_CFG_COMMON) | 0x10000,
         );
         if ca_combo {
-            e_wr(h, EMC_FBIO_CFG5, src.w(L::BURST_REGS_EMC_FBIO_CFG5) | 0x0800_0000);
+            e_wr(
+                h,
+                EMC_FBIO_CFG5,
+                src.w(L::BURST_REGS_EMC_FBIO_CFG5) | 0x0800_0000,
+            );
         }
         e_wr(h, EMC_DBG, dbg_o);
         if ch1 {
             ccfifo(h, EMC_CFG_SYNC, 0, 0);
         }
-        ccfifo(h, EMC_DBG, (dbg_o & !EMC_DBG_CFG_SWAP_MASK) | EMC_DBG_CFG_SWAP_SWAP, 0);
+        ccfifo(
+            h,
+            EMC_DBG,
+            (dbg_o & !EMC_DBG_CFG_SWAP_MASK) | EMC_DBG_CFG_SWAP_SWAP,
+            0,
+        );
     }
 
     // Step 10 - Self refresh.
@@ -782,37 +869,46 @@ pub(crate) fn change_clock<H: Hw>(
         ccfifo(
             h,
             EMC_MRW6,
-            (src.w(L::BURST_REGS_EMC_MRW6) & 0xC0C0) | (dst.w(L::BURST_REGS_EMC_MRW6) & 0xFFFF_3F3F),
+            (src.w(L::BURST_REGS_EMC_MRW6) & 0xC0C0)
+                | (dst.w(L::BURST_REGS_EMC_MRW6) & 0xFFFF_3F3F),
             0,
         );
         ccfifo(
             h,
             EMC_MRW14,
-            (src.w(L::BURST_REGS_EMC_MRW14) & 0x3838) | (dst.w(L::BURST_REGS_EMC_MRW14) & 0xFFFF_0707),
+            (src.w(L::BURST_REGS_EMC_MRW14) & 0x3838)
+                | (dst.w(L::BURST_REGS_EMC_MRW14) & 0xFFFF_0707),
             0,
         );
         if dev_num == TWO_RANK {
             ccfifo(
                 h,
                 EMC_MRW7,
-                (src.w(L::BURST_REGS_EMC_MRW7) & 0xC0C0) | (dst.w(L::BURST_REGS_EMC_MRW7) & 0xFFFF_3F3F),
+                (src.w(L::BURST_REGS_EMC_MRW7) & 0xC0C0)
+                    | (dst.w(L::BURST_REGS_EMC_MRW7) & 0xFFFF_3F3F),
                 0,
             );
             ccfifo(
                 h,
                 EMC_MRW15,
-                (src.w(L::BURST_REGS_EMC_MRW15) & 0x3838) | (dst.w(L::BURST_REGS_EMC_MRW15) & 0xFFFF_0707),
+                (src.w(L::BURST_REGS_EMC_MRW15) & 0x3838)
+                    | (dst.w(L::BURST_REGS_EMC_MRW15) & 0xFFFF_0707),
                 0,
             );
         }
-        let zq = if dev_num == ONE_RANK || zcal_shared { 0x8000_0001 } else { 1 };
+        let zq = if dev_num == ONE_RANK || zcal_shared {
+            0x8000_0001
+        } else {
+            1
+        };
         ccfifo(h, EMC_ZQ_CAL, zq, 0);
     }
 
     let t_rp_src = src.w(L::DRAM_TIMINGS_T_RP).wrapping_mul(1000) / src_period;
     let mut dbg_val = dbg_o;
     if in_training {
-        dbg_val = (dbg_o & !EMC_DBG_CFG_SWAP_MASK) | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_CFG_SWAP_SWAP;
+        dbg_val =
+            (dbg_o & !EMC_DBG_CFG_SWAP_MASK) | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_CFG_SWAP_SWAP;
         ccfifo(h, EMC_DBG, dbg_val, 0);
     }
     let ref_delay;
@@ -840,13 +936,23 @@ pub(crate) fn change_clock<H: Hw>(
 
     // Step 11 - Ramp down.
     ccfifo(h, EMC_CFG_SYNC, 0, 0);
-    ccfifo(h, EMC_DBG, dbg_val | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE, 0);
+    ccfifo(
+        h,
+        EMC_DBG,
+        dbg_val | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE,
+        0,
+    );
     let ramp_down_wait = ramp_down(h, false, src, dst, src_period);
 
     // Step 12 - Trigger clock change.
     ccfifo(h, EMC_STALL_THEN_EXE_AFTER_CLKCHANGE, 1, 0);
     if !in_training {
-        ccfifo(h, EMC_DBG, (dbg_val & !EMC_DBG_WRITE_ACTIVE_ONLY) | EMC_DBG_WRITE_MUX_ACTIVE, 0);
+        ccfifo(
+            h,
+            EMC_DBG,
+            (dbg_val & !EMC_DBG_WRITE_ACTIVE_ONLY) | EMC_DBG_WRITE_MUX_ACTIVE,
+            0,
+        );
     }
 
     // Step 13 - Ramp up.
@@ -873,7 +979,8 @@ pub(crate) fn change_clock<H: Hw>(
         let mut zq_latch_wait: i32 = if dst_period > 2000 {
             zqcal_fc_adj.wrapping_sub(t_pdex as i32)
         } else {
-            zqcal_fc_adj.wrapping_sub((ramp_up_wait.wrapping_add(ramp_down_wait) / dst_period) as i32)
+            zqcal_fc_adj
+                .wrapping_sub((ramp_up_wait.wrapping_add(ramp_down_wait) / dst_period) as i32)
         };
         let mrw3_latch = (flip_fspop & 0xF3FF_FFF7) | 0x0C00_0000;
         let emc_zq_cal;
@@ -942,7 +1049,11 @@ pub(crate) fn change_clock<H: Hw>(
         cmd |= 1 << 31; // GO: Start the Training.
         ccfifo(h, EMC_TRAINING_CMD, cmd, 0);
         if bg_change != 0 {
-            let v = if enable_bg { src_bg & 0xFFFF_FFFE } else { src_bg & 0xFFFF_FFFB };
+            let v = if enable_bg {
+                src_bg & 0xFFFF_FFFE
+            } else {
+                src_bg & 0xFFFF_FFFB
+            };
             ccfifo(h, EMC_PMACRO_BG_BIAS_CTRL_0, v, 0);
         }
         ccfifo(h, EMC_SWITCH_BACK_CTRL, 1, 0);
@@ -952,10 +1063,20 @@ pub(crate) fn change_clock<H: Hw>(
         }
         ccfifo(h, EMC_PIN, pin_o & 0xFFFF_FFF8, 0);
         ccfifo(h, EMC_CFG_SYNC, 0, 0);
-        ccfifo(h, EMC_DBG, dbg_val | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE, 0);
+        ccfifo(
+            h,
+            EMC_DBG,
+            dbg_val | EMC_DBG_WRITE_ACTIVE_ONLY | EMC_DBG_WRITE_MUX_ACTIVE,
+            0,
+        );
         ramp_down(h, true, src, dst, dst_period);
         ccfifo(h, EMC_STALL_THEN_EXE_AFTER_CLKCHANGE, 1, 0);
-        ccfifo(h, EMC_DBG, (dbg_val & !EMC_DBG_WRITE_ACTIVE_ONLY) | EMC_DBG_WRITE_MUX_ACTIVE, 0);
+        ccfifo(
+            h,
+            EMC_DBG,
+            (dbg_val & !EMC_DBG_WRITE_ACTIVE_ONLY) | EMC_DBG_WRITE_MUX_ACTIVE,
+            0,
+        );
         ramp_up(h, true, src, dst, needs_training, src_period);
         ccfifo(h, EMC_DBG, dbg_val, 0);
         if dev_num == TWO_RANK {
@@ -968,7 +1089,12 @@ pub(crate) fn change_clock<H: Hw>(
             ccfifo(h, EMC_TR_CTRL_0, 0x40, 1_000_000 / src_period);
             ccfifo(h, EMC_MRW3, catr_enable & 0xFFFF_FFFE, 0);
             ccfifo(h, EMC_INTSTATUS, 0, 1_000_000 / src_period);
-            ccfifo(h, EMC_PMACRO_DATA_RX_TERM_MODE, src.w(L::BURST_REGS_EMC_PMACRO_DATA_RX_TERM_MODE), 0);
+            ccfifo(
+                h,
+                EMC_PMACRO_DATA_RX_TERM_MODE,
+                src.w(L::BURST_REGS_EMC_PMACRO_DATA_RX_TERM_MODE),
+                0,
+            );
         }
         ccfifo(h, EMC_DBG, dbg_o, 0);
         ccfifo(h, EMC_ZQ_CAL, 0x8000_0001, 0);
@@ -1006,7 +1132,12 @@ pub(crate) fn change_clock<H: Hw>(
     // Step 21 - Restore ZCAL and ZCAL interval.
     ccfifo(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_MUX_ACTIVE, 0);
     if in_training {
-        ccfifo(h, EMC_ZCAL_INTERVAL, src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL), 0);
+        ccfifo(
+            h,
+            EMC_ZCAL_INTERVAL,
+            src.w(L::BURST_REGS_EMC_ZCAL_INTERVAL),
+            0,
+        );
     }
     ccfifo(h, EMC_CFG, dst.w(L::BURST_REGS_EMC_CFG) & 0xEFFF_FFFF, 0);
 
@@ -1073,7 +1204,11 @@ pub(crate) fn change_clock<H: Hw>(
     e_wr(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_MUX_ACTIVE);
     e_wr(h, EMC_CFG, dst.w(L::BURST_REGS_EMC_CFG));
     e_wr(h, EMC_DBG, dbg_o);
-    e_wr(h, EMC_FDPD_CTRL_CMD_NO_RAMP, dst.w(L::EMC_FDPD_CTRL_CMD_NO_RAMP));
+    e_wr(
+        h,
+        EMC_FDPD_CTRL_CMD_NO_RAMP,
+        dst.w(L::EMC_FDPD_CTRL_CMD_NO_RAMP),
+    );
     e_wr(h, EMC_SEL_DPD_CTRL, dst.w(L::EMC_SEL_DPD_CTRL));
 
     // Step 28 - Training recover.
@@ -1098,10 +1233,18 @@ pub(crate) fn change_clock<H: Hw>(
             e_wr(h, reg, src.w(L::EMC_AUTO_CAL_CONFIG2 + k));
         }
         e_wr(h, EMC_DBG, dbg_o);
-        e_wr(h, EMC_TR_DVFS, dst.w(L::BURST_REGS_EMC_TR_DVFS) & 0xFFFF_FFFE);
+        e_wr(
+            h,
+            EMC_TR_DVFS,
+            dst.w(L::BURST_REGS_EMC_TR_DVFS) & 0xFFFF_FFFE,
+        );
     }
     e_wr(h, EMC_DBG, dbg_o | EMC_DBG_WRITE_MUX_ACTIVE);
-    e_wr(h, EMC_PMACRO_AUTOCAL_CFG_COMMON, dst.w(L::BURST_REGS_EMC_PMACRO_AUTOCAL_CFG_COMMON));
+    e_wr(
+        h,
+        EMC_PMACRO_AUTOCAL_CFG_COMMON,
+        dst.w(L::BURST_REGS_EMC_PMACRO_AUTOCAL_CFG_COMMON),
+    );
     e_wr(h, EMC_DBG, dbg_o);
 
     // Step 29 - Power fix WAR.
@@ -1290,15 +1433,10 @@ pub fn mc_mismatches<H: Hw>(h: &mut H, t: &Table, out: &mut [(u32, u32, u32); 33
     n
 }
 
-/// The switch itself, between two given entries: the trace of register
-/// accesses is that of Minerva's `OP_SWITCH` (see `tests/trace.rs`).
-pub fn switch_entries<H: Hw>(h: &mut H, src: &Table, dst: &Table) -> Result<u32, Error> {
-    if src.rate_khz() == dst.rate_khz() {
-        return Err(Error::SameRate);
-    }
-    if dst.periodic() {
-        return Err(Error::Periodic);
-    }
+/// The EMC clock source for `dst` (`_minerva_do_training_switch`): PLLM
+/// and PLLMB alternate when the rate changes, so the running one is never
+/// reprogrammed.
+pub(crate) fn select_clk_src<H: Hw>(h: &mut H, src: &Table, dst: &Table) -> Result<u32, Error> {
     let changed = freq_changed(
         h,
         dst.rate_khz(),
@@ -1327,6 +1465,19 @@ pub fn switch_entries<H: Hw>(h: &mut H, src: &Table, dst: &Table) -> Result<u32,
         }
         sel
     };
+    Ok(sel)
+}
+
+/// The switch itself, between two given entries: the trace of register
+/// accesses is that of Minerva's `OP_SWITCH` (see `tests/trace.rs`).
+pub fn switch_entries<H: Hw>(h: &mut H, src: &Table, dst: &Table) -> Result<u32, Error> {
+    if src.rate_khz() == dst.rate_khz() {
+        return Err(Error::SameRate);
+    }
+    if dst.periodic() {
+        return Err(Error::Periodic);
+    }
+    let sel = select_clk_src(h, src, dst)?;
     // The switch writes nothing into the entry when it is not periodic.
     let mut copy = [0u32; crate::TABLE_WORDS];
     copy.copy_from_slice(dst.0);
@@ -1343,7 +1494,7 @@ mod tests {
     fn layout_is_contiguous() {
         assert_eq!(
             L::BURST_REG_PER_CH_EMC0_MRW10,
-            BURST + BURST_REGS_EMC_ADDR_TABLE.len()
+            L::BURST_REGS_EMC_RC + BURST_REGS_EMC_ADDR_TABLE.len()
         );
         assert_eq!(
             L::TRIM_PERCH_REGS_EMC_CMD_BRLSHFT_0,

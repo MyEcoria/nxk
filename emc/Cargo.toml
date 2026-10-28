@@ -8,3 +8,7 @@ license = "GPL-2.0-only"
 [features]
 # Tests record every register access; nothing else needs std.
 default = []
+
+# Minerva's arithmetic is C's: u32 wraps (tests build without overflow traps).
+[profile.dev]
+overflow-checks = false
