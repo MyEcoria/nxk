@@ -3,6 +3,53 @@
 #![allow(dead_code)]
 
 
+// bdk/memory_map.h
+pub const LDR_LOAD_ADDR: u32 = 0x40007000;
+pub const IPL_LOAD_ADDR: u32 = 0x40008000;
+pub const XUSB_RING_ADDR: u32 = 0x40020000;
+pub const SECMON_MIN_START: u32 = 0x4002b000;
+pub const SDRAM_PARAMS_ADDR: u32 = 0x40030000;
+pub const SDRAM_PARAMS_SZ: u32 = 0x838;
+pub const SYS_STACK_TOP_INIT: u32 = 0x4003ff00;
+pub const FIQ_STACK_TOP: u32 = 0x40040000;
+pub const IRQ_STACK_TOP: u32 = 0x40040000;
+pub const IPL_RELOC_ADDR: u32 = 0x4003ff00;
+pub const IPL_RELOC_SZ: u32 = 0x10;
+pub const EXCP_STORAGE_ADDR: u32 = 0x4003ff10;
+pub const EXCP_STORAGE_SZ: u32 = 0x10;
+pub const DRAM_START: u32 = 0x80000000;
+pub const NYX_LOAD_ADDR: u32 = 0x81000000;
+pub const IPL_HEAP_START: u32 = 0x82000000;
+pub const SMMU_HEAP_ADDR: u32 = 0x92000000;
+pub const RAM_DISK_ADDR: u32 = 0x95000000;
+pub const RAM_DISK_SZ: u32 = 0x50000000;
+pub const PSTORE_ADDR: u32 = 0xb0000000;
+pub const NX_BIS_CACHE_ADDR: u32 = 0xc7000000;
+pub const NX_BIS_CACHE_SZ: u32 = 0x10020000;
+pub const NX_BIS_LOOKUP_ADDR: u32 = 0xd8000000;
+pub const NX_BIS_LOOKUP_SZ: u32 = 0x8000000;
+pub const SDMMC_ALT_DMA_BUFFER: u32 = 0xe5000000;
+pub const NYX_STORAGE_ADDR: u32 = 0xed000000;
+pub const NYX_RES_ADDR: u32 = 0xee000000;
+pub const SDXC_BUF_ALIGNED: u32 = 0xef000000;
+pub const EMMC_BUF_ALIGNED: u32 = 0xf0000000;
+pub const MIXD_BUF_ALIGNED: u32 = 0xf0000000;
+pub const NYX_LV_VDB_ADR: u32 = 0xf1000000;
+pub const NYX_FB_SZ: u32 = 0x384000;
+pub const NYX_LV_MEM_ADR: u32 = 0xf1400000;
+pub const NYX_LV_MEM_SZ: u32 = 0x6600000;
+pub const IPL_FB_ADDRESS: u32 = 0xf5a00000;
+pub const IPL_FB_SZ: u32 = 0x384000;
+pub const LOG_FB_ADDRESS: u32 = 0xf5e00000;
+pub const LOG_FB_SZ: u32 = 0x334000;
+pub const NYX_FB_ADDRESS: u32 = 0xf6200000;
+pub const NYX_FB2_ADDRESS: u32 = 0xf6600000;
+pub const USBD_ADDR: u32 = 0xfef00000;
+pub const USB_DESCRIPTOR_ADDR: u32 = 0xfef40000;
+pub const USB_EP_CONTROL_BUF_ADDR: u32 = 0xfef80000;
+pub const USB_EP_BULK_IN_BUF_ADDR: u32 = 0xff000000;
+pub const USB_EP_BULK_OUT_BUF_ADDR: u32 = 0xff800000;
+
 // bdk/soc/t210.h
 pub const IROM_BASE: u32 = 0x100000;
 pub const IRAM_BASE: u32 = 0x40000000;
@@ -919,6 +966,7 @@ pub const PMC_SCRATCH0_MODE_RCM: u32 = 0x2;
 pub const PMC_SCRATCH0_MODE_PAYLOAD: u32 = 0x20000000;
 pub const PMC_SCRATCH0_MODE_BOOTLOADER: u32 = 0x40000000;
 pub const PMC_SCRATCH0_MODE_RECOVERY: u32 = 0x80000000;
+pub const PMC_SCRATCH0_MODE_CUSTOM_ALL: u32 = 0xe0000000;
 pub const APBDEV_PMC_SCRATCH1: u32 = 0x54;
 pub const APBDEV_PMC_SCRATCH2: u32 = 0x58;
 pub const APBDEV_PMC_SCRATCH3: u32 = 0x5c;
@@ -2393,6 +2441,9 @@ pub const MAX77621_DISCH_ENABLE: u32 = 0x20;
 pub const MAX77621_WDTMR_ENABLE: u32 = 0x40;
 pub const MAX77621_T_JUNCTION_120: u32 = 0x80;
 pub const MAX77621_CPU_CTRL1_POR_DEFAULT: u32 = 0x2;
+pub const MAX77621_CPU_CTRL1_HOS_DEFAULT: u32 = 0xb0;
+pub const MAX77621_CPU_CTRL2_POR_DEFAULT: u32 = 0x9d;
+pub const MAX77621_CPU_CTRL2_HOS_DEFAULT: u32 = 0xc1;
 pub const MAX77621_CTRL_HOS_CFG: u32 = 0x0;
 pub const MAX77621_CTRL_POR_CFG: u32 = 0x1;
 
@@ -4591,6 +4642,24 @@ pub const PANEL_OEM_CLONE_6_2: u32 = 0xf83;
 pub const PANEL_OEM_CLONE_5_5: u32 = 0xb3;
 pub const PANEL_OEM_CLONE: u32 = 0x0;
 
+// bdk/display/vic.h
+pub const VIC_THI_SLCG_OVERRIDE_LOW_A: u32 = 0x8c;
+pub const VIC_ROTATION_0: u32 = 0x0;
+pub const VIC_ROTATION_90: u32 = 0x1;
+pub const VIC_ROTATION_180: u32 = 0x2;
+pub const VIC_ROTATION_270: u32 = 0x3;
+pub const VIC_PIX_FORMAT_L8: u32 = 0x1;
+pub const VIC_PIX_FORMAT_X1B5G5R5: u32 = 0x15;
+pub const VIC_PIX_FORMAT_B5G5R5X1: u32 = 0x17;
+pub const VIC_PIX_FORMAT_A8B8G8R8: u32 = 0x1f;
+pub const VIC_PIX_FORMAT_A8R8G8B8: u32 = 0x20;
+pub const VIC_PIX_FORMAT_B8G8R8A8: u32 = 0x21;
+pub const VIC_PIX_FORMAT_R8G8B8A8: u32 = 0x22;
+pub const VIC_PIX_FORMAT_X8B8G8R8: u32 = 0x23;
+pub const VIC_PIX_FORMAT_X8R8G8B8: u32 = 0x24;
+pub const VIC_PIX_FORMAT_B8G8R8X8: u32 = 0x25;
+pub const VIC_PIX_FORMAT_R8G8B8X8: u32 = 0x26;
+
 // bdk/storage/sdmmc_t210.h
 pub const SDHCI_TEGRA_TUNING_TAP_HW_UPDATED: u32 = 0x20000;
 pub const SDHCI_TEGRA_DLLCAL_CALIBRATE: u32 = 0x80000000;
@@ -4736,6 +4805,7 @@ pub const SDHCI_ERR_INT_TARGET_RSP: u32 = 0x1000;
 pub const SDHCI_ERR_INT_SPI: u32 = 0x2000;
 pub const SDHCI_ERR_INT_VND_BOOT_TMO: u32 = 0x4000;
 pub const SDHCI_ERR_INT_VND_BOOT_ACK: u32 = 0x8000;
+pub const SDHCI_ERR_INT_ALL_EXCEPT_ADMA_BUSPWR: u32 = 0x17f;
 pub const SDHCI_CAP_TM_CLK_FREQ_MASK: u32 = 0x3f;
 pub const SDHCI_CAP_TM_UNIT_MHZ: u32 = 0x80;
 pub const SDHCI_CAP_BASE_CLK_FREQ_MASK: u32 = 0xff00;

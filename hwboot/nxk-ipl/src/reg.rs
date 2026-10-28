@@ -9,6 +9,8 @@ pub const GPIO: u32 = 0x6000_D000;
 pub const APB_MISC: u32 = 0x7000_0000;
 pub const PINMUX_AUX: u32 = 0x7000_3000;
 pub const UART: u32 = 0x7000_6000;
+pub const I2C: u32 = 0x7000_C000;
+pub const RTC: u32 = 0x7000_E000;
 pub const PMC: u32 = 0x7000_E400;
 pub const FUSE: u32 = 0x7000_F800;
 

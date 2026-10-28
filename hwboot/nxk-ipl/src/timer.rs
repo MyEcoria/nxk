@@ -1,8 +1,9 @@
-//! Time: the microsecond counter and the BPMP's timed halts (hekate
-//! bdk/soc/timer.c and bpmp.c without USE_RTC_TIMER: delays halt the BPMP
-//! in the flow controller, so they show in a register trace).
+//! Time (hekate bdk/soc/timer.c, built with USE_RTC_TIMER): delays poll
+//! the microsecond counter, milliseconds the RTC; the BPMP's timed halts
+//! in the flow controller only cover a counter about to wrap.
 
-use crate::reg::{rd, wr, FLOW_CTLR, TMR};
+use crate::hdr::{APBDEV_RTC_MILLI_SECONDS, APBDEV_RTC_SHADOW_SECONDS};
+use crate::reg::{rd, wr, FLOW_CTLR, RTC, TMR};
 
 const TIMERUS_CNTR_1US: u32 = TMR + 0x10;
 const FLOW_CTLR_HALT_COP_EVENTS: u32 = FLOW_CTLR + 0x4;
@@ -16,8 +17,30 @@ pub fn now_us() -> u32 {
     rd(TIMERUS_CNTR_1US)
 }
 
+/// `get_tmr_ms`: the RTC, milliseconds read first (it latches the seconds).
+pub fn now_ms() -> u32 {
+    let ms = rd(RTC + APBDEV_RTC_MILLI_SECONDS);
+    ms.wrapping_add(rd(RTC + APBDEV_RTC_SHADOW_SECONDS).wrapping_mul(1000))
+}
+
+/// `usleep`.
+pub fn usleep(us: u32) {
+    let start = now_us();
+    if start.wrapping_add(us) < start {
+        bpmp_usleep(us);
+    } else {
+        while now_us().wrapping_sub(start) <= us {}
+    }
+}
+
+/// `msleep`.
+pub fn msleep(ms: u32) {
+    let start = now_ms();
+    while now_ms().wrapping_sub(start) <= ms {}
+}
+
 /// `bpmp_usleep`.
-pub fn usleep(mut us: u32) {
+pub fn bpmp_usleep(mut us: u32) {
     while us > 0 {
         let d = us.min(HALT_MAX_CNT);
         us -= d;
@@ -26,7 +49,7 @@ pub fn usleep(mut us: u32) {
 }
 
 /// `bpmp_msleep`.
-pub fn msleep(mut ms: u32) {
+pub fn bpmp_msleep(mut ms: u32) {
     while ms > 0 {
         let d = ms.min(HALT_MAX_CNT);
         ms -= d;

@@ -15,6 +15,7 @@ import os
 import re
 
 HEADERS = [
+    "bdk/memory_map.h",
     "bdk/soc/t210.h",
     "bdk/soc/bpmp.h",
     "bdk/soc/ccplex.h",
@@ -38,6 +39,7 @@ HEADERS = [
     "bdk/mem/emc_t210.h",
     "bdk/mem/sdram.h",
     "bdk/display/di.h",
+    "bdk/display/vic.h",
     "bdk/storage/sdmmc_t210.h",
     "bdk/storage/sdmmc_driver.h",
     "bdk/storage/sdmmc.h",
@@ -78,7 +80,11 @@ def main():
     known, order, seen = {}, [], set()
     for h in HEADERS:
         in_enum = False
-        for line in open(os.path.join(a.hekate, h), encoding="utf-8", errors="replace"):
+        text = open(os.path.join(a.hekate, h), encoding="utf-8", errors="replace").read()
+        # Continued lines joined, comments inside them dropped.
+        text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+        text = text.replace("\\\n", " ")
+        for line in text.splitlines():
             if re.match(r"^\s*(typedef\s+)?enum\b", line):
                 in_enum = True
                 continue

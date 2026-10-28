@@ -9,7 +9,12 @@
 
 mod clock;
 mod hdr;
+mod hw;
+mod i2c;
+mod pmic;
 mod reg;
+mod sdram;
+mod soc;
 mod timer;
 mod uart;
 
@@ -61,8 +66,9 @@ _real_start:
 
 #[no_mangle]
 extern "C" fn ipl_main() -> ! {
+    hw::init();
     uart::init_debug();
-    uart::puts("\n[nxk-ipl] BPMP payload running\n");
+    uart::puts("\n[nxk-ipl] hardware up\n");
     halt()
 }
 
