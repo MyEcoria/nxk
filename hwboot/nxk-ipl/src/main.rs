@@ -10,6 +10,7 @@
 mod battery;
 mod ccplex;
 mod clock;
+mod con;
 mod di_tables;
 mod display;
 mod fat;
@@ -138,6 +139,11 @@ extern "C" fn ipl_main() -> ! {
     // The BPMP overclocked as hekate does it (back to 408 MHz at the launch).
     soc::bpmp_clk_rate_set(if soc::is_t210() { soc::BPMP_CLK_SUPER_BOOST } else { soc::BPMP_CLK_HYPER_BOOST });
     display::window_a();
+    con::ready();
+    // Vol+ held: the log rather than the boot screen, as nxk-bl31 does.
+    if !soc::gpio_read(hdr::GPIO_PORT_X, hdr::GPIO_PIN_6) {
+        con::show();
+    }
     display::splash(nxk_bootsplash::AT_IPL, true);
     display::backlight_pwm_init();
     display::brightness(100, 1000);
@@ -155,6 +161,12 @@ extern "C" fn ipl_main() -> ! {
         }
         None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),
     }
+    fail()
+}
+
+/// Stopped on an error: the log on the screen, then halt.
+pub fn fail() -> ! {
+    con::show();
     halt()
 }
 
@@ -192,6 +204,7 @@ fn train(entries: usize) -> Option<nxk_emc::Mtc<'static>> {
 /// The card, its FAT32 volume, then the two stages of nxk and the DRAM
 /// table.
 fn load() -> Option<(u32, u32, usize)> {
+    println!("[nxk-ipl] SD card: opening");
     let (card, board) = match sd::open() {
         Ok(c) => c,
         Err(e) => {
@@ -202,10 +215,24 @@ fn load() -> Option<(u32, u32, usize)> {
     println!("[nxk-ipl] SD card: {} MiB, {}-bit bus", card.blocks / 2048, card.bus_width());
     let r = (|| {
         let vol = fat::Volume::open(&card)?;
-        let bl31 = vol.lookup(&card, "nxk/bl31.bin")?;
-        let bl33 = vol.lookup(&card, "nxk/bl33.bin")?;
-        let bl31 = vol.read(&card, &bl31, TZDRAM_BASE)?;
-        let bl33 = vol.read(&card, &bl33, BL33_LOAD_BASE)?;
+        let find = |path| {
+            let f = vol.lookup(&card, path);
+            if f.is_none() {
+                println!("[nxk-ipl] {}: not found", path);
+            }
+            f
+        };
+        let read = |path, f: &fat::File, dst| {
+            let n = vol.read(&card, f, dst);
+            if n.is_none() {
+                println!("[nxk-ipl] {}: read failed ({} bytes)", path, f.size);
+            }
+            n
+        };
+        let bl31 = find("nxk/bl31.bin")?;
+        let bl33 = find("nxk/bl33.bin")?;
+        let bl31 = read("nxk/bl31.bin", &bl31, TZDRAM_BASE)?;
+        let bl33 = read("nxk/bl33.bin", &bl33, BL33_LOAD_BASE)?;
         // The DRAM training table (Erista): none means the boot rate.
         let mut entries = 0;
         if soc::is_t210() {
@@ -234,5 +261,5 @@ pub fn halt() -> ! {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     uart::puts("\n[nxk-ipl] panic\n");
-    halt()
+    fail()
 }

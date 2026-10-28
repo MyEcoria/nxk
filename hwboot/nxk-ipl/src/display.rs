@@ -376,6 +376,9 @@ pub fn rect(x: u32, y: u32, w: u32, h: u32, rgb: u32) {
 
 /// The boot screen at `p` thousandths into the framebuffer (window A).
 pub fn splash(p: u32, full: bool) {
+    if crate::con::is_text() {
+        return;
+    }
     let view = Splash::new(FB_H, FB_W);
     let mut fill = |x, y, w, h, c| {
         let (x, y, w, h) = splash::turn(x, y, w, h, FB_H);

@@ -37,14 +37,28 @@ fn le32(b: &[u8], o: usize) -> u32 {
 
 impl Volume {
     pub fn open(card: &SdCard) -> Option<Self> {
-        let mbr = sector(card, 0)?;
+        let Some(mbr) = sector(card, 0) else {
+            crate::println!("[nxk-ipl] SD: sector 0 not read");
+            return None;
+        };
+        let (sig, kind) = (le16(mbr, 510), mbr[0x1C2]);
         let mut start = 0;
-        if mbr[510] == 0x55 && mbr[511] == 0xAA && matches!(mbr[0x1C2], 0x0B | 0x0C) {
+        if sig == 0xAA55 && matches!(kind, 0x0B | 0x0C) {
             start = le32(mbr, 0x1C6);
         }
-        let bpb = sector(card, start)?;
+        let Some(bpb) = sector(card, start) else {
+            crate::println!("[nxk-ipl] SD: sector {} (volume start) not read", start);
+            return None;
+        };
         if le16(bpb, 11) != SECTOR || le16(bpb, 0x16) != 0 {
-            return None; // not 512-byte sectors, or not FAT32
+            crate::println!(
+                "[nxk-ipl] SD: no FAT32 volume (MBR {:#x}, first partition type {:#x} at {}, sector size {})",
+                sig,
+                kind,
+                le32(mbr, 0x1C6),
+                le16(bpb, 11)
+            );
+            return None;
         }
         let per_cluster = bpb[13] as u32;
         let reserved = le16(bpb, 14);

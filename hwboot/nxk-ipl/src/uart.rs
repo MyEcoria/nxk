@@ -70,6 +70,9 @@ fn wait_xfer(which: u32) {
 }
 
 pub fn putc(c: u8) {
+    if c != b'\r' {
+        crate::con::byte(c);
+    }
     while r(LSR) & UART_LSR_THRE == 0 {}
     w(THR_DLAB, c as u32);
 }

@@ -79,6 +79,7 @@ pub fn check() -> bool {
     let charging = charge_status();
     let mv = battery_mv();
     crate::report::set(crate::report::BATTERY_MV, mv);
+    crate::println!("[nxk-ipl] battery {} mV, charger status {}", mv, charging);
     let mut lit = false;
     if mv != 0 && mv <= enough_mv(charging) {
         crate::println!("[nxk-ipl] battery low ({} mV): waiting for the charger", mv);
