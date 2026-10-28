@@ -3,10 +3,11 @@
 # PAYLOAD (default hekate, autobooting its [nxk] L4T entry) -> nxk-bl31 ->
 # nxk -> shell. hekate's run is the reference nxk-ipl is compared with.
 # Usage: oracle.sh [-m tegrax1|tegrax1plus] [-p PAYLOAD] [-r DRAMID] [-t TRACE] [-s SECS]
-#                  [-d SHOT.ppm] [-u UART.log]
+#                  [-d SHOT.ppm] [-u UART.log] [-x ADDR:LEN:FILE]
 #   -r: the DRAM id in the emulated fuses (hekate fuse_read_dramid, default 0).
 #   -t: every BPMP and CPU register access (QEMU memory_region_ops) to TRACE.
-#   -d: the screen at the end. -u: UART-A's whole output.
+#   -d: the screen at the end. -u: UART-A's whole output. -x: physical
+#   memory at the end (e.g. 0xFFE80000:24640:mtc.bin, the DRAM table).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -18,9 +19,10 @@ payload="$here/dl/hekate_ctcaer_6.5.4.bin"
 trace=""
 shot=""
 ulog=""
+xdump=""
 secs=120
 dramid=0
-while getopts "m:p:r:t:s:d:u:" o; do
+while getopts "m:p:r:t:s:d:u:x:" o; do
     case "$o" in
     m) machine="$OPTARG" ;;
     p) payload="$OPTARG" ;;
@@ -29,6 +31,7 @@ while getopts "m:p:r:t:s:d:u:" o; do
     r) dramid="$OPTARG" ;;
     d) shot="$(realpath -m "$OPTARG")" ;;
     u) ulog="$(realpath -m "$OPTARG")" ;;
+    x) xdump="$OPTARG" ;;
     *) sed -n 2,6p "$0" >&2; exit 2 ;;
     esac
 done
@@ -67,6 +70,11 @@ adds=(--add "$tmp/hekate_ipl.ini:/bootloader/hekate_ipl.ini"
 while IFS= read -r f; do
     adds+=(--add "$f:/${f#"$tmp/card/"}")
 done < <(find "$tmp/card" -type f)
+# nxk-ipl's DRAM training tables (tools/mkemctab.py refs/hekate build/mtc).
+for v in 0 2 7; do
+    t="$root/build/mtc/odinx02_$v.bin"
+    [ ! -s "$t" ] || adds+=(--add "$t:/nxk/mtc_$v.bin")
+done
 python3 "$root/tools/mksd.py" -o "$tmp/sd.img" --size 256 --no-bin "${adds[@]}" >/dev/null
 
 # Fuses as on a retail console: SKU 0x83 (ODIN, which Minerva requires) and
@@ -95,6 +103,16 @@ while [ $(($(date +%s) - start)) -lt "$secs" ]; do
     grep -q "nxk> " "$tmp/uart.log" 2>/dev/null && break
     kill -0 "$pid" 2>/dev/null || break
 done
+if [ -n "$xdump" ]; then
+    IFS=: read -r xa xl xf <<<"$xdump"
+    python3 - "$tmp/mon" "$xa" "$xl" "$(realpath -m "$xf")" <<'PY'
+import socket, sys, time
+m = socket.socket(socket.AF_UNIX)
+m.connect(sys.argv[1])
+m.sendall(f"pmemsave {sys.argv[2]} {sys.argv[3]} \"{sys.argv[4]}\"\n".encode())
+time.sleep(2)
+PY
+fi
 if [ -n "$shot" ]; then
     python3 - "$tmp/mon" "$shot" <<'PY'
 import socket, sys, time

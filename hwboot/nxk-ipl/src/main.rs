@@ -16,6 +16,7 @@ mod hdr;
 mod hw;
 mod i2c;
 mod l4t;
+mod minerva;
 mod pmic;
 mod reg;
 mod sd;
@@ -84,10 +85,11 @@ extern "C" fn ipl_main() -> ! {
     display::backlight_pwm_init();
     display::brightness(100, 1000);
     match load() {
-        Some((bl31, bl33)) => {
-            println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes: starting the CPU", bl31, bl33);
+        Some((bl31, bl33, mtc_entries)) => {
+            println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes", bl31, bl33);
             display::splash(nxk_bootsplash::AT_LOADED, false);
-            l4t::launch()
+            let mtc = train(mtc_entries);
+            l4t::launch(mtc)
         }
         None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),
     }
@@ -99,8 +101,27 @@ extern "C" fn ipl_main() -> ! {
 const TZDRAM_BASE: u32 = 0xFFF0_0000;
 const BL33_LOAD_BASE: u32 = 0xAA00_0000;
 
-/// The card, its FAT32 volume, then the two stages of nxk.
-fn load() -> Option<(u32, u32)> {
+/// Minerva's training (`minerva_init`), DRAM at 1600 MHz; None without a
+/// table or on a failure (reported).
+fn train(entries: usize) -> Option<nxk_emc::Mtc<'static>> {
+    if entries == 0 {
+        return None;
+    }
+    match minerva::init(entries) {
+        Ok(m) => {
+            println!("[nxk-ipl] DRAM trained, {} MHz", minerva::rate_mhz(&m));
+            Some(m)
+        }
+        Err(e) => {
+            println!("[nxk-ipl] DRAM training failed: {:?}", e);
+            None
+        }
+    }
+}
+
+/// The card, its FAT32 volume, then the two stages of nxk and the DRAM
+/// table.
+fn load() -> Option<(u32, u32, usize)> {
     let (card, board) = match sd::open() {
         Ok(c) => c,
         Err(e) => {
@@ -113,7 +134,18 @@ fn load() -> Option<(u32, u32)> {
         let vol = fat::Volume::open(&card)?;
         let bl31 = vol.lookup(&card, "nxk/bl31.bin")?;
         let bl33 = vol.lookup(&card, "nxk/bl33.bin")?;
-        Some((vol.read(&card, &bl31, TZDRAM_BASE)?, vol.read(&card, &bl33, BL33_LOAD_BASE)?))
+        let bl31 = vol.read(&card, &bl31, TZDRAM_BASE)?;
+        let bl33 = vol.read(&card, &bl33, BL33_LOAD_BASE)?;
+        // The DRAM training table (Erista): none means the boot rate.
+        let mut entries = 0;
+        if soc::is_t210() {
+            let name = minerva::table_file(sdram::dram_id());
+            match vol.lookup(&card, name).filter(|f| f.size <= minerva::BUF_BYTES) {
+                Some(f) => entries = vol.read(&card, &f, minerva::BUF)? as usize / (nxk_emc::TABLE_WORDS * 4),
+                None => println!("[nxk-ipl] {} missing: the DRAM stays at its boot rate", name),
+            }
+        }
+        Some((bl31, bl33, entries))
     })();
     sd::close(&card, &board);
     r

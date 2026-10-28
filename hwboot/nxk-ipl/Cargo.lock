@@ -7,10 +7,15 @@ name = "nxk-bootsplash"
 version = "0.1.0"
 
 [[package]]
+name = "nxk-emc"
+version = "0.1.0"
+
+[[package]]
 name = "nxk-ipl"
 version = "0.1.0"
 dependencies = [
  "nxk-bootsplash",
+ "nxk-emc",
  "nxk-sdcard",
 ]
 

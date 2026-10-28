@@ -7,6 +7,7 @@ use crate::ccplex;
 use crate::clock::{self, car, set_car};
 use crate::hdr::*;
 use crate::hw;
+use crate::minerva;
 use crate::reg::{rd, wr};
 use crate::soc;
 
@@ -95,10 +96,6 @@ fn config_carveouts(t210b01: bool) {
     mc(MC_SEC_CARVEOUT_REG_CTRL, 0);
 
     let mut base = GEN_CARVEOUT_TOP;
-    // Minerva's table place (MTCTABLE_BASE, 256 KiB): zero until nxk-ipl
-    // trains the DRAM, so `emc` finds no table (revision 0) rather than
-    // whatever DRAM held at power-on.
-    unsafe { core::ptr::write_bytes((GEN_CARVEOUT_TOP + (512 << 10)) as *mut u8, 0, 256 << 10) };
     soc::bpmp_mmu_maintenance(18, false); // BPMP_MMU_MAINT_INVALID_WAY
     carveout(
         1,
@@ -185,8 +182,9 @@ fn hw_deinit() {
     }
 }
 
-/// Start nxk-bl31 on CPU0 and stop the BPMP.
-pub fn launch() -> ! {
+/// Start nxk-bl31 on CPU0 and stop the BPMP. `mtc`: the trained DRAM
+/// table (none: the DRAM stays at its rate and `emc` finds no table).
+pub fn launch(mtc: Option<nxk_emc::Mtc>) -> ! {
     let t210b01 = !soc::is_t210();
     soc::mc_disable_ahb_redirect();
 
@@ -196,6 +194,19 @@ pub fn launch() -> ! {
     clock::enable(&UARTB_CLK);
     soc::gpio_config(GPIO_PORT_G, GPIO_PIN_0, false);
     soc::gpio_config(GPIO_PORT_D, GPIO_PIN_1, false);
+
+    // The EMC table: the rest trained, 800 MHz to boot at, then published.
+    match mtc.map(|mut m| (minerva::prep_boot(&mut m), m)) {
+        Some((Ok(n), m)) => {
+            minerva::publish(n);
+            crate::println!("[nxk-ipl] DRAM at {} MHz, {} trained entries", minerva::rate_mhz(&m), n);
+        }
+        Some((Err(e), _)) => {
+            crate::println!("[nxk-ipl] DRAM boot rate: {:?}", e);
+            minerva::clear();
+        }
+        None => minerva::clear(),
+    }
 
     config_carveouts(t210b01);
     hw_deinit();
