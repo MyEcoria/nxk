@@ -3,11 +3,12 @@
 # PAYLOAD (default hekate, autobooting its [nxk] L4T entry) -> nxk-bl31 ->
 # nxk -> shell. hekate's run is the reference nxk-ipl is compared with.
 # Usage: oracle.sh [-m tegrax1|tegrax1plus] [-p PAYLOAD] [-r DRAMID] [-t TRACE] [-s SECS]
-#                  [-d SHOT.ppm] [-u UART.log] [-x ADDR:LEN:FILE]
+#                  [-d SHOT.ppm] [-u UART.log] [-x ADDR:LEN:FILE] [-g PORT]
 #   -r: the DRAM id in the emulated fuses (hekate fuse_read_dramid, default 0).
 #   -t: every BPMP and CPU register access (QEMU memory_region_ops) to TRACE.
 #   -d: the screen at the end. -u: UART-A's whole output. -x: physical
 #   memory at the end (e.g. 0xFFE80000:24640:mtc.bin, the DRAM table).
+#   -g: start paused, QEMU's gdb stub on PORT (hwboot/gdbrsp.py drives it).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
@@ -20,9 +21,10 @@ trace=""
 shot=""
 ulog=""
 xdump=""
+gdbport=""
 secs=120
 dramid=0
-while getopts "m:p:r:t:s:d:u:x:" o; do
+while getopts "m:p:r:t:s:d:u:x:g:" o; do
     case "$o" in
     m) machine="$OPTARG" ;;
     p) payload="$OPTARG" ;;
@@ -32,6 +34,7 @@ while getopts "m:p:r:t:s:d:u:x:" o; do
     d) shot="$(realpath -m "$OPTARG")" ;;
     u) ulog="$(realpath -m "$OPTARG")" ;;
     x) xdump="$OPTARG" ;;
+    g) gdbport="$OPTARG" ;;
     *) sed -n 2,6p "$0" >&2; exit 2 ;;
     esac
 done
@@ -95,6 +98,7 @@ args=(-object "secret,id=tegra.fuse.cache,file=$tmp/fuses.bin,format=raw"
     -serial "file:$tmp/uart.log" -serial null -serial null -serial null
     -monitor "unix:$tmp/mon,server,nowait")
 [ -z "$trace" ] || args+=(-d trace:memory_region_ops_write,trace:memory_region_ops_read -D "$trace")
+[ -z "$gdbport" ] || args+=(-S -gdb "tcp::$gdbport")
 "$qemu" "${args[@]}" >"$tmp/qemu.log" 2>&1 &
 pid=$!
 start=$(date +%s)

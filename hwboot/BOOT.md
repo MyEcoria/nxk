@@ -47,7 +47,10 @@ fuses with a chosen DRAM id) to nxk's shell, and can trace every register
 access. `hwboot/tracecmp.py` compares the BPMP's accesses of hekate's run
 and nxk-ipl's. Where the order legitimately differs (another SD driver,
 the CPU started by nxk-ipl rather than NVIDIA's `bpmpfw.bin`), the check
-becomes the registers' state at the CPU's start.
+becomes the registers' state at the CPU's start. `oracle.sh -g PORT`
+starts a run paused under QEMU's gdb stub, which `hwboot/gdbrsp.py`
+drives: the DRAM table at bpmpfw's and bl31's entries, a watchpoint, or
+a hang written into nxk-ipl to fire its watchdog.
 
 ## Design: two stages
 
@@ -94,14 +97,25 @@ modules:
    FIQ restarts nxk-ipl without training (tested by writing a hang into
    training over the gdb stub). Mariko: no training, as hekate's
    table-less boost path and `bpmpfw_b01.bin`'s DVFS are not ported.
-9. LP0 parameters in PMC scratch (SC7) and hekate's bl31 parameters
-   (`SECURE_SCRATCH108`-`114`): not written. Nothing in nxk reads them
-   today (nxk-bl31 only logs whether hekate's magic is there); SC7 will
-   need the LP0 block. Low-battery check: not ported yet.
-   State at the CPU's start otherwise equal to hekate's, but for the eMMC
-   clock source and pad (hekate's eMMC init), UART-A (nxk-ipl's log) and
-   the BPMP exception vectors.
-10. Console run, with Pierric's go: Erista first.
+9. Battery: hekate's `_check_low_battery` ported (charger enabled at
+   every boot, empty-battery screen and wait for the charger, power-off
+   when not charging, the PMIC's low-battery shutdown armed again; the
+   power-off path is not emulated). LP0 parameters in PMC scratch (SC7)
+   and hekate's bl31 parameters (`SECURE_SCRATCH108`-`114`): not written;
+   nothing in nxk reads them today, SC7 will need the LP0 block.
+   State at the CPU's start otherwise equal to hekate's (registers, I2C
+   transactions), but for the eMMC clock source and pad (hekate's eMMC
+   init), UART-A (nxk-ipl's log), the BPMP exception vectors and the SD
+   rail's power-up order (`nxk-sdcard`, same end state).
+   UART-A's pads are internal on a console: nxk-ipl leaves a record in
+   IRAM (`report.rs`) that nxk-bl31 prints, on the screen in text mode.
+   Not checked on hardware: after a watchdog restart nxk-ipl starts the
+   panel again with the backlight on (hekate's is still off there).
+10. Console run, with Pierric's go: Erista first. Battery charged (no
+    risk-free low-battery path yet on hardware), SD from `mksd-hw.sh`
+    (hekate stays on it as the fallback), `nxk-ipl.bin` injected with
+    Vol+ held for the text log: nxk-bl31's `nxk-ipl:` line should read
+    800 MHz and 5 trained entries, and `emc` in the USB-C shell the same.
 
 ## Notes
 
