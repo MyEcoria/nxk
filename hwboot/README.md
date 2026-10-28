@@ -297,12 +297,12 @@ directories: the program `NAME`, `game.txt` (`title=`, `publisher=`,
 `version=`, `description=`, `color=RRGGBB`) and `cover.bin` (its art,
 `tools/mkcovers.py`), re-read every 8 s; the time played goes to
 `/users/ID/playtime.cfg` of the user playing (users and their save
-data: `/users/ID/`, README "Users and save data"). `mksd-hw.sh` installs the ones built from
+data: `/users/ID/`, DEV.md "Users and save data"). `mksd-hw.sh` installs the ones built from
 `jeux/`; for a card in the console,
 `./tools/usbterm.py --put LOCAL:/games/NAME/NAME` (the directory first:
 `-c "mkdir /games/NAME"` in an earlier call).
 
-Game catalogs ("services", README "Services: game catalogs") go the same
+Game catalogs ("services", DEV.md "Services: game catalogs") go the same
 way: `mksd-hw.sh` installs `services/*/` in `/services/NAME/`; for a card
 in the console, `-c "mkdir /services" -c "mkdir /services/NAME"`, then
 `--put` the program and its `service.txt`. L and R on the home screen
@@ -1488,7 +1488,7 @@ within 5 s.
 56. 23/10/2026, Erista, boot image of run 54, `power` and `display` of
     `9142d46` reloaded over USB-C, `services/luna` in `/services/luna/`:
     **Amazon Luna signed in on silicon**. No Wi-Fi joined, so the PC
-    shared its connection over the cable (README "Internet over USB-C",
+    shared its connection over the cable ("Internet over USB-C" above,
     `nmcli ... nxk-share`). `power`'s SNTP set the clock from 2000-01-07 to
     the real time (`RTC offset 845468256 s`, kept in `/config/rtc_offset`).
     The Luna tab showed the QR code and a code; the user entered it at
