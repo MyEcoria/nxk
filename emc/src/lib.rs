@@ -16,6 +16,7 @@
 pub mod layout;
 pub mod regs;
 mod seq;
+mod train;
 pub mod warm;
 
 pub use seq::{check_lpddr4, current_rate_khz, mc_mismatches, switch, switch_entries};
@@ -67,7 +68,7 @@ pub enum Error {
 
 /// One validated table entry.
 #[derive(Clone, Copy)]
-pub struct Table<'a>(&'a [u32]);
+pub struct Table<'a>(pub(crate) &'a [u32]);
 
 impl<'a> Table<'a> {
     /// Check size, revision and the counts the sequence indexes with.
@@ -112,7 +113,43 @@ impl<'a> Table<'a> {
     pub fn periodic(&self) -> bool {
         self.0[layout::PERIODIC_TRAINING] != 0
     }
+}
 
+/// Word access to a table entry, read-only or not.
+pub trait Words {
+    fn w(&self, i: usize) -> u32;
+}
+
+impl Words for Table<'_> {
+    fn w(&self, i: usize) -> u32 {
+        self.0[i]
+    }
+}
+
+/// A table entry the sequence may write: training results, clock tree
+/// delays (Minerva writes them into the destination entry).
+pub struct TableMut<'a>(&'a mut [u32]);
+
+impl<'a> TableMut<'a> {
+    pub fn new(words: &'a mut [u32]) -> Result<Self, Error> {
+        Table::new(words)?;
+        Ok(Self(words))
+    }
+
+    pub fn view(&self) -> Table<'_> {
+        Table(self.0)
+    }
+
+    pub fn rate_khz(&self) -> u32 {
+        self.0[layout::RATE_KHZ]
+    }
+
+    pub fn set(&mut self, i: usize, v: u32) {
+        self.0[i] = v;
+    }
+}
+
+impl Words for TableMut<'_> {
     fn w(&self, i: usize) -> u32 {
         self.0[i]
     }
