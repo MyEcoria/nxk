@@ -20,7 +20,7 @@ tried in the emulator only (see "Hardware runs").
 
 ```bash
 cd hwboot
-./fetch.sh        # hekate RCM payload + Nyx SD pack -> dl/ (pinned v6.5.3)
+./fetch.sh        # hekate RCM payload + Nyx SD pack -> dl/ (pinned v6.5.4)
 make -C fusee-nano  # builds ./fusee-nano/fusee-nano (17 KiB, zero deps)
 sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules

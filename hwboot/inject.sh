@@ -5,7 +5,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-payload="${1:-$here/dl/hekate_ctcaer_6.5.3.bin}"
+payload="${1:-$here/dl/hekate_ctcaer_6.5.4.bin}"
 [ -s "$payload" ] || { echo "[inject] missing payload: $payload (run ./fetch.sh)" >&2; exit 1; }
 
 if [ ! -x "$here/fusee-nano/fusee-nano" ]; then
