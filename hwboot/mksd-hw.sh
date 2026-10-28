@@ -91,6 +91,13 @@ python3 "$here/mkbl31.py" -o "$here/dl/bl31.bin"
 mkdir -p "$sd/nxk"
 cp "$here/dl/bl31.bin" "$sd/nxk/bl31.bin"
 cp "$root/build/nxk.bin" "$sd/nxk/bl33.bin"
+# nxk-ipl's DRAM training tables (Erista; hekate's ODINX02 sets by DRAM id).
+mtc="$root/build/mtc"
+[ -s "$mtc/odinx02_7.bin" ] || python3 "$root/tools/mkemctab.py" "$root/refs/hekate" "$mtc" >/dev/null
+for v in 0 2 7; do
+    [ -s "$mtc/odinx02_$v.bin" ] || { echo "[mksd-hw] missing $mtc/odinx02_$v.bin" >&2; exit 1; }
+    cp "$mtc/odinx02_$v.bin" "$sd/nxk/mtc_$v.bin"
+done
 mkdir -p "$sd/bootloader/ini"
 cp "$here/nxk.ini" "$sd/bootloader/ini/nxk.ini"
 if [ ! -d "$sd/bootloader/sys/l4t" ]; then
