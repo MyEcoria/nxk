@@ -24,7 +24,7 @@ mod train;
 pub mod warm;
 
 pub use seq::{check_lpddr4, current_rate_khz, mc_mismatches, switch, switch_entries};
-pub use train::{periodic_compensation, Mtc, Op};
+pub use train::{bpmp_ptsa_rates, periodic_compensation, Mtc, Op};
 
 /// Size of one table entry in words.
 pub const TABLE_WORDS: usize = layout::TABLE_WORDS;

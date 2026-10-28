@@ -195,9 +195,11 @@ pub fn launch(mtc: Option<nxk_emc::Mtc>) -> ! {
     soc::gpio_config(GPIO_PORT_G, GPIO_PIN_0, false);
     soc::gpio_config(GPIO_PORT_D, GPIO_PIN_1, false);
 
-    // The EMC table: the rest trained, 800 MHz to boot at, then published.
+    // The EMC table: the rest trained, 800 MHz to boot at, then published
+    // with the PTSA rates hekate's T210 bpmpfw.bin writes before the CPU runs.
     match mtc.map(|mut m| (minerva::prep_boot(&mut m), m)) {
-        Some((Ok(n), m)) => {
+        Some((Ok(n), mut m)) => {
+            m.set_bpmp_ptsa_rates();
             minerva::publish(n);
             crate::println!("[nxk-ipl] DRAM at {} MHz, {} trained entries", minerva::rate_mhz(&m), n);
         }

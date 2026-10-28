@@ -1728,3 +1728,46 @@ impl<'a> Mtc<'a> {
         Ok(())
     }
 }
+
+/// MC_MLL_MPCORER, MC_FTOP and the third LA scale register's PTSA rates
+/// at `rate_khz`, as NVIDIA's T210 bpmpfw.bin rewrites them in every entry
+/// before starting the CPU (watched in hekate's run; only FTOP's differs
+/// from the shipped tables). Same double operations in the same order.
+pub fn bpmp_ptsa_rates(rate_khz: u32) -> [u32; 3] {
+    const K: f64 = 0.017586255386667447; // bpmpfw's constant
+    // Up to the next integer, as its soft-float code does it.
+    fn up(x: f64) -> u32 {
+        let r = x as u32;
+        let frac = x - r as f64;
+        if x > 0.0 && frac > 0.0 {
+            (x + 1.0) as u32
+        } else if x <= 0.0 && frac < 0.0 {
+            (x - 1.0) as u32
+        } else {
+            r
+        }
+    }
+    let f = rate_khz as f64;
+    let h = f * 0.5 / 100.0;
+    let mll = up(h * 9.0 / 25000.0 * K * 4096.0).min(0xfff);
+    let ftop = up(h / 25000.0 * K * 4096.0).min(0xfff);
+    let mut t = f / 25000.0 * K;
+    let mut third = 0;
+    if t >= 1.0 {
+        t -= 1.0;
+        third = 0x1000;
+    }
+    [mll, ftop, third | up(t * 4096.0).min(0xfff)]
+}
+
+impl Mtc<'_> {
+    /// `bpmp_ptsa_rates` written to every entry (whole words).
+    pub fn set_bpmp_ptsa_rates(&mut self) {
+        let w = crate::TABLE_WORDS;
+        for i in 0..self.entries {
+            let e = &mut self.words[i * w..(i + 1) * w];
+            let r = bpmp_ptsa_rates(e[L::RATE_KHZ]);
+            e[L::LA_SCALE_REGS..L::LA_SCALE_REGS + 3].copy_from_slice(&r);
+        }
+    }
+}
