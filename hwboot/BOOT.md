@@ -64,25 +64,28 @@ modules:
 
 ## Steps and status
 
-1. Boot screen on the current chain: **done** (`bootsplash/`, branch
-   `feat/boot-screen`), not yet seen on the console.
-2. The oracle and the trace comparison: **done**.
+1. Boot screen on the current chain: **done** (`bootsplash/`), not yet
+   seen on the console.
+2. The oracle and the trace comparison (`--state` too): **done**.
 3. Stage 1 skeleton (relocation, UART-A, hekate's register names): **done**.
 4. hw_init and DRAM init: **done**, identical to hekate's accesses for the
    8 Erista DRAM ids and the 10 Mariko DRAM codes.
-5. SD card and FAT32 in stage 1: `user/sd`'s card logic (Rust, run on the
-   Erista) moved into a shared `no_std` crate; 3.3 V default speed first
-   (about 0.4 s per boot), faster modes later for both users. The BPMP
-   cache must be invalidated after each DMA read (the emulator does not
-   model it).
-6. Stage 2: CPU start and the state at handoff compared with hekate's.
-   First milestone: nxk's shell from nxk-ipl in the emulator.
-7. Panel bring-up and the boot screen from stage 2 (`display/panel`
-   moved into a shared crate).
-8. Minerva port. Until then the DRAM stays at its boot rate: the hekate
-   chain stays the console's boot path, and `emc` must refuse a missing
-   table at `0xFFE80000`.
-9. LP0 parameters (sleep), low-battery check, watchdog, as hekate.
+5. SD card and FAT32: **done** (`sdcard/`, the `sd` service's own code,
+   3.3 V default speed).
+6. CPU start and hand-off: **done** in stage 1 (hekate's
+   `ccplex_boot_cpu0`, L4T late config, carveouts equal to hekate's).
+   nxk reaches its shell from nxk-ipl in the emulator, Erista and Mariko.
+7. Panel and boot screen: **done** in stage 1 (every panel; DC, DSI,
+   PWM, MIPI CAL, GPIO and pinmux state equal to hekate's); the screen
+   shows 1 s after injection. 40 KiB of IRAM used: no stage 2 so far.
+8. Minerva port (next): training in `emc/` (`nxk-emc`, whose switch
+   path is already checked against hekate's C), its tables (one 34.5 KiB
+   table per DRAM id, read from the card or built in), then the table at
+   `0xFFE80000`. Until then the DRAM stays at its boot rate, `emc` sees no
+   table (nxk-ipl zeroes the place) and the hekate chain stays the
+   console's boot path. Mariko: hekate's init rate boost, and what NVIDIA's
+   `bpmpfw_b01.bin` does after the CPU starts (EMC DVFS) to decide.
+9. LP0 parameters in PMC scratch (SC7), low-battery check, watchdog.
 10. Console run, with Pierric's go: Erista first.
 
 ## Notes
