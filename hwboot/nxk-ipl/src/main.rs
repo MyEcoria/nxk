@@ -20,6 +20,7 @@ mod l4t;
 mod minerva;
 mod pmic;
 mod reg;
+mod report;
 mod sd;
 mod sdram;
 mod sdram_seq;
@@ -123,6 +124,11 @@ extern "C" fn ipl_main() -> ! {
     hw::init();
     uart::init_debug();
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
+    report::start();
+    report::set(report::DRAM_ID, sdram::dram_id());
+    if wdt_fired {
+        report::flag(report::F_WATCHDOG);
+    }
     // The battery before the panel, as hekate checks it.
     let lit = battery::check();
     pmic::rtc_prep_read();
@@ -169,6 +175,7 @@ fn train(entries: usize) -> Option<nxk_emc::Mtc<'static>> {
     let r = minerva::init(entries);
     timer::watchdog_end();
     let ms = timer::now_us().wrapping_sub(start) / 1000;
+    report::set(report::TRAIN_MS, ms);
     match r {
         Ok(m) => {
             println!("[nxk-ipl] DRAM trained in {} ms, {} MHz", ms, minerva::rate_mhz(&m));
@@ -176,6 +183,7 @@ fn train(entries: usize) -> Option<nxk_emc::Mtc<'static>> {
         }
         Err(e) => {
             println!("[nxk-ipl] DRAM training failed: {:?}", e);
+            report::flag(report::F_TRAIN_FAILED);
             None
         }
     }
@@ -204,7 +212,10 @@ fn load() -> Option<(u32, u32, usize)> {
             let name = minerva::table_file(sdram::dram_id());
             match vol.lookup(&card, name).filter(|f| f.size <= minerva::BUF_BYTES) {
                 Some(f) => entries = vol.read(&card, &f, minerva::BUF)? as usize / (nxk_emc::TABLE_WORDS * 4),
-                None => println!("[nxk-ipl] {} missing: the DRAM stays at its boot rate", name),
+                None => {
+                    println!("[nxk-ipl] {} missing: the DRAM stays at its boot rate", name);
+                    report::flag(report::F_NO_TABLE);
+                }
             }
         }
         Some((bl31, bl33, entries))

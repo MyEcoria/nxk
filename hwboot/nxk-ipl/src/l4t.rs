@@ -202,10 +202,13 @@ pub fn launch(mtc: Option<nxk_emc::Mtc>) -> ! {
         Some((Ok(n), mut m)) => {
             m.set_bpmp_ptsa_rates();
             minerva::publish(n);
+            crate::report::set(crate::report::ENTRIES, n as u32);
+            crate::report::set(crate::report::EMC_MHZ, minerva::rate_mhz(&m));
             crate::println!("[nxk-ipl] DRAM at {} MHz, {} trained entries", minerva::rate_mhz(&m), n);
         }
         Some((Err(e), _)) => {
             crate::println!("[nxk-ipl] DRAM boot rate: {:?}", e);
+            crate::report::flag(crate::report::F_PREP_FAILED);
             minerva::clear();
         }
         None => minerva::clear(),
