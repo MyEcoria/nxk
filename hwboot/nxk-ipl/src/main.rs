@@ -7,11 +7,13 @@
 #![no_std]
 #![no_main]
 
+mod ccplex;
 mod clock;
 mod fat;
 mod hdr;
 mod hw;
 mod i2c;
+mod l4t;
 mod pmic;
 mod reg;
 mod sd;
@@ -74,7 +76,10 @@ extern "C" fn ipl_main() -> ! {
     uart::init_debug();
     println!("\n[nxk-ipl] hardware up, DRAM id {}", sdram::dram_id());
     match load() {
-        Some((bl31, bl33)) => println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes", bl31, bl33),
+        Some((bl31, bl33)) => {
+            println!("[nxk-ipl] loaded bl31 {} bytes, bl33 {} bytes: starting the CPU", bl31, bl33);
+            l4t::launch()
+        }
         None => println!("[nxk-ipl] ERROR: nxk/bl31.bin and nxk/bl33.bin not loaded"),
     }
     halt()
