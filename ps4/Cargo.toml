@@ -2,7 +2,7 @@
 # Host-testable crates: `cd ps4 && cargo test` on the PC.
 [workspace]
 resolver = "2"
-members = ["ps4fmt"]
+members = ["ps4fmt", "x86emu"]
 
 [profile.release]
 opt-level = 3

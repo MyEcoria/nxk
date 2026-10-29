@@ -46,7 +46,7 @@ dump), then put the JIT behind the same decoder.
 | Phase | Content | State |
 |---|---|---|
 | 1 | `ps4fmt`: SHA-1, NIDs, `param.sfo`, plaintext ELF/SELF | done (host tests) |
-| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | next |
+| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | started: ALU, mov/lea/test, push/pop, jmp/jcc/ret (32/64-bit), bit-exact flags against the host CPU; no_std, builds for aarch64 |
 | 3 | PS4 runtime service (libkernel/libc imports by NID, threads, files) | to do |
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |

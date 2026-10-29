@@ -1,0 +1,6 @@
+[package]
+name = "x86emu"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "x86-64 decoder and interpreter for the nxk PS4 layer"
