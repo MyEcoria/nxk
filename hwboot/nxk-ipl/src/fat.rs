@@ -23,7 +23,10 @@ pub struct File {
 }
 
 fn sector(card: &SdCard, lba: u32) -> Option<&'static [u8; 512]> {
-    card.transfer(lba as u64, 1, true, BUF as u64).ok()?;
+    if let Err(e) = card.transfer(lba as u64, 1, true, BUF as u64) {
+        crate::println!("[nxk-ipl] SD: sector {} not read: {}", lba, nxk_sdcard::err_name(e));
+        return None;
+    }
     Some(unsafe { &*(BUF as *const [u8; 512]) })
 }
 
@@ -66,6 +69,14 @@ impl Volume {
         let fat_size = le32(bpb, 0x24);
         let root = le32(bpb, 0x2C);
         let fat = start + reserved;
+        crate::println!(
+            "[nxk-ipl] FAT32 at {}: {} sectors a cluster, FAT at {}, data at {}, root cluster {}",
+            start,
+            per_cluster,
+            fat,
+            fat + fats * fat_size,
+            root
+        );
         Some(Volume {
             fat,
             data: fat + fats * fat_size,
@@ -87,13 +98,23 @@ impl Volume {
     /// `name` (8.3, "NAME    EXT" form) in the directory at `dir`.
     fn find(&self, card: &SdCard, dir: u32, name: &[u8; 11]) -> Option<File> {
         let mut c = dir;
+        let mut seen = 0;
         loop {
             for k in 0..self.per_cluster {
                 let s = sector(card, self.cluster_lba(c) + k)?;
                 for e in s.chunks_exact(32) {
                     if e[0] == 0 {
+                        crate::println!("[nxk-ipl] FAT: {} entries in cluster {} and on, none named so", seen, dir);
                         return None;
                     }
+                    if seen < 12 && e[0] != 0xE5 && e[11] != 0x0F {
+                        crate::println!(
+                            "[nxk-ipl]   '{}' attr {:#x}",
+                            core::str::from_utf8(&e[..11]).unwrap_or("?"),
+                            e[11]
+                        );
+                    }
+                    seen += 1;
                     if e[0] == 0xE5 || e[11] == 0x0F || e[11] & 0x08 != 0 {
                         continue; // free, long name part, volume label
                     }
@@ -106,7 +127,13 @@ impl Volume {
                     }
                 }
             }
-            c = self.next(card, c)?;
+            c = match self.next(card, c) {
+                Some(n) => n,
+                None => {
+                    crate::println!("[nxk-ipl] FAT: end of directory {} after {} entries", dir, seen);
+                    return None;
+                }
+            };
         }
     }
 
