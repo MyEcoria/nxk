@@ -1556,6 +1556,13 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+78. 29/10/2026, same console and boot as run 76 (gauge 44 %, charging), `x86test`
+    with VEX (AVX1), BMI1, MOVBE, CRC32 and SSE3..SSE4.1 sent with `usbterm.py --put`:
+    6/6. The third guest pair, built at -O3 for the PS4's CPU (`-march=btver2`), prints
+    exactly what the PC's native run prints (456409 instructions, 5.5 MIPS at 998 MHz,
+    5.4 at 1224 MHz in a first build). That first build ran the ALU loop at 6.6 MIPS
+    (7.9 at 1224); with the rare paths kept out of the dispatch loop, 9.0 MIPS at
+    998 MHz and the guests 5.1 to 5.5. stdtest 19/19.
 77. 29/10/2026, same console and boot as run 76 (gauge 47 %, charging), `x86test`
     rebuilt with the wider x86-64 decoder and the PS4 runtime (`ps4rt`) and sent
     with `usbterm.py --put`: 5/5. The PC-built guests (`ps4/guest/`, a libc module

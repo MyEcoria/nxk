@@ -7,6 +7,7 @@ Needs gcc on an x86-64 Linux PC. Outputs (committed, so neither build.sh nor CI
 needs gcc):
   libmini.so   guest "libc" module (standard ELF dynamic tags)
   main.so      main program, imports by name (standard ELF)
+  *-jaguar.so  both again at -O3 for the PS4's CPU (-march=btver2: AVX, BMI1, SSE4.2)
   main.sce     main.so repacked in the PS4 layout: ET_SCE_DYNEXEC, dynamic tables in a
                PT_SCE_DYNLIBDATA segment under the SCE tags, imports named NID#lib#module
   expected.txt stdout of the same C built natively, then "exit N"
@@ -22,6 +23,8 @@ COMMON = ["-O2", "-fno-stack-protector", "-fcf-protection=none", "-fno-asynchron
           "-fno-ident", "-ffreestanding", "-nostdlib"]
 SO = COMMON + ["-fPIC", "-shared", "-Wl,-z,now", "-Wl,--hash-style=sysv", "-Wl,--build-id=none"]
 LIBMINI_EXTRA = ["-fno-tree-loop-distribute-patterns"]  # or memcpy's loop becomes a call to memcpy
+# Jaguar builds; the reference stays a generic native build (btver2 adds SSE4A, absent on Intel).
+JAGUAR = ["-O3", "-march=btver2"]
 
 PT_DYNAMIC, PT_GNU_STACK, PT_SCE_DYNLIBDATA = 2, 0x6474E551, 0x61000000
 ET_SCE_DYNEXEC = 0xFE10
@@ -154,6 +157,10 @@ def main():
     src = lambda n: os.path.join(HERE, n)
     run(["gcc", *SO, *LIBMINI_EXTRA, "-Wl,-soname,libmini.so", src("libmini.c"), "-o", os.path.join(OUT, "libmini.so")])
     run(["gcc", *SO, "-Wl,-e,_start", src("main.c"), "-L" + OUT, "-lmini", "-o", os.path.join(OUT, "main.so")])
+    run(["gcc", *SO, *JAGUAR, *LIBMINI_EXTRA, "-Wl,-soname,libmini.so", src("libmini.c"), "-o",
+         os.path.join(OUT, "libmini-jaguar.so")])
+    run(["gcc", *SO, *JAGUAR, "-Wl,-e,_start", src("main.c"), "-L" + OUT, "-lmini", "-o",
+         os.path.join(OUT, "main-jaguar.so")])
     with tempfile.TemporaryDirectory() as tmp:
         exe = os.path.join(tmp, "main.native")
         run(["gcc", *COMMON, *LIBMINI_EXTRA, "-static", "-no-pie", "-Wl,-e,native_entry",

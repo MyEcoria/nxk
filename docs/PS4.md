@@ -86,7 +86,7 @@ place, so it costs neither CPU time nor a copy.
 | Phase | Content | State |
 |---|---|---|
 | 1 | `ps4fmt`: SHA-1, NIDs, `param.sfo`, plaintext ELF/SELF | done (host tests) |
-| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; SSE2 integer and data moves (movdqa/movups/movd/movq, padd/psub/pcmpeq/pcmpgt/pmuludq, logic, shifts, pshufd, punpck). Every form compared with the host CPU (registers, defined flags, memory). Not yet: VEX/AVX, x87, SSE floating point, `syscall` |
+| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; MOVBE, CRC32 (SSE4.2), BMI1 (andn, bextr, blsi, blsmsk, blsr); SSE2..SSE4.1 integer and data moves (saturating, min/max, multiplies, pack/unpack, pshufb, palignr, pmovsx/zx, ptest, pextr/pinsr, pmovmskb...), legacy and VEX encoded; AVX1: VEX.128 for all of them (upper ymm half cleared), VEX.256 for the moves, the ps/pd logic, vinsertf128/vextractf128, vzeroupper/vzeroall. Alignment faults as on the CPU (legacy 128-bit operands, aligned moves). Every form compared with the host CPU (registers, defined flags, memory, both ymm halves). Not yet: x87, SSE/AVX floating point, F16C, SSE4A, SSE4.2 string compares, `syscall` |
 | 3 | PS4 runtime (`ps4rt`): loader, NID linker, HLE imports | started: maps PT_LOAD/RELRO, reads the dynamic tables in either layout (SCE tags in `PT_SCE_DYNLIBDATA` with `NID#lib#module` names, or standard `DT_*`), applies RELATIVE / 64 / GLOB_DAT / JUMP_SLOT, binds imports to guest modules first (the game's own `libc.prx`), then to HLE thunks; an import nothing provides stops the run with its NID when called. HLE so far: `write`, `_exit`. The entry is called with the SysV alignment (rsp + 8 on 16 bytes), checked by the interpreter: legacy-SSE 16-byte accesses other than movdqu/movups stop with `Misaligned`, as #GP would. Not yet: TLS relocations, threads, files, the other 1200 imports, data imports served by HLE (an STT_OBJECT import such as `__stack_chk_guard` gets a code-thunk address and faults when read, instead of naming its NID), the real entry convention of the eboot (to take from upstream's runtime) |
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |
@@ -103,16 +103,29 @@ PS4 toolchain builds (no CET, no stack protector through `fs:0x28`, `-z now`).
 SCE tags, imports named `NID#lib#module` from libkernel and libc). The outputs are
 committed so that neither `build.sh` nor CI needs gcc. Both layouts print exactly what
 the native run prints, on the PC (`cargo test -p ps4rt`), in the emulator and on the
-Erista (`x86test guest-elf`, `guest-sce`; hwboot run 77).
+Erista (`x86test guest-elf`, `guest-sce`; hwboot run 77). A third pair is the same C at
+-O3 for the PS4's CPU (`-march=btver2`: AVX, BMI1, SSE4.x; `*-jaguar.so`), against the
+same reference (`x86test guest-jaguar`; run 78).
 
 Decoder coverage of a binary: `x86emu/examples/coverage.rs` reads `mnemonic<TAB>bytes`
-lines (objdump output) and lists what `decode` rejects. The guests decode completely
-(1573 instructions, lengths equal to objdump's). Built for the PS4's CPU
-(`-march=btver2`) the same C needs VEX: 47 of 1542 instructions at -O2, 309 of 2293 at
--O3 (vmovdqu/vmovdqa, vpxor, vpand, vpmulld, vpsrld, vzeroupper...). VEX decoding onto
-the same operations, with the upper ymm halves, is the next decoder step; upstream's
-`port/docs/isa_rewrite.md` lists what else the 1.07 eboot uses (BMI1 1615 sites, LZCNT
-164, MOVBE 27, SSE4A 96, F16C 13), with AVX and SSE4.2 throughout.
+lines (objdump output) and lists what `decode` rejects. Every guest decodes completely,
+lengths equal to objdump's: 1573 instructions generic, 1542 (-O2) and 2293 (-O3) for
+`-march=btver2` (before VEX decoding: 47 and 309 rejected).
+
+The scope follows Jaguar, not the PC: AVX1 only, so a 256-bit integer op (AVX2) is
+refused, as it would be #UD on a PS4; BMI1 and MOVBE are in (upstream's
+`port/docs/isa_rewrite.md` counts 1615 BMI1 and 27 MOVBE sites in the 1.07 eboot), BMI2
+and FMA are not Jaguar's. Left for later: SSE4A (96 sites; no Intel host has it, so it
+cannot be compared with a native run), F16C (13 sites) with the floating-point phase. Upper
+ymm halves are a second array (`ymm_hi`) next to `xmm` rather than `[[u128; 2]; 16]`, so
+the SSE paths stay as they were; legacy writes keep the upper half, VEX.128 writes clear
+it.
+
+Next phase: floating point. x87 and SSE/AVX float need their own design, since the
+results must be bit-exact with the PS4: MXCSR rounding modes and exception flags, x86's
+NaN propagation (AArch64 returns a default NaN unless FPCR.DN is clear and the operand
+order matches), denormals and flush-to-zero (MXCSR.FTZ/DAZ against FPCR.FZ), 80-bit x87
+precision.
 
 For the JIT: EL0 cannot clean the data cache, but none is needed for code it writes:
 `vm::protect` cleans to the point of unification and invalidates the instruction cache
@@ -120,4 +133,4 @@ whenever a page becomes executable (`kernel/src/mm/vm.rs`), so RW then RX throug
 `mem_protect` is enough. tegra_qemu models no instruction cache, so the Erista is the
 only check of that path.
 
-Run the host tests: `cd ps4 && cargo test`. On nxk, `x86test` (apps/, in `build.sh` and on the SD card) replays 1568 ALU vectors recorded from a native run on a PC, checks self-modifying code and times the interpreter: `./tools/nxtest.py -c x86test --sd build/sd.img` (identical in the emulator; its MIPS figure is the emulator's, not the console's). On the Erista (hwboot run 76) all vectors match too, at 10.6 MIPS with the CPU at 998 MHz, about 94 cycles per guest instruction: two orders of magnitude below one 1.6 GHz Jaguar core, so the JIT of phase 5 is required, not an option. The wider decoder costs speed (run 77: 8.2 MIPS on the same loop at 998 MHz, 10.1 at 1224 MHz; the guests run at 5.1 and 6.2 MIPS; 47.5 MIPS on a PC, from 55): accepted, since the JIT replaces the interpreter on the hot path and the interpreter stays as the reference. Regenerate the vectors with the `gen_vectors` test (see its comment).
+Run the host tests: `cd ps4 && cargo test`. On nxk, `x86test` (apps/, in `build.sh` and on the SD card) replays 1568 ALU vectors recorded from a native run on a PC, checks self-modifying code and times the interpreter: `./tools/nxtest.py -c x86test --sd build/sd.img` (identical in the emulator; its MIPS figure is the emulator's, not the console's). On the Erista (hwboot run 76) all vectors match too, at 10.6 MIPS with the CPU at 998 MHz, about 94 cycles per guest instruction: two orders of magnitude below one 1.6 GHz Jaguar core, so the JIT of phase 5 is required, not an option. The wider decoder first cost speed (run 77: 8.2 MIPS on the same loop at 998 MHz; 47.5 on a PC, from 55); with the rare paths (SIMD, BMI, mul/div, bit ops, strings) kept out of the dispatch loop (`#[inline(never)]`), run 78 measures 9.0 MIPS at 998 MHz, the guests 5.1 to 5.5 MIPS, and 66 MIPS on a PC. The JIT stays required. Regenerate the vectors with the `gen_vectors` test (see its comment).

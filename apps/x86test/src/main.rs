@@ -98,8 +98,12 @@ const EXPECTED: &str = include_str!("../../../ps4/guest/bin/expected.txt");
 
 /// Load the guest "libc" and `main`, link by NID, run, compare with the PC's native output.
 fn guest(main: &[u8]) -> Result<String, String> {
+    guest_with(LIBMINI, main)
+}
+
+fn guest_with(libc: &[u8], main: &[u8]) -> Result<String, String> {
     let mut p = ps4rt::Process::new(ps4rt::hle::libkernel());
-    p.load("libmini.so", "libc", LIBMINI).map_err(|e| e.to_string())?;
+    p.load("libmini.so", "libc", libc).map_err(|e| e.to_string())?;
     let m = p.load("main", "main", main).map_err(|e| e.to_string())?;
     let report = p.link().map_err(|e| e.to_string())?;
     let t = Instant::now();
@@ -132,13 +136,22 @@ fn guest_sce() -> Result<String, String> {
     guest(include_bytes!("../../../ps4/guest/bin/main.sce"))
 }
 
+/// The same guests built at -O3 for the PS4's CPU (AVX, BMI1, SSE4.x).
+fn guest_jaguar() -> Result<String, String> {
+    guest_with(
+        include_bytes!("../../../ps4/guest/bin/libmini-jaguar.so"),
+        include_bytes!("../../../ps4/guest/bin/main-jaguar.so"),
+    )
+}
+
 fn main() {
-    let tests: [(&str, fn() -> Result<String, String>); 5] = [
+    let tests: [(&str, fn() -> Result<String, String>); 6] = [
         ("alu", alu_vectors),
         ("smc", self_modifying),
         ("speed", speed),
         ("guest-elf", guest_elf),
         ("guest-sce", guest_sce),
+        ("guest-jaguar", guest_jaguar),
     ];
     let mut failed = 0;
     for (name, test) in tests {

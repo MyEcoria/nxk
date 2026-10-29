@@ -6,11 +6,17 @@ use ps4rt::{hle, LinkReport, Outcome, Process};
 const LIBMINI: &[u8] = include_bytes!("../../guest/bin/libmini.so");
 const MAIN_SO: &[u8] = include_bytes!("../../guest/bin/main.so");
 const MAIN_SCE: &[u8] = include_bytes!("../../guest/bin/main.sce");
+const LIBMINI_JAGUAR: &[u8] = include_bytes!("../../guest/bin/libmini-jaguar.so");
+const MAIN_JAGUAR: &[u8] = include_bytes!("../../guest/bin/main-jaguar.so");
 const EXPECTED: &str = include_str!("../../guest/bin/expected.txt");
 
 fn run(main: &[u8]) -> (String, LinkReport) {
+    run_with(LIBMINI, main)
+}
+
+fn run_with(libc: &[u8], main: &[u8]) -> (String, LinkReport) {
     let mut p = Process::new(hle::libkernel());
-    p.load("libmini.so", "libc", LIBMINI).unwrap();
+    p.load("libmini.so", "libc", libc).unwrap();
     let m = p.load("main", "main", main).unwrap();
     let report = p.link().unwrap();
     let out = p.run(m, 100_000_000);
@@ -33,6 +39,14 @@ fn standard_layout_matches_native() {
 #[test]
 fn sce_layout_matches_native() {
     let (out, report) = run(MAIN_SCE);
+    assert_eq!(out, EXPECTED);
+    assert_eq!(report.missing, 0, "{report:?}");
+}
+
+#[test]
+fn jaguar_build_matches_native() {
+    // -O3 -march=btver2: AVX (VEX), BMI1 and SSE4.x as the PS4's compiler may emit them.
+    let (out, report) = run_with(LIBMINI_JAGUAR, MAIN_JAGUAR);
     assert_eq!(out, EXPECTED);
     assert_eq!(report.missing, 0, "{report:?}");
 }
