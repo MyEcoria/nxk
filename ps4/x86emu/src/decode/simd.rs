@@ -59,6 +59,14 @@ fn xmm_op(c: &mut Ctx, op: SseOp, form: Form, allow256: bool) -> Result<Inst, De
     }
 }
 
+/// #UD for a VEX encoding naming a vvvv register the instruction has no use for.
+fn no_vvvv(c: &Ctx) -> Result<(), DecodeError> {
+    if is_vex(c) && c.vvvv != 0 {
+        return Err(DecodeError::Unsupported(0xc4));
+    }
+    Ok(())
+}
+
 /// Ops that read only `src` (VEX.vvvv unused).
 fn one_source(op: SseOp) -> bool {
     use SseOp::*;
@@ -169,6 +177,7 @@ pub(super) fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
         (3, 0x12) => xmm_op(c, SseOp::MovDup, Load, false),
         (1, 0x6e | 0x7e) if !wide(c) => {
             // movd/movq between a GPR (or memory) and an xmm register.
+            no_vvvv(c)?;
             let m = c.modrm()?;
             let size = if c.rex & 8 != 0 { 8 } else { 4 };
             let x = Operand::Xmm(m.reg);
@@ -202,6 +211,7 @@ pub(super) fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
             c.done(Op::Sse(op), 16, Operand::Xmm(dst), Operand::Xmm(src), imm)
         }
         (1, 0xd7) if !wide(c) => {
+            no_vvvv(c)?;
             let m = c.modrm()?;
             let Operand::Reg(src) = m.rm else {
                 return Err(DecodeError::Unsupported(b));
@@ -221,6 +231,7 @@ pub(super) fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
         }
         (1, 0xc5) if !wide(c) => {
             // pextrw r32, xmm, imm: here reg is the GPR and rm the xmm register.
+            no_vvvv(c)?;
             let m = c.modrm()?;
             let Operand::Reg(src) = m.rm else {
                 return Err(DecodeError::Unsupported(b));
@@ -332,6 +343,9 @@ pub(super) fn decode_0f3a(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
     match b {
         0x0f => xmm_op(c, SseOp::Alignr, Form::LoadImm, false),
         0x14 | 0x15 | 0x16 | 0x20 | 0x22 if !wide(c) => {
+            if b < 0x20 {
+                no_vvvv(c)?;
+            }
             let m = c.modrm()?;
             let imm = c.r.imm(1)? & 0xff;
             let e = match b {
@@ -353,6 +367,9 @@ pub(super) fn decode_0f3a(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
             }
         }
         0x18 | 0x19 if is_vex(c) && wide(c) => {
+            if b == 0x19 {
+                no_vvvv(c)?;
+            }
             let m = c.modrm()?;
             let imm = c.r.imm(1)? & 0xff;
             let (reg, rm) = (Operand::Xmm(m.reg), xmm(m.rm));

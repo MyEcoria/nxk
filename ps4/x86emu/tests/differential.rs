@@ -636,6 +636,25 @@ fn vex3(pp: u8, map: u8, w: bool, l: bool, vvvv: u8, op: u8, rest: &[u8]) -> Vec
     v
 }
 
+/// A three-byte VEX prefix with the R, X, B register extensions.
+#[allow(clippy::too_many_arguments)]
+fn vex3x(
+    pp: u8,
+    map: u8,
+    w: bool,
+    l: bool,
+    vvvv: u8,
+    rxb: (bool, bool, bool),
+    op: u8,
+    rest: &[u8],
+) -> Vec<u8> {
+    let b1 = (((!rxb.0) as u8) << 7) | (((!rxb.1) as u8) << 6) | (((!rxb.2) as u8) << 5) | map;
+    let last = ((w as u8) << 7) | ((!vvvv & 15) << 3) | ((l as u8) << 2) | pp;
+    let mut v = vec![0xc4, b1, last, op];
+    v.extend_from_slice(rest);
+    v
+}
+
 /// The two-byte VEX form (map 0F, W0).
 fn vex2(pp: u8, l: bool, vvvv: u8, op: u8, rest: &[u8]) -> Vec<u8> {
     let mut v = vec![0xc5, 0x80 | ((!vvvv & 15) << 3) | ((l as u8) << 2) | pp, op];
@@ -808,6 +827,133 @@ fn sse4_and_vex_integer() {
     ];
     let refs: Vec<(&[u8], u64)> = pt.iter().map(|c| (&c[..], FLAG_MASK)).collect();
     check_all(&refs, 0x1111_2222_3333_4444);
+}
+
+/// xmm8..15, vvvv >= 8 and r8..r15 as base / index: the inverted R, X, B and vvvv bits.
+#[test]
+fn vex_extended_registers() {
+    let to10_11 = [0x66, 0x44, 0x0f, 0x6f, 0xd0, 0x66, 0x44, 0x0f, 0x6f, 0xda]; // movdqa xmm10, xmm0; xmm11, xmm2
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    for op in [0xfeu8, 0xef, 0xd4, 0x62, 0xf4] {
+        // vpOP xmm9, xmm10, xmm11; movdqa xmm0, xmm9
+        let mut c = to10_11.to_vec();
+        c.extend(vex3x(
+            1,
+            1,
+            false,
+            false,
+            10,
+            (true, false, true),
+            op,
+            &[0xcb],
+        ));
+        c.extend_from_slice(&[0x66, 0x41, 0x0f, 0x6f, 0xc1]);
+        cases.push(ymm_case(&c));
+        // C5 with R: vpOP xmm12, xmm10, xmm2; movdqa xmm0, xmm12
+        let mut c = to10_11.to_vec();
+        c.extend_from_slice(&[0xc5, ((!10u8 & 15) << 3) | 1, op, 0xe2]);
+        c.extend_from_slice(&[0x66, 0x41, 0x0f, 0x6f, 0xc4]);
+        cases.push(ymm_case(&c));
+    }
+    let zero_r13 = [0x45, 0x31, 0xed]; // xor r13d, r13d
+                                       // vpaddd xmm0, xmm0, [r12 + r13]
+    let mut c = zero_r13.to_vec();
+    c.extend(vex3x(
+        1,
+        1,
+        false,
+        false,
+        0,
+        (false, true, true),
+        0xfe,
+        &[0x04, 0x2c],
+    ));
+    cases.push(ymm_case(&c));
+    // vmovdqu ymm8, [r12 + r13]; vmovdqu ymm0, ymm8
+    let mut c = zero_r13.to_vec();
+    c.extend(vex3x(
+        2,
+        1,
+        false,
+        true,
+        0,
+        (true, true, true),
+        0x6f,
+        &[0x04, 0x2c],
+    ));
+    c.extend(vex3x(
+        2,
+        1,
+        false,
+        true,
+        0,
+        (false, false, true),
+        0x6f,
+        &[0xc0],
+    ));
+    cases.push(ymm_case(&c));
+    // vxorps ymm8, ymm10, ymm11 (after vinsertf128 ymm10, ymm10, xmm0, 1); vmovdqu ymm0, ymm8
+    let mut c = to10_11.to_vec();
+    c.extend(vex3x(
+        1,
+        3,
+        false,
+        true,
+        10,
+        (true, false, false),
+        0x18,
+        &[0xd0, 1],
+    ));
+    c.extend(vex3x(
+        0,
+        1,
+        false,
+        true,
+        10,
+        (true, false, true),
+        0x57,
+        &[0xc3],
+    ));
+    c.extend(vex3x(
+        2,
+        1,
+        false,
+        true,
+        0,
+        (false, false, true),
+        0x6f,
+        &[0xc0],
+    ));
+    cases.push(ymm_case(&c));
+    // vmovq r9, xmm11 (W, B); vmovq xmm0, r9
+    let mut c = to10_11.to_vec();
+    c.extend(vex3x(
+        1,
+        1,
+        true,
+        false,
+        0,
+        (true, false, true),
+        0x7e,
+        &[0xd9],
+    ));
+    c.extend(vex3x(
+        1,
+        1,
+        true,
+        false,
+        0,
+        (false, false, true),
+        0x6e,
+        &[0xc1],
+    ));
+    cases.push(ymm_case(&c));
+    // andn r9, r10, r11 (BMI1 with every extension)
+    let mut bmi = vex3x(0, 2, true, false, 10, (true, false, true), 0xf2, &[0xcb]);
+    bmi.push(0xc3);
+    let mut refs: Vec<(&[u8], u64)> = cases.iter().map(|c| (&c[..], 0)).collect();
+    refs.push((&bmi, CF | ZF | SF | OF));
+    check_all(&refs, 0x8888_9999_aaaa_bbbb);
 }
 
 #[test]
