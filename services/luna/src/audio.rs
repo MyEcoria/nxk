@@ -16,11 +16,19 @@ pub struct Audio {
     pub empty: u64,
 }
 
+/// Makeup gain (`gain_db=` of `service.txt`, 0 to 24): the stream measured
+/// at -42 dBFS RMS with peaks at -23 dBFS (Tomb Raider's first minutes).
+const DEFAULT_GAIN_DB: f32 = 12.0;
+
 impl Default for Audio {
     fn default() -> Self {
+        let gain = crate::setting("gain_db")
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|g| (0.0..=24.0).contains(g))
+            .unwrap_or(DEFAULT_GAIN_DB);
         Self {
             config: None,
-            player: Player::start(),
+            player: Player::start(gain),
             empty: 0,
         }
     }

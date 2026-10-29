@@ -4,7 +4,8 @@
 //! playing them: the cloud session, the stream, the gamepad, the sound and
 //! the picture (decoded by `nxh264`, shown by the GPU). The Amazon domain of the account is
 //! `domain=` in this catalog's `service.txt` (amazon.com by default); `refresh=` (24 to 60)
-//! and `max_mbit=` set the picture rate and bit rate cap the stream announces.
+//! and `max_mbit=` set the picture rate and bit rate cap the stream announces, `gain_db=` (0 to 24)
+//! the sound's makeup gain.
 
 mod account;
 mod api;

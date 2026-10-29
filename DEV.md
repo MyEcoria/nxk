@@ -315,7 +315,13 @@ wrong, else every minute; another gives the link (longest time without a
 datagram, the stream thread's longest busy spell and send, audio packets
 lost on the network). Speakers that do not take 48 kHz (the
 emulator's run at a quarter of it) are replaced by a clock after 4 s, so
-the rest still runs there. The `display` channel is answered (capabilities at 1280x720, 45 Hz and an 8
+the rest still runs there. The stream arrives far below full scale (measured
+2026-10-29, Tomb Raider's first minutes: about -42 dBFS RMS, peaks under
+-23 dBFS), so the player adds a makeup gain (+12 dB, `gain_db=` 0 to 24 in
+`service.txt`) and a look-ahead peak limiter at -1 dBFS (`stream::limiter`);
+the line gives the stream's level before the gain (`stream::level`) and how
+often the limiter acted. `audio`'s volume curve and the tones are unchanged.
+The `display` channel is answered (capabilities at 1280x720, 45 Hz and an 8
 Mbit/s cap by default, `refresh=` (24 to 60) and `max_mbit=` in the catalog's
 `service.txt` change them; experiments, off unless set there: `notify_resolution=1280x720`,
 `max_display=1280x720`, `min_quality=`, `max_quality=` and `bitrate_kbps=` (the protocol's
