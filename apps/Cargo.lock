@@ -9,3 +9,14 @@ version = "0.1.0"
 [[package]]
 name = "stdtest"
 version = "0.1.0"
+
+[[package]]
+name = "x86emu"
+version = "0.1.0"
+
+[[package]]
+name = "x86test"
+version = "0.1.0"
+dependencies = [
+ "x86emu",
+]

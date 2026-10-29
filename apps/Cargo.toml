@@ -4,7 +4,7 @@
 # "nxk" toolchain prepared by tools/mkstd.py (ported standard library).
 [workspace]
 resolver = "2"
-members = ["hello", "stdtest"]
+members = ["hello", "stdtest", "x86test"]
 
 [profile.release]
 opt-level = 3

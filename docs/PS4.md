@@ -91,4 +91,4 @@ place, so it costs neither CPU time nor a copy.
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |
 
-Run the host tests: `cd ps4 && cargo test`.
+Run the host tests: `cd ps4 && cargo test`. On nxk, `x86test` (apps/, in `build.sh` and on the SD card) replays 1568 ALU vectors recorded from a native run on a PC, checks self-modifying code and times the interpreter: `./tools/nxtest.py -c x86test --sd build/sd.img` (identical in the emulator; its MIPS figure is the emulator's, not the console's). Regenerate the vectors with the `gen_vectors` test (see its comment).
