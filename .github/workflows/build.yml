@@ -67,9 +67,9 @@ jobs:
       - name: Boot payloads and SD image
         run: |
           mkdir -p dist
-          ./hwboot/mkbl31.py -o dist/bl31.bin
-          ./hwboot/mkipl.py -o dist/nxk-ipl.bin
-          ./tools/mksd.py -o build/sd.img
+          python3 hwboot/mkbl31.py -o dist/bl31.bin
+          python3 hwboot/mkipl.py -o dist/nxk-ipl.bin
+          python3 tools/mksd.py -o build/sd.img
           cp -L build/nxk.elf dist/nxk.elf
           cp build/nxk.bin build/bootfs.img dist/
           xz -9 -T0 -c build/sd.img > dist/sd.img.xz
