@@ -31,12 +31,39 @@ pub enum Stop {
     Budget,
 }
 
+const ICACHE_LINES: usize = 256;
+
+/// Direct-mapped cache of decoded instructions, keyed by rip.
+///
+/// Writes made by the guest itself to a page holding cached code flush it; writes from
+/// elsewhere (DMA, other threads) must call `Cpu::flush_icache`.
+#[derive(Clone)]
+struct ICache {
+    lines: [Option<(u64, Inst)>; ICACHE_LINES],
+    /// One bit per hashed code page: a write to a page whose bit is set flushes the cache.
+    code_pages: u64,
+}
+
+impl Default for ICache {
+    fn default() -> Self {
+        ICache {
+            lines: [None; ICACHE_LINES],
+            code_pages: 0,
+        }
+    }
+}
+
+fn page_bit(addr: u64) -> u64 {
+    1 << ((addr >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58)
+}
+
 /// Architectural state: 16 GPRs (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15), rip, flags.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct Cpu {
     pub gpr: [u64; 16],
     pub rip: u64,
     pub flags: u64,
+    icache: ICache,
 }
 
 fn mask(size: u8) -> u64 {
@@ -99,6 +126,54 @@ fn alu(op: AluOp, a: u64, b: u64, cf_in: bool, size: u8) -> (u64, u64) {
 }
 
 impl Cpu {
+    /// A CPU with the given registers and an empty instruction cache.
+    pub fn new(gpr: [u64; 16], rip: u64, flags: u64) -> Cpu {
+        Cpu {
+            gpr,
+            rip,
+            flags,
+            icache: ICache::default(),
+        }
+    }
+
+    /// Drop every cached decoded instruction (call after code changed behind the CPU's back).
+    pub fn flush_icache(&mut self) {
+        self.icache = ICache::default();
+    }
+
+    fn note_write(&mut self, addr: u64, size: u8) {
+        let last = addr.wrapping_add(size as u64 - 1);
+        if self.icache.code_pages & (page_bit(addr) | page_bit(last)) != 0 {
+            self.flush_icache();
+        }
+    }
+
+    fn fetch(&mut self, mem: &mut dyn Mem) -> Result<Inst, Stop> {
+        let slot = (self.rip as usize ^ (self.rip >> 12) as usize) % ICACHE_LINES;
+        if let Some((rip, inst)) = &self.icache.lines[slot] {
+            if *rip == self.rip {
+                return Ok(*inst);
+            }
+        }
+        let mut buf = [0u8; 15];
+        let mut n = 0;
+        while n < 15 {
+            match mem.read(self.rip.wrapping_add(n as u64), 1) {
+                Some(b) => buf[n] = b as u8,
+                None => break,
+            }
+            n += 1;
+        }
+        let inst = decode(&buf[..n]).map_err(|e| match e {
+            DecodeError::Truncated if n == 0 => Stop::Fault(self.rip),
+            e => Stop::Decode(self.rip, e),
+        })?;
+        let end = self.rip.wrapping_add(inst.len as u64 - 1);
+        self.icache.code_pages |= page_bit(self.rip) | page_bit(end);
+        self.icache.lines[slot] = Some((self.rip, inst));
+        Ok(inst)
+    }
+
     fn ea(&self, m: &MemRef, next: u64) -> u64 {
         let mut a = m.disp as u64;
         if m.rip {
@@ -140,6 +215,7 @@ impl Cpu {
                 if !mem.write(a, size, v) {
                     return Err(Stop::Fault(a));
                 }
+                self.note_write(a, size);
             }
             Operand::Imm(_) => unreachable!("decoder never yields an immediate destination"),
         }
@@ -167,6 +243,7 @@ impl Cpu {
             return Err(Stop::Fault(sp));
         }
         self.gpr[4] = sp;
+        self.note_write(sp, 8);
         Ok(())
     }
 
@@ -252,19 +329,7 @@ impl Cpu {
     /// `Ok(())` once the sentinel is returned to, otherwise why it stopped.
     pub fn run(&mut self, mem: &mut dyn Mem, sentinel: u64, max_steps: u64) -> Result<(), Stop> {
         for _ in 0..max_steps {
-            let mut buf = [0u8; 15];
-            let mut n = 0;
-            while n < 15 {
-                match mem.read(self.rip.wrapping_add(n as u64), 1) {
-                    Some(b) => buf[n] = b as u8,
-                    None => break,
-                }
-                n += 1;
-            }
-            let inst = decode(&buf[..n]).map_err(|e| match e {
-                DecodeError::Truncated if n == 0 => Stop::Fault(self.rip),
-                e => Stop::Decode(self.rip, e),
-            })?;
+            let inst = self.fetch(mem)?;
             if self.exec(inst, mem, sentinel)? {
                 return Ok(());
             }

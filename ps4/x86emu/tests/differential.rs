@@ -200,11 +200,7 @@ fn check(code: &[u8], flag_mask: u64, rng: &mut Rng) {
         ],
     };
     assert!(mem.write(s - 8, 8, SENTINEL));
-    let mut cpu = Cpu {
-        gpr: regs.gpr,
-        rip: page as u64,
-        flags: regs.flags,
-    };
+    let mut cpu = Cpu::new(regs.gpr, page as u64, regs.flags);
     cpu.gpr[4] = s - 8;
     let run = cpu.run(&mut mem, SENTINEL, 10_000);
     let emu_stack: Vec<u8> =

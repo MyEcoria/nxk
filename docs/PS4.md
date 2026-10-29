@@ -41,12 +41,52 @@ Plan: build a decoder and an interpreter first (differentially tested against
 the host x86-64 CPU on the PC, which is the only way to test without the
 dump), then put the JIT behind the same decoder.
 
+## CPU, GPU and memory data path
+
+The GPU cannot run the game's x86 code; it runs what the game gives it:
+shaders (GCN translated to the `shader/` IR, compiled to SASS by `gpu`),
+texture conversion and, later, compute. The aim is that no byte is copied
+more than once between the CPU and the GPU, and that the CPU never waits for
+the GPU except at a frame boundary.
+
+Facts checked in the tree:
+
+- `shm_create` has an `UNCACHED` flag (Normal-NC, MAIR index 2): the GPU does
+  not snoop CPU caches, and Normal-NC lets the CPU combine writes.
+  The `gpu` service maps client memory page by page through its GMMU
+  (`shm_paddr` per page), so a buffer does not need to be physically contiguous.
+- The kernel runs with MAIR = device, Normal write-back, Normal non-cacheable.
+  No cache-maintenance syscall exists, and EL0 has no `DC CVAC` (SCTLR_EL1.UCI is not set).
+- upstream's `sceKernelAllocateDirectMemory` carries a memory-type argument
+  (`memory_type` in `runtime_memory.c`); its values are to be taken from there
+  when the runtime is ported, not written from memory.
+
+Options for the guest's memory:
+
+1. *All guest memory in `UNCACHED` shm.* Zero copy, but the guest stack and heap
+   would be uncached: the interpreter and the JIT would crawl. Rejected.
+2. *Cached memory, copy to the GPU on use, track dirty pages by write faults*
+   (upstream's PC approach). Works with no kernel change, but faults and
+   copies over a shared LPDDR4 are the most expensive thing available.
+   Kept only as the fallback.
+3. *Split by PS4 memory type.* GPU-optimised, write-combined memory (what the
+   PS4 CPU only writes) is allocated in `UNCACHED` shm and handed to the GPU as is:
+   textures, vertex and index buffers, command buffers, render targets. CPU-coherent
+   memory stays cached; the GPU sees it through a copy at submission of the ranges a
+   draw references, until a cache-clean syscall exists (a later phase, with the usual
+   ABI, kernel, libnx and `ktest` work). Retained.
+
+Submission: PM4 command buffers are translated on the CPU into one `Frame` per
+image, so one IPC per frame and never one per draw. Texture detiling (GCN tiling to
+Tegra block-linear) runs as a compute shader on the GPU, reading the guest memory in
+place, so it costs neither CPU time nor a copy.
+
 ## Phases
 
 | Phase | Content | State |
 |---|---|---|
 | 1 | `ps4fmt`: SHA-1, NIDs, `param.sfo`, plaintext ELF/SELF | done (host tests) |
-| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | started: ALU, mov/lea/test, push/pop, jmp/jcc/ret (32/64-bit), bit-exact flags against the host CPU; no_std, builds for aarch64 |
+| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | started (decoded-instruction cache, about 55 MIPS on a PC in release): ALU, mov/lea/test, push/pop, jmp/jcc/ret (32/64-bit), bit-exact flags against the host CPU; no_std, builds for aarch64 |
 | 3 | PS4 runtime service (libkernel/libc imports by NID, threads, files) | to do |
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |
