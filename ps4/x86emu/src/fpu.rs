@@ -152,7 +152,7 @@ fn unpack_no_de(f: Fmt, v: u64, env: &mut Env) -> Val {
 }
 
 /// Round `sig / 2^62 * 2^exp` to `f`, with overflow, underflow and FTZ.
-fn round_pack(f: Fmt, env: &mut Env, sign: bool, mut exp: i32, mut sig: u64) -> u64 {
+pub(crate) fn round_pack(f: Fmt, env: &mut Env, sign: bool, mut exp: i32, mut sig: u64) -> u64 {
     let (bias, shift) = (f.bias(), 62 - f.frac);
     let (emin, emax) = (1 - bias, bias);
     let rmask = (1u64 << shift) - 1;

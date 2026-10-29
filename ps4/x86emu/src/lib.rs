@@ -8,3 +8,4 @@
 pub mod cpu;
 pub mod decode;
 pub mod fpu;
+pub mod fpu80;
