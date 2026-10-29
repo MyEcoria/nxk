@@ -94,8 +94,10 @@ pub enum BtOp {
 /// SSE2 operations on xmm registers. `u8` payloads are element sizes in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseOp {
-    /// 128-bit move (movdqa/movdqu/movaps/movups/movapd/movupd).
+    /// Aligned 128-bit move (movdqa/movaps/movapd): a misaligned address faults.
     Mov,
+    /// Unaligned 128-bit move (movdqu/movups/movupd).
+    MovU,
     /// movd/movq into an xmm register (zero-extended) or out of one; `size` is 4 or 8.
     MovGpr,
     /// movq xmm, xmm/m64 (zero-extended) and movq m64, xmm.
@@ -769,10 +771,12 @@ fn decode_sse(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
         }
     };
     match b {
-        0x10 | 0x11 | 0x28 | 0x29 if !f3 && c.rep == Rep::None => {
-            sse(c, SseOp::Mov, b & 1 == 0, false)
+        0x10 | 0x11 if !f3 && c.rep == Rep::None => sse(c, SseOp::MovU, b == 0x10, false),
+        0x28 | 0x29 if !f3 && c.rep == Rep::None => sse(c, SseOp::Mov, b == 0x28, false),
+        0x6f | 0x7f if p66 || f3 => {
+            let op = if f3 { SseOp::MovU } else { SseOp::Mov };
+            sse(c, op, b == 0x6f, false)
         }
-        0x6f | 0x7f if p66 || f3 => sse(c, SseOp::Mov, b == 0x6f, false),
         0x54 if !f3 => sse(c, SseOp::And, true, false),
         0x55 if !f3 => sse(c, SseOp::Andn, true, false),
         0x56 if !f3 => sse(c, SseOp::Or, true, false),

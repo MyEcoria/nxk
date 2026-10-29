@@ -43,6 +43,8 @@ pub enum Stop {
     Trap(u64),
     /// Division by zero or quotient overflow (`#DE`) at this address.
     DivideError(u64),
+    /// A 16-byte SSE access that must be aligned was not (`#GP`): the address accessed.
+    Misaligned(u64),
 }
 
 const ICACHE_LINES: usize = 256;
@@ -812,6 +814,17 @@ impl Cpu {
             }
             _ => {}
         }
+        // Legacy-SSE memory operands must be 16-byte aligned, but for the unaligned moves.
+        if op != SseOp::MovU {
+            for o in [i.dst, i.src] {
+                if let Operand::Mem(m) = o {
+                    let a = self.addr(&m, next);
+                    if a & 15 != 0 {
+                        return Err(Stop::Misaligned(a));
+                    }
+                }
+            }
+        }
         let shift_count = |cpu: &Cpu, mem: &mut dyn Mem| -> Result<u64, Stop> {
             match i.src {
                 Operand::Imm(n) => Ok(n as u64),
@@ -819,7 +832,7 @@ impl Cpu {
             }
         };
         let r = match op {
-            SseOp::Mov => self.get_x(i.src, mem, next)?,
+            SseOp::Mov | SseOp::MovU => self.get_x(i.src, mem, next)?,
             SseOp::Sll(e) | SseOp::Srl(e) | SseOp::Sra(e) => {
                 let a = self.xmm_of(i.dst);
                 let n = shift_count(self, mem)?;

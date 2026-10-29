@@ -176,7 +176,8 @@ impl Process {
     /// # Args
     /// * `m` - module index; `budget` - instruction limit
     pub fn run(&mut self, m: usize, budget: u64) -> Outcome {
-        self.cpu.gpr[4] = STACK_TOP - 64;
+        // As after a `call`: the return address sits at rsp, rsp + 8 is 16-byte aligned.
+        self.cpu.gpr[4] = STACK_TOP - 72;
         assert!(self.mem.write(self.cpu.gpr[4], 8, SENTINEL));
         self.cpu.rip = self.modules[m].entry;
         let end = self.cpu.steps.saturating_add(budget);
