@@ -172,6 +172,103 @@ pub enum SseOp {
     /// vzeroupper / vzeroall.
     ZeroUpper,
     ZeroAll,
+    /// Floating-point arithmetic, compares (`imm`: predicate) and roundings, lane-wise.
+    Fp(FpOp, Ty),
+    /// Conversions between float formats and integers.
+    Cvt(CvtOp),
+    /// comiss / ucomiss / comisd / ucomisd: EFLAGS from a compare (`true`: signaling).
+    Comis(Ty, bool),
+    /// movss / movsd: merge the low element (register) or zero-extend it (load).
+    MovS(Ty),
+    /// movlps / movhps / movhlps / movlhps / movsldup / movshdup.
+    MovLH(LhOp),
+    /// shufps / shufpd with `imm`, per 128-bit lane.
+    Shufp(Ty),
+    /// movmskps / movmskpd: sign bits to a GPR.
+    Movmsk(Ty),
+}
+
+/// Element type of a float op: packed or scalar, single or double.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ty {
+    Ps,
+    Pd,
+    Ss,
+    Sd,
+}
+
+impl Ty {
+    pub fn is_scalar(self) -> bool {
+        matches!(self, Ty::Ss | Ty::Sd)
+    }
+    pub fn is_double(self) -> bool {
+        matches!(self, Ty::Pd | Ty::Sd)
+    }
+    /// Element size in bytes.
+    pub fn width(self) -> u8 {
+        if self.is_double() {
+            8
+        } else {
+            4
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Sqrt,
+    /// Approximate reciprocal and reciprocal square root (rcpps, rsqrtps).
+    Rcp,
+    Rsqrt,
+    /// cmpps with predicate `imm` (0..8 legacy, 0..32 VEX).
+    Cmp,
+    /// roundps with `imm` (mode, MXCSR select, precision suppression).
+    Round,
+    /// haddps / hsubps / addsubps.
+    HAdd,
+    HSub,
+    AddSub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CvtOp {
+    /// Between float formats: cvtps2pd, cvtpd2ps, cvtss2sd, cvtsd2ss.
+    Ps2Pd,
+    Pd2Ps,
+    Ss2Sd,
+    Sd2Ss,
+    /// Packed int32 <-> float (`true`: truncating).
+    Dq2Ps,
+    Ps2Dq(bool),
+    Dq2Pd,
+    Pd2Dq(bool),
+    /// Scalar from a GPR or memory integer of `size` bytes.
+    Si2Ss,
+    Si2Sd,
+    /// Scalar to a GPR of `size` bytes (`true`: truncating).
+    Ss2Si(bool),
+    Sd2Si(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LhOp {
+    /// movlps / movlpd load: low quadword from memory, high kept.
+    LoadLo,
+    LoadHi,
+    StoreLo,
+    StoreHi,
+    /// movhlps: low = source's high; movlhps: high = source's low.
+    HiToLo,
+    LoToHi,
+    /// movsldup / movshdup: even / odd singles duplicated.
+    DupLo,
+    DupHi,
 }
 
 /// BMI1 operations (VEX-encoded, on GPRs).
@@ -264,6 +361,8 @@ pub enum Op {
     Movbe,
     /// SSE4.2 crc32 (Castagnoli) of a `u8`-byte source into a 32-bit accumulator.
     Crc32(u8),
+    /// ldmxcsr (`true`) / stmxcsr of a 32-bit memory operand.
+    Mxcsr(bool),
 }
 
 /// `rep` / `repne` prefix state.
@@ -793,10 +892,13 @@ fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
         }
         0xae => {
             let m = c.modrm()?;
-            if !matches!(m.rm, Operand::Reg(_)) || m.reg & 7 < 5 {
-                return Err(DecodeError::Unsupported(b));
+            match (m.rm, m.reg & 7) {
+                (Operand::Mem(_), 2 | 3) if !c.opsz && c.rep == Rep::None => {
+                    c.done(Op::Mxcsr(m.reg & 7 == 2), 4, m.rm, NONE, 0)
+                }
+                (Operand::Reg(_), 5..) => c.done(Op::Nop, size, NONE, NONE, 0),
+                _ => Err(DecodeError::Unsupported(b)),
             }
-            c.done(Op::Nop, size, NONE, NONE, 0)
         }
         0x40..=0x4f => {
             let m = c.modrm()?;

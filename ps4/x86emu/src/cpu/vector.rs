@@ -4,7 +4,7 @@
 //! (moves, logic, vinsertf128) writes both halves.
 
 use super::{flag, mask, sext, Cpu, Mem, Stop, CF, FLAG_MASK, ZF};
-use crate::decode::{Inst, Operand, SseOp, VEX, VEX_L};
+use crate::decode::{CvtOp, Inst, LhOp, Operand, SseOp, Ty, VEX, VEX_L};
 
 /// Apply `f` to each `e`-byte lane of `a` and `b`.
 fn lanes(a: u128, b: u128, e: u8, f: impl Fn(u64, u64) -> u64) -> u128 {
@@ -76,7 +76,7 @@ fn extend(v: u128, from: u8, to: u8, signed: bool) -> u128 {
 
 impl Cpu {
     /// Bytes `[a, a + n)` of guest memory as a little-endian value (n <= 16).
-    fn read_n(&self, a: u64, n: u8, mem: &mut dyn Mem) -> Result<u128, Stop> {
+    pub(super) fn read_n(&self, a: u64, n: u8, mem: &mut dyn Mem) -> Result<u128, Stop> {
         let mut v = 0u128;
         let mut off = 0u8;
         while off < n {
@@ -90,7 +90,13 @@ impl Cpu {
     }
 
     /// The low `n` bytes of an xmm register or memory operand.
-    fn get_n(&self, o: Operand, n: u8, mem: &mut dyn Mem, next: u64) -> Result<u128, Stop> {
+    pub(super) fn get_n(
+        &self,
+        o: Operand,
+        n: u8,
+        mem: &mut dyn Mem,
+        next: u64,
+    ) -> Result<u128, Stop> {
         match o {
             Operand::Xmm(x) => Ok(self.xmm[x as usize]),
             Operand::Mem(m) => self.read_n(self.addr(&m, next), n, mem),
@@ -99,7 +105,13 @@ impl Cpu {
     }
 
     /// Write an xmm result; a VEX.128 write clears the register's upper ymm half.
-    fn put_v(&mut self, i: &Inst, v: u128, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
+    pub(super) fn put_v(
+        &mut self,
+        i: &Inst,
+        v: u128,
+        mem: &mut dyn Mem,
+        next: u64,
+    ) -> Result<(), Stop> {
         self.put_x(i.dst, v, mem, next)?;
         if let Operand::Xmm(x) = i.dst {
             if i.vex & VEX != 0 {
@@ -133,7 +145,29 @@ impl Cpu {
             | SseOp::MovDup
             | SseOp::Movx(..)
             | SseOp::Insert(_)
-            | SseOp::Extract(_) => return Ok(()),
+            | SseOp::Extract(_)
+            | SseOp::Fp(_, Ty::Ss | Ty::Sd)
+            | SseOp::Comis(..)
+            | SseOp::MovS(_)
+            | SseOp::Movmsk(_)
+            | SseOp::MovLH(
+                LhOp::LoadLo
+                | LhOp::LoadHi
+                | LhOp::StoreLo
+                | LhOp::StoreHi
+                | LhOp::HiToLo
+                | LhOp::LoToHi,
+            )
+            | SseOp::Cvt(
+                CvtOp::Ss2Sd
+                | CvtOp::Sd2Ss
+                | CvtOp::Si2Ss
+                | CvtOp::Si2Sd
+                | CvtOp::Ss2Si(_)
+                | CvtOp::Sd2Si(_)
+                | CvtOp::Ps2Pd
+                | CvtOp::Dq2Pd,
+            ) => return Ok(()),
             _ => 16,
         };
         for o in [i.dst, i.src] {
@@ -210,6 +244,16 @@ impl Cpu {
             _ => {}
         }
         self.check_align(op, &i, next)?;
+        match op {
+            SseOp::Fp(f, t) => return self.fp(f, t, i, mem, next),
+            SseOp::Cvt(c) => return self.cvt(c, i, mem, next),
+            SseOp::Comis(t, s) => return self.comis(t, s, i, mem, next),
+            SseOp::MovS(t) => return self.movs(t, i, mem, next),
+            SseOp::MovLH(l) => return self.movlh(l, i, mem, next),
+            SseOp::Shufp(t) => return self.shufp(t, i, mem, next),
+            SseOp::Movmsk(t) => return self.movmsk(t, i, mem, next),
+            _ => {}
+        }
         if i.vex & VEX_L != 0 {
             return self.sse256(op, i, mem, next);
         }
@@ -279,7 +323,12 @@ impl Cpu {
     }
 
     /// 32 bytes of a ymm register or memory operand.
-    fn get_y(&self, o: Operand, mem: &mut dyn Mem, next: u64) -> Result<(u128, u128), Stop> {
+    pub(super) fn get_y(
+        &self,
+        o: Operand,
+        mem: &mut dyn Mem,
+        next: u64,
+    ) -> Result<(u128, u128), Stop> {
         match o {
             Operand::Xmm(x) => Ok((self.xmm[x as usize], self.ymm_hi[x as usize])),
             Operand::Mem(m) => {
@@ -290,7 +339,7 @@ impl Cpu {
         }
     }
 
-    fn put_y(
+    pub(super) fn put_y(
         &mut self,
         o: Operand,
         v: (u128, u128),

@@ -72,7 +72,26 @@ fn one_source(op: SseOp) -> bool {
     use SseOp::*;
     matches!(
         op,
-        Mov | MovU | MovQ | MovDup | Abs(_) | Movx(..) | Shufd | Shuflw | Shufhw | Ptest
+        Mov | MovU
+            | MovQ
+            | MovDup
+            | Abs(_)
+            | Movx(..)
+            | Shufd
+            | Shuflw
+            | Shufhw
+            | Ptest
+            | MovLH(LhOp::DupLo | LhOp::DupHi)
+            | Fp(
+                FpOp::Sqrt | FpOp::Rcp | FpOp::Rsqrt | FpOp::Round,
+                Ty::Ps | Ty::Pd
+            )
+            | Cvt(CvtOp::Ps2Pd
+                | CvtOp::Pd2Ps
+                | CvtOp::Dq2Ps
+                | CvtOp::Ps2Dq(_)
+                | CvtOp::Dq2Pd
+                | CvtOp::Pd2Dq(_))
     )
 }
 
@@ -137,10 +156,215 @@ fn op_66_0f(b: u8) -> Option<SseOp> {
     })
 }
 
+/// Element type of a float op from its mandatory prefix.
+fn ty(p: u8) -> Ty {
+    [Ty::Ps, Ty::Pd, Ty::Ss, Ty::Sd][p as usize]
+}
+
+/// A scalar op ignores VEX.L (LIG); a packed one exists at 256 bits.
+fn fp_op(c: &mut Ctx, op: SseOp, t: Ty, form: Form) -> Result<Inst, DecodeError> {
+    if t.is_scalar() {
+        c.vex &= !VEX_L;
+    }
+    xmm_op(c, op, form, !t.is_scalar())
+}
+
+/// Float opcodes of the 0F map, or `None` when `b` is not one.
+fn decode_float(c: &mut Ctx, p: u8, b: u8) -> Option<Result<Inst, DecodeError>> {
+    use Form::*;
+    let t = ty(p);
+    let arith = match b {
+        0x51 => Some(FpOp::Sqrt),
+        0x52 if p == 0 || p == 2 => Some(FpOp::Rsqrt),
+        0x53 if p == 0 || p == 2 => Some(FpOp::Rcp),
+        0x58 => Some(FpOp::Add),
+        0x59 => Some(FpOp::Mul),
+        0x5c => Some(FpOp::Sub),
+        0x5d => Some(FpOp::Min),
+        0x5e => Some(FpOp::Div),
+        0x5f => Some(FpOp::Max),
+        0x7c if p & 1 == 1 => Some(FpOp::HAdd),
+        0x7d if p & 1 == 1 => Some(FpOp::HSub),
+        0xd0 if p & 1 == 1 => Some(FpOp::AddSub),
+        _ => None,
+    };
+    if let Some(op) = arith {
+        // hadd / hsub / addsub: 66 is pd, F2 is ps.
+        let t = if matches!(op, FpOp::HAdd | FpOp::HSub | FpOp::AddSub) {
+            if p == 1 {
+                Ty::Pd
+            } else {
+                Ty::Ps
+            }
+        } else {
+            t
+        };
+        return Some(fp_op(c, SseOp::Fp(op, t), t, Load));
+    }
+    Some(match (p, b) {
+        (_, 0xc2) => {
+            if t.is_scalar() {
+                c.vex &= !VEX_L;
+            }
+            let r = xmm_op(c, SseOp::Fp(FpOp::Cmp, t), LoadImm, !t.is_scalar());
+            // Legacy encodings use predicates 0..8 only.
+            r.map(|mut i| {
+                if i.vex & VEX == 0 {
+                    i.imm &= 7;
+                }
+                i
+            })
+        }
+        (0 | 1, 0x2e | 0x2f) => {
+            if let Err(e) = no_vvvv(c) {
+                return Some(Err(e));
+            }
+            c.vex &= !VEX_L;
+            xmm_op(c, SseOp::Comis(ty(p + 2), b == 0x2f), Load, false)
+        }
+        (2 | 3, 0x10 | 0x11) => {
+            c.vex &= !VEX_L;
+            let r = xmm_op(
+                c,
+                SseOp::MovS(t),
+                if b == 0x10 { Load } else { Store },
+                false,
+            );
+            // A VEX load from memory has no vvvv operand.
+            match r {
+                Ok(i) if i.vex & VEX != 0 && i.vvvv != 0 && matches!(i.src, Operand::Mem(_)) => {
+                    Err(DecodeError::Unsupported(b))
+                }
+                r => r,
+            }
+        }
+        (0 | 1, 0x12 | 0x16) => {
+            let m_is_mem = c.r.b.get(c.r.pos).is_some_and(|m| m >> 6 != 3);
+            let op = match (b, m_is_mem) {
+                (0x12, true) => LhOp::LoadLo,
+                (0x16, true) => LhOp::LoadHi,
+                (0x12, false) if p == 0 => LhOp::HiToLo,
+                (0x16, false) if p == 0 => LhOp::LoToHi,
+                _ => return Some(Err(DecodeError::Unsupported(b))),
+            };
+            xmm_op(c, SseOp::MovLH(op), Load, false)
+        }
+        (0 | 1, 0x13 | 0x17) => {
+            let op = if b == 0x13 {
+                LhOp::StoreLo
+            } else {
+                LhOp::StoreHi
+            };
+            match xmm_op(c, SseOp::MovLH(op), Store, false) {
+                Ok(i) if matches!(i.dst, Operand::Mem(_)) => Ok(i),
+                Ok(_) => Err(DecodeError::Unsupported(b)),
+                e => e,
+            }
+        }
+        (2, 0x12) => xmm_op(c, SseOp::MovLH(LhOp::DupLo), Load, true),
+        (2, 0x16) => xmm_op(c, SseOp::MovLH(LhOp::DupHi), Load, true),
+        (0, 0x14) => xmm_op(c, SseOp::UnpackLo(4), Load, true),
+        (0, 0x15) => xmm_op(c, SseOp::UnpackHi(4), Load, true),
+        (1, 0x14) => xmm_op(c, SseOp::UnpackLo(8), Load, true),
+        (1, 0x15) => xmm_op(c, SseOp::UnpackHi(8), Load, true),
+        (0 | 1, 0xc6) => xmm_op(c, SseOp::Shufp(t), LoadImm, true),
+        (0 | 1, 0x50) => {
+            if let Err(e) = no_vvvv(c) {
+                return Some(Err(e));
+            }
+            let m = match c.modrm() {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            };
+            let Operand::Reg(src) = m.rm else {
+                return Some(Err(DecodeError::Unsupported(b)));
+            };
+            c.rep = Rep::None;
+            c.done(
+                Op::Sse(SseOp::Movmsk(t)),
+                4,
+                Operand::Reg(m.reg),
+                Operand::Xmm(src),
+                0,
+            )
+        }
+        (_, 0x5a) => {
+            let op = [CvtOp::Ps2Pd, CvtOp::Pd2Ps, CvtOp::Ss2Sd, CvtOp::Sd2Ss][p as usize];
+            if p >= 2 {
+                c.vex &= !VEX_L;
+            }
+            xmm_op(c, SseOp::Cvt(op), Load, p < 2)
+        }
+        (0..=2, 0x5b) => {
+            let op = [CvtOp::Dq2Ps, CvtOp::Ps2Dq(false), CvtOp::Ps2Dq(true)][p as usize];
+            xmm_op(c, SseOp::Cvt(op), Load, true)
+        }
+        (1..=3, 0xe6) => {
+            let op = [CvtOp::Pd2Dq(true), CvtOp::Dq2Pd, CvtOp::Pd2Dq(false)][p as usize - 1];
+            xmm_op(c, SseOp::Cvt(op), Load, true)
+        }
+        (2 | 3, 0x2a) => {
+            c.vex &= !VEX_L;
+            let size = if c.rex & 8 != 0 { 8 } else { 4 };
+            let m = match c.modrm() {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            };
+            c.rep = Rep::None;
+            let op = if p == 2 { CvtOp::Si2Ss } else { CvtOp::Si2Sd };
+            c.done(Op::Sse(SseOp::Cvt(op)), size, Operand::Xmm(m.reg), m.rm, 0)
+        }
+        (2 | 3, 0x2c | 0x2d) => {
+            if let Err(e) = no_vvvv(c) {
+                return Some(Err(e));
+            }
+            c.vex &= !VEX_L;
+            let size = if c.rex & 8 != 0 { 8 } else { 4 };
+            let m = match c.modrm() {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            };
+            c.rep = Rep::None;
+            let trunc = b == 0x2c;
+            let op = if p == 2 {
+                CvtOp::Ss2Si(trunc)
+            } else {
+                CvtOp::Sd2Si(trunc)
+            };
+            c.done(
+                Op::Sse(SseOp::Cvt(op)),
+                size,
+                Operand::Reg(m.reg),
+                xmm(m.rm),
+                0,
+            )
+        }
+        (0, 0xae) if is_vex(c) => {
+            if let Err(e) = no_vvvv(c) {
+                return Some(Err(e));
+            }
+            let m = match c.modrm() {
+                Ok(m) => m,
+                Err(e) => return Some(Err(e)),
+            };
+            match (m.rm, m.reg & 7) {
+                (Operand::Mem(_), 2 | 3) if !wide(c) => {
+                    c.done(Op::Mxcsr(m.reg & 7 == 2), 4, m.rm, NONE, 0)
+                }
+                _ => Err(DecodeError::Unsupported(b)),
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// The 0F map's SIMD opcodes (`b` follows 0F, or a VEX prefix with map 1).
 pub(super) fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
     use Form::*;
     let p = pp(c);
+    if let Some(r) = decode_float(c, p, b) {
+        return r;
+    }
     match (p, b) {
         (0, 0x77) if is_vex(c) => {
             let op = if wide(c) {
@@ -341,6 +565,10 @@ pub(super) fn decode_0f3a(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
     }
     let wsize = if c.rex & 8 != 0 { 8 } else { 4 };
     match b {
+        0x08..=0x0b => {
+            let t = [Ty::Ps, Ty::Pd, Ty::Ss, Ty::Sd][(b - 8) as usize];
+            fp_op(c, SseOp::Fp(FpOp::Round, t), t, Form::LoadImm)
+        }
         0x0f => xmm_op(c, SseOp::Alignr, Form::LoadImm, false),
         0x14 | 0x15 | 0x16 | 0x20 | 0x22 if !wide(c) => {
             if b < 0x20 {

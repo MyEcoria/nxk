@@ -2,7 +2,10 @@
 
 use core::ops::Range;
 
+mod float;
 mod vector;
+
+pub use float::{MXCSR_MASK, MXCSR_RESET};
 
 use crate::decode::{
     decode, AluOp, BitOp, BmiOp, BtOp, DecodeError, Inst, MemRef, Op, Operand, Rep, Seg, ShiftOp,
@@ -45,8 +48,12 @@ pub enum Stop {
     Trap(u64),
     /// Division by zero or quotient overflow (`#DE`) at this address.
     DivideError(u64),
-    /// A 16-byte SSE access that must be aligned was not (`#GP`): the address accessed.
+    /// A 16/32-byte SSE access that must be aligned was not (`#GP`): the address accessed.
     Misaligned(u64),
+    /// An unmasked SIMD floating-point exception (`#XM`) at this address.
+    FpException(u64),
+    /// Another `#GP` (a reserved MXCSR bit) at this address.
+    GeneralProtection(u64),
 }
 
 const ICACHE_LINES: usize = 256;
@@ -77,7 +84,7 @@ fn page_bit(addr: u64) -> u64 {
 
 /// Architectural state: 16 GPRs (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15), rip,
 /// flags, 16 xmm registers and the fs / gs bases.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Cpu {
     pub gpr: [u64; 16],
     pub rip: u64,
@@ -85,6 +92,7 @@ pub struct Cpu {
     pub xmm: [u128; 16],
     /// Upper halves of the ymm registers (AVX).
     pub ymm_hi: [u128; 16],
+    pub mxcsr: u32,
     pub fs_base: u64,
     pub gs_base: u64,
     /// Addresses that stop execution with `Stop::Hle` instead of being fetched.
@@ -236,6 +244,25 @@ fn crc32c(mut crc: u32, v: u64, n: u8) -> u32 {
         }
     }
     crc
+}
+
+impl Default for Cpu {
+    /// Registers zero, MXCSR at its reset value, no HLE range.
+    fn default() -> Self {
+        Cpu {
+            gpr: [0; 16],
+            rip: 0,
+            flags: 2,
+            xmm: [0; 16],
+            ymm_hi: [0; 16],
+            mxcsr: MXCSR_RESET,
+            fs_base: 0,
+            gs_base: 0,
+            hle: 0..0,
+            steps: 0,
+            icache: ICache::default(),
+        }
+    }
 }
 
 impl Cpu {
@@ -607,6 +634,7 @@ impl Cpu {
                 };
                 self.put(i.dst, sz, swapped, mem, next)?;
             }
+            Op::Mxcsr(load) => self.mxcsr_op(load, i, mem, next)?,
             Op::Crc32(from) => {
                 let v = self.get(i.src, from, mem, next)?;
                 let crc = crc32c(self.gpr[i.dst_reg()] as u32, v, from);

@@ -150,6 +150,11 @@ const STACK: usize = 8192;
 
 /// Run `code` (ending in `ret`) natively and interpreted from the same random state.
 fn check(code: &[u8], flag_mask: u64, rng: &mut Rng) {
+    check_init(code, flag_mask, rng, &|_, _| {});
+}
+
+/// `check`, with `init` adjusting the random registers first.
+fn check_init(code: &[u8], flag_mask: u64, rng: &mut Rng, init: &dyn Fn(&mut [u64; 16], &mut Rng)) {
     let _guard = NATIVE.lock().unwrap_or_else(|e| e.into_inner());
     let page = unsafe { mmap(std::ptr::null_mut(), 4096, 7, 0x22, -1, 0) };
     assert!(page as isize != -1);
@@ -167,6 +172,7 @@ fn check(code: &[u8], flag_mask: u64, rng: &mut Rng) {
     for r in [1usize, 2, 3, 5, 6, 12] {
         regs.gpr[r] = s - 256 + (rng.next() % 64) * 2;
     }
+    init(&mut regs.gpr, rng);
     regs.flags = 2 | (rng.next() & FLAG_MASK);
     regs.code = page as u64;
     let mut init = vec![0u8; STACK];
@@ -992,6 +998,289 @@ fn bmi1_movbe_crc32() {
     }
     let refs: Vec<(&[u8], u64)> = cases.iter().map(|(c, m)| (&c[..], *m)).collect();
     check_all(&refs, 0x00b1_0b1e_c0c0_a5a5);
+}
+
+/// A float bit pattern: edge values of binary32 (two per quadword) or binary64.
+fn fp_value(rng: &mut Rng) -> u64 {
+    const E32: [u32; 16] = [
+        0,
+        0x8000_0000,
+        1,
+        0x007f_ffff,
+        0x0080_0000,
+        0x0080_0001,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x7f7f_ffff,
+        0x7f80_0000,
+        0xff80_0000,
+        0x7fc0_0000,
+        0x7f80_0001,
+        0xffc0_1234,
+        0x4f00_0000,
+        0xcf00_0001,
+    ];
+    const E64: [u64; 14] = [
+        0,
+        1 << 63,
+        1,
+        0x000f_ffff_ffff_ffff,
+        0x0010_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+        0xbff8_0000_0000_0000,
+        0x7fef_ffff_ffff_ffff,
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000,
+        0x7ff8_0000_0000_0000,
+        0x7ff0_0000_0000_0001,
+        0x43e0_0000_0000_0000,
+        0xc1e0_0000_0020_0000,
+    ];
+    let pick32 = |rng: &mut Rng| match rng.next() % 3 {
+        0 => E32[(rng.next() % 16) as usize] as u64,
+        1 => rng.next() & 0x807f_ffff | 0x3f00_0000 | (rng.next() & 0x0300_0000), // near 1.0
+        _ => rng.next() & 0xffff_ffff,
+    };
+    match rng.next() % 3 {
+        0 => pick32(rng) | pick32(rng) << 32,
+        1 => E64[(rng.next() % 14) as usize],
+        _ => {
+            rng.next() & 0x800f_ffff_ffff_ffff
+                | 0x3fe0_0000_0000_0000
+                | (rng.next() & 0x0030_0000_0000_0000)
+        }
+    }
+}
+
+/// Every MXCSR setting a test may load: all exceptions masked, 4 modes x FTZ x DAZ.
+const MXCSRS: [u32; 16] = {
+    let mut m = [0u32; 16];
+    let mut k = 0;
+    while k < 16 {
+        m[k] = 0x1f80
+            | ((k as u32 & 3) << 13)
+            | (((k as u32 >> 2) & 1) << 15)
+            | (((k as u32 >> 3) & 1) << 6);
+        k += 1;
+    }
+    m
+};
+
+/// `ymm_case(op)` run under MXCSR `mx`; the MXCSR it ends with is stored at [rsp-24] (so
+/// the stack comparison checks the flags), then reset to 0x1f80.
+fn fp_case(op: &[u8], mx: u32) -> Vec<u8> {
+    let mut c = vec![0xc7, 0x44, 0x24, 0xe8];
+    c.extend_from_slice(&mx.to_le_bytes());
+    c.extend_from_slice(&[0x0f, 0xae, 0x54, 0x24, 0xe8]); // ldmxcsr [rsp-24]
+    let mut body = op.to_vec();
+    body.extend_from_slice(&[0x0f, 0xae, 0x5c, 0x24, 0xe8]); // stmxcsr [rsp-24]
+    body.extend_from_slice(&[0xc7, 0x44, 0x24, 0xe0, 0x80, 0x1f, 0, 0]);
+    body.extend_from_slice(&[0x0f, 0xae, 0x54, 0x24, 0xe0]); // ldmxcsr [rsp-32] (0x1f80)
+    c.extend(ymm_case(&body));
+    c
+}
+
+/// Run float cases under every MXCSR setting, with float edge values in rax..rdx.
+fn check_fp(ops: &[Vec<u8>], flag_mask: u64, rounds: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    let init = |g: &mut [u64; 16], rng: &mut Rng| {
+        for r in [0usize, 1, 2, 3, 6] {
+            g[r] = fp_value(rng);
+        }
+        // Equal operands now and then (xmm2 = xmm0), where predicates and min/max differ.
+        if rng.next().is_multiple_of(4) {
+            (g[1], g[2]) = (g[0], g[3]);
+        }
+    };
+    for op in ops {
+        for mx in MXCSRS {
+            let code = fp_case(op, mx);
+            for _ in 0..rounds {
+                check_init(&code, flag_mask, &mut rng, &init);
+            }
+        }
+    }
+}
+
+/// Legacy, VEX (and the swapped VEX source order) forms of `pfx 0F b modrm [imm]`.
+fn fp_forms(pp: u8, b: u8, imm: Option<u8>, two_source: bool, wide: bool, out: &mut Vec<Vec<u8>>) {
+    let mut legacy = match pp {
+        1 => vec![0x66],
+        2 => vec![0xf3],
+        3 => vec![0xf2],
+        _ => vec![],
+    };
+    legacy.extend_from_slice(&[0x0f, b, 0xc2]);
+    legacy.extend(imm);
+    out.push(legacy);
+    let mut rest = vec![0xc2];
+    rest.extend(imm);
+    out.push(vex2(pp, false, 0, b, &rest));
+    if two_source {
+        let mut sw = vec![0xc0];
+        sw.extend(imm);
+        out.push(vex2(pp, false, 2, b, &sw));
+    }
+    if wide {
+        out.push(vex2(pp, true, 0, b, &rest));
+    }
+}
+
+#[test]
+fn sse_float_arithmetic() {
+    let mut ops = Vec::new();
+    for b in [0x58u8, 0x59, 0x5c, 0x5d, 0x5e, 0x5f] {
+        for pp in 0..4 {
+            fp_forms(pp, b, None, true, pp < 2, &mut ops);
+        }
+    }
+    for pp in 0..4 {
+        // sqrt: packed forms have one source; scalar forms take the upper lanes from vvvv.
+        fp_forms(pp, 0x51, None, pp >= 2, pp < 2, &mut ops);
+    }
+    for (pp, b) in [
+        (3u8, 0x7cu8),
+        (3, 0x7d),
+        (1, 0x7c),
+        (1, 0x7d),
+        (3, 0xd0),
+        (1, 0xd0),
+    ] {
+        fp_forms(pp, b, None, true, true, &mut ops);
+    }
+    // Memory forms: scalar from [r12] (unaligned allowed), packed VEX from [r12].
+    ops.push(vec![0xf3, 0x41, 0x0f, 0x58, 0x04, 0x24]); // addss xmm0, [r12]
+    ops.push(vec![0xf2, 0x41, 0x0f, 0x59, 0x04, 0x24]); // mulsd xmm0, [r12]
+    ops.push(vex3x(
+        0,
+        1,
+        false,
+        true,
+        0,
+        (false, false, true),
+        0x5e,
+        &[0x04, 0x24],
+    )); // vdivps ymm0, ymm0, [r12]
+    check_fp(&ops, 0, 6, 0xf10a_7000_0000_0001);
+}
+
+#[test]
+fn sse_float_compares_and_conversions() {
+    let mut ops = Vec::new();
+    for pp in 0..4u8 {
+        for imm in 0..8u8 {
+            let mut l = match pp {
+                1 => vec![0x66],
+                2 => vec![0xf3],
+                3 => vec![0xf2],
+                _ => vec![],
+            };
+            l.extend_from_slice(&[0x0f, 0xc2, 0xc2, imm]);
+            ops.push(l);
+        }
+        for imm in 0..32u8 {
+            ops.push(vex2(pp, false, 0, 0xc2, &[0xc2, imm]));
+        }
+        ops.push(vex2(pp, pp < 2, 2, 0xc2, &[0xc0, 0x1d]));
+    }
+    for pp in 0..4 {
+        fp_forms(pp, 0x5a, None, pp >= 2, pp < 2, &mut ops); // cvtps2pd / pd2ps / ss2sd / sd2ss
+    }
+    for pp in 0..3 {
+        fp_forms(pp, 0x5b, None, false, true, &mut ops); // cvtdq2ps / ps2dq / tps2dq
+    }
+    for pp in 1..4 {
+        fp_forms(pp, 0xe6, None, false, true, &mut ops); // cvttpd2dq / dq2pd / pd2dq
+    }
+    for (pfx, w) in [(0xf3u8, false), (0xf2, false), (0xf3, true), (0xf2, true)] {
+        let mut c = vec![pfx];
+        if w {
+            c.push(0x48);
+        }
+        let n = c.len();
+        c.extend_from_slice(&[0x0f, 0x2a, 0xc6]); // cvtsi2ss/sd xmm0, esi / rsi
+        ops.push(c.clone());
+        for b in [0x2cu8, 0x2d] {
+            c.truncate(n);
+            c.extend_from_slice(&[0x0f, b, 0xf2]); // cvt(t)ss/sd2si esi / rsi, xmm2
+            ops.push(c.clone());
+        }
+    }
+    ops.push(vex3x(
+        2,
+        1,
+        true,
+        false,
+        2,
+        (false, false, false),
+        0x2a,
+        &[0xc6],
+    )); // vcvtsi2ss xmm0, xmm2, rsi
+    ops.push(vex2(3, false, 0, 0x2d, &[0xf2])); // vcvtsd2si esi, xmm2
+    for pp in 0..4u8 {
+        for imm in [0u8, 1, 2, 3, 4, 8, 9, 0xc] {
+            let mut c = vec![0x66, 0x0f, 0x3a, 0x08 + pp, 0xc2, imm]; // roundps/pd/ss/sd
+            ops.push(c.clone());
+            c.clear();
+            ops.push(vex3(
+                1,
+                3,
+                false,
+                pp < 2,
+                if pp >= 2 { 2 } else { 0 },
+                0x08 + pp,
+                &[if pp >= 2 { 0xc0 } else { 0xc2 }, imm],
+            ));
+        }
+    }
+    check_fp(&ops, 0, 3, 0xf10a_7000_0000_0002);
+    // comiss / ucomiss / comisd / ucomisd: ZF, PF, CF set, OF, SF, AF cleared.
+    let mut flags_ops = Vec::new();
+    for (pp, b) in [(0u8, 0x2eu8), (0, 0x2f), (1, 0x2e), (1, 0x2f)] {
+        fp_forms(pp, b, None, false, false, &mut flags_ops);
+    }
+    check_fp(&flags_ops, FLAG_MASK, 6, 0xf10a_7000_0000_0003);
+}
+
+#[test]
+fn sse_float_moves_and_shuffles() {
+    let mut ops: Vec<Vec<u8>> = vec![
+        vec![0xf3, 0x0f, 0x10, 0xc2],                 // movss xmm0, xmm2
+        vec![0xf2, 0x0f, 0x10, 0xc2],                 // movsd xmm0, xmm2
+        vec![0xf3, 0x0f, 0x11, 0xd0],                 // movss xmm0, xmm2 (store form)
+        vec![0xf3, 0x0f, 0x10, 0x44, 0x24, 0xc0],     // movss xmm0, [rsp-64]
+        vec![0xf2, 0x0f, 0x10, 0x44, 0x24, 0xc1],     // movsd xmm0, [rsp-63]
+        vec![0xf3, 0x0f, 0x11, 0x44, 0x24, 0xc3],     // movss [rsp-61], xmm0
+        vec![0xf2, 0x0f, 0x11, 0x44, 0x24, 0xc5],     // movsd [rsp-59], xmm0
+        vec![0x0f, 0x12, 0x44, 0x24, 0xc0],           // movlps xmm0, [rsp-64]
+        vec![0x66, 0x0f, 0x16, 0x44, 0x24, 0xc4],     // movhpd xmm0, [rsp-60]
+        vec![0x0f, 0x12, 0xc2],                       // movhlps xmm0, xmm2
+        vec![0x0f, 0x16, 0xc2],                       // movlhps xmm0, xmm2
+        vec![0x0f, 0x13, 0x44, 0x24, 0xc0],           // movlps [rsp-64], xmm0
+        vec![0x0f, 0x17, 0x44, 0x24, 0xc8],           // movhps [rsp-56], xmm0
+        vec![0xf3, 0x0f, 0x12, 0xc2],                 // movsldup
+        vec![0xf3, 0x0f, 0x16, 0xc2],                 // movshdup
+        vec![0x0f, 0x50, 0xf0],                       // movmskps esi, xmm0
+        vec![0x66, 0x0f, 0x50, 0xf0],                 // movmskpd esi, xmm0
+        vex2(2, false, 2, 0x10, &[0xc0]),             // vmovss xmm0, xmm2, xmm0
+        vex2(3, false, 0, 0x10, &[0x44, 0x24, 0xc0]), // vmovsd xmm0, [rsp-64]
+        vex2(0, false, 2, 0x12, &[0xc0]),             // vmovhlps xmm0, xmm2, xmm0
+        vex2(0, false, 2, 0x16, &[0x44, 0x24, 0xc0]), // vmovhps xmm0, xmm2, [rsp-64]
+        vex2(2, true, 0, 0x16, &[0xc2]),              // vmovshdup ymm0, ymm2
+        vex2(0, true, 0, 0x50, &[0xf0]),              // vmovmskps esi, ymm0
+        vex2(1, true, 0, 0x50, &[0xf0]),              // vmovmskpd esi, ymm0
+        vex2(0, false, 0, 0xae, &[0x5c, 0x24, 0xd0]), // vstmxcsr [rsp-48]
+    ];
+    for imm in [0u8, 0x1b, 0x4e, 0xb1, 0xe4, 0xff] {
+        ops.push(vec![0x0f, 0xc6, 0xc2, imm]);
+        ops.push(vec![0x66, 0x0f, 0xc6, 0xc2, imm & 3]);
+        ops.push(vex2(0, true, 2, 0xc6, &[0xc0, imm]));
+        ops.push(vex2(1, true, 0, 0xc6, &[0xc2, imm & 15]));
+    }
+    for (pp, b) in [(0u8, 0x14u8), (0, 0x15), (1, 0x14), (1, 0x15)] {
+        fp_forms(pp, b, None, true, true, &mut ops);
+    }
+    check_fp(&ops, 0, 3, 0xf10a_7000_0000_0004);
 }
 
 /// Regenerates `apps/x86test/src/vectors.rs`: `cargo test -p x86emu --test differential
