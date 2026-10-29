@@ -5,8 +5,10 @@ use core::ops::Range;
 mod float;
 mod shuffle;
 mod vector;
+mod x87;
 
 pub use float::{MXCSR_MASK, MXCSR_RESET};
+pub use x87::{Fpu, FCW_RESET};
 
 use crate::decode::{
     decode, AluOp, BitOp, BmiOp, BtOp, DecodeError, Inst, MemRef, Op, Operand, Rep, Seg, ShiftOp,
@@ -94,6 +96,7 @@ pub struct Cpu {
     /// Upper halves of the ymm registers (AVX).
     pub ymm_hi: [u128; 16],
     pub mxcsr: u32,
+    pub fpu: Fpu,
     pub fs_base: u64,
     pub gs_base: u64,
     /// Addresses that stop execution with `Stop::Hle` instead of being fetched.
@@ -257,6 +260,7 @@ impl Default for Cpu {
             xmm: [0; 16],
             ymm_hi: [0; 16],
             mxcsr: MXCSR_RESET,
+            fpu: Fpu::default(),
             fs_base: 0,
             gs_base: 0,
             hle: 0..0,
@@ -636,6 +640,7 @@ impl Cpu {
                 self.put(i.dst, sz, swapped, mem, next)?;
             }
             Op::Mxcsr(load) => self.mxcsr_op(load, i, mem, next)?,
+            Op::X87(x) => self.x87(x, i, mem, next)?,
             Op::Crc32(from) => {
                 let v = self.get(i.src, from, mem, next)?;
                 let crc = crc32c(self.gpr[i.dst_reg()] as u32, v, from);

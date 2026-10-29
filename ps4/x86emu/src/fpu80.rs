@@ -376,7 +376,7 @@ pub fn sqrt(a: X80, env: &mut Env80) -> X80 {
         Val::Inf(true) | Val::Num(true, ..) => invalid(env),
         Val::Num(false, e, m) => {
             // Digit-by-digit root of m (64 bits, made even-exponent), then 61 more bits.
-            let m = (m >> 63);
+            let m = m >> 63;
             let (n, half) = if e % 2 == 0 {
                 (m << 63, e / 2)
             } else {

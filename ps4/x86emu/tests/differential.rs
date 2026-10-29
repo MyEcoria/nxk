@@ -1372,6 +1372,197 @@ fn sse_float_blends_permutes_f16c() {
     check_fp_with(&dots, 0, 6, 0xf10a_7000_0000_0006, true);
 }
 
+/// A pair of random x87 operands: (significand, sign/exponent).
+fn x80_value(rng: &mut Rng) -> (u64, u64) {
+    let one = 1u64 << 63;
+    let edges: [(u64, u64); 14] = [
+        (0, 0),
+        (one, 0x3fff),
+        (one, 0x7fff),
+        (one | 1 << 62, 0x7fff),
+        (one | 1, 0x7fff),
+        (u64::MAX, 0x7ffe),
+        (one, 1),
+        (1, 0),
+        (one, 0),
+        (0, 0x7fff),
+        (1 << 62, 0x3fff),
+        (one | 0x1234, 0x4000),
+        (u64::MAX, 0x3ffe),
+        (one | 1, 0x403e),
+    ];
+    let (sig, se) = match rng.next() % 4 {
+        0 => edges[(rng.next() % 14) as usize],
+        1 => (rng.next() | one, 0x3fff + rng.next() % 40 - 20),
+        2 => (rng.next() | one, rng.next() % 0x7fff),
+        _ => (rng.next() | one, rng.next() % 8),
+    };
+    (sig, se | (rng.next() & 0x8000))
+}
+
+/// An x87 test case around `op`: fninit, control word `cw`, ST(0) = a (rax:rcx),
+/// ST(1) = b (rbx:rdx), `op`, then the status word (ANDed with `swmask`), the control word,
+/// and ST(0), ST(1) stored in the compared stack area; fninit leaves the stack empty.
+fn x87_case(op: &[u8], cw: u16, swmask: u16) -> Vec<u8> {
+    let mut c: Vec<u8> = vec![
+        0x48, 0x89, 0x44, 0x24, 0x80, // mov [rsp-128], rax
+        0x48, 0x89, 0x4c, 0x24, 0x88, // mov [rsp-120], rcx
+        0x48, 0x89, 0x5c, 0x24, 0x90, // mov [rsp-112], rbx
+        0x48, 0x89, 0x54, 0x24, 0x98, // mov [rsp-104], rdx
+        0xdb, 0xe3, // fninit
+        0xc7, 0x44, 0x24, 0xa0,
+    ];
+    c.extend_from_slice(&(cw as u32).to_le_bytes());
+    c.extend_from_slice(&[
+        0xd9, 0x6c, 0x24, 0xa0, // fldcw [rsp-96]
+        0xdb, 0x6c, 0x24, 0x90, // fld tbyte [rsp-112]  (b)
+        0xdb, 0x6c, 0x24, 0x80, // fld tbyte [rsp-128]  (a)
+    ]);
+    c.extend_from_slice(op);
+    c.extend_from_slice(&[0xdd, 0x7c, 0x24, 0xa8]); // fnstsw [rsp-88]
+    c.extend_from_slice(&[0x66, 0x81, 0x64, 0x24, 0xa8]); // and word [rsp-88], mask
+    c.extend_from_slice(&swmask.to_le_bytes());
+    c.extend_from_slice(&[
+        0xd9, 0x7c, 0x24, 0xac, // fnstcw [rsp-84]
+        0xdb, 0x7c, 0x24, 0xb0, // fstp tbyte [rsp-80]
+        0xdb, 0x7c, 0x24, 0xc0, // fstp tbyte [rsp-64]
+        0xdb, 0xe3, // fninit
+        0xc3,
+    ]);
+    c
+}
+
+/// Run x87 cases under 12 control words with random operands (and random stack bytes
+/// for the memory forms).
+fn check_x87(ops: &[Vec<u8>], swmask: u16, rounds: usize, seed: u64) {
+    let mut rng = Rng(seed);
+    let init = |g: &mut [u64; 16], rng: &mut Rng| {
+        let (a, b) = (x80_value(rng), x80_value(rng));
+        (g[0], g[1], g[3], g[2]) = (a.0, a.1, b.0, b.1);
+        if rng.next().is_multiple_of(4) {
+            (g[3], g[2]) = (g[0], g[1]); // equal operands
+        }
+    };
+    for op in ops {
+        for pc in [0u16, 2, 3] {
+            for rc in 0..4u16 {
+                let code = x87_case(op, 0x7f | pc << 8 | rc << 10, swmask);
+                for _ in 0..rounds {
+                    check_init(&code, FLAG_MASK, &mut rng, &init);
+                }
+            }
+        }
+    }
+}
+
+/// Status bits that are defined after every instruction: exception flags and stack fault,
+/// TOP, and C1 (the condition codes C0, C2, C3 are checked where an instruction sets them).
+const SW_BASE: u16 = 0x7f | 0x3800 | 1 << 9;
+const SW_ALL: u16 = SW_BASE | 1 << 8 | 1 << 10 | 1 << 14;
+
+#[test]
+fn x87_arithmetic_and_loads() {
+    let mut ops: Vec<Vec<u8>> = Vec::new();
+    for r in [0u8, 1, 4, 5, 6, 7] {
+        ops.push(vec![0xd8, 0xc0 | r << 3 | 1]); // op st, st(1)
+        ops.push(vec![0xdc, 0xc0 | r << 3 | 1]); // op st(1), st
+        ops.push(vec![0xde, 0xc0 | r << 3 | 1]); // op st(1), st; pop
+        for (esc, name) in [(0xd8u8, 0), (0xdc, 1), (0xda, 2), (0xde, 3)] {
+            let _ = name;
+            ops.push(vec![esc, 0x44 | r << 3, 0x24, 0xc0]); // op [rsp-64]
+        }
+    }
+    for b in [
+        vec![0xd9, 0x44, 0x24, 0xc0],
+        vec![0xdd, 0x44, 0x24, 0xc0],
+        vec![0xdb, 0x6c, 0x24, 0xc0],
+        vec![0xdf, 0x44, 0x24, 0xc0],
+        vec![0xdb, 0x44, 0x24, 0xc0],
+        vec![0xdf, 0x6c, 0x24, 0xc0],
+        vec![0xd9, 0xc1],
+        vec![0xd9, 0xc9],
+        vec![0xd9, 0xe0],
+        vec![0xd9, 0xe1],
+        vec![0xd9, 0xfa],
+        vec![0xd9, 0xfc],
+        vec![0xd9, 0xfd],
+        vec![0xd9, 0xf4],
+    ] {
+        ops.push(b);
+    }
+    for k in 0xe8u8..=0xee {
+        ops.push(vec![0xd9, k]);
+    }
+    check_x87(&ops, SW_BASE, 6, 0x8787_0000_0000_0001);
+}
+
+#[test]
+fn x87_stores_and_compares() {
+    let mut ops: Vec<Vec<u8>> = Vec::new();
+    for b in [
+        vec![0xd9, 0x54, 0x24, 0xd0],
+        vec![0xd9, 0x5c, 0x24, 0xd0],
+        vec![0xdd, 0x54, 0x24, 0xd0],
+        vec![0xdd, 0x5c, 0x24, 0xd0],
+        vec![0xdb, 0x7c, 0x24, 0xd0],
+        vec![0xdf, 0x54, 0x24, 0xd0],
+        vec![0xdf, 0x5c, 0x24, 0xd0],
+        vec![0xdb, 0x54, 0x24, 0xd0],
+        vec![0xdb, 0x5c, 0x24, 0xd0],
+        vec![0xdf, 0x7c, 0x24, 0xd0],
+        vec![0xdf, 0x4c, 0x24, 0xd0],
+        vec![0xdb, 0x4c, 0x24, 0xd0],
+        vec![0xdd, 0x4c, 0x24, 0xd0],
+        vec![0xdd, 0xd1],
+        vec![0xdd, 0xd9],
+        vec![0xdb, 0xe2],
+        vec![0xd9, 0xf6],
+        vec![0xd9, 0xf7],
+        vec![0xdd, 0xc1],
+        vec![0xd9, 0xd0],
+    ] {
+        ops.push(b);
+    }
+    check_x87(&ops, SW_BASE, 6, 0x8787_0000_0000_0002);
+    let mut cmps: Vec<Vec<u8>> = Vec::new();
+    for b in [
+        vec![0xd8, 0xd1],
+        vec![0xd8, 0xd9],
+        vec![0xd8, 0x54, 0x24, 0xc0],
+        vec![0xd8, 0x5c, 0x24, 0xc0],
+        vec![0xdc, 0x54, 0x24, 0xc0],
+        vec![0xdc, 0x5c, 0x24, 0xc0],
+        vec![0xda, 0x54, 0x24, 0xc0],
+        vec![0xde, 0x5c, 0x24, 0xc0],
+        vec![0xdd, 0xe1],
+        vec![0xdd, 0xe9],
+        vec![0xda, 0xe9],
+        vec![0xde, 0xd9],
+        vec![0xdb, 0xe9],
+        vec![0xdb, 0xf1],
+        vec![0xdf, 0xe9],
+        vec![0xdf, 0xf1],
+        vec![0xd9, 0xe4],
+        vec![0xd9, 0xe5],
+        vec![0xdf, 0xe0],
+    ] {
+        cmps.push(b);
+    }
+    check_x87(&cmps, SW_ALL, 6, 0x8787_0000_0000_0003);
+    let conds: Vec<Vec<u8>> = [0xda, 0xdb]
+        .iter()
+        .flat_map(|e| (0..4u8).map(move |k| vec![*e, 0xc0 | k << 3 | 1]))
+        .collect();
+    check_x87(&conds, SW_BASE, 4, 0x8787_0000_0000_0004);
+}
+
+#[test]
+fn x87_remainders() {
+    // C0, C3, C1 hold the quotient's low bits and C2 the "incomplete" flag.
+    let ops = vec![vec![0xd9, 0xf8], vec![0xd9, 0xf5]];
+    check_x87(&ops, SW_ALL, 40, 0x8787_0000_0000_0005);
+}
+
 /// Regenerates `apps/x86test/src/vectors.rs`: `cargo test -p x86emu --test differential
 /// gen_vectors -- --ignored --nocapture > apps/x86test/src/vectors.rs`.
 #[test]
