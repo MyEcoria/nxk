@@ -149,6 +149,12 @@ fn guest_jaguar() -> Result<String, String> {
 }
 
 const FP_EXPECTED: &str = include_str!("../../../ps4/guest/bin/fp-expected.txt");
+const X87_EXPECTED: &str = include_str!("../../../ps4/guest/bin/x87-expected.txt");
+
+/// The long double guest (x87).
+fn guest_x87() -> Result<String, String> {
+    guest_expect(LIBMINI, include_bytes!("../../../ps4/guest/bin/x87.so"), X87_EXPECTED)
+}
 
 /// The floating-point guest, generic and for Jaguar (AVX).
 fn guest_fp() -> Result<String, String> {
@@ -161,7 +167,7 @@ fn guest_fp() -> Result<String, String> {
 }
 
 fn main() {
-    let tests: [(&str, fn() -> Result<String, String>); 7] = [
+    let tests: [(&str, fn() -> Result<String, String>); 8] = [
         ("alu", alu_vectors),
         ("smc", self_modifying),
         ("speed", speed),
@@ -169,6 +175,7 @@ fn main() {
         ("guest-sce", guest_sce),
         ("guest-jaguar", guest_jaguar),
         ("guest-fp", guest_fp),
+        ("guest-x87", guest_x87),
     ];
     let mut failed = 0;
     for (name, test) in tests {

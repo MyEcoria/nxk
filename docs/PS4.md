@@ -86,7 +86,7 @@ place, so it costs neither CPU time nor a copy.
 | Phase | Content | State |
 |---|---|---|
 | 1 | `ps4fmt`: SHA-1, NIDs, `param.sfo`, plaintext ELF/SELF | done (host tests) |
-| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; MOVBE, CRC32 (SSE4.2), BMI1 (andn, bextr, blsi, blsmsk, blsr); SSE2..SSE4.1 integer and data moves (saturating, min/max, multiplies, pack/unpack, pshufb, palignr, pmovsx/zx, ptest, pextr/pinsr, pmovmskb...), legacy and VEX encoded; AVX1: VEX.128 for all of them (upper ymm half cleared), VEX.256 for the moves, the ps/pd logic, vinsertf128/vextractf128, vzeroupper/vzeroall. Alignment faults as on the CPU (legacy 128-bit operands, aligned moves). Every form compared with the host CPU (registers, defined flags, memory, both ymm halves). SSE / AVX floating point on a soft-float core (see below): arithmetic, compares, conversions, rounding, horizontal ops, dpps, blends, shuffles, permutes, broadcasts, F16C, MXCSR. Not yet: x87, SSE4A, SSE4.2 string compares, vtestps/vmaskmovps, `syscall` |
+| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; MOVBE, CRC32 (SSE4.2), BMI1 (andn, bextr, blsi, blsmsk, blsr); SSE2..SSE4.1 integer and data moves (saturating, min/max, multiplies, pack/unpack, pshufb, palignr, pmovsx/zx, ptest, pextr/pinsr, pmovmskb...), legacy and VEX encoded; AVX1: VEX.128 for all of them (upper ymm half cleared), VEX.256 for the moves, the ps/pd logic, vinsertf128/vextractf128, vzeroupper/vzeroall. Alignment faults as on the CPU (legacy 128-bit operands, aligned moves). Every form compared with the host CPU (registers, defined flags, memory, both ymm halves). SSE / AVX floating point on a soft-float core (see below): arithmetic, compares, conversions, rounding, horizontal ops, dpps, blends, shuffles, permutes, broadcasts, F16C, MXCSR. x87 (80-bit, below). Not yet: SSE4A, SSE4.2 string compares, vtestps/vmaskmovps, `syscall` |
 | 3 | PS4 runtime (`ps4rt`): loader, NID linker, HLE imports | started: maps PT_LOAD/RELRO, reads the dynamic tables in either layout (SCE tags in `PT_SCE_DYNLIBDATA` with `NID#lib#module` names, or standard `DT_*`), applies RELATIVE / 64 / GLOB_DAT / JUMP_SLOT, binds imports to guest modules first (the game's own `libc.prx`), then to HLE thunks; an import nothing provides stops the run with its NID when called. HLE so far: `write`, `_exit`. The entry is called with the SysV alignment (rsp + 8 on 16 bytes), checked by the interpreter: legacy-SSE 16-byte accesses other than movdqu/movups stop with `Misaligned`, as #GP would. Not yet: TLS relocations, threads, files, the other 1200 imports, data imports served by HLE (an STT_OBJECT import such as `__stack_chk_guard` gets a code-thunk address and faults when read, instead of naming its NID), the real entry convention of the eboot (to take from upstream's runtime), the floating-point state of threads: a new thread starts with its creator's MXCSR and x87 control word, as FreeBSD's libthr does (inFAMOUS sets FTZ in one thread, then creates its job workers from it; upstream's `runtime_thread.c`), and the main thread's initial values are to be taken from upstream's runtime, not assumed to be 0x1f80 |
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |
@@ -158,7 +158,7 @@ The float guest (`fpmain.c`: series, 4x4 matrices, normalisation, conversions,
 specials, FTZ/DAZ as inFAMOUS sets them, MXCSR rounding, a particle loop) prints the
 native run's bits, generic and for Jaguar, on the PC, in the emulator and on the Erista
 (run 79). The host suites (`cd ps4 && cargo test`) are not in CI yet, so every float
-result so far is from Intel cores; none from an AMD one. Next: x87 (80-bit, on the same core with an explicit integer bit).
+result so far is from Intel cores; none from an AMD one. 
 
 For the JIT: EL0 cannot clean the data cache, but none is needed for code it writes:
 `vm::protect` cleans to the point of unification and invalidates the instruction cache
@@ -167,3 +167,34 @@ whenever a page becomes executable (`kernel/src/mm/vm.rs`), so RW then RX throug
 only check of that path.
 
 Run the host tests: `cd ps4 && cargo test`. On nxk, `x86test` (apps/, in `build.sh` and on the SD card) replays 1568 ALU vectors recorded from a native run on a PC, checks self-modifying code and times the interpreter: `./tools/nxtest.py -c x86test --sd build/sd.img` (identical in the emulator; its MIPS figure is the emulator's, not the console's). On the Erista (hwboot run 76) all vectors match too, at 10.6 MIPS with the CPU at 998 MHz, about 94 cycles per guest instruction: two orders of magnitude below one 1.6 GHz Jaguar core, so the JIT of phase 5 is required, not an option. The wider decoder first cost speed (run 77: 8.2 MIPS on the same loop at 998 MHz; 47.5 on a PC, from 55); with the rare paths (SIMD, BMI, mul/div, bit ops, strings) kept out of the dispatch loop (`#[inline(never)]`), run 78 measures 9.0 MIPS at 998 MHz, the guests 5.1 to 5.5 MIPS, and 66 MIPS on a PC. The JIT stays required. Regenerate the vectors with the `gen_vectors` test (see its comment).
+
+### x87
+
+`x86emu/src/fpu80.rs` is a second soft-float core for the 80-bit format, kept apart from
+the SSE one: explicit integer bit and invalid encodings (pseudo-denormals, unnormals,
+pseudo-NaN), precision control (24, 53 or 64 bits, the 15-bit exponent range kept), the
+x87's own NaN rule (QNaN over SNaN, then the larger significand) and the C1 round-up bit.
+Widening the SSE core was rejected: it would branch on all of that and touch the code
+that is tested and fast on the A57.
+
+`cpu/x87.rs` adds the register stack (TOP, an empty bit per register, stack faults), the
+control word (reset 0x37f, 64-bit precision, round to nearest, all masked: what upstream's
+Linux host gives the game) and the status word. Covered: arithmetic in every operand
+form, loads and stores of every width, fist/fisttp, constants, fxch/fchs/fabs, ftst,
+fxam, fsqrt, frndint, fscale, fxtract, fprem/fprem1, the fcom and fcomi families,
+fcmovcc, stack control, fnstenv/fldenv (control, status and tag words only). Not decoded,
+on purpose: the transcendentals (f2xm1, fyl2x, fyl2xp1, fptan, fpatan, fsin, fcos,
+fsincos: neither vendor rounds them correctly and Jaguar's microcode cannot be measured
+here) and BCD (fbld, fbstp); nothing shows the game uses them. An unmasked x87 exception
+stops before the result is written; the real x87 defers it to the next waiting
+instruction, which games never rely on.
+
+Everything above is compared with the host's x87 under 3 precisions x 4 rounding modes
+(`tests/softfloat80.rs`: the core; `tests/differential.rs`: whole instructions, status
+word, control word and both registers), on a P-core and on an E-core. The tests settled
+what the SDM leaves open: precision control applies to the arithmetic, not to fscale;
+stores and integer conversions raise no DE; a pseudo-denormal result comes back with
+exponent 1; fldl2t is the only constant that differs between round-nearest and round-up
+(and its round-down value equals the nearest one). The `long double` guest (`x87main.c`:
+series, conversions, truncation through fnstcw/fldcw, 24/53/64-bit precision, fprem
+loops, overflow and NaN) prints the native run's bits on the PC and in the emulator.
