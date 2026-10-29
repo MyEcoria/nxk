@@ -7,6 +7,8 @@ description = "Runs the PS4 layer's x86-64 interpreter on nxk against vectors re
 
 [dependencies]
 x86emu = { path = "../../ps4/x86emu" }
+ps4rt = { path = "../../ps4/ps4rt" }
+ps4fmt = { path = "../../ps4/ps4fmt" }
 
 [[bin]]
 name = "x86test"

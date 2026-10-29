@@ -1556,6 +1556,14 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+77. 29/10/2026, same console and boot as run 76 (gauge 47 %, charging), `x86test`
+    rebuilt with the wider x86-64 decoder and the PS4 runtime (`ps4rt`) and sent
+    with `usbterm.py --put`: 5/5. The PC-built guests (`ps4/guest/`, a libc module
+    and a main program, gcc -O2) load, link by NID (9 imports to the libc module, 2
+    to HLE) and print exactly what the PC's native run prints, in the standard ELF
+    layout and repacked in the PS4's SCE layout: 486412 guest instructions, 5.1 MIPS
+    at 998 MHz, 6.2 at 1224 MHz (`cpufreq 1224`, back to `boot` after). The ALU loop
+    runs at 8.2 MIPS (10.1 at 1224), from 10.6 in run 76: the price of the decoder.
 76. 29/10/2026, Erista, card of run 75 (no `abi/`, `std/`, `libnx` or kernel
     change since), `dev` at `7acc0f3`, `nxk-ipl.bin` injected: **the x86-64
     interpreter of the PS4 layer runs on the console**. `x86test` sent with

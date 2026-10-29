@@ -7,6 +7,18 @@ name = "hello-std"
 version = "0.1.0"
 
 [[package]]
+name = "ps4fmt"
+version = "0.1.0"
+
+[[package]]
+name = "ps4rt"
+version = "0.1.0"
+dependencies = [
+ "ps4fmt",
+ "x86emu",
+]
+
+[[package]]
 name = "stdtest"
 version = "0.1.0"
 
@@ -18,5 +30,7 @@ version = "0.1.0"
 name = "x86test"
 version = "0.1.0"
 dependencies = [
+ "ps4fmt",
+ "ps4rt",
  "x86emu",
 ]

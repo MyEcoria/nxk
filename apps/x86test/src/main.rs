@@ -1,5 +1,6 @@
 //! x86emu on nxk: replays ALU vectors recorded from a native x86-64 run on a PC,
-//! checks self-modifying code, and times the interpreter.
+//! checks self-modifying code, times the interpreter, and runs the PC-built guest
+//! programs (`ps4/guest/`) through the PS4 runtime's loader and NID linker.
 
 use std::time::Instant;
 use x86emu::cpu::{AF, CF, Cpu, FLAG_MASK, Mem};
@@ -92,9 +93,53 @@ fn speed() -> Result<String, String> {
     Ok(format!("{:.1} MIPS ({} instructions in {:.0} ms)", 3.0 * n as f64 / secs / 1e6, 3 * n, secs * 1e3))
 }
 
+const LIBMINI: &[u8] = include_bytes!("../../../ps4/guest/bin/libmini.so");
+const EXPECTED: &str = include_str!("../../../ps4/guest/bin/expected.txt");
+
+/// Load the guest "libc" and `main`, link by NID, run, compare with the PC's native output.
+fn guest(main: &[u8]) -> Result<String, String> {
+    let mut p = ps4rt::Process::new(ps4rt::hle::libkernel());
+    p.load("libmini.so", "libc", LIBMINI).map_err(|e| e.to_string())?;
+    let m = p.load("main", "main", main).map_err(|e| e.to_string())?;
+    let report = p.link().map_err(|e| e.to_string())?;
+    let t = Instant::now();
+    let outcome = p.run(m, 100_000_000);
+    let secs = t.elapsed().as_secs_f64();
+    let mut out = String::from_utf8_lossy(&p.stdout).into_owned();
+    match outcome {
+        ps4rt::Outcome::Exited(code) => out.push_str(&format!("exit {code}\n")),
+        other => return Err(format!("stopped: {other:?} after {:?}", out.lines().last())),
+    }
+    if out != EXPECTED {
+        let at = out.lines().zip(EXPECTED.lines()).position(|(a, b)| a != b);
+        return Err(format!("output differs from the PC's at line {at:?}"));
+    }
+    Ok(format!(
+        "{} lines identical to the PC's run; imports: {} to libmini, {} to HLE; {} instructions, {:.1} MIPS",
+        out.lines().count(),
+        report.to_modules,
+        report.to_hle,
+        p.cpu.steps,
+        p.cpu.steps as f64 / secs / 1e6
+    ))
+}
+
+fn guest_elf() -> Result<String, String> {
+    guest(include_bytes!("../../../ps4/guest/bin/main.so"))
+}
+
+fn guest_sce() -> Result<String, String> {
+    guest(include_bytes!("../../../ps4/guest/bin/main.sce"))
+}
+
 fn main() {
-    let tests: [(&str, fn() -> Result<String, String>); 3] =
-        [("alu", alu_vectors), ("smc", self_modifying), ("speed", speed)];
+    let tests: [(&str, fn() -> Result<String, String>); 5] = [
+        ("alu", alu_vectors),
+        ("smc", self_modifying),
+        ("speed", speed),
+        ("guest-elf", guest_elf),
+        ("guest-sce", guest_sce),
+    ];
     let mut failed = 0;
     for (name, test) in tests {
         match test() {
