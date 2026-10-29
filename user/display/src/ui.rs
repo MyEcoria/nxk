@@ -363,11 +363,14 @@ pub struct Ui {
     pub login_art: Option<Cover>,
     /// The overlay over a game: what the last second showed.
     pub perf: Option<crate::perf::Sample>,
+    /// The boot screen, until the users are read.
+    pub boot: Option<crate::boot::Boot>,
 }
 
 impl Ui {
     pub fn new() -> Self {
         Self {
+            boot: Some(crate::boot::Boot::new()),
             page: LIBRARY,
             pressed: None,
             modal: None,
@@ -731,7 +734,8 @@ impl Ui {
     }
 
     pub fn animating(&self) -> bool {
-        self.flow.is_some()
+        self.boot.is_some()
+            || self.flow.is_some()
             || (self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5)
             || (self.sheet == Some(Sheet::Wifi) && self.wifi.busy())
     }
@@ -739,7 +743,7 @@ impl Ui {
     /// Time between two frames of an animation: the flows redraw often
     /// but change little, the home row's scroll moves all of it.
     pub fn frame_ns(&self) -> u64 {
-        if self.flow.is_some() {
+        if self.boot.is_some() || self.flow.is_some() {
             33_000_000
         } else if self.sheet == Some(Sheet::Wifi) {
             250_000_000
@@ -1319,6 +1323,12 @@ impl Ui {
 
     /// Whole frame into `s` (not yet on screen: `Screen::present`).
     pub fn draw(&mut self, s: &mut Screen, d: &Data, msgs: &Messages, term: &Term, now: u64) {
+        if let Some(b) = self.boot.as_mut() {
+            if !b.over(now) {
+                return b.draw(s, now);
+            }
+            self.boot = None;
+        }
         let p = pal();
         self.zones.clear();
         self.wall = libnx::time::realtime_ns();

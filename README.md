@@ -43,6 +43,7 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 | Tools | ✅ Complete | Build, SD card image, tests, gdb, L4T comparison, USB-C terminal |
 | Base drivers | ✅ Complete | UART, I2C, PMIC, RTC, temperatures |
 | Screen | ✅ Complete | InnoLux 720x1280 panel taken over from hekate, backlight and sleep; JDI and AUO power-down tables untested |
+| Boot screen | 🟡 Partial | nxk logo and progress bar from the monitor to the library, logs with Vol+ held; checked pixel for pixel in the emulator, not yet seen on the Erista |
 | Touchscreen | ✅ Complete | FTM3BD56, read on its interrupt line, polled as a fallback |
 | Fan | ✅ Complete | Temperature curve as in Nyx, speed read from the tachometer |
 | Joy-Con | 🟡 Partial | Left Joy-Con works on the Erista; right one not detected; charging and rumble to do |

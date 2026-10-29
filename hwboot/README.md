@@ -20,7 +20,7 @@ tried in the emulator only (see "Hardware runs").
 
 ```bash
 cd hwboot
-./fetch.sh        # hekate RCM payload + Nyx SD pack -> dl/ (pinned v6.5.3)
+./fetch.sh        # hekate RCM payload + Nyx SD pack -> dl/ (pinned v6.5.4)
 make -C fusee-nano  # builds ./fusee-nano/fusee-nano (17 KiB, zero deps)
 sudo cp 99-switch-rcm.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
 sudo cp 99-nxk-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
@@ -159,24 +159,29 @@ NXTEST_QEMU_ARGS="-device loader,file=hwboot/dl/bl31-test.bin,addr=0xFFF00000,fo
 ## Screen: what to expect
 
 Without a UART adapter, the screen is the only output: hekate leaves it
-on when launching an L4T entry, and the monitor then the kernel write to
-it (white text on black, portrait like the hekate text menu: hold the
-console vertically) until the `display` service turns it landscape. In
-order:
+on when launching an L4T entry, and the monitor then the kernel draw on
+it until the `display` service takes it over. By default that is the
+**boot screen** (`bootsplash/`, the same picture at every stage): the
+nxk logo and a progress bar on the dark theme's background, landscape
+(hold the console normally). Hold **Vol+** while nxk starts to get the
+logs as text instead (white on black, portrait like the hekate text
+menu: hold the console vertically). In order:
 
 1. hekate logo, then one **line** filling up at the bottom of the
    screen: the hekate countdown (`bootwait`), cleared just before the
    jump to `bl31.bin`. Normal.
-2. Black screen, `[nxk-bl31] ...` lines: the monitor is running.
-3. `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ... launching
-   init` lines: the kernel is running. A kernel panic or fault shows up
-   here too.
-4. The `display` service takes over the screen, in landscape (hold the
-   console normally): midnight-blue background, a header with the nxk
-   logo, the USB, ETH, WI-FI, SD and FAN states, the temperature and
-   the uptime, a tab bar at the bottom (HOME, SYSTEM, NETWORK, TERMINAL,
-   LOGS) and the HOME tiles: CPU, MEMORY, STORAGE (SD card free space),
-   NETWORK and TERMINAL, refreshed every second. User space is alive.
+2. Boot screen, bar at 15 %: the monitor is running (with Vol+: a
+   black screen and `[nxk-bl31] ...` lines).
+3. Bar at 30 %, then 45 % when init starts: the kernel is running (with
+   Vol+: the `nxk v0.1.0` banner, `[mem]`, `[screen]`, `[boot] ...
+   launching init` lines). A kernel panic, a monitor error or a program
+   killed on a fault before `display` is up turns the boot screen into
+   text: the messages so far, the failure last.
+4. The `display` service takes over the screen: the same boot screen,
+   its bar going on from 60 % until the users are read from the card
+   (15 s at most without one; buttons and taps are dropped meanwhile),
+   then the library (HOME), or the first-start setup on a new card:
+   user space is alive.
    Logs (the kernel's, the services' such as `[usbcon]` or `[sd]`
    lines, and `fbecho`) go to the LOGS page, whose tab counts the
    unread ones; the TERMINAL page shows the shell's session only, the
@@ -192,9 +197,10 @@ order:
    interrupt stuck low, polling instead` means the line never went back
    high (then taps still work, up to 0.5 s late).
 
-Photograph the screen wherever it stops: the last line locates the
-failure. If the logo stays on after the line clears (1 without 2), the
-monitor did not run or did not find the screen.
+Photograph the screen wherever it stops: the bar's length (or with
+Vol+, the last line) locates the failure. If hekate's logo stays on
+after its line clears (1 without 2), the monitor did not run or did not
+find the screen.
 
 ## Shell over USB-C (usbcon)
 
@@ -1550,6 +1556,18 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+75. 29/10/2026, Erista, branch `feat/boot-screen` at `5c6c569`: **nxk boots
+    without hekate**. `nxk-ipl.bin` injected (fusee-nano), SD card from
+    `mksd-hw.sh`. Two failures first, read off nxk-ipl's own screen log
+    (Vol+): the 4-bit SD bus times out on this slot (as for the `sd`
+    service) and the 1-bit fallback reads; then `nxk/bl31.bin` was "not
+    found": Linux had stored it as the 8.3 alias `BL31~1.BIN` with a long
+    name, which nxk-ipl's FAT32 reader now matches. Then the shell over
+    USB-C: `emc` shows 800 MHz and 5 trained rates (204, 408, 800, 1331,
+    1600, Minerva's training done by nxk-ipl), switches 800 -> 408 -> 800
+    MHz in 96-99 us; stdtest 19/19; ktest 31/32 then 32/32 twice (the
+    core hotplug case failed once: "spinner 0 stopped once cores 2-3 went
+    off", three spinners at one priority on two cores).
 74. 25/10/2026, same console (gauge 45 %), `luna` at 45 Hz, volume 10 %, the
     capture armed, `init`'s supervision in place (the 30th Luna session, 16
     minutes of Shadow of the Tomb Raider): the stream was steady for the whole

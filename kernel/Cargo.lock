@@ -7,8 +7,13 @@ name = "nxk"
 version = "0.1.0"
 dependencies = [
  "nxk-abi",
+ "nxk-bootsplash",
 ]
 
 [[package]]
 name = "nxk-abi"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-bootsplash"
 version = "0.1.0"

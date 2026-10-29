@@ -19,6 +19,7 @@ trace-sched = []
 
 [dependencies]
 nxk-abi = { path = "../abi" }
+nxk-bootsplash = { path = "../bootsplash" }
 
 [profile.release]
 opt-level        = 3

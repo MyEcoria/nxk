@@ -1,0 +1,8 @@
+[package]
+name = "nxk-sdcard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Switch SD card slot (SDMMC1, SDHCI): power, pads and card protocol, shared by user/sd and nxk-ipl"
+
+[dependencies]

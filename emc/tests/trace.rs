@@ -517,3 +517,97 @@ fn mc_check_compares_the_burst_registers() {
     assert_eq!(out[0].0, regs::BURST_MC_REGS_ADDR_TABLE[5]);
     assert_eq!(out[1].0, regs::BURST_MC_REGS_ADDR_TABLE[20]);
 }
+
+/// The oracle's trace and final table words for `op` from `src` to `dst`.
+fn oracle_run(bin: &str, c: &Case, op: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("nxk-emc-{}-{}", std::process::id(), c.name));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("src.bin"), words_to_bytes(&c.src)).unwrap();
+    std::fs::write(dir.join("dst.bin"), words_to_bytes(&c.dst)).unwrap();
+    std::fs::write(dir.join("regs.txt"), init_text(c.seed, &c.init)).unwrap();
+    let out = Command::new(bin)
+        .args([
+            dir.join("src.bin").into_os_string(),
+            dir.join("dst.bin").into_os_string(),
+            dir.join("regs.txt").into_os_string(),
+            op.into(),
+        ])
+        .output()
+        .expect("run oracle");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "oracle failed on {}", c.name);
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// The same with the Rust `Mtc`: trace, then both entries' words.
+fn rust_run(c: &Case, op: nxk_emc::Op) -> String {
+    let w = nxk_emc::TABLE_WORDS;
+    let mut words = c.src.clone();
+    words.extend_from_slice(&c.dst);
+    let mut m = Model::new(c.seed, &c.init);
+    let mut mtc = nxk_emc::Mtc::new(&mut words, 2, c.src[L::RATE_KHZ]);
+    mtc.run(&mut m, op, c.dst[L::RATE_KHZ]).unwrap();
+    let mut out = m.trace;
+    for e in 0..2 {
+        for k in 0..w {
+            writeln!(out, "T {} {} {:x}", e, k, words[e * w + k]).unwrap();
+        }
+    }
+    out
+}
+
+/// Training (Minerva's OP_TRAIN and OP_TRAIN_SWITCH) and switches to
+/// periodic-training entries on hekate's odinx02 tables (`NXK_EMC_TABLES`
+/// files, comma-separated): register traces and the trained tables equal
+/// the C code's.
+#[test]
+fn odinx02_training_matches_c() {
+    let (Ok(bin), Ok(paths)) = (
+        std::env::var("NXK_EMC_ORACLE"),
+        std::env::var("NXK_EMC_TRAIN_TABLES"),
+    ) else {
+        return;
+    };
+    let mut done = 0;
+    for path in paths.split(',') {
+        let raw = std::fs::read(path).unwrap();
+        let entries: Vec<Vec<u32>> = raw
+            .chunks(4928)
+            .map(|c| {
+                c.chunks(4)
+                    .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                    .collect()
+            })
+            .collect();
+        let src = &entries[0]; // 204 MHz, what the boot runs at
+        for dst in &entries[1..] {
+            for (op, name) in [
+                (nxk_emc::Op::Train, "train"),
+                (nxk_emc::Op::TrainSwitch, "train_switch"),
+                (nxk_emc::Op::Switch, "switch"),
+            ] {
+                let mut rng = Rng(1234 + done);
+                let init = gen_init(&mut rng, src[L::CLK_SRC_EMC], true);
+                let c = Case {
+                    name: format!("train{done}"),
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    seed: rng.next(),
+                    init,
+                };
+                let rust = rust_run(&c, op);
+                let theirs = oracle_run(&bin, &c, name);
+                assert!(
+                    rust == theirs,
+                    "{} {} -> {}: {}",
+                    name,
+                    src[L::RATE_KHZ],
+                    dst[L::RATE_KHZ],
+                    first_diff(&rust, &theirs)
+                );
+                done += 1;
+            }
+        }
+    }
+    assert!(done >= 18);
+}

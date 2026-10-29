@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "nxk-bl31"
 version = "0.1.0"
+dependencies = [
+ "nxk-bootsplash",
+]
+
+[[package]]
+name = "nxk-bootsplash"
+version = "0.1.0"

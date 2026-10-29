@@ -6,8 +6,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dl="$here/dl"
 mkdir -p "$dl"
 
-HEKATE_VER="6.5.3"
-NYX_VER="1.9.3"
+HEKATE_VER="6.5.4"
+NYX_VER="1.9.4"
 base="https://github.com/CTCaer/hekate/releases/download/v${HEKATE_VER}"
 
 get() {
@@ -21,7 +21,9 @@ get() {
 }
 
 get "$base/hekate_ctcaer_${HEKATE_VER}.bin" "$dl/hekate_ctcaer_${HEKATE_VER}.bin"
-get "$base/hekate_ctcaer_${HEKATE_VER}_Nyx_${NYX_VER}.zip" "$dl/hekate_nyx.zip"
+get "$base/hekate_ctcaer_${HEKATE_VER}_Nyx_${NYX_VER}.zip" "$dl/hekate_nyx_${NYX_VER}.zip"
+# mksd-hw.sh takes the pinned pack under a fixed name.
+ln -sf "hekate_nyx_${NYX_VER}.zip" "$dl/hekate_nyx.zip"
 
 ls -lh "$dl"
 # Sanity: hekate RCM payload must fit the ~196 KiB IRAM window (fusee-gelee).

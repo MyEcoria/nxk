@@ -6,3 +6,4 @@ license = "GPL-2.0-only"
 
 [dependencies]
 libnx = { path = "../libnx" }
+nxk-bootsplash = { path = "../../bootsplash" }

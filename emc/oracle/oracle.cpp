@@ -1,12 +1,14 @@
 // Test oracle for nxk-emc: runs hekate's Minerva OP_SWITCH on two table
 // entries against a modelled register file and prints every access.
 //
-//   oracle SRC.bin DST.bin REGS.txt > trace.txt
+//   oracle SRC.bin DST.bin REGS.txt [switch|train|train_switch] > trace.txt
 //
 // REGS.txt: "seed N" and "<C|M|E> <offset hex> <value hex>" lines (initial
 // register values; any other register reads a hash of seed, bank, offset).
 // The Rust side (emc/tests/trace.rs) models the same bus; the traces must be
-// identical. Trace lines: "R b off val", "W b off val", "U us".
+// identical. Trace lines: "R b off val", "W b off val", "U us"; with an
+// operation given, the two entries' words follow ("T entry word value"),
+// for what training writes into the table.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,8 +88,8 @@ static void load(const char *path, void *dst, size_t n)
 
 int main(int argc, char **argv)
 {
-	if (argc != 4) {
-		fprintf(stderr, "usage: oracle SRC.bin DST.bin REGS.txt\n");
+	if (argc != 4 && argc != 5) {
+		fprintf(stderr, "usage: oracle SRC.bin DST.bin REGS.txt [switch|train|train_switch]\n");
 		return 2;
 	}
 	alarm(30);
@@ -117,6 +119,13 @@ int main(int argc, char **argv)
 	cfg.rate_to = tbl[1].rate_khz;
 	cfg.train_mode = OP_SWITCH;
 	cfg.init_done = MTC_INIT_MAGIC;
+	cfg.train_ram_patterns = 1;
+	if (argc == 5)
+		cfg.train_mode = !strcmp(argv[4], "train") ? OP_TRAIN : !strcmp(argv[4], "train_switch") ? OP_TRAIN_SWITCH : OP_SWITCH;
 	minerva_entry(&cfg, NULL);
+	if (argc == 5)
+		for (int e = 0; e < 2; e++)
+			for (unsigned k = 0; k < sizeof(emc_table_t) / 4; k++)
+				printf("T %d %u %x\n", e, k, ((unsigned *)&tbl[e])[k]);
 	return 0;
 }

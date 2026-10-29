@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate emc/src/regs.rs and emc/src/layout.rs from hekate's Minerva sources.
 
-    tools/mkemctab.py HEKATE_DIR
+    tools/mkemctab.py HEKATE_DIR [TABLES_DIR]
 
 HEKATE_DIR is a hekate checkout (refs/hekate): the register names come from
 modules/hekate_libsys_minerva/mtc_mc_emc_regs.h, the address tables from
@@ -50,7 +50,7 @@ def parse_tables(text, defs):
     ):
         name, count, body = m.groups()
         if name.startswith("ram_pattern"):
-            continue
+            continue  # patterns.rs
         items = [x.strip() for x in body.split(",") if x.strip()]
         vals = [defs[i] if i in defs else int(i, 0) for i in items]
         n = int(count, 0) if count.isdigit() or count.startswith("0x") else len(vals)
@@ -137,6 +137,31 @@ def main():
             f.write(f"pub const {const}: usize = {off};\n")
             if cnt > 1:
                 f.write(f"pub const {const}_LEN: usize = {cnt};\n")
+
+    # RAM training patterns (the tables Minerva loads into EMC_TRAINING_PATRAM).
+    with open(here / "patterns.rs", "w") as f:
+        f.write(HDR)
+        f.write("//! RAM patterns for the DQ and DMI training (256 words per pattern).\n\n")
+        for m in re.finditer(
+            r"static const u32 (ram_pattern_\w+)\[(\w+)\]\s*=\s*\{(.*?)\};", strip_comments(seq), re.S
+        ):
+            vals = [int(x.strip(), 0) for x in m.group(3).split(",") if x.strip()]
+            assert len(vals) == int(m.group(2), 0), m.group(1)
+            f.write(f"pub static {m.group(1).upper()}: [u32; {len(vals)}] = [\n")
+            for i in range(0, len(vals), 8):
+                f.write("    " + ", ".join(f"{x:#010x}" for x in vals[i : i + 8]) + ",\n")
+            f.write("];\n")
+
+    # ODINX02 base tables (7 entries of 4928 bytes) as raw files, for the
+    # card (nxk-ipl reads the one its DRAM id needs).
+    if len(sys.argv) > 2:
+        out = Path(sys.argv[2])
+        out.mkdir(parents=True, exist_ok=True)
+        sw = strip_comments((root / "mtc_switch_tables.h").read_text())
+        for m in re.finditer(r"static const unsigned char (odinx02_a2_(\d+)\w*?)\[\w+\]\s*=\s*\{(.*?)\};", sw, re.S):
+            data = bytes(int(x.strip(), 0) for x in m.group(3).split(",") if x.strip())
+            assert len(data) == 7 * 4928, (m.group(1), len(data))
+            (out / f"odinx02_{m.group(2)}.bin").write_bytes(data)
 
 
 main()

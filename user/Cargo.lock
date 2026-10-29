@@ -119,6 +119,7 @@ name = "display"
 version = "0.1.0"
 dependencies = [
  "libnx",
+ "nxk-bootsplash",
 ]
 
 [[package]]
@@ -259,7 +260,15 @@ name = "nxk-abi"
 version = "0.1.0"
 
 [[package]]
+name = "nxk-bootsplash"
+version = "0.1.0"
+
+[[package]]
 name = "nxk-emc"
+version = "0.1.0"
+
+[[package]]
+name = "nxk-sdcard"
 version = "0.1.0"
 
 [[package]]
@@ -303,6 +312,7 @@ name = "sd"
 version = "0.1.0"
 dependencies = [
  "libnx",
+ "nxk-sdcard",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ extern crate alloc;
 mod art;
 mod avatar;
 mod backlight;
+mod boot;
 mod cache;
 mod catalog;
 mod config;
@@ -1380,6 +1381,9 @@ fn main() -> i32 {
     let pa = fb.paddr(0).expect("display: image address") as u32;
     let mut scr = Screen::new(fb, w, h);
     let (sw, sh) = scr.size();
+    // The boot screen as the kernel left it, before window A shows the image.
+    boot::draw(&mut scr, nxk_bootsplash::AT_DISPLAY);
+    scr.present();
 
     wr(&dc, CMD_DISPLAY_WINDOW_HEADER, 1 << 4); // window A
     wr(&dc, WIN_COLOR_DEPTH, R8G8B8A8);
@@ -1923,6 +1927,9 @@ fn main() -> i32 {
             if cfg_loaded && !users_loaded {
                 if let Some((list, last)) = users::load() {
                     users_loaded = true;
+                    if let Some(b) = ui.boot.as_mut() {
+                        b.finish(now);
+                    }
                     ui.users = users::Users::new(list);
                     let pick = last
                         .and_then(|id| ui.users.list.iter().position(|p| p.id == id))
@@ -2337,6 +2344,11 @@ fn main() -> i32 {
                         wake_sleep!(now);
                         finger = None;
                     }
+                    continue;
+                }
+                // Input on the boot screen is dropped: a blind tap must not
+                // land on the library once it shows.
+                if ui.boot.is_some() {
                     continue;
                 }
                 last_input = now;
