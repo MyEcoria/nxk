@@ -1556,6 +1556,13 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+76. 29/10/2026, Erista, card of run 75 (no `abi/`, `std/`, `libnx` or kernel
+    change since), `dev` at `7acc0f3`, `nxk-ipl.bin` injected: **the x86-64
+    interpreter of the PS4 layer runs on the console**. `x86test` sent with
+    `usbterm.py --put`: 3/3, the 1568 ALU vectors identical to a PC's CPU,
+    self-modifying code re-decoded, **10.6 MIPS** (3 M instructions in 283 ms,
+    CPU at its 998 MHz boot clock: about 94 cycles per guest instruction).
+    stdtest 19/19. The battery gauge was not read (no shell command for it).
 75. 29/10/2026, Erista, branch `feat/boot-screen` at `5c6c569`: **nxk boots
     without hekate**. `nxk-ipl.bin` injected (fusee-nano), SD card from
     `mksd-hw.sh`. Two failures first, read off nxk-ipl's own screen log
