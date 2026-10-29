@@ -30,7 +30,7 @@ impl core::fmt::Display for Error {
 }
 
 /// Bounds-checked sub-slice (`offset..offset+size`).
-pub(crate) fn span(data: &[u8], offset: u64, size: u64) -> Result<&[u8], Error> {
+pub fn span(data: &[u8], offset: u64, size: u64) -> Result<&[u8], Error> {
     let len = data.len() as u64;
     match offset.checked_add(size) {
         Some(end) if end <= len => Ok(&data[offset as usize..end as usize]),
@@ -38,17 +38,17 @@ pub(crate) fn span(data: &[u8], offset: u64, size: u64) -> Result<&[u8], Error> 
     }
 }
 
-pub(crate) fn u16le(data: &[u8], offset: u64) -> Result<u16, Error> {
+pub fn u16le(data: &[u8], offset: u64) -> Result<u16, Error> {
     Ok(u16::from_le_bytes(
         span(data, offset, 2)?.try_into().unwrap(),
     ))
 }
-pub(crate) fn u32le(data: &[u8], offset: u64) -> Result<u32, Error> {
+pub fn u32le(data: &[u8], offset: u64) -> Result<u32, Error> {
     Ok(u32::from_le_bytes(
         span(data, offset, 4)?.try_into().unwrap(),
     ))
 }
-pub(crate) fn u64le(data: &[u8], offset: u64) -> Result<u64, Error> {
+pub fn u64le(data: &[u8], offset: u64) -> Result<u64, Error> {
     Ok(u64::from_le_bytes(
         span(data, offset, 8)?.try_into().unwrap(),
     ))

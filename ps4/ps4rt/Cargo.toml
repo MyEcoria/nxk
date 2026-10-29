@@ -1,0 +1,10 @@
+[package]
+name = "ps4rt"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "PS4 runtime for nxk: module loader, NID linker, HLE imports, guest runner"
+
+[dependencies]
+ps4fmt = { path = "../ps4fmt" }
+x86emu = { path = "../x86emu" }

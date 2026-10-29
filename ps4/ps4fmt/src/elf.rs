@@ -4,8 +4,10 @@
 
 use crate::{span, u16le, u32le, u64le, Error};
 
-/// ELF types of PS4 executables (ET_SCE_EXEC, ET_SCE_DYNEXEC, ET_SCE_DYNAMIC).
-const SCE_TYPES: [u16; 3] = [0xfe00, 0xfe10, 0xfe18];
+/// ELF types accepted: the PS4's (ET_SCE_EXEC, ET_SCE_DYNEXEC, ET_SCE_DYNAMIC), plus ET_DYN
+/// for the shared objects a PC compiles as test guests.
+const TYPES: [u16; 4] = [0xfe00, 0xfe10, 0xfe18, ET_DYN];
+pub const ET_DYN: u16 = 3;
 const SELF_MAGIC: [u8; 4] = [0x4f, 0x15, 0x3d, 0x1d];
 /// Largest image accepted, as a guard against corrupt headers.
 pub const IMAGE_LIMIT: u64 = 512 << 20;
@@ -129,8 +131,10 @@ fn image_end(phdrs: &[Phdr]) -> Result<u64, Error> {
 
 fn parse_elf(data: &[u8]) -> Result<Image, Error> {
     let (kind, entry, phoff, num) = header(data, 0)?;
-    if !SCE_TYPES.contains(&kind) {
-        return Err(Error::Unsupported("ELF type is not ET_SCE_*"));
+    if !TYPES.contains(&kind) {
+        return Err(Error::Unsupported(
+            "ELF type is neither ET_SCE_* nor ET_DYN",
+        ));
     }
     let phdrs = phdrs(data, phoff, num)?;
     let end = image_end(&phdrs)?;
