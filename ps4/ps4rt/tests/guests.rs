@@ -9,6 +9,9 @@ const MAIN_SCE: &[u8] = include_bytes!("../../guest/bin/main.sce");
 const LIBMINI_JAGUAR: &[u8] = include_bytes!("../../guest/bin/libmini-jaguar.so");
 const MAIN_JAGUAR: &[u8] = include_bytes!("../../guest/bin/main-jaguar.so");
 const EXPECTED: &str = include_str!("../../guest/bin/expected.txt");
+const FP: &[u8] = include_bytes!("../../guest/bin/fp.so");
+const FP_JAGUAR: &[u8] = include_bytes!("../../guest/bin/fp-jaguar.so");
+const FP_EXPECTED: &str = include_str!("../../guest/bin/fp-expected.txt");
 
 fn run(main: &[u8]) -> (String, LinkReport) {
     run_with(LIBMINI, main)
@@ -49,6 +52,13 @@ fn jaguar_build_matches_native() {
     let (out, report) = run_with(LIBMINI_JAGUAR, MAIN_JAGUAR);
     assert_eq!(out, EXPECTED);
     assert_eq!(report.missing, 0, "{report:?}");
+}
+
+#[test]
+fn float_guest_matches_native() {
+    // Float and double arithmetic, conversions, specials, FTZ/DAZ and MXCSR rounding.
+    assert_eq!(run_with(LIBMINI, FP).0, FP_EXPECTED);
+    assert_eq!(run_with(LIBMINI_JAGUAR, FP_JAGUAR).0, FP_EXPECTED);
 }
 
 #[test]

@@ -86,7 +86,7 @@ place, so it costs neither CPU time nor a copy.
 | Phase | Content | State |
 |---|---|---|
 | 1 | `ps4fmt`: SHA-1, NIDs, `param.sfo`, plaintext ELF/SELF | done (host tests) |
-| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; MOVBE, CRC32 (SSE4.2), BMI1 (andn, bextr, blsi, blsmsk, blsr); SSE2..SSE4.1 integer and data moves (saturating, min/max, multiplies, pack/unpack, pshufb, palignr, pmovsx/zx, ptest, pextr/pinsr, pmovmskb...), legacy and VEX encoded; AVX1: VEX.128 for all of them (upper ymm half cleared), VEX.256 for the moves, the ps/pd logic, vinsertf128/vextractf128, vzeroupper/vzeroall. Alignment faults as on the CPU (legacy 128-bit operands, aligned moves). Every form compared with the host CPU (registers, defined flags, memory, both ymm halves). Not yet: x87, SSE/AVX floating point, F16C, SSE4A, SSE4.2 string compares, the AVX1 256-bit shuffles, permutes and broadcasts (vperm2f128, vbroadcastss, vshufps / vunpcklps ymm, vpermilps, vblendps: AVX1 code moves integer data with them too, so the eboot likely has them; with the floating-point phase), `syscall` |
+| 2 | `x86emu`: decoder + interpreter, differential tests on the PC | integer set done: ALU, mov/movzx/movsx, lea, xchg, push/pop, call/ret/leave, jmp/jcc (direct and indirect), shifts and rotates, mul/imul/div/idiv, neg/not/inc/dec, setcc/cmovcc, bt*, bsf/bsr/tzcnt/lzcnt/popcnt, bswap, cmpxchg/xadd, rep movs/stos, 8/16/32/64-bit operands with ah..bh, `fs`/`gs`; MOVBE, CRC32 (SSE4.2), BMI1 (andn, bextr, blsi, blsmsk, blsr); SSE2..SSE4.1 integer and data moves (saturating, min/max, multiplies, pack/unpack, pshufb, palignr, pmovsx/zx, ptest, pextr/pinsr, pmovmskb...), legacy and VEX encoded; AVX1: VEX.128 for all of them (upper ymm half cleared), VEX.256 for the moves, the ps/pd logic, vinsertf128/vextractf128, vzeroupper/vzeroall. Alignment faults as on the CPU (legacy 128-bit operands, aligned moves). Every form compared with the host CPU (registers, defined flags, memory, both ymm halves). SSE / AVX floating point on a soft-float core (see below): arithmetic, compares, conversions, rounding, horizontal ops, dpps, blends, shuffles, permutes, broadcasts, F16C, MXCSR. Not yet: x87, SSE4A, SSE4.2 string compares, vtestps/vmaskmovps, `syscall` |
 | 3 | PS4 runtime (`ps4rt`): loader, NID linker, HLE imports | started: maps PT_LOAD/RELRO, reads the dynamic tables in either layout (SCE tags in `PT_SCE_DYNLIBDATA` with `NID#lib#module` names, or standard `DT_*`), applies RELATIVE / 64 / GLOB_DAT / JUMP_SLOT, binds imports to guest modules first (the game's own `libc.prx`), then to HLE thunks; an import nothing provides stops the run with its NID when called. HLE so far: `write`, `_exit`. The entry is called with the SysV alignment (rsp + 8 on 16 bytes), checked by the interpreter: legacy-SSE 16-byte accesses other than movdqu/movups stop with `Misaligned`, as #GP would. Not yet: TLS relocations, threads, files, the other 1200 imports, data imports served by HLE (an STT_OBJECT import such as `__stack_chk_guard` gets a code-thunk address and faults when read, instead of naming its NID), the real entry convention of the eboot (to take from upstream's runtime) |
 | 4 | GCN -> SASS translator on top of `shader/` | to do |
 | 5 | JIT, library card, tests on the Erista | to do |
@@ -121,11 +121,43 @@ ymm halves are a second array (`ymm_hi`) next to `xmm` rather than `[[u128; 2]; 
 the SSE paths stay as they were; legacy writes keep the upper half, VEX.128 writes clear
 it.
 
-Next phase: floating point. x87 and SSE/AVX float need their own design, since the
-results must be bit-exact with the PS4: MXCSR rounding modes and exception flags, x86's
-NaN propagation (AArch64 returns a default NaN unless FPCR.DN is clear and the operand
-order matches), denormals and flush-to-zero (MXCSR.FTZ/DAZ against FPCR.FZ), 80-bit x87
-precision.
+### Floating point
+
+Results must be the PS4's bit for bit: MXCSR rounding modes and sticky flags, x86's NaN
+choice (first source, negative "indefinite" QNaN for invalid operations), FTZ and DAZ.
+inFAMOUS turns FTZ on in its job threads (upstream `runtime_thread.c`: without it,
+denormals reach divisions in the particle and light code), so FTZ has to be exact.
+
+Options considered:
+
+1. *Host FPU with fix-ups* (NaN choice, FTZ, DAZ in software around native ops; other
+   rounding modes and the flags through error-free transformations). Rejected: FTZ
+   cannot be patched after the host has rounded with bounded exponents (just below
+   2^-126 the host gives the smallest normal where x86 gives zero), and `core` has no
+   `sqrt` or `mul_add` in `no_std`.
+2. *Host FPU for round-to-nearest, soft-float otherwise.* Rejected for now: it is option
+   3 plus a fast path, and needs option 3 as its reference anyway.
+3. *Soft-float* (`x86emu/src/fpu.rs`). Retained: one integer-only core generic over
+   (exponent, fraction) widths for binary16/32/64, exact by construction, with the
+   flags and modes, and the reference a later JIT fast path is checked against.
+
+The core matches the host's SSE unit on every pair of edge and random operands under
+the 4 rounding modes x FTZ x DAZ, results and flags (`tests/softfloat.rs`). The tests
+settled what the SDM leaves to read between the lines: tininess is detected after
+rounding (the band test fails with before-rounding detection), DE is not raised by
+cvt*2si or roundss, and is hidden by IE or ZE. Each lane gets its own flags, or-ed into
+MXCSR; an unmasked exception stops before the destination is written.
+
+Known gaps: rcpps / rsqrtps are approximations whose exact bits are model-specific
+(Jaguar's tables are not Intel's); they are only checked against the SDM's bound. dpps
+picks between two different NaNs differently on this host's own P- and E-cores (Core
+Ultra 7 155H, measured with the test pinned to each kind of core): the E-core order is
+modelled, Jaguar's is unknown. AMD's MXCSR.MM bit is refused (Intel's MXCSR_MASK).
+
+The float guest (`fpmain.c`: series, 4x4 matrices, normalisation, conversions,
+specials, FTZ/DAZ as inFAMOUS sets them, MXCSR rounding, a particle loop) prints the
+native run's bits, generic and for Jaguar, on the PC, in the emulator and on the Erista
+(run 79). Next: x87 (80-bit, on the same core with an explicit integer bit).
 
 For the JIT: EL0 cannot clean the data cache, but none is needed for code it writes:
 `vm::protect` cleans to the point of unification and invalidates the instruction cache

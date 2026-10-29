@@ -102,6 +102,10 @@ fn guest(main: &[u8]) -> Result<String, String> {
 }
 
 fn guest_with(libc: &[u8], main: &[u8]) -> Result<String, String> {
+    guest_expect(libc, main, EXPECTED)
+}
+
+fn guest_expect(libc: &[u8], main: &[u8], expected: &str) -> Result<String, String> {
     let mut p = ps4rt::Process::new(ps4rt::hle::libkernel());
     p.load("libmini.so", "libc", libc).map_err(|e| e.to_string())?;
     let m = p.load("main", "main", main).map_err(|e| e.to_string())?;
@@ -114,8 +118,8 @@ fn guest_with(libc: &[u8], main: &[u8]) -> Result<String, String> {
         ps4rt::Outcome::Exited(code) => out.push_str(&format!("exit {code}\n")),
         other => return Err(format!("stopped: {other:?} after {:?}", out.lines().last())),
     }
-    if out != EXPECTED {
-        let at = out.lines().zip(EXPECTED.lines()).position(|(a, b)| a != b);
+    if out != expected {
+        let at = out.lines().zip(expected.lines()).position(|(a, b)| a != b);
         return Err(format!("output differs from the PC's at line {at:?}"));
     }
     Ok(format!(
@@ -144,14 +148,27 @@ fn guest_jaguar() -> Result<String, String> {
     )
 }
 
+const FP_EXPECTED: &str = include_str!("../../../ps4/guest/bin/fp-expected.txt");
+
+/// The floating-point guest, generic and for Jaguar (AVX).
+fn guest_fp() -> Result<String, String> {
+    guest_expect(LIBMINI, include_bytes!("../../../ps4/guest/bin/fp.so"), FP_EXPECTED)?;
+    guest_expect(
+        include_bytes!("../../../ps4/guest/bin/libmini-jaguar.so"),
+        include_bytes!("../../../ps4/guest/bin/fp-jaguar.so"),
+        FP_EXPECTED,
+    )
+}
+
 fn main() {
-    let tests: [(&str, fn() -> Result<String, String>); 6] = [
+    let tests: [(&str, fn() -> Result<String, String>); 7] = [
         ("alu", alu_vectors),
         ("smc", self_modifying),
         ("speed", speed),
         ("guest-elf", guest_elf),
         ("guest-sce", guest_sce),
         ("guest-jaguar", guest_jaguar),
+        ("guest-fp", guest_fp),
     ];
     let mut failed = 0;
     for (name, test) in tests {

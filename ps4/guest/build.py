@@ -8,6 +8,9 @@ needs gcc):
   libmini.so   guest "libc" module (standard ELF dynamic tags)
   main.so      main program, imports by name (standard ELF)
   *-jaguar.so  both again at -O3 for the PS4's CPU (-march=btver2: AVX, BMI1, SSE4.2)
+  fp.so, fp-jaguar.so, fp-expected.txt
+               the floating-point guest (fpmain.c), generic and for Jaguar, and its native
+               output (no fast-math, no contraction: IEEE fixes every bit)
   main.sce     main.so repacked in the PS4 layout: ET_SCE_DYNEXEC, dynamic tables in a
                PT_SCE_DYNLIBDATA segment under the SCE tags, imports named NID#lib#module
   expected.txt stdout of the same C built natively, then "exit N"
@@ -25,6 +28,7 @@ SO = COMMON + ["-fPIC", "-shared", "-Wl,-z,now", "-Wl,--hash-style=sysv", "-Wl,-
 LIBMINI_EXTRA = ["-fno-tree-loop-distribute-patterns"]  # or memcpy's loop becomes a call to memcpy
 # Jaguar builds; the reference stays a generic native build (btver2 adds SSE4A, absent on Intel).
 JAGUAR = ["-O3", "-march=btver2"]
+FP = ["-ffp-contract=off", "-fno-math-errno"]
 
 PT_DYNAMIC, PT_GNU_STACK, PT_SCE_DYNLIBDATA = 2, 0x6474E551, 0x61000000
 ET_SCE_DYNEXEC = 0xFE10
@@ -161,6 +165,17 @@ def main():
          os.path.join(OUT, "libmini-jaguar.so")])
     run(["gcc", *SO, *JAGUAR, "-Wl,-e,_start", src("main.c"), "-L" + OUT, "-lmini", "-o",
          os.path.join(OUT, "main-jaguar.so")])
+    run(["gcc", *SO, *FP, "-Wl,-e,_start", src("fpmain.c"), "-L" + OUT, "-lmini", "-o",
+         os.path.join(OUT, "fp.so")])
+    run(["gcc", *SO, *JAGUAR, *FP, "-Wl,-e,_start", src("fpmain.c"), "-L" + OUT, "-lmini", "-o",
+         os.path.join(OUT, "fp-jaguar.so")])
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = os.path.join(tmp, "fp.native")
+        run(["gcc", *COMMON, *FP, *LIBMINI_EXTRA, "-static", "-no-pie", "-Wl,-e,native_entry",
+             src("fpmain.c"), src("libmini.c"), src("native.c"), "-o", exe])
+        r = subprocess.run([exe], stdout=subprocess.PIPE)
+    with open(os.path.join(OUT, "fp-expected.txt"), "wb") as f:
+        f.write(r.stdout + f"exit {r.returncode}\n".encode())
     with tempfile.TemporaryDirectory() as tmp:
         exe = os.path.join(tmp, "main.native")
         run(["gcc", *COMMON, *LIBMINI_EXTRA, "-static", "-no-pie", "-Wl,-e,native_entry",
