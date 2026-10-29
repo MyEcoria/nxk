@@ -2,8 +2,8 @@
 
 Goal: nxk starts the console itself (hardware init, load, hand-off), with no
 third-party bootloader, and shows a boot screen from the first moment.
-Status: in progress, see "Steps and status"; the console still boots
-through hekate.
+Status: the Erista boots nxk from nxk-ipl (2026-10-29); hekate stays on
+the card as the fallback. See "Steps and status".
 
 ## What cannot go away
 
@@ -111,11 +111,9 @@ modules:
    IRAM (`report.rs`) that nxk-bl31 prints, on the screen in text mode.
    Not checked on hardware: after a watchdog restart nxk-ipl starts the
    panel again with the backlight on (hekate's is still off there).
-10. Console run, with Pierric's go: Erista first. Battery charged (no
-    risk-free low-battery path yet on hardware), SD from `mksd-hw.sh`
-    (hekate stays on it as the fallback), `nxk-ipl.bin` injected with
-    Vol+ held for the text log: nxk-bl31's `nxk-ipl:` line should read
-    800 MHz and 5 trained entries, and `emc` in the USB-C shell the same.
+10. Console run: **done** on the Erista (`hwboot/README.md` run 75): nxk
+    boots from nxk-ipl, DRAM trained, `emc` at 800 MHz with 5 rates,
+    switches work. Mariko not run yet.
 
 ## Notes
 

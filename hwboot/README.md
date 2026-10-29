@@ -1556,6 +1556,18 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+75. 29/10/2026, Erista, branch `feat/boot-screen` at `5c6c569`: **nxk boots
+    without hekate**. `nxk-ipl.bin` injected (fusee-nano), SD card from
+    `mksd-hw.sh`. Two failures first, read off nxk-ipl's own screen log
+    (Vol+): the 4-bit SD bus times out on this slot (as for the `sd`
+    service) and the 1-bit fallback reads; then `nxk/bl31.bin` was "not
+    found": Linux had stored it as the 8.3 alias `BL31~1.BIN` with a long
+    name, which nxk-ipl's FAT32 reader now matches. Then the shell over
+    USB-C: `emc` shows 800 MHz and 5 trained rates (204, 408, 800, 1331,
+    1600, Minerva's training done by nxk-ipl), switches 800 -> 408 -> 800
+    MHz in 96-99 us; stdtest 19/19; ktest 31/32 then 32/32 twice (the
+    core hotplug case failed once: "spinner 0 stopped once cores 2-3 went
+    off", three spinners at one priority on two cores).
 74. 25/10/2026, same console (gauge 45 %), `luna` at 45 Hz, volume 10 %, the
     capture armed, `init`'s supervision in place (the 30th Luna session, 16
     minutes of Shadow of the Tomb Raider): the stream was steady for the whole
