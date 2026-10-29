@@ -15,70 +15,71 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: System packages
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  run: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    sudo apt-get update
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    sudo apt-get install -y --no-install-recommends \
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      dosfstools fonts-lato fonts-dejavu-core console-setup-linux python3-venv python3-pil
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dosfstools fonts-lato fonts-dejavu-core console-setup-linux python3-venv python3-pil
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# tools/mksd.py re-executes itself in this venv when pyfatfs is missing.
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: pyfatfs venv
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  run: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    python3 -m venv ~/.cache/tegra_qemu/fsvenv
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    ~/.cache/tegra_qemu/fsvenv/bin/pip install pyfatfs "setuptools<81"
+      # tools/mksd.py re-executes itself in this venv when pyfatfs is missing
+      # (pyfatfs -> fs needs pkg_resources, gone from setuptools 81).
+      - name: pyfatfs venv
+        run: |
+          python3 -m venv ~/.cache/tegra_qemu/fsvenv
+          ~/.cache/tegra_qemu/fsvenv/bin/pip install pyfatfs "setuptools<81"
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# The std port (tools/mkstd.py) patches one exact rustc release, so it
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# is pinned (RUST_VERSION; raise it together with std/). The tools look
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# for the rustup toolchain "stable", so the pinned one takes its place.
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: Rust toolchain
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  env:
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    RUST_VERSION: "1.98.1"
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  run: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    rustup toolchain install "$RUST_VERSION" --profile minimal \
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      -c rust-src -c llvm-tools \
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      -t aarch64-unknown-none -t aarch64-unknown-none-softfloat
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    tc=~/.rustup/toolchains
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    rustup toolchain uninstall stable
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    mv "$tc/$RUST_VERSION-x86_64-unknown-linux-gnu" "$tc/stable-x86_64-unknown-linux-gnu"
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    rustup default stable
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    rustc -Vv
+      # The std port (tools/mkstd.py) patches one exact rustc release, so it
+      # is pinned (RUST_VERSION; raise it together with std/). The tools look
+      # for the rustup toolchain "stable", so the pinned one takes its place.
+      - name: Rust toolchain
+        env:
+          RUST_VERSION: "1.98.1"
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            -c rust-src -c llvm-tools \
+            -t aarch64-unknown-none -t aarch64-unknown-none-softfloat
+          tc=~/.rustup/toolchains
+          rustup toolchain uninstall stable
+          mv "$tc/$RUST_VERSION-x86_64-unknown-linux-gnu" "$tc/stable-x86_64-unknown-linux-gnu"
+          rustup default stable
+          rustc -Vv
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# Build dirs only: the "nxk" toolchain is rebuilt by mkstd.py (hardlinks
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.# into the rustup sysroot, not cacheable).
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: Cache build dirs
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  uses: actions/cache@v4
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  with:
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    path: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      ~/.cache/nxk/target-user
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      ~/.cache/nxk/target-apps
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      ~/.cache/nxk/target-kernel
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      ~/.cache/nxk/target-ipl
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      ~/.cache/nxk/target-bl31
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    key: build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-${{ github.sha }}
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    restore-keys: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.      build-${{ runner.os }}-
+      # Build dirs only: the "nxk" toolchain is rebuilt by mkstd.py (hardlinks
+      # into the rustup sysroot, not cacheable).
+      - name: Cache build dirs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/nxk/target-user
+            ~/.cache/nxk/target-apps
+            ~/.cache/nxk/target-kernel
+            ~/.cache/nxk/target-ipl
+            ~/.cache/nxk/target-bl31
+          key: build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-
+            build-${{ runner.os }}-
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: Build (userland, std chain, kernel)
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  run: ./tools/build.sh
+      - name: Build (userland, std chain, kernel)
+        run: ./tools/build.sh
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- name: Boot payloads and SD image
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  run: |
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    mkdir -p dist
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    python3 hwboot/mkbl31.py -o dist/bl31.bin
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    python3 hwboot/mkipl.py -o dist/nxk-ipl.bin
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    python3 tools/mksd.py -o build/sd.img
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    cp -L build/nxk.elf dist/nxk.elf
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    cp build/nxk.bin build/bootfs.img dist/
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    xz -9 -T0 -c build/sd.img > dist/sd.img.xz
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    (cd dist && sha256sum * > SHA256SUMS)
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    ls -l dist
+      - name: Boot payloads and SD image
+        run: |
+          mkdir -p dist
+          python3 hwboot/mkbl31.py -o dist/bl31.bin
+          python3 hwboot/mkipl.py -o dist/nxk-ipl.bin
+          python3 tools/mksd.py -o build/sd.img
+          cp -L build/nxk.elf dist/nxk.elf
+          cp build/nxk.bin build/bootfs.img dist/
+          xz -9 -T0 -c build/sd.img > dist/sd.img.xz
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
 
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.- uses: actions/upload-artifact@v4
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.  with:
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    name: nxk-build
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    path: dist/
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    if-no-files-found: error
- tools/mksd.py re-executes itself in this venv when pyfatfs is missing.    retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nxk-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
