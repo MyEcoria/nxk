@@ -1560,7 +1560,8 @@ within 5 s.
     with SSE/AVX floating point on the soft-float core, sent with `usbterm.py --put`:
     7/7. The float guest (float and double arithmetic, conversions, specials, FTZ and
     DAZ, MXCSR rounding) prints the PC's native output bit for bit, built generic and
-    for Jaguar (63321 instructions, 3.6 MIPS at 998 MHz, 4.4 at 1224 MHz). The ALU
+    for Jaguar; the figures shown are the Jaguar build's (63321 instructions, 3.6 MIPS
+    at 998 MHz, 4.4 at 1224 MHz), the generic one was only checked for output. The ALU
     loop is unchanged (9.0 MIPS at 998 MHz, 11.0 at 1224), the integer guests 5.1 to
     5.5 (6.2 to 6.7). stdtest 19/19.
 78. 29/10/2026, same console and boot as run 76 (gauge 44 %, charging), `x86test`
