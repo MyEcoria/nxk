@@ -249,6 +249,12 @@ Key details agents must respect:
 
 - After every task, `commit` **and** `push` the result (do not leave changes
   unpushed in the working tree).
+- **`main` is protected: never push to it.** Work and push on `dev` (or a
+  branch merged into `dev`); changes reach `main` only through a pull request
+  `dev` -> `main` (merge commit) once the required checks (`.github/workflows/`)
+  are green. Every merge into `main` publishes a GitHub release (next patch of
+  the latest `vX.Y.Z` tag) with `nxk.elf`, `nxk.bin`, `bootfs.img`, `bl31.bin`,
+  `nxk-ipl.bin` and `sd.img.xz`.
 - Message format (Conventional Commits, all in English):
 
   ```text

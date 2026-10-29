@@ -425,6 +425,12 @@ cargo test --manifest-path services/nxspeed/Cargo.toml    # on the PC
 
 ## Build, run, test
 
+CI (`.github/workflows/`): `ci.yml` runs the PC tests (`shader`, `emc`,
+`services/{lunacore,nxopus,nxh264,nxdtls}`) and the full `tools/build.sh` +
+`mkbl31.py` + `mkipl.py` + `mksd.py` on every pull request and push to `dev`;
+`release.yml` does the same on `main` and publishes a release. The emulator
+is not in this repository, so `ktest`/`stdtest` stay a local step.
+
 Prerequisites: stable Rust with `rust-src`
 (`rustup component add rust-src`; targets `aarch64-unknown-none` and
 `aarch64-unknown-none-softfloat`), the compiled `tegra_qemu` emulator,
