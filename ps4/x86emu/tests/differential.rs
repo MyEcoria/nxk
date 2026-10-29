@@ -1082,10 +1082,36 @@ fn fp_case(op: &[u8], mx: u32) -> Vec<u8> {
 
 /// Run float cases under every MXCSR setting, with float edge values in rax..rdx.
 fn check_fp(ops: &[Vec<u8>], flag_mask: u64, rounds: usize, seed: u64) {
+    check_fp_with(ops, flag_mask, rounds, seed, false);
+}
+
+/// A NaN half or whole (as binary64, then as binary32) replaced by 1.0.
+fn no_nan(v: u64) -> u64 {
+    let v = if v & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000 && v << 12 != 0 {
+        0x3ff0_0000_0000_0000
+    } else {
+        v
+    };
+    let half = |h: u64| {
+        if h & 0x7f80_0000 == 0x7f80_0000 && h & 0x7f_ffff != 0 {
+            0x3f80_0000
+        } else {
+            h
+        }
+    };
+    half(v & 0xffff_ffff) | half(v >> 32) << 32
+}
+
+/// `check_fp`; with `nan_free`, no input NaN (for dpps / dppd, whose choice between two
+/// different NaNs differs between this host's P- and E-cores).
+fn check_fp_with(ops: &[Vec<u8>], flag_mask: u64, rounds: usize, seed: u64, nan_free: bool) {
     let mut rng = Rng(seed);
     let init = |g: &mut [u64; 16], rng: &mut Rng| {
         for r in [0usize, 1, 2, 3, 6] {
             g[r] = fp_value(rng);
+            if nan_free {
+                g[r] = no_nan(g[r]);
+            }
         }
         // Equal operands now and then (xmm2 = xmm0), where predicates and min/max differ.
         if rng.next().is_multiple_of(4) {
@@ -1281,6 +1307,69 @@ fn sse_float_moves_and_shuffles() {
         fp_forms(pp, b, None, true, true, &mut ops);
     }
     check_fp(&ops, 0, 3, 0xf10a_7000_0000_0004);
+}
+
+#[test]
+fn sse_float_blends_permutes_f16c() {
+    let mut ops: Vec<Vec<u8>> = Vec::new();
+    let mut dots: Vec<Vec<u8>> = Vec::new();
+    for imm in [0u8, 1, 0x5a, 0xa5, 0x0f, 0xff, 0x3c, 0x81] {
+        for b in [0x0cu8, 0x0d, 0x0e] {
+            ops.push(vec![0x66, 0x0f, 0x3a, b, 0xc2, imm]);
+            ops.push(vex3(1, 3, false, false, 2, b, &[0xc0, imm]));
+        }
+        ops.push(vex3(1, 3, false, true, 0, 0x0c, &[0xc2, imm])); // vblendps ymm
+        ops.push(vex3(1, 3, false, true, 2, 0x0d, &[0xc0, imm])); // vblendpd ymm
+        ops.push(vec![0x66, 0x0f, 0x3a, 0x21, 0xc2, imm]); // insertps xmm0, xmm2
+        ops.push(vec![0x66, 0x0f, 0x3a, 0x21, 0x44, 0x24, 0xc0, imm]); // insertps xmm0, [rsp-64]
+        ops.push(vex3(1, 3, false, false, 2, 0x21, &[0xc0, imm])); // vinsertps xmm0, xmm2, xmm0
+        ops.push(vec![0x66, 0x0f, 0x3a, 0x17, 0xd6, imm]); // extractps esi, xmm2
+        dots.push(vec![0x66, 0x0f, 0x3a, 0x40, 0xc2, imm]); // dpps
+        dots.push(vec![0x66, 0x0f, 0x3a, 0x41, 0xc2, imm & 0x33]); // dppd
+        dots.push(vex3(1, 3, false, true, 2, 0x40, &[0xc0, imm])); // vdpps ymm0, ymm2, ymm0
+        ops.push(vex3(1, 3, false, true, 0, 0x06, &[0xc2, imm])); // vperm2f128
+        for (l, b) in [(false, 0x04u8), (true, 0x04), (false, 0x05), (true, 0x05)] {
+            ops.push(vex3(1, 3, false, l, 0, b, &[0xc2, imm])); // vpermilps/pd imm
+        }
+        ops.push(vex3(1, 3, false, false, 0, 0x1d, &[0xd0, imm & 7])); // vcvtps2ph xmm0, xmm2
+        ops.push(vex3(1, 3, false, true, 0, 0x1d, &[0xd0, imm & 7])); // vcvtps2ph xmm0, ymm2
+        ops.push(vex3(
+            1,
+            3,
+            false,
+            true,
+            0,
+            0x1d,
+            &[0x54, 0x24, 0xc0, imm & 7],
+        )); // to [rsp-64]
+    }
+    // blendv: legacy (mask xmm0, into xmm1) and VEX (mask register in the immediate).
+    for b in [0x10u8, 0x14, 0x15] {
+        ops.push(vec![
+            0x66, 0x0f, 0x6f, 0xc8, 0x66, 0x0f, 0x38, b, 0xca, 0x66, 0x0f, 0x6f, 0xc1,
+        ]);
+    }
+    for (b, wide) in [
+        (0x4au8, false),
+        (0x4a, true),
+        (0x4b, false),
+        (0x4b, true),
+        (0x4c, false),
+    ] {
+        ops.push(vex3(1, 3, false, wide, 0, b, &[0xc2, 0x20]));
+        ops.push(vex3(1, 3, false, wide, 2, b, &[0xc0, 0x00]));
+    }
+    for (l, b) in [(false, 0x0cu8), (true, 0x0c), (false, 0x0d), (true, 0x0d)] {
+        ops.push(vex3(1, 2, false, l, 0, b, &[0xc2])); // vpermilps/pd by control
+    }
+    ops.push(vex3(1, 2, false, false, 0, 0x13, &[0xc2])); // vcvtph2ps xmm0, xmm2
+    ops.push(vex3(1, 2, false, true, 0, 0x13, &[0xc2])); // vcvtph2ps ymm0, xmm2
+    ops.push(vex3(1, 2, false, false, 0, 0x18, &[0x44, 0x24, 0xc0])); // vbroadcastss xmm0
+    ops.push(vex3(1, 2, false, true, 0, 0x18, &[0x44, 0x24, 0xc4])); // vbroadcastss ymm0
+    ops.push(vex3(1, 2, false, true, 0, 0x19, &[0x44, 0x24, 0xc0])); // vbroadcastsd
+    ops.push(vex3(1, 2, false, true, 0, 0x1a, &[0x44, 0x24, 0xc0])); // vbroadcastf128
+    check_fp(&ops, 0, 3, 0xf10a_7000_0000_0005);
+    check_fp_with(&dots, 0, 6, 0xf10a_7000_0000_0006, true);
 }
 
 /// Regenerates `apps/x86test/src/vectors.rs`: `cargo test -p x86emu --test differential

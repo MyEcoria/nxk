@@ -148,6 +148,7 @@ impl Cpu {
             | SseOp::Extract(_)
             | SseOp::Fp(_, Ty::Ss | Ty::Sd)
             | SseOp::Comis(..)
+            | SseOp::Insertps
             | SseOp::MovS(_)
             | SseOp::Movmsk(_)
             | SseOp::MovLH(
@@ -252,6 +253,16 @@ impl Cpu {
             SseOp::MovLH(l) => return self.movlh(l, i, mem, next),
             SseOp::Shufp(t) => return self.shufp(t, i, mem, next),
             SseOp::Movmsk(t) => return self.movmsk(t, i, mem, next),
+            SseOp::Blend(_)
+            | SseOp::Blendv(_)
+            | SseOp::Insertps
+            | SseOp::Dp(_)
+            | SseOp::Broadcast(_)
+            | SseOp::Perm2f128
+            | SseOp::PermilV(_)
+            | SseOp::PermilI(_)
+            | SseOp::Cvtph2ps
+            | SseOp::Cvtps2ph => return self.shuffle(op, i, mem, next),
             _ => {}
         }
         if i.vex & VEX_L != 0 {

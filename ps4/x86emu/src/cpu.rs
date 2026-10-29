@@ -3,6 +3,7 @@
 use core::ops::Range;
 
 mod float;
+mod shuffle;
 mod vector;
 
 pub use float::{MXCSR_MASK, MXCSR_RESET};

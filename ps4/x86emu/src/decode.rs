@@ -186,6 +186,25 @@ pub enum SseOp {
     Shufp(Ty),
     /// movmskps / movmskpd: sign bits to a GPR.
     Movmsk(Ty),
+    /// blendps / blendpd / pblendw: `u8`-byte elements picked by `imm` bits.
+    Blend(u8),
+    /// blendvps / blendvpd / pblendvb: picked by the mask register's element sign bits
+    /// (xmm0 for legacy encodings, `imm` (the register number) under VEX).
+    Blendv(u8),
+    /// insertps with `imm`.
+    Insertps,
+    /// dpps / dppd with `imm`.
+    Dp(Ty),
+    /// vbroadcastss / sd / f128 of a `u8`-byte memory operand.
+    Broadcast(u8),
+    /// vperm2f128 with `imm`.
+    Perm2f128,
+    /// vpermilps / vpermilpd by a control vector (`V`) or by `imm` (`I`).
+    PermilV(Ty),
+    PermilI(Ty),
+    /// F16C: vcvtph2ps, vcvtps2ph (rounding from `imm`).
+    Cvtph2ps,
+    Cvtps2ph,
 }
 
 /// Element type of a float op: packed or scalar, single or double.

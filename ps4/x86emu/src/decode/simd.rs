@@ -82,6 +82,9 @@ fn one_source(op: SseOp) -> bool {
             | Shufhw
             | Ptest
             | MovLH(LhOp::DupLo | LhOp::DupHi)
+            | PermilI(_)
+            | Cvtph2ps
+            | Broadcast(_)
             | Fp(
                 FpOp::Sqrt | FpOp::Rcp | FpOp::Rsqrt | FpOp::Round,
                 Ty::Ps | Ty::Pd
@@ -527,6 +530,42 @@ pub(super) fn decode_0f38(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
             c.done(Op::Movbe, size, m.rm, Operand::Reg(m.reg), 0)
         };
     }
+    if p == 1 && !is_vex(c) && matches!(b, 0x10 | 0x14 | 0x15) {
+        // blendv with the implicit mask register xmm0.
+        let e = match b {
+            0x10 => 1,
+            0x14 => 4,
+            _ => 8,
+        };
+        return xmm_op(c, Blendv(e), Load, false);
+    }
+    if p == 1 && is_vex(c) {
+        let r = match b {
+            0x0c => Some(xmm_op(c, PermilV(Ty::Ps), Load, true)),
+            0x0d => Some(xmm_op(c, PermilV(Ty::Pd), Load, true)),
+            0x13 => {
+                no_vvvv(c)?;
+                Some(xmm_op(c, Cvtph2ps, Load, true))
+            }
+            0x18..=0x1a => {
+                no_vvvv(c)?;
+                let n = [4, 8, 16][(b - 0x18) as usize];
+                if n > 4 && !wide(c) {
+                    return Err(DecodeError::Unsupported(b));
+                }
+                // AVX1 broadcasts read memory only (register sources are AVX2).
+                match xmm_op(c, Broadcast(n), Load, true) {
+                    Ok(i) if matches!(i.src, Operand::Mem(_)) => Some(Ok(i)),
+                    Ok(_) => Some(Err(DecodeError::Unsupported(b))),
+                    e => Some(e),
+                }
+            }
+            _ => None,
+        };
+        if let Some(r) = r {
+            return r;
+        }
+    }
     if p != 1 || wide(c) {
         return Err(DecodeError::Unsupported(b));
     }
@@ -564,7 +603,53 @@ pub(super) fn decode_0f3a(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
         return Err(DecodeError::Unsupported(b));
     }
     let wsize = if c.rex & 8 != 0 { 8 } else { 4 };
+    let vex = is_vex(c);
     match b {
+        0x04 | 0x05 if vex => {
+            no_vvvv(c)?;
+            let t = if b == 0x04 { Ty::Ps } else { Ty::Pd };
+            xmm_op(c, SseOp::PermilI(t), Form::LoadImm, true)
+        }
+        0x06 if vex && wide(c) => xmm_op(c, SseOp::Perm2f128, Form::LoadImm, true),
+        0x0c => xmm_op(c, SseOp::Blend(4), Form::LoadImm, true),
+        0x0d => xmm_op(c, SseOp::Blend(8), Form::LoadImm, true),
+        0x0e => xmm_op(c, SseOp::Blend(2), Form::LoadImm, false),
+        0x17 if !wide(c) => {
+            // extractps: pextrd's operands and result.
+            no_vvvv(c)?;
+            let m = c.modrm()?;
+            let imm = c.r.imm(1)? & 0xff;
+            c.done(
+                Op::Sse(SseOp::Extract(4)),
+                4,
+                m.rm,
+                Operand::Xmm(m.reg),
+                imm,
+            )
+        }
+        0x21 => xmm_op(c, SseOp::Insertps, Form::LoadImm, false),
+        0x40 => xmm_op(c, SseOp::Dp(Ty::Ps), Form::LoadImm, true),
+        0x41 => xmm_op(c, SseOp::Dp(Ty::Pd), Form::LoadImm, false),
+        0x4a..=0x4c if vex && c.rex & 8 == 0 => {
+            let e = [4, 8, 1][(b - 0x4a) as usize];
+            // The mask register is in the immediate's top four bits.
+            xmm_op(c, SseOp::Blendv(e), Form::LoadImm, e != 1).map(|mut i| {
+                i.imm = (i.imm >> 4) & 15;
+                i
+            })
+        }
+        0x1d if vex => {
+            no_vvvv(c)?;
+            let m = c.modrm()?;
+            let imm = c.r.imm(1)? & 0xff;
+            c.done(
+                Op::Sse(SseOp::Cvtps2ph),
+                16,
+                xmm(m.rm),
+                Operand::Xmm(m.reg),
+                imm,
+            )
+        }
         0x08..=0x0b => {
             let t = [Ty::Ps, Ty::Pd, Ty::Ss, Ty::Sd][(b - 8) as usize];
             fp_op(c, SseOp::Fp(FpOp::Round, t), t, Form::LoadImm)

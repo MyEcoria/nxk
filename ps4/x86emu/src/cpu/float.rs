@@ -20,11 +20,11 @@ fn fmt(t: Ty) -> Fmt {
     }
 }
 
-fn lane(v: u128, w: u8, i: u32) -> u64 {
+pub(super) fn lane(v: u128, w: u8, i: u32) -> u64 {
     (v >> (i * 8 * w as u32)) as u64 & mask(w)
 }
 
-fn set_lane(v: u128, w: u8, i: u32, x: u64) -> u128 {
+pub(super) fn set_lane(v: u128, w: u8, i: u32, x: u64) -> u128 {
     let sh = i * 8 * w as u32;
     (v & !((mask(w) as u128) << sh)) | ((x & mask(w)) as u128) << sh
 }
@@ -166,7 +166,7 @@ fn lanes128(op: FpOp, t: Ty, a: u128, b: u128, imm: i64, mx: u32, flags: &mut u3
 
 impl Cpu {
     /// Or `flags` into MXCSR; an unmasked exception stops at `here`.
-    fn raise(&mut self, flags: u32, here: u64) -> Result<(), Stop> {
+    pub(super) fn raise(&mut self, flags: u32, here: u64) -> Result<(), Stop> {
         self.mxcsr |= flags;
         let masked = (self.mxcsr >> 7) & 0x3f;
         if flags & !masked != 0 {
@@ -176,7 +176,7 @@ impl Cpu {
     }
 
     /// Both 128-bit halves of the first source: vvvv under VEX, else the destination.
-    fn first_y(&self, i: &Inst) -> (u128, u128) {
+    pub(super) fn first_y(&self, i: &Inst) -> (u128, u128) {
         let x = if i.vex & VEX != 0 {
             i.vvvv as usize
         } else {
@@ -189,7 +189,7 @@ impl Cpu {
     }
 
     /// The second source: `n` bytes of memory, or the register (both halves when wide).
-    fn second(
+    pub(super) fn second(
         &self,
         i: &Inst,
         n: u8,
@@ -205,7 +205,7 @@ impl Cpu {
     }
 
     /// Write a float result: both halves when wide, else as `put_v`.
-    fn put_fp(
+    pub(super) fn put_fp(
         &mut self,
         i: &Inst,
         v: (u128, u128),

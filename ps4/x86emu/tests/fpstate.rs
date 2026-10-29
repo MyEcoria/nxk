@@ -130,3 +130,15 @@ fn approximate_reciprocals_within_the_bound() {
         }
     }
 }
+
+/// dpps between two different NaNs: the order modelled is the one an Intel E-core
+/// (Crestmont) shows; P-cores of the same chip pick differently, Jaguar is unknown.
+#[test]
+fn dpps_nan_order_is_the_modelled_one() {
+    let mut cpu = Cpu::new([0; 16], BASE, 2);
+    cpu.xmm[0] = 0x000f_ffff_ffff_ffff_3ff4_b367_d38e_7d2c;
+    cpu.xmm[1] = 0x7ff0_0000_0000_0001_3ff3_2121_b99f_4583;
+    let (r, _) = run(&[0x66, 0x0f, 0x3a, 0x40, 0xc1, 0xff], &mut cpu, 0);
+    assert_eq!(r, Ok(()));
+    assert_eq!(cpu.xmm[0], 0x7ff0_0000_7ff0_0000_7ff0_0000_7ff0_0000);
+}
