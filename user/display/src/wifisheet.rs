@@ -31,7 +31,7 @@ const VIEW: usize = 392;
 const PSK_MAX: usize = 64;
 const PSK_MIN: usize = 8;
 /// A finger moves this far before a touch is a drag, not a tap.
-const SLOP: i64 = 12;
+const SLOP: i64 = crate::pan::TOUCH_SLOP;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Stage {

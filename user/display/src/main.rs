@@ -32,6 +32,7 @@ mod home;
 mod keyboard;
 mod known;
 mod pages;
+mod pan;
 mod panel;
 mod perf;
 mod playtime;

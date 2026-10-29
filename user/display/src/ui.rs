@@ -17,6 +17,7 @@ use crate::config::{Config, SLEEP_MIN};
 use crate::flow::Flow;
 use crate::font::{self, Face};
 use crate::games::{Cover, GameInfo};
+use crate::pan::Pan;
 use crate::playtime::Playtime;
 use crate::screen::{mix, Screen};
 use crate::speedsheet::SpeedUi;
@@ -330,6 +331,8 @@ pub struct Ui {
     pub(crate) last_game: usize,
     pub(crate) scroll: f32,
     pub(crate) scroll_to: f32,
+    /// A finger on the home row, or the row left by hand.
+    pub(crate) pan: Pan,
     pub cfg: Config,
     pub play: Playtime,
     pub has_backlight: bool,
@@ -413,6 +416,7 @@ impl Ui {
             last_game: 0,
             scroll: 0.0,
             scroll_to: 0.0,
+            pan: Pan::default(),
             cfg: Config::new(),
             play: Playtime::default(),
             has_backlight: false,
@@ -616,6 +620,7 @@ impl Ui {
         self.last_game = 0;
         self.scroll = 0.0;
         self.scroll_to = 0.0;
+        self.pan = Pan::default();
     }
 
     /// L or R on the home screen: the catalog before or after.
@@ -736,7 +741,8 @@ impl Ui {
     pub fn animating(&self) -> bool {
         self.boot.is_some()
             || self.flow.is_some()
-            || (self.page == LIBRARY && (self.scroll - self.scroll_to).abs() > 0.5)
+            || (self.page == LIBRARY
+                && ((self.scroll - self.scroll_to).abs() > 0.5 || self.pan.glide != 0.0))
             || (self.sheet == Some(Sheet::Wifi) && self.wifi.busy())
     }
 
@@ -904,17 +910,22 @@ impl Ui {
                     self.drag = Some((id, sx, sw));
                     return self.slide(id, x, sx, sw);
                 }
+                self.pan_down(x, y, hit);
+                if self.pan.stopped {
+                    self.pressed = None;
+                }
                 None
             }
             input::TOUCH_MOVE => {
                 if let Some((id, sx, sw)) = self.drag {
                     return self.slide(id, x, sx, sw);
                 }
-                if self.wifi_touch_move(y) {
+                if self.wifi_touch_move(y) || self.pan_move(x, libnx::time::now_ns()) {
                     self.pressed = None;
                     return None;
                 }
-                if self.pressed != hit {
+                // A big finger rolls: it left a tap only by moving far.
+                if self.pan.far(x, y) {
                     self.pressed = None;
                 }
                 None
@@ -927,12 +938,14 @@ impl Ui {
                     self.pressed = None;
                     return Some(Action::Save);
                 }
-                if self.wifi_touch_up() {
+                if self.wifi_touch_up() || self.pan_up(libnx::time::now_ns()) {
                     self.pressed = None;
                     return None;
                 }
+                let stopped = core::mem::take(&mut self.pan.stopped);
                 let p = self.pressed.take()?;
-                if Some(p) == hit {
+                // The tap goes to what the finger went down on.
+                if !stopped && !self.pan.far(x, y) {
                     self.tap(p)
                 } else {
                     None
@@ -956,6 +969,9 @@ impl Ui {
                 BTN_B | BTN_HOME => Some(Action::Cancel),
                 _ => None,
             };
+        }
+        if self.page == LIBRARY && !open && self.pan_pad(code) {
+            return None;
         }
         if self.page == LIBRARY && !open {
             if let Some(a) = self.home_pad(code) {

@@ -22,7 +22,7 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 
 | Feature | Status | Details |
 |---|---|---|
-| Game library | ✅ Complete | `/games` library with touch and gamepad, HOME to leave a game, cover art |
+| Game library | ✅ Complete | `/games` library with touch (drag and flick the row) and gamepad, HOME to leave a game, cover art |
 | User management | ✅ Complete | First-start setup, avatar, theme and PIN per user, Users page, saves and play time per user |
 | Settings and system pages | ✅ Complete | Quick settings, System Settings, System, Network, Terminal and Logs pages; dark and light themes |
 | Sleep mode | ✅ Complete | Screen and GPU rail off, services suspended; sleep and wake with the Power button, validated on the Erista |
