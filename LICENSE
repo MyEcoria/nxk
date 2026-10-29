@@ -12,6 +12,10 @@ code they derive from.
     (bdk/display/di.inl, (c) CTCaer). GNU GPL version 2 only
     (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html); the `emc`
     and `display` programs built from them are distributed under it.
+  * ps4/: a Rust rewrite of HayatoG/iss_pc (itself derived from
+    gow3_pc, bloodborne_pc and shadPS4), GNU GPL version 2 or later
+    (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html). Programs
+    built from it are distributed under it.
   * services/nxopus/: a port of libopus 1.6.1, BSD 3-clause
     (services/nxopus/LICENSE).
   * services/nxh264/src/tables.rs: data tables of Cisco's OpenH264,

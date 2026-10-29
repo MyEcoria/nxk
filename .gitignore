@@ -4,6 +4,7 @@ firmware/
 kernel/target/
 user/target/
 abi/target/
+ps4/target/
 refs/
 # The Luna client's reverse (APK, decompiled code, builds): never published.
 sources/

@@ -1,0 +1,11 @@
+# PS4 compatibility layer for nxk (port of HayatoG/iss_pc, GPL-2.0-or-later).
+# Host-testable crates: `cd ps4 && cargo test` on the PC.
+[workspace]
+resolver = "2"
+members = ["ps4fmt"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
