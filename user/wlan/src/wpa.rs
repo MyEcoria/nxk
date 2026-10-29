@@ -45,7 +45,9 @@ const EID_RSN: u8 = 48;
 const EID_VENDOR: u8 = 221;
 const OUI_IEEE: [u8; 3] = [0x00, 0x0F, 0xAC];
 const SUITE_CCMP: [u8; 4] = [0x00, 0x0F, 0xAC, 4];
+pub const SUITE_1X: [u8; 4] = [0x00, 0x0F, 0xAC, 1];
 const SUITE_PSK: [u8; 4] = [0x00, 0x0F, 0xAC, 2];
+pub const SUITE_1X_SHA256: [u8; 4] = [0x00, 0x0F, 0xAC, 5];
 /// KDE data type of a group key.
 const KDE_GTK: u8 = 1;
 /// RSN capabilities: management frame protection required.
@@ -55,6 +57,12 @@ const RSN_MFPR: u16 = 1 << 6;
 /// capabilities (no management frame protection).
 pub const RSN_IE: [u8; 22] = [
     EID_RSN, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 2,
+    0, 0,
+];
+
+/// Our RSN element for WPA2-Enterprise (802.1X AKM `00-0F-AC:1`).
+pub const RSN_IE_EAP: [u8; 22] = [
+    EID_RSN, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 1,
     0, 0,
 ];
 
@@ -126,6 +134,24 @@ pub fn element(ies: &[u8], id: u8) -> Option<&[u8]> {
 /// CCMP for both ciphers, PSK among the key managements, and management
 /// frame protection not required.
 pub fn check_rsn(rsn: &[u8]) -> Result<(), &'static str> {
+    check_rsn_suite(
+        rsn,
+        &SUITE_PSK,
+        "no PSK key management (WPA3-only or enterprise)",
+    )
+}
+
+/// Whether we can join a WPA2-Enterprise network announcing `rsn`:
+/// CCMP ciphers, 802.1X (`00-0F-AC:1`) among AKMs, and MFPR not set.
+pub fn check_rsn_eap(rsn: &[u8]) -> Result<(), &'static str> {
+    check_rsn_suite(rsn, &SUITE_1X, "no 802.1X (SHA-1) key management")
+}
+
+fn check_rsn_suite(
+    rsn: &[u8],
+    want_akm: &[u8; 4],
+    akm_err: &'static str,
+) -> Result<(), &'static str> {
     let b = rsn.get(2..).ok_or("no RSN element")?;
     if b.len() < 8 || le16(b, 0) != 1 {
         return Err("unknown RSN version");
@@ -143,8 +169,8 @@ pub fn check_rsn(rsn: &[u8]) -> Result<(), &'static str> {
     }
     let akm_at = 8 + pairwise.len();
     let akm = b.get(akm_at..akm_at + 2).and(suites(akm_at));
-    if !akm.is_some_and(|a| a.chunks(4).any(|s| s == SUITE_PSK)) {
-        return Err("no PSK key management (WPA3-only or enterprise)");
+    if !akm.is_some_and(|a| a.chunks(4).any(|s| s == want_akm)) {
+        return Err(akm_err);
     }
     let caps_at = akm_at + 2 + akm.map_or(0, |a| a.len());
     if b.len() >= caps_at + 2 && le16(b, caps_at) & RSN_MFPR != 0 {
@@ -571,6 +597,11 @@ mod tests {
         // WPA3 only: SAE, MFP required.
         let sae = hex("30140100000fac040100000fac040100000fac08c000");
         assert!(check_rsn(&sae).is_err());
+        // WPA2-Enterprise (IONIS): CCMP, 802.1X + 802.1X-SHA256, MFPC=1 MFPR=0.
+        assert!(check_rsn_eap(&RSN_IE_EAP).is_ok());
+        let ionis = hex("30180100000fac040100000fac040200000fac01000fac058c00");
+        assert!(check_rsn_eap(&ionis).is_ok());
+        assert!(check_rsn(&ionis).is_err());
         let ies = hex("000874657374000000003014");
         assert_eq!(element(&ies, 0).map(|e| e.len()), Some(10));
         assert_eq!(element(&ies, EID_RSN), None);

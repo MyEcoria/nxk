@@ -2299,8 +2299,9 @@ pub mod proto {
         /// that many records, each `RECORD` bytes plus its SSID.
         pub const SCAN: u32 = 1;
         /// Join a network. word 0 = timeout ns (0: default); bytes =
-        /// SSID, a 0 byte, then the passphrase (empty: open network).
-        /// Replies once associated, or with the failure.
+        /// SSID, a 0 byte, then the passphrase (empty: open network;
+        /// `identity\0password`: WPA2-Enterprise). Replies once
+        /// associated, or with the failure.
         pub const CONNECT: u32 = 2;
         /// Leave the current network.
         pub const DISCONNECT: u32 = 3;
@@ -2344,6 +2345,7 @@ pub mod proto {
         pub const SEC_WPA: u8 = 2;
         pub const SEC_WPA2: u8 = 3;
         pub const SEC_WPA3: u8 = 4;
+        pub const SEC_WPA2_EAP: u8 = 5;
         /// Longest SSID (802.11).
         pub const MAX_SSID: usize = 32;
         /// One endpoint, two names: the badge tells the link apart from

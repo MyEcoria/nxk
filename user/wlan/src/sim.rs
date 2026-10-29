@@ -25,10 +25,10 @@ const fn ap(ssid: &'static str, channel: u8, security: u8, signal: u8, n: u8) ->
         security,
         signal,
         bssid: [0x02, 0x4E, 0x58, 0x4B, 0xA0, n],
-        psk: if security == wifi::SEC_OPEN {
-            ""
-        } else {
-            "nxkwifi2026"
+        psk: match security {
+            wifi::SEC_OPEN => "",
+            wifi::SEC_WPA2_EAP => "user@example.org\0nxkwifi2026",
+            _ => "nxkwifi2026",
         },
     }
 }
@@ -58,6 +58,7 @@ pub const APS: &[Ap] = &[
     ),
     ap("Hotel Lobby", 6, wifi::SEC_OPEN, 79, 15),
     ap("Printer-Direct-3E", 4, wifi::SEC_WPA2, 86, 16),
+    ap("IONIS", 36, wifi::SEC_WPA2_EAP, 55, 17),
 ];
 
 /// Shortest WPA2 passphrase (802.11i).
@@ -93,17 +94,36 @@ impl Sim {
             .iter()
             .position(|a| a.ssid.as_bytes() == ssid)
             .ok_or(-ENOENT)?;
-        let secured = APS[i].security != wifi::SEC_OPEN;
-        if secured && !(MIN_PSK..=64).contains(&psk.len()) {
-            return Err(-EINVAL);
-        }
-        if !matches!(APS[i].security, wifi::SEC_OPEN | wifi::SEC_WPA2) {
-            return Err(-EOPNOTSUPP);
+        let sec = APS[i].security;
+        match sec {
+            wifi::SEC_OPEN => {}
+            wifi::SEC_WPA2 => {
+                if !(MIN_PSK..=64).contains(&psk.len()) {
+                    return Err(-EINVAL);
+                }
+            }
+            wifi::SEC_WPA2_EAP => {
+                let sep = psk
+                    .iter()
+                    .position(|&b| b == 0 || b == b':')
+                    .filter(|&p| p > 0 && p + 1 < psk.len());
+                if sep.is_none() || psk.len() > 256 {
+                    return Err(-EINVAL);
+                }
+            }
+            _ => return Err(-EOPNOTSUPP),
         }
         // As the chip's join: the old network goes first.
         self.joined = None;
         libnx::time::sleep_ms(JOIN_MS);
-        if secured && psk != APS[i].psk.as_bytes() {
+        let ok = match sec {
+            wifi::SEC_OPEN => true,
+            wifi::SEC_WPA2_EAP => {
+                psk == APS[i].psk.as_bytes() || psk == b"user@example.org:nxkwifi2026"
+            }
+            _ => psk == APS[i].psk.as_bytes(),
+        };
+        if !ok {
             return Err(-EACCES);
         }
         self.joined = Some(i);

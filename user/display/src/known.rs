@@ -48,7 +48,7 @@ impl Known {
             }
         }
         let ssid = ssid.filter(|s| !s.is_empty() && s.len() <= 32)?;
-        if psk.len() > 64 {
+        if psk.len() > 256 {
             return None;
         }
         Some(Self { ssid, psk })

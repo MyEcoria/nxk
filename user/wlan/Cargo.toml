@@ -7,3 +7,4 @@ description = "Wi-Fi station: PCIe root complex, BCM4356, link and control"
 
 [dependencies]
 libnx = { path = "../libnx" }
+nxeap = { path = "../nxeap" }
