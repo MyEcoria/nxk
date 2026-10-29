@@ -4,7 +4,7 @@
 
 use std::arch::global_asm;
 use std::sync::Mutex;
-use x86emu::cpu::{Cpu, Mem, AF, CF, FLAG_MASK, OF, ZF};
+use x86emu::cpu::{Cpu, Mem, AF, CF, FLAG_MASK, OF, SF, ZF};
 
 #[repr(C)]
 #[derive(Clone, Default)]
@@ -626,6 +626,226 @@ fn sse_integer() {
     }
     let refs: Vec<(&[u8], u64)> = cases.iter().map(|c| (&c[..], 0)).collect();
     check_all(&refs, 0x55aa_33cc_0ff0_9669);
+}
+
+/// A three-byte VEX prefix and opcode for registers 0..7 (R, X, B clear).
+fn vex3(pp: u8, map: u8, w: bool, l: bool, vvvv: u8, op: u8, rest: &[u8]) -> Vec<u8> {
+    let last = ((w as u8) << 7) | ((!vvvv & 15) << 3) | ((l as u8) << 2) | pp;
+    let mut v = vec![0xc4, 0xe0 | map, last, op];
+    v.extend_from_slice(rest);
+    v
+}
+
+/// The two-byte VEX form (map 0F, W0).
+fn vex2(pp: u8, l: bool, vvvv: u8, op: u8, rest: &[u8]) -> Vec<u8> {
+    let mut v = vec![0xc5, 0x80 | ((!vvvv & 15) << 3) | ((l as u8) << 2) | pp, op];
+    v.extend_from_slice(rest);
+    v
+}
+
+/// Wrap `op` for an xmm check through the GPRs: vzeroupper; xmm0 = rbx:rax, xmm2 = rdx:rcx,
+/// ymm0's upper half = xmm2; run `op`; then rax:rbx = xmm0 and rcx:rdx = ymm0's upper half.
+fn ymm_case(op: &[u8]) -> Vec<u8> {
+    let mut c = vec![0xc5, 0xf8, 0x77]; // vzeroupper
+    c.extend_from_slice(&[
+        0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+        0x66, 0x48, 0x0f, 0x6e, 0xcb, // movq xmm1, rbx
+        0x66, 0x0f, 0x6c, 0xc1, // punpcklqdq xmm0, xmm1
+        0x66, 0x48, 0x0f, 0x6e, 0xd1, // movq xmm2, rcx
+        0x66, 0x48, 0x0f, 0x6e, 0xda, // movq xmm3, rdx
+        0x66, 0x0f, 0x6c, 0xd3, // punpcklqdq xmm2, xmm3
+    ]);
+    c.extend(vex3(1, 3, false, true, 0, 0x18, &[0xc2, 0x01])); // vinsertf128 ymm0, ymm0, xmm2, 1
+    c.extend_from_slice(op);
+    c.extend(vex3(1, 3, false, true, 0, 0x19, &[0xc1, 0x01])); // vextractf128 xmm1, ymm0, 1
+    c.extend_from_slice(&[
+        0x66, 0x48, 0x0f, 0x7e, 0xc0, // movq rax, xmm0
+        0x66, 0x0f, 0x73, 0xd8, 0x08, // psrldq xmm0, 8
+        0x66, 0x48, 0x0f, 0x7e, 0xc3, // movq rbx, xmm0
+        0x66, 0x48, 0x0f, 0x7e, 0xc9, // movq rcx, xmm1
+        0x66, 0x0f, 0x73, 0xd9, 0x08, // psrldq xmm1, 8
+        0x66, 0x48, 0x0f, 0x7e, 0xca, // movq rdx, xmm1
+        0xc3,
+    ]);
+    c
+}
+
+/// Legacy and VEX.128 forms of the same `op xmm0, xmm2` (VEX: `xmm0 = op(xmm0, xmm2)` and
+/// the swapped `xmm0 = op(xmm2, xmm0)`), each checked with ymm0's upper half live.
+fn both_forms(map: u8, op: u8, imm: Option<u8>, out: &mut Vec<Vec<u8>>) {
+    let mut rest = vec![0xc2];
+    rest.extend(imm);
+    let mut legacy = vec![0x66, 0x0f];
+    match map {
+        2 => legacy.push(0x38),
+        3 => legacy.push(0x3a),
+        _ => {}
+    }
+    legacy.push(op);
+    legacy.extend_from_slice(&rest);
+    out.push(ymm_case(&legacy));
+    out.push(ymm_case(&vex3(1, map, false, false, 0, op, &rest)));
+    // One-source ops have no vvvv operand (it must be 1111b, else #UD).
+    let one_source = map == 2 && matches!(op, 0x17 | 0x1c..=0x1e | 0x20..=0x25 | 0x30..=0x35);
+    if one_source {
+        return;
+    }
+    let mut swapped = vec![0xc0];
+    swapped.extend(imm);
+    out.push(ymm_case(&vex3(1, map, false, false, 2, op, &swapped)));
+}
+
+#[test]
+fn sse4_and_vex_integer() {
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    let two_source_0f = [
+        0x60u8, 0x61, 0x62, 0x6c, 0x68, 0x69, 0x6a, 0x6d, 0x63, 0x6b, 0x67, 0x64, 0x65, 0x66, 0x74,
+        0x75, 0x76, 0xd1, 0xd2, 0xd3, 0xe1, 0xe2, 0xf1, 0xf2, 0xf3, 0xd4, 0xfc, 0xfd, 0xfe, 0xf8,
+        0xf9, 0xfa, 0xfb, 0xec, 0xed, 0xdc, 0xdd, 0xe8, 0xe9, 0xd8, 0xd9, 0xda, 0xde, 0xea, 0xee,
+        0xd5, 0xe5, 0xe4, 0xf4, 0xdb, 0xdf, 0xeb, 0xef,
+    ];
+    for op in two_source_0f {
+        both_forms(1, op, None, &mut cases);
+    }
+    for op in [
+        0x00u8, 0x1c, 0x1d, 0x1e, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x30, 0x31, 0x32, 0x33, 0x34,
+        0x35, 0x28, 0x29, 0x2b, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+    ] {
+        both_forms(2, op, None, &mut cases);
+    }
+    for imm in [0u8, 1, 5, 8, 15, 16, 17, 31, 32] {
+        both_forms(3, 0x0f, Some(imm), &mut cases); // palignr
+    }
+    for imm in [0x1bu8, 0x00, 0xe4, 0x4e, 0xb1] {
+        for (pp, prefix) in [(1u8, 0x66u8), (2, 0xf3), (3, 0xf2)] {
+            cases.push(ymm_case(&[prefix, 0x0f, 0x70, 0xc2, imm])); // pshufd / pshufhw / pshuflw
+            cases.push(ymm_case(&vex2(pp, false, 0, 0x70, &[0xc2, imm])));
+        }
+    }
+    for imm in [0u8, 1, 3, 7, 8, 15, 16, 31, 33, 63, 64, 200] {
+        for (op, reg) in [
+            (0x71u8, 2u8),
+            (0x71, 4),
+            (0x71, 6),
+            (0x72, 2),
+            (0x72, 4),
+            (0x72, 6),
+            (0x73, 2),
+            (0x73, 6),
+            (0x73, 3),
+            (0x73, 7),
+        ] {
+            cases.push(ymm_case(&[0x66, 0x0f, op, 0xc0 | (reg << 3), imm]));
+            // VEX: the destination is vvvv (xmm0), the source rm (xmm2).
+            cases.push(ymm_case(&vex2(1, false, 0, op, &[0xc2 | (reg << 3), imm])));
+        }
+    }
+    let one_source: &[&[u8]] = &[
+        &[0xf2, 0x0f, 0x12, 0xc2],                         // movddup xmm0, xmm2
+        &[0xf3, 0x0f, 0x7e, 0xc2],                         // movq xmm0, xmm2
+        &[0x66, 0x0f, 0xd6, 0xd0],                         // movq xmm0, xmm2 (store form)
+        &[0x66, 0x0f, 0x6f, 0xc2],                         // movdqa xmm0, xmm2
+        &[0x0f, 0x28, 0xc2],                               // movaps xmm0, xmm2
+        &[0x66, 0x0f, 0x7e, 0xd6, 0x66, 0x0f, 0x6e, 0xc6], // movd esi, xmm2; movd xmm0, esi
+        &[0x66, 0x0f, 0xd7, 0xf0],                         // pmovmskb esi, xmm0
+        &[0x66, 0x0f, 0xc5, 0xf0, 0x05],                   // pextrw esi, xmm0, 5
+        &[0x66, 0x0f, 0xc4, 0xc6, 0x03],                   // pinsrw xmm0, esi, 3
+        &[0x66, 0x0f, 0x3a, 0x14, 0xc6, 0x09],             // pextrb esi, xmm0, 9
+        &[0x66, 0x0f, 0x3a, 0x16, 0xc6, 0x02],             // pextrd esi, xmm0, 2
+        &[0x66, 0x48, 0x0f, 0x3a, 0x16, 0xc6, 0x01],       // pextrq rsi, xmm0, 1
+        &[0x66, 0x0f, 0x3a, 0x20, 0xc6, 0x0b],             // pinsrb xmm0, esi, 11
+        &[0x66, 0x0f, 0x3a, 0x22, 0xc6, 0x03],             // pinsrd xmm0, esi, 3
+        &[0x66, 0x48, 0x0f, 0x3a, 0x22, 0xc6, 0x01],       // pinsrq xmm0, rsi, 1
+        &[
+            0xf3, 0x0f, 0x7f, 0x44, 0x24, 0xc0, 0x66, 0x0f, 0xef, 0xc0, 0xf3, 0x0f, 0x6f, 0x44,
+            0x24, 0xc4,
+        ], // movdqu store, pxor, movdqu load (offset)
+    ];
+    for c in one_source {
+        cases.push(ymm_case(c));
+    }
+    let vex_moves = [
+        vex2(1, false, 0, 0x7e, &[0xd6]),              // vmovd esi, xmm2
+        vex3(1, 1, true, false, 0, 0x6e, &[0xc6]),     // vmovq xmm0, rsi
+        vex2(2, false, 0, 0x7e, &[0xc2]),              // vmovq xmm0, xmm2
+        vex2(3, false, 0, 0x12, &[0xc2]),              // vmovddup xmm0, xmm2
+        vex2(1, false, 0, 0xd7, &[0xf0]),              // vpmovmskb esi, xmm0
+        vex3(1, 3, true, false, 0, 0x16, &[0xc6, 1]),  // vpextrq rsi, xmm0, 1
+        vex3(1, 3, false, false, 2, 0x22, &[0xc6, 2]), // vpinsrd xmm0, xmm2, esi, 2
+        vex2(1, true, 0, 0x6f, &[0xc2]),               // vmovdqa ymm0, ymm2
+        vex2(2, true, 0, 0x6f, &[0xc2]),               // vmovdqu ymm0, ymm2
+        vex2(0, true, 0, 0x57, &[0xc0]),               // vxorps ymm0, ymm0, ymm0
+        vex2(0, true, 2, 0x55, &[0xc0]),               // vandnps ymm0, ymm2, ymm0
+        vex2(1, true, 0, 0x56, &[0xc2]),               // vorpd ymm0, ymm0, ymm2
+        vex2(0, true, 0, 0x54, &[0xc2]),               // vandps ymm0, ymm0, ymm2
+        vex3(1, 3, false, true, 2, 0x18, &[0xc0, 0]),  // vinsertf128 ymm0, ymm2, xmm0, 0
+        vex2(0, false, 0, 0x77, &[]),                  // vzeroupper
+        vex2(0, true, 0, 0x77, &[]),                   // vzeroall
+        // vmovdqu [rsp-64], ymm0; vxorps ymm0, ymm0, ymm0; vmovdqu ymm0, [rsp-60]
+        [
+            vex2(2, true, 0, 0x7f, &[0x44, 0x24, 0xc0]),
+            vex2(0, true, 0, 0x57, &[0xc0]),
+            vex2(2, true, 0, 0x6f, &[0x44, 0x24, 0xc4]),
+        ]
+        .concat(),
+        // vextractf128 [rsp-48], ymm0, 1; vmovups xmm0, [rsp-48]
+        [
+            vex3(1, 3, false, true, 0, 0x19, &[0x44, 0x24, 0xd0, 1]),
+            vex2(0, false, 0, 0x10, &[0x44, 0x24, 0xd0]),
+        ]
+        .concat(),
+    ];
+    for c in &vex_moves {
+        cases.push(ymm_case(c));
+    }
+    let refs: Vec<(&[u8], u64)> = cases.iter().map(|c| (&c[..], 0)).collect();
+    check_all(&refs, 0x0a0b_0c0d_5a5b_5c5d);
+    // ptest sets ZF and CF only.
+    let pt = [
+        ymm_case(&[0x66, 0x0f, 0x38, 0x17, 0xc2]),
+        ymm_case(&vex3(1, 2, false, false, 0, 0x17, &[0xc2])),
+        ymm_case(&[0x66, 0x0f, 0x38, 0x17, 0xc0]),
+    ];
+    let refs: Vec<(&[u8], u64)> = pt.iter().map(|c| (&c[..], FLAG_MASK)).collect();
+    check_all(&refs, 0x1111_2222_3333_4444);
+}
+
+#[test]
+fn bmi1_movbe_crc32() {
+    let mut cases: Vec<(Vec<u8>, u64)> = Vec::new();
+    let all = CF | ZF | SF | OF;
+    for w in [true, false] {
+        // andn rax, rbx, rcx
+        cases.push((vex3(0, 2, w, false, 3, 0xf2, &[0xc1]), all));
+        // bextr rax, rcx, rbx with a small control (and ebx, 0x7f7f first)
+        let mut b = vec![0x81, 0xe3, 0x7f, 0x7f, 0, 0];
+        b.extend(vex3(0, 2, w, false, 3, 0xf7, &[0xc1]));
+        cases.push((b, ZF | CF | OF));
+        cases.push((vex3(0, 2, w, false, 3, 0xf7, &[0xc1]), ZF | CF | OF));
+        // blsr / blsmsk / blsi rax, rbx
+        for reg in [1u8, 2, 3] {
+            cases.push((vex3(0, 2, w, false, 0, 0xf3, &[0xc3 | (reg << 3)]), all));
+        }
+    }
+    let fixed: &[(&[u8], u64)] = &[
+        (&[0x48, 0x0f, 0x38, 0xf0, 0x03], FLAG_MASK), // movbe rax, [rbx]
+        (&[0x0f, 0x38, 0xf0, 0x03], FLAG_MASK),       // movbe eax, [rbx]
+        (&[0x66, 0x0f, 0x38, 0xf0, 0x03], FLAG_MASK), // movbe ax, [rbx]
+        (&[0x0f, 0x38, 0xf1, 0x0b], FLAG_MASK),       // movbe [rbx], ecx
+        (&[0x48, 0x0f, 0x38, 0xf1, 0x0b], FLAG_MASK), // movbe [rbx], rcx
+        (&[0xf2, 0x0f, 0x38, 0xf0, 0xc3], FLAG_MASK), // crc32 eax, bl
+        (&[0xf2, 0x0f, 0x38, 0xf0, 0xc7], FLAG_MASK), // crc32 eax, bh
+        (&[0xf2, 0x0f, 0x38, 0xf1, 0xc3], FLAG_MASK), // crc32 eax, ebx
+        (&[0x66, 0xf2, 0x0f, 0x38, 0xf1, 0xc3], FLAG_MASK), // crc32 eax, bx
+        (&[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0xc3], FLAG_MASK), // crc32 rax, rbx
+        (&[0xf2, 0x48, 0x0f, 0x38, 0xf1, 0x03], FLAG_MASK), // crc32 rax, [rbx]
+    ];
+    cases.extend(fixed.iter().map(|(c, m)| (c.to_vec(), *m)));
+    for (c, _) in cases.iter_mut() {
+        c.push(0xc3);
+    }
+    let refs: Vec<(&[u8], u64)> = cases.iter().map(|(c, m)| (&c[..], *m)).collect();
+    check_all(&refs, 0x00b1_0b1e_c0c0_a5a5);
 }
 
 /// Regenerates `apps/x86test/src/vectors.rs`: `cargo test -p x86emu --test differential

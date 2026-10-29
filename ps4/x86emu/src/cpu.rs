@@ -2,8 +2,10 @@
 
 use core::ops::Range;
 
+mod vector;
+
 use crate::decode::{
-    decode, AluOp, BitOp, BtOp, DecodeError, Inst, MemRef, Op, Operand, Rep, Seg, ShiftOp, SseOp,
+    decode, AluOp, BitOp, BmiOp, BtOp, DecodeError, Inst, MemRef, Op, Operand, Rep, Seg, ShiftOp,
     UnOp,
 };
 
@@ -81,6 +83,8 @@ pub struct Cpu {
     pub rip: u64,
     pub flags: u64,
     pub xmm: [u128; 16],
+    /// Upper halves of the ymm registers (AVX).
+    pub ymm_hi: [u128; 16],
     pub fs_base: u64,
     pub gs_base: u64,
     /// Addresses that stop execution with `Stop::Hle` instead of being fetched.
@@ -223,28 +227,15 @@ fn shift(op: ShiftOp, a: u64, count: u32, size: u8, flags: u64) -> (u64, u64) {
     (res, f)
 }
 
-/// Apply `f` to each `e`-byte lane of `a` and `b`.
-fn lanes(a: u128, b: u128, e: u8, f: impl Fn(u64, u64) -> u64) -> u128 {
-    let (bits, m) = (8 * e as u32, mask(e));
-    let mut r = 0u128;
-    for i in 0..(16 / e as u32) {
-        let sh = i * bits;
-        let (x, y) = ((a >> sh) as u64 & m, (b >> sh) as u64 & m);
-        r |= ((f(x, y) & m) as u128) << sh;
+/// CRC-32C (Castagnoli, reflected) of the low `n` bytes of `v`, as the crc32 instruction.
+fn crc32c(mut crc: u32, v: u64, n: u8) -> u32 {
+    for k in 0..n {
+        crc ^= (v >> (8 * k)) as u8 as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82f6_3b78 & (crc & 1).wrapping_neg());
+        }
     }
-    r
-}
-
-/// Interleave the `e`-byte lanes of the low (or high) halves of `a` and `b`.
-fn unpack(a: u128, b: u128, e: u8, high: bool) -> u128 {
-    let (bits, m) = (8 * e as u32, mask(e) as u128);
-    let (a, b) = if high { (a >> 64, b >> 64) } else { (a, b) };
-    let mut r = 0u128;
-    for i in 0..(8 / e as u32) {
-        r |= ((a >> (i * bits)) & m) << (2 * i * bits);
-        r |= ((b >> (i * bits)) & m) << ((2 * i + 1) * bits);
-    }
-    r
+    crc
 }
 
 impl Cpu {
@@ -366,19 +357,6 @@ impl Cpu {
             Operand::Imm(_) => unreachable!("decoder never yields an immediate destination"),
         }
         Ok(())
-    }
-
-    fn get_x(&self, o: Operand, mem: &mut dyn Mem, next: u64) -> Result<u128, Stop> {
-        match o {
-            Operand::Xmm(x) => Ok(self.xmm[x as usize]),
-            Operand::Mem(m) => {
-                let a = self.addr(&m, next);
-                let lo = mem.read(a, 8).ok_or(Stop::Fault(a))?;
-                let hi = mem.read(a + 8, 8).ok_or(Stop::Fault(a + 8))?;
-                Ok(lo as u128 | (hi as u128) << 64)
-            }
-            _ => unreachable!("decoder: xmm operand is a register or memory"),
-        }
     }
 
     fn put_x(&mut self, o: Operand, v: u128, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
@@ -619,10 +597,27 @@ impl Cpu {
             Op::Hlt => return Err(Stop::Halt(here)),
             Op::Trap => return Err(Stop::Trap(here)),
             Op::Sse(op) => self.sse(op, i, mem, next)?,
+            Op::Bmi(op) => self.bmi(op, i, mem, next)?,
+            Op::Movbe => {
+                let v = self.get(i.src, sz, mem, next)?;
+                let swapped = match sz {
+                    2 => (v as u16).swap_bytes() as u64,
+                    4 => (v as u32).swap_bytes() as u64,
+                    _ => v.swap_bytes(),
+                };
+                self.put(i.dst, sz, swapped, mem, next)?;
+            }
+            Op::Crc32(from) => {
+                let v = self.get(i.src, from, mem, next)?;
+                let crc = crc32c(self.gpr[i.dst_reg()] as u32, v, from);
+                // The accumulator is 32-bit; a 64-bit destination gets it zero-extended.
+                self.put(i.dst, 4, crc as u64, mem, next)?;
+            }
         }
         Ok(false)
     }
 
+    #[inline(never)]
     fn unary(
         &mut self,
         op: UnOp,
@@ -717,6 +712,7 @@ impl Cpu {
         }
     }
 
+    #[inline(never)]
     fn bits(&mut self, op: BitOp, i: Inst, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
         let sz = i.size;
         let bits = 8 * sz as u32;
@@ -741,6 +737,7 @@ impl Cpu {
         self.put(i.dst, sz, res, mem, next)
     }
 
+    #[inline(never)]
     fn bt(&mut self, op: BtOp, i: Inst, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
         let sz = i.size;
         let bits = 8 * sz as i64;
@@ -767,6 +764,7 @@ impl Cpu {
     }
 
     /// movs / stos, with or without a rep prefix (64-bit addresses).
+    #[inline(never)]
     fn string(&mut self, i: Inst, mem: &mut dyn Mem) -> Result<(), Stop> {
         let sz = i.size;
         let step = if self.flags & DF != 0 {
@@ -798,107 +796,47 @@ impl Cpu {
         Ok(())
     }
 
-    fn sse(&mut self, op: SseOp, i: Inst, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
-        match op {
-            SseOp::MovGpr => {
-                // Into xmm: zero-extended; out of xmm: a GPR or memory write of `size`.
-                let v = self.get(i.src, i.size, mem, next)?;
-                return self.put(i.dst, i.size, v, mem, next);
+    #[inline(never)]
+    fn bmi(&mut self, op: BmiOp, i: Inst, mem: &mut dyn Mem, next: u64) -> Result<(), Stop> {
+        let sz = i.size;
+        let (m, bits) = (mask(sz), 8 * sz as u64);
+        let src = self.get(i.src, sz, mem, next)?;
+        let other = self.gpr[i.vvvv as usize] & m;
+        let sign = |r: u64| flag(r & (1 << (bits - 1)) != 0, SF);
+        let (res, f) = match op {
+            BmiOp::Andn => {
+                let r = !other & src & m;
+                (r, sign(r) | flag(r == 0, ZF))
             }
-            SseOp::MovQ => {
-                let v = match i.src {
-                    Operand::Xmm(x) => self.xmm[x as usize] as u64,
-                    s => self.get(s, 8, mem, next)?,
+            BmiOp::Bextr => {
+                let (start, len) = (other & 0xff, (other >> 8) & 0xff);
+                let r = if start >= bits {
+                    0
+                } else {
+                    let v = src >> start;
+                    if len >= 64 {
+                        v
+                    } else {
+                        v & ((1u64 << len) - 1)
+                    }
                 };
-                return self.put(i.dst, 8, v, mem, next);
+                (r, flag(r == 0, ZF))
             }
-            _ => {}
-        }
-        // Legacy-SSE memory operands must be 16-byte aligned, but for the unaligned moves.
-        if op != SseOp::MovU {
-            for o in [i.dst, i.src] {
-                if let Operand::Mem(m) = o {
-                    let a = self.addr(&m, next);
-                    if a & 15 != 0 {
-                        return Err(Stop::Misaligned(a));
-                    }
-                }
+            BmiOp::Blsr => {
+                let r = src & src.wrapping_sub(1) & m;
+                (r, sign(r) | flag(r == 0, ZF) | flag(src == 0, CF))
             }
-        }
-        let shift_count = |cpu: &Cpu, mem: &mut dyn Mem| -> Result<u64, Stop> {
-            match i.src {
-                Operand::Imm(n) => Ok(n as u64),
-                s => Ok(cpu.get_x(s, mem, next)? as u64),
+            BmiOp::Blsmsk => {
+                let r = (src ^ src.wrapping_sub(1)) & m;
+                (r, sign(r) | flag(src == 0, CF))
+            }
+            BmiOp::Blsi => {
+                let r = src.isolate_lowest_one() & m;
+                (r, sign(r) | flag(r == 0, ZF) | flag(src != 0, CF))
             }
         };
-        let r = match op {
-            SseOp::Mov | SseOp::MovU => self.get_x(i.src, mem, next)?,
-            SseOp::Sll(e) | SseOp::Srl(e) | SseOp::Sra(e) => {
-                let a = self.xmm_of(i.dst);
-                let n = shift_count(self, mem)?;
-                let bits = 8 * e as u64;
-                lanes(a, 0, e, |x, _| match op {
-                    SseOp::Sll(_) if n < bits => x << n,
-                    SseOp::Srl(_) if n < bits => x >> n,
-                    SseOp::Sra(_) => (sext(x, e) >> n.min(bits - 1)) as u64,
-                    _ => 0,
-                })
-            }
-            SseOp::Slldq | SseOp::Srldq => {
-                let (a, n) = (self.xmm_of(i.dst), i.imm as u32);
-                match (op, n) {
-                    (_, 16..) => 0,
-                    (SseOp::Slldq, n) => a << (8 * n),
-                    (_, n) => a >> (8 * n),
-                }
-            }
-            SseOp::Shufd => {
-                let a = self.get_x(i.src, mem, next)?;
-                (0..4).fold(0u128, |r, k| {
-                    let sel = (i.imm >> (2 * k)) & 3;
-                    r | ((a >> (32 * sel)) & 0xffff_ffff) << (32 * k)
-                })
-            }
-            _ => {
-                let a = self.xmm_of(i.dst);
-                let b = self.get_x(i.src, mem, next)?;
-                match op {
-                    SseOp::Xor => a ^ b,
-                    SseOp::And => a & b,
-                    SseOp::Andn => !a & b,
-                    SseOp::Or => a | b,
-                    SseOp::Add(e) => lanes(a, b, e, u64::wrapping_add),
-                    SseOp::Sub(e) => lanes(a, b, e, u64::wrapping_sub),
-                    SseOp::CmpEq(e) => lanes(a, b, e, |x, y| if x == y { u64::MAX } else { 0 }),
-                    SseOp::CmpGt(e) => {
-                        lanes(
-                            a,
-                            b,
-                            e,
-                            |x, y| {
-                                if sext(x, e) > sext(y, e) {
-                                    u64::MAX
-                                } else {
-                                    0
-                                }
-                            },
-                        )
-                    }
-                    SseOp::MulUdq => lanes(a, b, 8, |x, y| (x & 0xffff_ffff) * (y & 0xffff_ffff)),
-                    SseOp::UnpackLo(e) => unpack(a, b, e, false),
-                    SseOp::UnpackHi(e) => unpack(a, b, e, true),
-                    _ => unreachable!("handled above"),
-                }
-            }
-        };
-        self.put_x(i.dst, r, mem, next)
-    }
-
-    fn xmm_of(&self, o: Operand) -> u128 {
-        match o {
-            Operand::Xmm(x) => self.xmm[x as usize],
-            _ => unreachable!("decoder: destination of this SSE op is a register"),
-        }
+        self.set_arith(f);
+        self.put(i.dst, sz, res, mem, next)
     }
 
     /// Run from `self.rip` until a `ret` pops `sentinel`.

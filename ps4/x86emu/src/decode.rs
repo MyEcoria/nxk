@@ -1,5 +1,8 @@
-//! x86-64 instruction decoder: the general-purpose integer set, string moves and SSE2
-//! integer / data moves, as compilers emit them (8/16/32/64-bit operands).
+//! x86-64 instruction decoder: the general-purpose integer set, string moves, BMI1, MOVBE,
+//! and SSE2..SSE4.2 / AVX1 integer and data-move instructions (`simd`), as compilers
+//! emit them for the PS4's Jaguar (8/16/32/64-bit operands, legacy and VEX encodings).
+
+mod simd;
 
 /// Why decoding stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,38 +94,97 @@ pub enum BtOp {
     Btc,
 }
 
-/// SSE2 operations on xmm registers. `u8` payloads are element sizes in bytes.
+/// SIMD operations on xmm (and, for AVX1 moves and logic, ymm) registers. `u8` payloads
+/// are element sizes in bytes; `bool` payloads say signed.
+///
+/// Two-source operations read `vvvv` under VEX and the destination otherwise; one-source
+/// operations (moves, shuffles, immediate shifts, extensions) read `src` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseOp {
-    /// Aligned 128-bit move (movdqa/movaps/movapd): a misaligned address faults.
+    /// Aligned move (movdqa/movaps/movapd/movntdq): a misaligned address faults.
     Mov,
-    /// Unaligned 128-bit move (movdqu/movups/movupd).
+    /// Unaligned move (movdqu/movups/movupd/lddqu).
     MovU,
     /// movd/movq into an xmm register (zero-extended) or out of one; `size` is 4 or 8.
     MovGpr,
     /// movq xmm, xmm/m64 (zero-extended) and movq m64, xmm.
     MovQ,
+    /// movddup: the low quadword in both halves.
+    MovDup,
     Xor,
     And,
     Andn,
     Or,
     Add(u8),
     Sub(u8),
+    /// Saturating signed / unsigned add and subtract.
+    AddS(u8),
+    AddUS(u8),
+    SubS(u8),
+    SubUS(u8),
     CmpEq(u8),
     CmpGt(u8),
-    /// pmuludq.
+    Min(u8, bool),
+    Max(u8, bool),
+    /// Low half of each product (pmullw, pmulld).
+    MulLo(u8),
+    /// High half of 16-bit products (pmulhw, pmulhuw).
+    MulHi(bool),
+    /// Even 32-bit lanes to 64-bit products: pmuludq, pmuldq.
     MulUdq,
-    /// Shift each element by an immediate (`imm`) or by xmm/m128's low quadword.
+    MulDq,
+    Abs(u8),
+    /// Shift each element by the low quadword of `src`.
     Sll(u8),
     Srl(u8),
     Sra(u8),
-    /// Whole-register byte shifts (pslldq / psrldq) by `imm`.
+    /// Shift `src`'s elements by `imm`.
+    SllI(u8),
+    SrlI(u8),
+    SraI(u8),
+    /// Whole-register byte shifts of `src` by `imm` (pslldq / psrldq).
     Slldq,
     Srldq,
-    /// pshufd with `imm`.
+    /// pshufd / pshuflw / pshufhw with `imm`; pshufb by a control register.
     Shufd,
+    Shuflw,
+    Shufhw,
+    Shufb,
+    /// palignr by `imm` bytes.
+    Alignr,
     UnpackLo(u8),
     UnpackHi(u8),
+    /// Narrow `u8`-byte elements with signed / unsigned saturation.
+    PackSS(u8),
+    PackUS(u8),
+    /// pmovsx / pmovzx: from, to element sizes, signed.
+    Movx(u8, u8, bool),
+    /// pmovmskb: byte sign bits to a GPR.
+    Movmskb,
+    /// ptest: ZF and CF from `dst & src` and `!dst & src`.
+    Ptest,
+    /// pextr / pinsr of a `u8`-byte element, lane `imm`.
+    Extract(u8),
+    Insert(u8),
+    /// vinsertf128 / vextractf128, half `imm & 1`.
+    Insert128,
+    Extract128,
+    /// vzeroupper / vzeroall.
+    ZeroUpper,
+    ZeroAll,
+}
+
+/// BMI1 operations (VEX-encoded, on GPRs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BmiOp {
+    /// `dst = !vvvv & src`.
+    Andn,
+    /// `dst = bits of src`, start and length from `vvvv`.
+    Bextr,
+    /// `vvvv = src & (src - 1)`, `src ^ (src - 1)`, `src & -src`.
+    Blsr,
+    Blsmsk,
+    Blsi,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +259,11 @@ pub enum Op {
     /// ud2 or int3: a deliberate trap.
     Trap,
     Sse(SseOp),
+    Bmi(BmiOp),
+    /// Byte-swapping load or store.
+    Movbe,
+    /// SSE4.2 crc32 (Castagnoli) of a `u8`-byte source into a 32-bit accumulator.
+    Crc32(u8),
 }
 
 /// `rep` / `repne` prefix state.
@@ -218,7 +285,16 @@ pub struct Inst {
     /// Third operand: `imul` / `pshufd` / shift immediates, `ret` pop count.
     pub imm: i64,
     pub rep: Rep,
+    /// VEX.vvvv: the extra source (or BLS* destination) register.
+    pub vvvv: u8,
+    /// `VEX` and `VEX_L` bits.
+    pub vex: u8,
 }
+
+/// `Inst::vex`: VEX-encoded.
+pub const VEX: u8 = 1;
+/// `Inst::vex`: VEX.L = 1 (256-bit).
+pub const VEX_L: u8 = 2;
 
 struct Reader<'a> {
     b: &'a [u8],
@@ -311,9 +387,12 @@ struct Ctx<'a> {
     r: Reader<'a>,
     rex: u8,
     seg: Seg,
-    /// 0x66 seen.
+    /// 0x66 seen (or VEX.pp = 1).
     opsz: bool,
     rep: Rep,
+    vvvv: u8,
+    /// `VEX` / `VEX_L` bits.
+    vex: u8,
 }
 
 impl Ctx<'_> {
@@ -350,6 +429,8 @@ impl Ctx<'_> {
             src,
             imm,
             rep: self.rep,
+            vvvv: self.vvvv,
+            vex: self.vex,
         })
     }
 }
@@ -376,6 +457,8 @@ pub fn decode(code: &[u8]) -> Result<Inst, DecodeError> {
         seg: Seg::None,
         opsz: false,
         rep: Rep::None,
+        vvvv: 0,
+        vex: 0,
     };
     let mut b = c.r.u8()?;
     loop {
@@ -393,15 +476,59 @@ pub fn decode(code: &[u8]) -> Result<Inst, DecodeError> {
         }
         b = c.r.u8()?;
     }
+    if b == 0xc4 || b == 0xc5 {
+        return vex(&mut c, b);
+    }
     if b & 0xf0 == 0x40 {
         c.rex = b;
         b = c.r.u8()?;
     }
     if b == 0x0f {
-        let b2 = c.r.u8()?;
-        return decode_0f(&mut c, b2);
+        return match c.r.u8()? {
+            0x38 => {
+                let b3 = c.r.u8()?;
+                simd::decode_0f38(&mut c, b3)
+            }
+            0x3a => {
+                let b3 = c.r.u8()?;
+                simd::decode_0f3a(&mut c, b3)
+            }
+            b2 => decode_0f(&mut c, b2),
+        };
     }
     decode_1byte(&mut c, b)
+}
+
+/// A VEX prefix (C4: three bytes, C5: two), then its opcode in the map it selects.
+fn vex(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
+    // 66 / F2 / F3 before VEX is #UD (a REX before C4/C5 makes them plain opcodes, refused).
+    if c.opsz || c.rep != Rep::None {
+        return Err(DecodeError::Unsupported(b));
+    }
+    let b1 = c.r.u8()?;
+    let (map, last) = if b == 0xc5 {
+        c.rex = (!b1 >> 5) & 4;
+        (1, b1)
+    } else {
+        let b2 = c.r.u8()?;
+        c.rex = ((!b1 >> 5) & 7) | ((b2 >> 4) & 8);
+        (b1 & 0x1f, b2)
+    };
+    c.vvvv = (!last >> 3) & 15;
+    c.vex = VEX | if last & 4 != 0 { VEX_L } else { 0 };
+    match last & 3 {
+        1 => c.opsz = true,
+        2 => c.rep = Rep::Rep,
+        3 => c.rep = Rep::Repne,
+        _ => {}
+    }
+    let op = c.r.u8()?;
+    match map {
+        1 => simd::decode_0f(c, op),
+        2 => simd::decode_0f38(c, op),
+        3 => simd::decode_0f3a(c, op),
+        _ => Err(DecodeError::Unsupported(b)),
+    }
 }
 
 fn decode_1byte(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
@@ -751,101 +878,20 @@ fn decode_0f(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
             NONE,
             0,
         ),
-        _ => decode_sse(c, b),
-    }
-}
-
-/// SSE2 integer and data-move opcodes of the 0x0f map.
-fn decode_sse(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
-    let (p66, f3) = (c.opsz, c.rep == Rep::Rep);
-    // A mandatory prefix is not a rep for the executor.
-    let sse = |c: &mut Ctx, op: SseOp, load: bool, imm: bool| -> Result<Inst, DecodeError> {
-        let m = c.modrm()?;
-        let imm = if imm { c.r.imm(1)? & 0xff } else { 0 };
-        c.rep = Rep::None;
-        let (reg, rm) = (Operand::Xmm(m.reg), xmm(m.rm));
-        if load {
-            c.done(Op::Sse(op), 16, reg, rm, imm)
-        } else {
-            c.done(Op::Sse(op), 16, rm, reg, imm)
+        0x0d => {
+            // prefetchw
+            c.modrm()?;
+            c.done(Op::Nop, size, NONE, NONE, 0)
         }
-    };
-    match b {
-        0x10 | 0x11 if !f3 && c.rep == Rep::None => sse(c, SseOp::MovU, b == 0x10, false),
-        0x28 | 0x29 if !f3 && c.rep == Rep::None => sse(c, SseOp::Mov, b == 0x28, false),
-        0x6f | 0x7f if p66 || f3 => {
-            let op = if f3 { SseOp::MovU } else { SseOp::Mov };
-            sse(c, op, b == 0x6f, false)
-        }
-        0x54 if !f3 => sse(c, SseOp::And, true, false),
-        0x55 if !f3 => sse(c, SseOp::Andn, true, false),
-        0x56 if !f3 => sse(c, SseOp::Or, true, false),
-        0x57 if !f3 => sse(c, SseOp::Xor, true, false),
-        0x6e | 0x7e if p66 => {
-            // movd/movq between a GPR (or memory) and an xmm register.
+        0xc3 if !c.opsz && c.rep == Rep::None => {
+            // movnti: a plain store here.
             let m = c.modrm()?;
-            let size = if c.rex & 8 != 0 { 8 } else { 4 };
-            let (x, g) = (Operand::Xmm(m.reg), m.rm);
-            if b == 0x6e {
-                c.done(Op::Sse(SseOp::MovGpr), size, x, g, 0)
-            } else {
-                c.done(Op::Sse(SseOp::MovGpr), size, g, x, 0)
+            if !matches!(m.rm, Operand::Mem(_)) {
+                return Err(DecodeError::Unsupported(b));
             }
+            c.done(Op::Mov, size, m.rm, Operand::Reg(m.reg), 0)
         }
-        0x7e if f3 => sse(c, SseOp::MovQ, true, false),
-        0xd6 if p66 => sse(c, SseOp::MovQ, false, false),
-        _ if !p66 => Err(DecodeError::Unsupported(b)),
-        0x60 => sse(c, SseOp::UnpackLo(1), true, false),
-        0x61 => sse(c, SseOp::UnpackLo(2), true, false),
-        0x62 => sse(c, SseOp::UnpackLo(4), true, false),
-        0x6c => sse(c, SseOp::UnpackLo(8), true, false),
-        0x68 => sse(c, SseOp::UnpackHi(1), true, false),
-        0x69 => sse(c, SseOp::UnpackHi(2), true, false),
-        0x6a => sse(c, SseOp::UnpackHi(4), true, false),
-        0x6d => sse(c, SseOp::UnpackHi(8), true, false),
-        0x64 => sse(c, SseOp::CmpGt(1), true, false),
-        0x65 => sse(c, SseOp::CmpGt(2), true, false),
-        0x66 => sse(c, SseOp::CmpGt(4), true, false),
-        0x74 => sse(c, SseOp::CmpEq(1), true, false),
-        0x75 => sse(c, SseOp::CmpEq(2), true, false),
-        0x76 => sse(c, SseOp::CmpEq(4), true, false),
-        0x70 => sse(c, SseOp::Shufd, true, true),
-        0x71..=0x73 => {
-            let m = c.modrm()?;
-            let imm = c.r.imm(1)? & 0xff;
-            let elem = [2, 4, 8][(b - 0x71) as usize];
-            let op = match (b, m.reg & 7) {
-                (_, 2) => SseOp::Srl(elem),
-                (0x71 | 0x72, 4) => SseOp::Sra(elem),
-                (_, 6) => SseOp::Sll(elem),
-                (0x73, 3) => SseOp::Srldq,
-                (0x73, 7) => SseOp::Slldq,
-                _ => return Err(DecodeError::Unsupported(b)),
-            };
-            c.done(Op::Sse(op), 16, xmm(m.rm), Operand::Imm(imm), imm)
-        }
-        0xd1 => sse(c, SseOp::Srl(2), true, false),
-        0xd2 => sse(c, SseOp::Srl(4), true, false),
-        0xd3 => sse(c, SseOp::Srl(8), true, false),
-        0xe1 => sse(c, SseOp::Sra(2), true, false),
-        0xe2 => sse(c, SseOp::Sra(4), true, false),
-        0xf1 => sse(c, SseOp::Sll(2), true, false),
-        0xf2 => sse(c, SseOp::Sll(4), true, false),
-        0xf3 => sse(c, SseOp::Sll(8), true, false),
-        0xd4 => sse(c, SseOp::Add(8), true, false),
-        0xfc => sse(c, SseOp::Add(1), true, false),
-        0xfd => sse(c, SseOp::Add(2), true, false),
-        0xfe => sse(c, SseOp::Add(4), true, false),
-        0xfb => sse(c, SseOp::Sub(8), true, false),
-        0xf8 => sse(c, SseOp::Sub(1), true, false),
-        0xf9 => sse(c, SseOp::Sub(2), true, false),
-        0xfa => sse(c, SseOp::Sub(4), true, false),
-        0xf4 => sse(c, SseOp::MulUdq, true, false),
-        0xdb => sse(c, SseOp::And, true, false),
-        0xdf => sse(c, SseOp::Andn, true, false),
-        0xeb => sse(c, SseOp::Or, true, false),
-        0xef => sse(c, SseOp::Xor, true, false),
-        _ => Err(DecodeError::Unsupported(b)),
+        _ => simd::decode_0f(c, b),
     }
 }
 
@@ -916,6 +962,27 @@ mod tests {
         assert_eq!((i.op, i.len), (Op::Nop, 10));
         let i = decode(&[0xf3, 0x48, 0xab]).unwrap(); // rep stosq
         assert_eq!((i.op, i.size, i.rep), (Op::Stos, 8, Rep::Rep));
+    }
+
+    #[test]
+    fn vex() {
+        let i = decode(&[0xc5, 0xf1, 0xfe, 0xc2]).unwrap(); // vpaddd xmm0, xmm1, xmm2
+        assert_eq!(
+            (i.op, i.vvvv, i.vex, i.len),
+            (Op::Sse(SseOp::Add(4)), 1, VEX, 4)
+        );
+        let i = decode(&[0xc4, 0x41, 0x7e, 0x6f, 0x07]).unwrap(); // vmovdqu ymm8, [r15]
+        assert_eq!(
+            (i.op, i.dst, i.vex),
+            (Op::Sse(SseOp::MovU), Operand::Xmm(8), VEX | VEX_L)
+        );
+        let i = decode(&[0xc4, 0xe2, 0xe0, 0xf2, 0xc1]).unwrap(); // andn rax, rbx, rcx
+        assert_eq!((i.op, i.size, i.vvvv), (Op::Bmi(BmiOp::Andn), 8, 3));
+        // AVX2 (256-bit integer) is not Jaguar's: refused, as vpaddd ymm would #UD there.
+        assert!(decode(&[0xc5, 0xf5, 0xfe, 0xc2]).is_err());
+        // A legacy prefix before VEX, and a one-source op naming vvvv, are #UD.
+        assert!(decode(&[0x66, 0xc5, 0xf1, 0xfe, 0xc2]).is_err());
+        assert!(decode(&[0xc4, 0xe2, 0x69, 0x1c, 0xc0]).is_err());
     }
 
     #[test]
