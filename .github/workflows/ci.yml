@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # main only accepts pull requests from dev of this repository (a ruleset
+  # cannot filter the source branch, so this required check does).
+  guard:
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Only dev may target main
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$BASE" = main ] && { [ "$HEAD" != dev ] || [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; }; then
+            echo "::error::main only accepts pull requests from the dev branch of $GITHUB_REPOSITORY (got $HEAD_REPO:$HEAD)"
+            exit 1
+          fi
+
+  # Crates with tests that run on the PC (AGENTS.md section 2).
+  host-tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [shader, emc, services/lunacore, services/nxopus, services/nxh264, services/nxdtls]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: target-host
+          key: host-${{ matrix.crate }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.crate), format('{0}/Cargo.toml', matrix.crate)) }}
+          restore-keys: host-${{ matrix.crate }}-
+      - name: cargo test
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-host
+        run: cargo test --manifest-path ${{ matrix.crate }}/Cargo.toml
+
+  build:
+    uses: ./.github/workflows/build.yml

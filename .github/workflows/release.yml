@@ -1,0 +1,53 @@
+# Every push to main (that is, every merged dev -> main pull request) builds
+# nxk and publishes a GitHub release: the next patch of the latest vX.Y tag.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nxk-build
+          path: dist
+
+      # v1.1 -> v1.1.1, v1.1.7 -> v1.1.8 (a missing patch counts as 0).
+      - name: Next version
+        id: ver
+        run: |
+          last=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          last=${last:-v0.0.0}
+          IFS=. read -r maj min pat <<<"${last#v}"
+          echo "tag=v${maj}.${min:-0}.$(( ${pat:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "nxk $TAG" \
+            --generate-notes \
+            --notes "Built from $GITHUB_SHA. nxk-ipl.bin is the RCM payload, bl31.bin + nxk.bin the L4T-entry chain, sd.img.xz a 128 MiB SD image (xz). Checksums in SHA256SUMS."

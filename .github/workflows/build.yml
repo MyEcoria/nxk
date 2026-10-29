@@ -1,0 +1,85 @@
+# Full nxk build (userland, std programs, games, services, kernel, bl31,
+# nxk-ipl, SD image). Reusable: called by ci.yml (PRs, dev) and release.yml
+# (main). tegra_qemu is not in this repository, so ktest/stdtest cannot run
+# here: they stay a local step (AGENTS.md section 3).
+name: build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dosfstools fonts-lato fonts-dejavu-core console-setup-linux python3-venv python3-pil
+
+      # tools/mksd.py re-executes itself in this venv when pyfatfs is missing
+      # (pyfatfs -> fs needs pkg_resources, gone from setuptools 81).
+      - name: pyfatfs venv
+        run: |
+          python3 -m venv ~/.cache/tegra_qemu/fsvenv
+          ~/.cache/tegra_qemu/fsvenv/bin/pip install pyfatfs "setuptools<81"
+
+      # The std port (tools/mkstd.py) patches one exact rustc release, so it
+      # is pinned (RUST_VERSION; raise it together with std/). The tools look
+      # for the rustup toolchain "stable", so the pinned one takes its place.
+      - name: Rust toolchain
+        env:
+          RUST_VERSION: "1.98.1"
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            -c rust-src -c llvm-tools \
+            -t aarch64-unknown-none -t aarch64-unknown-none-softfloat
+          tc=~/.rustup/toolchains
+          rustup toolchain uninstall stable
+          mv "$tc/$RUST_VERSION-x86_64-unknown-linux-gnu" "$tc/stable-x86_64-unknown-linux-gnu"
+          rustup default stable
+          rustc -Vv
+
+      # Build dirs only: the "nxk" toolchain is rebuilt by mkstd.py (hardlinks
+      # into the rustup sysroot, not cacheable).
+      - name: Cache build dirs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/nxk/target-user
+            ~/.cache/nxk/target-apps
+            ~/.cache/nxk/target-kernel
+            ~/.cache/nxk/target-ipl
+            ~/.cache/nxk/target-bl31
+          key: build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'std/**', 'tools/mkstd.py') }}-
+            build-${{ runner.os }}-
+
+      - name: Build (userland, std chain, kernel)
+        run: ./tools/build.sh
+
+      - name: Boot payloads and SD image
+        run: |
+          mkdir -p dist
+          python3 hwboot/mkbl31.py -o dist/bl31.bin
+          python3 hwboot/mkipl.py -o dist/nxk-ipl.bin
+          python3 tools/mksd.py -o build/sd.img
+          cp -L build/nxk.elf dist/nxk.elf
+          cp build/nxk.bin build/bootfs.img dist/
+          xz -9 -T0 -c build/sd.img > dist/sd.img.xz
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nxk-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
