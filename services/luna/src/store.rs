@@ -2,7 +2,13 @@
 //! directory for this catalog (`dir`). FAT keeps no
 //! permissions: anyone with the card can read the tokens.
 
+use std::sync::Mutex;
+
 use lunacore::auth::State;
+
+/// Held while the tokens are read, renewed and written: the catalog
+/// thread and a launch must not each save a token the other has replaced.
+pub static TOKENS: Mutex<()> = Mutex::new(());
 
 /// This catalog's directory for the user (`NXK_SERVICE_DIR`).
 pub fn dir() -> String {

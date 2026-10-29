@@ -13,6 +13,17 @@ pub fn is_money_operation(op: &str) -> bool {
         .any(|w| op.contains(w))
 }
 
+/// The status in an error such as `"getPage: HTTP 499"`.
+pub fn status_of(e: &str) -> Option<u16> {
+    e.rsplit("HTTP ").next()?.parse().ok()
+}
+
+/// Whether the call was turned down for its tokens: 401 and 403, and 499,
+/// which the proxy answered live for tokens it no longer took.
+pub fn token_refused(e: &str) -> bool {
+    matches!(status_of(e), Some(401 | 403 | 499))
+}
+
 /// The headers of a proxy call (`session`: none before the sign-in).
 pub fn headers(serial: &str, session: Option<&Session>) -> Vec<(&'static str, String)> {
     let mut h = vec![
@@ -68,6 +79,14 @@ mod tests {
         assert!(is_money_operation("updatePurchaseTransactionState"));
         assert!(!is_money_operation("getPage"));
         assert!(!is_money_operation("getProductEntitlementStatuses"));
+    }
+
+    #[test]
+    fn refused_tokens_are_told_from_other_errors() {
+        assert!(token_refused("Hogwarts Legacy: getPage: HTTP 499"));
+        assert!(token_refused("getPage: HTTP 403"));
+        assert!(!token_refused("getPage: HTTP 500"));
+        assert!(!token_refused("getPage: timed out"));
     }
 
     #[test]

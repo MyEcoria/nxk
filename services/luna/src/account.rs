@@ -15,13 +15,15 @@ use lunacore::{config, cover, pages};
 use nxsvc::{Catalog, Cover, Game, State};
 use serde_json::json;
 
-use crate::api::{status_of, Api, Result};
+use crate::api::{token_refused, Api, Result};
 use crate::{qr, store};
 
 /// Certificates cannot be checked before the clock is past this (`power`
 /// sets it from the network): 2026-10-01.
 const TIME_FLOOR_S: u64 = 1_790_812_800;
 const RETRY: Duration = Duration::from_secs(15);
+/// Tokens refused again right after new ones: Amazon is not asked every 15 s.
+const RETRY_REFUSED: Duration = Duration::from_secs(120);
 const REFRESH: Duration = Duration::from_secs(30 * 60);
 const COVER_SIDE: usize = 256;
 
@@ -44,6 +46,7 @@ pub fn run(cat: Catalog, domain: String, user: String) {
         list(&cat, &lib);
         from_card(&cat, dir, &lib, &mut shown);
     }
+    let mut refused = false;
     loop {
         while unix_now() < TIME_FLOOR_S {
             cat.set_state_idle(State::Loading("Waiting for the network time".into()));
@@ -69,12 +72,19 @@ pub fn run(cat: Catalog, domain: String, user: String) {
                 }
                 lib = new;
                 covers(&cat, &mut api, dir, &lib, &mut shown);
+                refused = false;
                 REFRESH
             }
             Err(e) => {
                 println!("luna: {}", e);
+                let again = token_refused(&e) && refused;
+                refused = token_refused(&e);
                 cat.set_state_idle(State::Error(e));
-                RETRY
+                if again {
+                    RETRY_REFUSED
+                } else {
+                    RETRY
+                }
             }
         };
         sleep(wait);
@@ -95,7 +105,21 @@ fn signed_in(
         st.session = Some(s);
         store::save(st);
     }
-    let s = st.session.as_mut().expect("session");
+    *st = renewed(cat, api, user, false)?;
+    Ok(())
+}
+
+/// The stored state with a token good for a call: renewed if due, and
+/// the token and the player asked for again from Amazon when `refused`
+/// (the proxy turned them down before they ran out). One at a time: the
+/// catalog and a launch both come here, and a renewal rewrites the card.
+pub fn renewed(cat: &Catalog, api: &mut Api, user: &str, refused: bool) -> Result<Stored> {
+    let _turn = store::TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = store::load();
+    if refused {
+        forget(&mut st);
+    }
+    let s = st.session.as_mut().ok_or("sign in first")?;
     if auth::needs_refresh(s, unix_now()) {
         cat.set_state_idle(State::Loading("Signing in".into()));
         let (code, reply) = api.panda(
@@ -108,12 +132,12 @@ fn signed_in(
             // The device was removed from the account: sign in again.
             (400 | 401, _) => {
                 st.session = None;
-                store::save(st);
+                store::save(&st);
                 return Err("Signed out by Amazon: sign in again".into());
             }
             _ => return Err(format!("auth/token: HTTP {}", code)),
         }
-        store::save(st);
+        store::save(&st);
     }
     let s = st.session.as_mut().expect("session");
     if s.profile_token.is_none() {
@@ -133,9 +157,17 @@ fn signed_in(
                 .ok_or("playerLogin: no token")?
                 .to_string(),
         );
+        store::save(&st);
+    }
+    Ok(st)
+}
+
+/// The tokens count as run out: the next `renewed` asks for new ones.
+fn forget(st: &mut Stored) {
+    if let Some(n) = st.session.as_mut() {
+        (n.expires_at, n.profile_token) = (0, None);
         store::save(st);
     }
-    Ok(())
 }
 
 /// Code-based linking: show a code and its page (and a QR code of the
@@ -210,10 +242,9 @@ fn read_catalog(api: &mut Api, st: &mut Stored) -> Result<Vec<catalog::Game>> {
             Ok(c.games)
         }
         Err(e) => {
-            if matches!(status_of(&e), Some(401 | 403)) {
-                let n = st.session.as_mut().expect("session");
-                (n.expires_at, n.profile_token) = (0, None);
-                store::save(st);
+            if token_refused(&e) {
+                let _turn = store::TOKENS.lock().unwrap_or_else(|e| e.into_inner());
+                forget(&mut store::load());
             }
             Err(e)
         }

@@ -87,8 +87,8 @@ fn main() {
     };
     cat.set_state(State::Loading("Starting".into()));
     let user = std::env::var("NXK_USER").unwrap_or_default();
-    let (c2, d) = (cat.clone(), domain());
-    std::thread::spawn(move || account::run(c2, d, user));
+    let (c2, d, u2) = (cat.clone(), domain(), user.clone());
+    std::thread::spawn(move || account::run(c2, d, u2));
     let mut playing: Option<launch::Launch> = None;
     while let Ok(r) = rx.recv() {
         match r {
@@ -96,7 +96,7 @@ fn main() {
                 if playing.as_ref().is_some_and(|l| l.running()) {
                     cat.set_state(State::Ready("A game is already starting".into()));
                 } else {
-                    playing = Some(launch::Launch::start(cat.clone(), id));
+                    playing = Some(launch::Launch::start(cat.clone(), id, user.clone()));
                 }
             }
             // Asleep the network goes: the stream and its session end too.

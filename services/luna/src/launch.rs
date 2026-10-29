@@ -23,8 +23,8 @@ use nxk_abi::proto::provider::Stats;
 use nxsvc::{Catalog, State};
 use serde_json::{json, Value};
 
-use crate::api::{Api, Result};
-use crate::{clocks::CpuBoost, pad, present::Presenter, store, stream, video};
+use crate::api::{token_refused, Api, Result};
+use crate::{account, clocks::CpuBoost, pad, present::Presenter, store, stream, video};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
 const END_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46,7 +46,7 @@ pub struct Launch {
 }
 
 impl Launch {
-    pub fn start(cat: Catalog, id: String) -> Self {
+    pub fn start(cat: Catalog, id: String, user: String) -> Self {
         let (stop, done) = (
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -54,7 +54,7 @@ impl Launch {
         let (s2, d2) = (stop.clone(), done.clone());
         std::thread::spawn(move || {
             let title = cat.game(&id).map(|g| g.title).unwrap_or_else(|| id.clone());
-            let why = match play(&cat, &id, &s2) {
+            let why = match play(&cat, &id, &user, &s2) {
                 Ok(()) => String::new(),
                 Err(e) => {
                     println!("luna: {}: {}", title, e);
@@ -100,20 +100,46 @@ fn stopped(stop: &AtomicBool) -> Result<()> {
     }
 }
 
-fn play(cat: &Catalog, id: &str, stop: &AtomicBool) -> Result<()> {
-    let st = store::load();
-    let s = st.session.ok_or("sign in first")?;
-    let mut api = Api::quick(&st.device_serial, CALL_TIMEOUT);
-    end_left_open(&mut api, &s);
-    stopped(stop)?;
-    let page = api.call(
-        Some(&s),
-        "getPage",
-        &pages::request("game_detail", Some(id)),
-    )?;
-    let launch: LaunchParams = pages::game_session_payload(&page)
-        .and_then(|p| serde_json::from_value(p).ok())
-        .ok_or("this game cannot be played with this account")?;
+/// The game's launch parameters, read with tokens that are good: a
+/// refusal of the tokens renews them, once, and asks again.
+fn launch_params(
+    cat: &Catalog,
+    api: &mut Api,
+    user: &str,
+    id: &str,
+    stop: &AtomicBool,
+) -> Result<(Session, LaunchParams)> {
+    let mut refused = false;
+    loop {
+        let s = account::renewed(cat, api, user, refused)?
+            .session
+            .ok_or("sign in first")?;
+        end_left_open(api, &s);
+        stopped(stop)?;
+        let page = api.call(
+            Some(&s),
+            "getPage",
+            &pages::request("game_detail", Some(id)),
+        );
+        match page {
+            Err(e) if token_refused(&e) && !refused => {
+                println!("luna: {}, the tokens are asked for again", e);
+                refused = true;
+            }
+            page => {
+                let launch = pages::game_session_payload(&page?)
+                    .and_then(|p| serde_json::from_value(p).ok())
+                    .ok_or("this game cannot be played with this account")?;
+                return Ok((s, launch));
+            }
+        }
+    }
+}
+
+fn play(cat: &Catalog, id: &str, user: &str, stop: &AtomicBool) -> Result<()> {
+    let serial = store::load().device_serial;
+    let mut api = Api::quick(&serial, CALL_TIMEOUT);
+    let (s, launch) = launch_params(cat, &mut api, user, id, stop)?;
     stopped(stop)?;
     let (latencies, preferences) = gs::to_json(&regions());
     let request = gs::create_job_request(&launch, latencies, preferences, SIDE);
