@@ -21,7 +21,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            dosfstools fonts-lato fonts-dejavu-core console-setup-linux python3-venv
+            dosfstools fonts-lato fonts-dejavu-core console-setup-linux python3-venv python3-pil
 
       # tools/mksd.py re-executes itself in this venv when pyfatfs is missing.
       - name: pyfatfs venv
