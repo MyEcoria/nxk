@@ -95,8 +95,11 @@ impl Volume {
         (2..0x0FFF_FFF8).contains(&n).then_some(n)
     }
 
-    /// `name` (8.3, "NAME    EXT" form) in the directory at `dir`.
-    fn find(&self, card: &SdCard, dir: u32, name: &[u8; 11]) -> Option<File> {
+    /// `name` in the directory at `dir`: its 8.3 name, or its long name
+    /// (Linux writes a lowercase "bl31.bin" as "BL31~1.BIN" plus a long name).
+    fn find(&self, card: &SdCard, dir: u32, name: &str) -> Option<File> {
+        let short = short_name(name);
+        let mut long = Long::new();
         let mut c = dir;
         let mut seen = 0;
         loop {
@@ -104,40 +107,42 @@ impl Volume {
                 let s = sector(card, self.cluster_lba(c) + k)?;
                 for e in s.chunks_exact(32) {
                     if e[0] == 0 {
-                        crate::println!("[nxk-ipl] FAT: {} entries in cluster {} and on, none named so", seen, dir);
+                        crate::println!("[nxk-ipl] FAT: {} entries in cluster {}, no {}", seen, dir, name);
                         return None;
                     }
-                    if seen < 12 && e[0] != 0xE5 && e[11] != 0x0F {
-                        crate::println!(
-                            "[nxk-ipl]   '{}' attr {:#x}",
-                            core::str::from_utf8(&e[..11]).unwrap_or("?"),
-                            e[11]
-                        );
-                    }
                     seen += 1;
-                    if e[0] == 0xE5 || e[11] == 0x0F || e[11] & 0x08 != 0 {
-                        continue; // free, long name part, volume label
+                    if e[0] == 0xE5 {
+                        long.reset();
+                        continue;
                     }
-                    if e[..11].eq_ignore_ascii_case(name) {
-                        let cluster = le16(e, 20) << 16 | le16(e, 26);
-                        return Some(File {
-                            cluster,
-                            size: le32(e, 28),
-                        });
+                    if e[11] == 0x0F {
+                        long.add(e);
+                        continue;
                     }
+                    let matches = short.is_some_and(|n| e[..11].eq_ignore_ascii_case(&n))
+                        || long.is(name, checksum(&e[..11]));
+                    long.reset();
+                    if e[11] & 0x08 != 0 || !matches {
+                        continue; // volume label, or another name
+                    }
+                    let cluster = le16(e, 20) << 16 | le16(e, 26);
+                    return Some(File {
+                        cluster,
+                        size: le32(e, 28),
+                    });
                 }
             }
             c = match self.next(card, c) {
                 Some(n) => n,
                 None => {
-                    crate::println!("[nxk-ipl] FAT: end of directory {} after {} entries", dir, seen);
+                    crate::println!("[nxk-ipl] FAT: end of directory {} after {} entries, no {}", dir, seen, name);
                     return None;
                 }
             };
         }
     }
 
-    /// A path such as "nxk/bl31.bin" (8.3 components only).
+    /// A path such as "nxk/bl31.bin".
     pub fn lookup(&self, card: &SdCard, path: &str) -> Option<File> {
         let mut dir = self.root;
         let mut found = None;
@@ -145,7 +150,7 @@ impl Volume {
             if found.is_some() {
                 dir = found.take().map(|f: File| f.cluster)?;
             }
-            found = Some(self.find(card, dir, &short_name(part)?)?);
+            found = Some(self.find(card, dir, part)?);
         }
         found
     }
@@ -182,4 +187,64 @@ fn short_name(s: &str) -> Option<[u8; 11]> {
         *o = b.to_ascii_uppercase();
     }
     Some(out)
+}
+
+/// The 8.3 name's checksum a long name's entries carry.
+fn checksum(short: &[u8]) -> u8 {
+    short.iter().fold(0u8, |sum, &b| sum.rotate_right(1).wrapping_add(b))
+}
+
+/// A long name being gathered from its entries (they precede the 8.3 one,
+/// last part first). ASCII only: other characters never match.
+struct Long {
+    chars: [u16; 260],
+    len: usize,
+    sum: u8,
+    valid: bool,
+}
+
+impl Long {
+    fn new() -> Self {
+        Long {
+            chars: [0; 260],
+            len: 0,
+            sum: 0,
+            valid: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.valid = false;
+    }
+
+    fn add(&mut self, e: &[u8]) {
+        let seq = (e[0] & 0x1F) as usize;
+        if seq == 0 || seq > 20 {
+            self.valid = false;
+            return;
+        }
+        if e[0] & 0x40 != 0 {
+            (self.valid, self.len, self.sum) = (true, seq * 13, e[13]);
+        } else if !self.valid || e[13] != self.sum {
+            self.valid = false;
+            return;
+        }
+        const AT: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+        for (i, &o) in AT.iter().enumerate() {
+            self.chars[(seq - 1) * 13 + i] = u16::from_le_bytes([e[o], e[o + 1]]);
+        }
+    }
+
+    fn is(&self, name: &str, sum: u8) -> bool {
+        if !self.valid || sum != self.sum {
+            return false;
+        }
+        let chars = &self.chars[..self.len];
+        let end = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
+        end == name.len()
+            && chars[..end]
+                .iter()
+                .zip(name.bytes())
+                .all(|(&c, b)| c < 0x80 && (c as u8).eq_ignore_ascii_case(&b))
+    }
 }
