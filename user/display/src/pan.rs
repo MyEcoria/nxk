@@ -104,7 +104,8 @@ impl Ui {
         self.scroll = s;
         self.scroll_to = s;
         t.samples.push((now, s));
-        t.samples.retain(|k| now.saturating_sub(k.0) <= VEL_WINDOW_NS);
+        t.samples
+            .retain(|k| now.saturating_sub(k.0) <= VEL_WINDOW_NS);
         true
     }
 

@@ -944,8 +944,9 @@ impl Ui {
                 }
                 let stopped = core::mem::take(&mut self.pan.stopped);
                 let p = self.pressed.take()?;
-                // The tap goes to what the finger went down on.
-                if !stopped && !self.pan.far(x, y) {
+                // The tap goes to what the finger went down on, if it is
+                // still there (a catalog may have swapped its list).
+                if !stopped && !self.pan.far(x, y) && self.zones.iter().any(|z| z.id == p) {
                     self.tap(p)
                 } else {
                     None
@@ -1121,7 +1122,11 @@ impl Ui {
             Id::Service(k) if !self.catalog_busy() => return Some(Action::Service(k)),
             Id::Service(_) => {}
             Id::Cancel => return Some(Action::Cancel),
-            Id::Game(i) if self.home == i => return Some(Action::Launch(i)),
+            Id::Game(i) if self.home == i => {
+                // The row follows the selection again after the game.
+                self.pan = Pan::default();
+                return Some(Action::Launch(i));
+            }
             Id::Game(i) => {
                 self.home = i;
                 self.last_game = i;
