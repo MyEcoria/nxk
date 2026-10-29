@@ -16,7 +16,7 @@ use libnx::{env, ns, println, time};
 libnx::entry!(main);
 
 /// Connecting and scanning outlast the default reply wait.
-const CALL_TIMEOUT: u64 = 20_000_000_000;
+const CALL_TIMEOUT: u64 = 35_000_000_000;
 /// After a join, how long DHCP gets to give `net` an address.
 const ADDRESS_WAIT_NS: u64 = 10_000_000_000;
 
@@ -48,6 +48,7 @@ fn security_name(s: u8) -> &'static str {
         proto::SEC_WPA => "WPA",
         proto::SEC_WPA2 => "WPA2",
         proto::SEC_WPA3 => "WPA3",
+        proto::SEC_WPA2_EAP => "802.1X",
         _ => "open",
     }
 }
@@ -92,10 +93,14 @@ fn scan() -> Result<(), i64> {
     Ok(())
 }
 
-fn connect(ssid: &str, psk: &str) -> Result<(), i64> {
+fn connect(ssid: &str, psk: &str, pass2: Option<&str>) -> Result<(), i64> {
     let mut data = Vec::from(ssid.as_bytes());
     data.push(0);
     data.extend_from_slice(psk.as_bytes());
+    if let Some(p2) = pass2 {
+        data.push(0);
+        data.extend_from_slice(p2.as_bytes());
+    }
     // Word 0 is the timeout the service may use; 0 means its default.
     call(&ipc::pack_at(proto::CONNECT, &[0], &data))?;
     println!("connected to {}", ssid);
@@ -195,7 +200,11 @@ fn main() -> i32 {
     let args: Vec<&str> = env::args().collect();
     let r = match args.get(1).copied() {
         Some("scan") => scan(),
-        Some("connect") if args.len() >= 3 => connect(args[2], args.get(3).copied().unwrap_or("")),
+        Some("connect") if args.len() >= 3 => connect(
+            args[2],
+            args.get(3).copied().unwrap_or(""),
+            args.get(4).copied(),
+        ),
         Some("disconnect") => call(&Msg::new(proto::DISCONNECT, 0, 0)).map(|_| ()),
         Some("retry") => text(proto::RETRY),
         Some("poke") if args.get(2).copied() == Some("die") => {
@@ -209,7 +218,7 @@ fn main() -> i32 {
         }
         Some("status") | None => status(),
         _ => {
-            println!("usage: wifi scan | connect SSID [PASSPHRASE] | disconnect | status | retry | radio on|off");
+            println!("usage: wifi scan | connect SSID [PASSPHRASE | IDENTITY PASSWORD] | disconnect | status | retry | radio on|off");
             return 2;
         }
     };

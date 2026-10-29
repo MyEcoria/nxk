@@ -33,15 +33,15 @@ pub const BUTTONS: [&str; 7] = [
 
 /// Minimum number of square slots shown in the game row (empty slots fill
 /// the rest, as on the Switch).
-const MIN_SLOTS: usize = 4;
+pub(crate) const MIN_SLOTS: usize = 4;
 /// Left edge of the first square icon when the row is at rest.
-const X0: usize = 104;
+pub(crate) const X0: usize = 104;
 /// Top and size of the square game icons, their corner radius, the gap
 /// between them, and the cyan selection frame around the chosen one.
 const ICON_Y: usize = 166;
-const ICON: usize = 256;
+pub(crate) const ICON: usize = 256;
 const ICON_R: usize = 22;
-const GAP: usize = 22;
+pub(crate) const GAP: usize = 22;
 const FRAME: usize = 8;
 const FRAME_T: usize = 5;
 /// Center line of the selected game's title and play time above the row.
@@ -173,11 +173,14 @@ impl Ui {
         let active_game = self.last_game.min(n.saturating_sub(1));
         let slots = n.max(MIN_SLOTS);
         let sel_x = X0 + active_game * (ICON + GAP);
-        let end = X0 + slots * ICON + slots.saturating_sub(1) * GAP;
-        self.scroll_to = (sel_x - X0).min(end.saturating_sub(W - X0)) as f32;
-        self.scroll += (self.scroll_to - self.scroll) * 0.35;
-        if (self.scroll - self.scroll_to).abs() <= 0.5 {
-            self.scroll = self.scroll_to;
+        if self.pan.free {
+            self.pan_step(libnx::time::now_ns());
+        } else {
+            self.scroll_to = (sel_x - X0).min(self.row_max()) as f32;
+            self.scroll += (self.scroll_to - self.scroll) * 0.35;
+            if (self.scroll - self.scroll_to).abs() <= 0.5 {
+                self.scroll = self.scroll_to;
+            }
         }
         let off = self.scroll as i32;
         let last_idx = self
@@ -338,7 +341,7 @@ impl Ui {
     }
 
     /// The catalog shown asks for an account.
-    fn signing_in(&self) -> bool {
+    pub(crate) fn signing_in(&self) -> bool {
         !self.service.is_empty()
             && self
                 .prov

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libnx", "init", "console", "shell", "hello", "ipcbench", "crash", "fptest", "bench", "true", "ktest", "clk", "i2c", "power", "fan", "cpufreq", "emc", "sd", "fs", "display", "input", "joycon", "audio", "usb", "usbcon", "net", "nettest", "wlan", "wifi", "bluetooth", "bt", "gpu", "powertest", "audiotest"]
+members = ["libnx", "nxeap", "init", "console", "shell", "hello", "ipcbench", "crash", "fptest", "bench", "true", "ktest", "clk", "i2c", "power", "fan", "cpufreq", "emc", "sd", "fs", "display", "input", "joycon", "audio", "usb", "usbcon", "net", "nettest", "wlan", "wifi", "bluetooth", "bt", "gpu", "powertest", "audiotest"]
 
 [profile.release]
 opt-level = 3

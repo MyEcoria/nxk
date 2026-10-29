@@ -29,9 +29,10 @@ const LIST_TOP: usize = 96;
 const VIEW: usize = 392;
 /// Longest passphrase: 63 characters, or 64 hex digits for the raw key.
 const PSK_MAX: usize = 64;
+const EAP_MAX: usize = 128;
 const PSK_MIN: usize = 8;
 /// A finger moves this far before a touch is a drag, not a tap.
-const SLOP: i64 = 12;
+const SLOP: i64 = crate::pan::TOUCH_SLOP;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Stage {
@@ -112,13 +113,35 @@ impl WifiUi {
     }
 
     /// The passphrase as typed is one the chip may be given: 8 to 63
-    /// characters, or the 64 hex digits of the key itself.
+    /// characters, 64 hex digits of the key, or `identity:password` for 802.1X.
     fn pass_ok(&self) -> Result<(), &'static str> {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.2 == wifi::SEC_WPA2_EAP)
+        {
+            return match self.pass.split_once(':') {
+                Some((u, p)) if !u.is_empty() && !p.is_empty() => Ok(()),
+                _ => Err("Enter identity:password for 802.1X"),
+            };
+        }
         match self.pass.len() {
             PSK_MIN..PSK_MAX => Ok(()),
             PSK_MAX if self.pass.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(()),
             PSK_MAX => Err("64 characters must be hexadecimal digits"),
             _ => Err("The passphrase has 8 to 63 characters"),
+        }
+    }
+
+    fn max_len(&self) -> usize {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|t| t.2 == wifi::SEC_WPA2_EAP)
+        {
+            EAP_MAX
+        } else {
+            PSK_MAX
         }
     }
 }
@@ -158,13 +181,14 @@ fn security_text(sec: u8) -> &'static str {
         wifi::SEC_WEP => "WEP",
         wifi::SEC_WPA => "WPA",
         wifi::SEC_WPA2 => "WPA2",
+        wifi::SEC_WPA2_EAP => "802.1X",
         _ => "WPA3 only",
     }
 }
 
-/// Open and WPA2 (AES) are what `wlan` joins.
+/// Open, WPA2 (AES) and WPA2-Enterprise (802.1X) are what `wlan` joins.
 fn joinable(sec: u8) -> bool {
-    matches!(sec, wifi::SEC_OPEN | wifi::SEC_WPA2)
+    matches!(sec, wifi::SEC_OPEN | wifi::SEC_WPA2 | wifi::SEC_WPA2_EAP)
 }
 
 impl Ui {
@@ -311,7 +335,7 @@ impl Ui {
                 None
             }
             Id::Key(c) if typing => {
-                if self.wifi.pass.len() < PSK_MAX {
+                if self.wifi.pass.len() < self.wifi.max_len() {
                     let c = if self.wifi.shift && !self.wifi.symbols {
                         c.to_ascii_uppercase()
                     } else {
@@ -324,7 +348,7 @@ impl Ui {
                 None
             }
             Id::KeySpace if typing => {
-                if self.wifi.pass.len() < PSK_MAX {
+                if self.wifi.pass.len() < self.wifi.max_len() {
                     self.wifi.pass.push(' ');
                 }
                 self.wifi.error = None;
@@ -577,8 +601,13 @@ impl Ui {
         s.ring_round(fx, fy, fw, fh, 8, 2, p.accent);
         let cy = fy + fh / 2;
         let len = self.wifi.pass.len();
+        let hint = if sec == wifi::SEC_WPA2_EAP {
+            "identity:password"
+        } else {
+            "Passphrase"
+        };
         let end = if len == 0 {
-            s.label(fx + 20, cy, "Passphrase", Face::Body, p.faint);
+            s.label(fx + 20, cy, hint, Face::Body, p.faint);
             fx + 20
         } else if self.wifi.show {
             // The end of what is typed, as much as fits.
@@ -647,7 +676,7 @@ impl Ui {
             Tone::Plain,
             !busy,
         );
-        let ready = len >= PSK_MIN && !busy;
+        let ready = self.wifi.pass_ok().is_ok() && !busy;
         let join = if busy { "Joining..." } else { "Join" };
         self.button(
             s,

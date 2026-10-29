@@ -38,7 +38,7 @@ const MTU: u64 = 1500;
 /// Scan time when the caller asks for no particular one.
 const SCAN_TIMEOUT: u64 = 12_000_000_000;
 /// Join time likewise: scan, authentication and the key handshake.
-const CONNECT_TIMEOUT: u64 = 15_000_000_000;
+const CONNECT_TIMEOUT: u64 = 20_000_000_000;
 /// While joined, the rings are also polled this often: the chip's
 /// interrupt drives them, this is the safety net should one be missed.
 const POLL_NS: u64 = 500_000_000;

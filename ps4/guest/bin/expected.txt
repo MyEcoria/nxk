@@ -1,0 +1,20 @@
+guest: hello from x86-64
+sort.fwd 5105773081205236173
+sort.rev -1317540915577079837
+crc32 0x414fa339
+fib 6765
+ackermann 9
+switch 7903496571377717118
+struct 342232
+memset 7686
+narrow 4942807481144396828
+muldiv.u 0x3c552dd7541e6751
+muldiv.s -6558070205170108623
+bits 0x7e3637ef03d31040
+ARGET NO EDOC 4SP SNUR KXN
+strcmp 1
+list 48213036
+zeroonetwothree
+errno 7
+guest: done
+exit 3

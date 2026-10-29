@@ -1,0 +1,6 @@
+[package]
+name = "ps4fmt"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "PS4 file formats for nxk: param.sfo, SELF/ELF images, NIDs"

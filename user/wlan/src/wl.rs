@@ -28,8 +28,11 @@ const WLC_SET_PM: u32 = 86;
 const WLC_GET_RSSI: u32 = 127;
 
 // Security settings (`brcmf_set_wpa_version`, `_set_wsec_mode`).
+const WPA2_AUTH_UNSPEC1X: u32 = 0x0040;
 const WPA2_AUTH_PSK: u32 = 0x0080;
 const AES_ENABLED: u32 = 0x4;
+/// Wait after link-up before sending `EAPOL-Start` if the AP stayed silent.
+const EAPOL_START_DELAY_NS: u64 = 150_000_000;
 /// 802.11i passphrase lengths.
 const PSK_MIN: usize = 8;
 const PSK_MAX: usize = 63;
@@ -173,10 +176,11 @@ pub struct Bss {
     pub rsn: Vec<u8>,
 }
 
-/// Security from the information elements: RSN (WPA2, or WPA3 when SAE
-/// is the only key management), WPA, or just the privacy bit (WEP).
+/// Security from the information elements: RSN (WPA2, WPA2-Enterprise
+/// when 802.1X is the key management, or WPA3 when SAE is the only one),
+/// WPA, or just the privacy bit (WEP).
 fn security(cap: u16, ies: &[u8]) -> u8 {
-    let (mut rsn, mut wpa, mut sae_only) = (false, false, false);
+    let (mut rsn, mut wpa, mut sae_only, mut eap) = (false, false, false, false);
     let mut k = 0;
     while k + 2 <= ies.len() {
         let (id, len) = (ies[k], ies[k + 1] as usize);
@@ -194,6 +198,11 @@ fn security(cap: u16, ies: &[u8]) -> u8 {
                 let n = le16(body, akm) as usize;
                 let suites = &body[(akm + 2).min(body.len())..(akm + 2 + 4 * n).min(body.len())];
                 sae_only = n > 0 && suites.chunks(4).all(|s| s == [0x00, 0x0F, 0xAC, 8]);
+                let has_psk = suites.chunks(4).any(|s| s == [0x00, 0x0F, 0xAC, 2]);
+                let has_1x = suites
+                    .chunks(4)
+                    .any(|s| s == wpa::SUITE_1X || s == wpa::SUITE_1X_SHA256);
+                eap = has_1x && !has_psk;
             }
         } else if id == 221 && body.starts_with(&[0x00, 0x50, 0xF2, 0x01]) {
             wpa = true;
@@ -202,11 +211,24 @@ fn security(cap: u16, ies: &[u8]) -> u8 {
     }
     match () {
         _ if rsn && sae_only => wifi::SEC_WPA3,
+        _ if rsn && eap => wifi::SEC_WPA2_EAP,
         _ if rsn => wifi::SEC_WPA2,
         _ if wpa => wifi::SEC_WPA,
         _ if cap & CAP_PRIVACY != 0 => wifi::SEC_WEP,
         _ => wifi::SEC_OPEN,
     }
+}
+
+fn split_eap_creds(psk: &[u8]) -> Option<(&[u8], &str)> {
+    let sep = psk
+        .iter()
+        .position(|&b| b == 0)
+        .or_else(|| psk.iter().position(|&b| b == b':'))?;
+    let (id, pass) = (&psk[..sep], &psk[sep + 1..]);
+    if id.is_empty() || pass.is_empty() {
+        return None;
+    }
+    Some((id, core::str::from_utf8(pass).ok()?))
 }
 
 /// BSS records of an escan result (`brcmf_escan_result_le`).
@@ -413,16 +435,18 @@ impl Dev<'_> {
         let (wpa_auth, wsec) = match security {
             wifi::SEC_OPEN => (0, 0),
             wifi::SEC_WPA2 => (WPA2_AUTH_PSK, AES_ENABLED),
+            wifi::SEC_WPA2_EAP => (WPA2_AUTH_UNSPEC1X, AES_ENABLED),
             wifi::SEC_WPA => {
                 let why = String::from("WPA (TKIP) networks are not supported, WPA2 only");
                 return Err((-EOPNOTSUPP, why));
             }
             _ => {
-                let why = String::from("only open and WPA2 personal networks");
+                let why = String::from("only open, WPA2 personal and WPA2 enterprise networks");
                 return Err((-EINVAL, why));
             }
         };
         let mut sup = None;
+        let mut peap = None;
         if security == wifi::SEC_WPA2 {
             let raw_key = crypto::pmk_from_hex(psk);
             if raw_key.is_none() && !(PSK_MIN..=PSK_MAX).contains(&psk.len()) {
@@ -437,10 +461,26 @@ impl Dev<'_> {
             wpa::check_rsn(rsn).map_err(|why| (-EOPNOTSUPP, String::from(why)))?;
             let pmk = raw_key.unwrap_or_else(|| crypto::psk(psk, ssid));
             sup = Some(Supplicant::new(pmk, *mac, sys::getrandom));
+        } else if security == wifi::SEC_WPA2_EAP {
+            let (user, pass) = split_eap_creds(psk).ok_or_else(|| {
+                (
+                    -EINVAL,
+                    String::from("802.1X requires identity and password"),
+                )
+            })?;
+            wpa::check_rsn_eap(rsn).map_err(|why| (-EOPNOTSUPP, String::from(why)))?;
+            peap = Some(
+                nxeap::Peap::new(user, pass, &[], *mac, sys::getrandom)
+                    .map_err(|e| (-EINVAL, e))?,
+            );
         }
         // Our RSN element for the association request, none for an open
         // network (brcmfmac `wpaie`); the firmware may build its own.
-        let ie: &[u8] = if sup.is_some() { &wpa::RSN_IE } else { &[] };
+        let ie: &[u8] = match security {
+            wifi::SEC_WPA2 => &wpa::RSN_IE,
+            wifi::SEC_WPA2_EAP => &wpa::RSN_IE_EAP,
+            _ => &[],
+        };
         if let Err(e) = self.mb.set_var(bp, tcm, "wpaie", ie) {
             println!("[wlan] {}", e);
         }
@@ -476,15 +516,23 @@ impl Dev<'_> {
         self.mb.set_var(bp, tcm, "join", &join).map_err(io)?;
 
         let deadline = time::now_ns() + timeout_ns;
-        let (mut associated, mut link, mut keyed) = (false, false, sup.is_none());
+        let (mut associated, mut link, mut keyed) = (false, false, security == wifi::SEC_OPEN);
         let mut ie_read = false;
+        let mut bssid: Option<[u8; 6]> = None;
+        let mut link_at: Option<u64> = None;
+        let mut eapol_started = false;
         loop {
             self.mb.poll(bp, tcm).map_err(io)?;
             let mut eapol = Vec::new();
             while let Some(f) = self.mb.event() {
                 let Some(e) = parse_event(&f) else { continue };
                 match e.kind {
-                    E_SET_SSID if e.status == 0 => associated = true,
+                    E_SET_SSID if e.status == 0 => {
+                        associated = true;
+                        if e.addr != [0; 6] {
+                            bssid = Some(e.addr);
+                        }
+                    }
                     E_SET_SSID => {
                         let why = SET_SSID_FAILURES
                             .get(e.status as usize)
@@ -493,9 +541,17 @@ impl Dev<'_> {
                         let errno = if e.status == 3 { -ENOENT } else { -EIO };
                         return Err((errno, format!("join {} (status {})", why, e.status)));
                     }
-                    E_LINK => link = e.flags & LINK_UP != 0,
+                    E_ASSOC if e.status == 0 && e.addr != [0; 6] => bssid = Some(e.addr),
+                    E_LINK => {
+                        link = e.flags & LINK_UP != 0;
+                        if link && e.addr != [0; 6] {
+                            bssid = Some(e.addr);
+                        }
+                    }
                     E_DEAUTH | E_DEAUTH_IND | E_DISASSOC | E_DISASSOC_IND => {
-                        let why = if sup.as_ref().is_some_and(|s| s.unconfirmed()) {
+                        let why = if peap.is_some() {
+                            format!("802.1X authentication refused (reason {})", e.reason)
+                        } else if sup.as_ref().is_some_and(|s| s.unconfirmed()) {
                             format!(
                                 "key handshake refused, wrong passphrase? (reason {})",
                                 e.reason
@@ -514,17 +570,51 @@ impl Dev<'_> {
                     eapol.push(f);
                 }
             }
+            if associated && link && link_at.is_none() {
+                link_at = Some(time::now_ns());
+            }
+            if let (Some(p), Some(aa), Some(t0)) = (&peap, bssid, link_at) {
+                if !eapol_started && !p.started() && time::now_ns() >= t0 + EAPOL_START_DELAY_NS {
+                    eapol_started = true;
+                    let start = p.eapol_start(&aa);
+                    self.mb.send(bp, tcm, &start).map_err(io)?;
+                }
+            }
             for f in eapol {
+                if f.get(15) == Some(&nxeap::EAPOL_EAP) {
+                    let Some(p) = peap.as_mut() else { continue };
+                    match p.receive(&f) {
+                        Ok(nxeap::Step::None) => {}
+                        Ok(nxeap::Step::Reply(reply)) => {
+                            self.mb.send(bp, tcm, &reply).map_err(io)?;
+                        }
+                        Ok(nxeap::Step::Success(pmk)) => {
+                            if let Some(c) = p.server_cert() {
+                                println!(
+                                    "[wlan] EAP-PEAP ok (cert {:02x}{:02x}..{:02x}{:02x})",
+                                    c[0], c[1], c[30], c[31]
+                                );
+                            }
+                            let mut s = Supplicant::new(pmk, *mac, sys::getrandom);
+                            s.set_ie(&wpa::RSN_IE_EAP);
+                            sup = Some(s);
+                            peap = None;
+                        }
+                        Ok(nxeap::Step::Failed(why)) => return Err((-EACCES, why)),
+                        Err(why) => println!("[wlan] EAP frame dropped: {}", why),
+                    }
+                    continue;
+                }
                 let Some(s) = sup.as_mut() else { continue };
                 // Message 2 repeats the RSN element the association
                 // request carried: the firmware's, if it built one.
                 if !ie_read {
                     ie_read = true;
-                    if let Some(ie) = self.assoc_rsn() {
-                        if ie != wpa::RSN_IE {
-                            println!("[wlan] association RSN element {:02x?}", ie);
+                    if let Some(assoc_ie) = self.assoc_rsn() {
+                        if assoc_ie != ie {
+                            println!("[wlan] association RSN element {:02x?}", assoc_ie);
                         }
-                        s.set_ie(&ie);
+                        s.set_ie(&assoc_ie);
                     }
                 }
                 match s.receive(&f) {
@@ -549,9 +639,11 @@ impl Dev<'_> {
                 return Ok(sup);
             }
             if time::now_ns() > deadline {
-                let handshake = match &sup {
-                    Some(s) if s.unconfirmed() => ", no message 3: wrong passphrase?",
-                    Some(s) if s.aa().is_none() => ", no key handshake started",
+                let handshake = match (&peap, &sup) {
+                    (Some(p), _) if !p.started() => ", no 802.1X request from access point",
+                    (Some(_), _) => ", 802.1X authentication unfinished",
+                    (_, Some(s)) if s.unconfirmed() => ", no message 3: wrong passphrase?",
+                    (_, Some(s)) if s.aa().is_none() => ", no key handshake started",
                     _ => "",
                 };
                 let why = format!(

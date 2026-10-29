@@ -1,0 +1,15 @@
+[package]
+name = "x86test"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+description = "Runs the PS4 layer's x86-64 interpreter on nxk against vectors recorded on a PC"
+
+[dependencies]
+x86emu = { path = "../../ps4/x86emu" }
+ps4rt = { path = "../../ps4/ps4rt" }
+ps4fmt = { path = "../../ps4/ps4fmt" }
+
+[[bin]]
+name = "x86test"
+path = "src/main.rs"

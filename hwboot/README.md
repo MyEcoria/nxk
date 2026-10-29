@@ -1556,6 +1556,37 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+79. 29/10/2026, same console and boot as run 76 (gauge 40 %, charging), `x86test`
+    with SSE/AVX floating point on the soft-float core, sent with `usbterm.py --put`:
+    7/7. The float guest (float and double arithmetic, conversions, specials, FTZ and
+    DAZ, MXCSR rounding) prints the PC's native output bit for bit, built generic and
+    for Jaguar; the figures shown are the Jaguar build's (63321 instructions, 3.6 MIPS
+    at 998 MHz, 4.4 at 1224 MHz), the generic one was only checked for output. The ALU
+    loop is unchanged (9.0 MIPS at 998 MHz, 11.0 at 1224), the integer guests 5.1 to
+    5.5 (6.2 to 6.7). stdtest 19/19.
+78. 29/10/2026, same console and boot as run 76 (gauge 44 %, charging), `x86test`
+    with VEX (AVX1), BMI1, MOVBE, CRC32 and SSE3..SSE4.1 sent with `usbterm.py --put`:
+    6/6 in both builds below. The third guest pair, built at -O3 for the PS4's CPU
+    (`-march=btver2`), prints exactly what the PC's native run prints (456409
+    instructions). First build: ALU loop 6.6 MIPS, guests 4.1 / 4.1 / 4.4 at 998 MHz;
+    7.9 and 5.1 / 5.1 / 5.4 at 1224 MHz; stdtest 19/19. Second build, the rare paths
+    kept out of the dispatch loop (`#[inline(never)]`): 9.0 MIPS and 5.1 / 5.1 / 5.5 at
+    998 MHz.
+77. 29/10/2026, same console and boot as run 76 (gauge 47 %, charging), `x86test`
+    rebuilt with the wider x86-64 decoder and the PS4 runtime (`ps4rt`) and sent
+    with `usbterm.py --put`: 5/5. The PC-built guests (`ps4/guest/`, a libc module
+    and a main program, gcc -O2) load, link by NID (9 imports to the libc module, 2
+    to HLE) and print exactly what the PC's native run prints, in the standard ELF
+    layout and repacked in the PS4's SCE layout: 486412 guest instructions, 5.1 MIPS
+    at 998 MHz, 6.2 at 1224 MHz (`cpufreq 1224`, back to `boot` after). The ALU loop
+    runs at 8.2 MIPS (10.1 at 1224), from 10.6 in run 76: the price of the decoder.
+76. 29/10/2026, Erista, card of run 75 (no `abi/`, `std/`, `libnx` or kernel
+    change since), `dev` at `7acc0f3`, `nxk-ipl.bin` injected: **the x86-64
+    interpreter of the PS4 layer runs on the console**. `x86test` sent with
+    `usbterm.py --put`: 3/3, the 1568 ALU vectors identical to a PC's CPU,
+    self-modifying code re-decoded, **10.6 MIPS** (3 M instructions in 283 ms,
+    CPU at its 998 MHz boot clock: about 94 cycles per guest instruction).
+    stdtest 19/19. The battery gauge was not read (no shell command for it).
 75. 29/10/2026, Erista, branch `feat/boot-screen` at `5c6c569`: **nxk boots
     without hekate**. `nxk-ipl.bin` injected (fusee-nano), SD card from
     `mksd-hw.sh`. Two failures first, read off nxk-ipl's own screen log
