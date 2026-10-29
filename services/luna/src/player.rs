@@ -417,10 +417,9 @@ impl State {
     }
 
     fn report(&self, sink: &dyn Sink) -> String {
-        let level = self
-            .meter
-            .report()
-            .map_or(String::new(), |l| format!("; {}; {}", l, self.limiter.report()));
+        let level = self.meter.report().map_or(String::new(), |l| {
+            format!("; {}; {}", l, self.limiter.report())
+        });
         let c = &self.counts;
         let j = &self.playout.jitter;
         let p = self.playout.arrivals.percentiles();

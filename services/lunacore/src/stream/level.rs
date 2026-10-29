@@ -29,7 +29,7 @@ pub struct Meter {
 impl Meter {
     /// Adds interleaved stereo samples (±1.0).
     pub fn push(&mut self, pcm: &[f32]) {
-        for f in pcm.chunks_exact(2) {
+        for f in pcm.as_chunks::<2>().0 {
             let (l, r) = (f[0], f[1]);
             self.peak[0] = self.peak[0].max(l.abs());
             self.peak[1] = self.peak[1].max(r.abs());
@@ -61,7 +61,8 @@ impl Meter {
     fn percentile(&self, p: f32) -> Option<f32> {
         let mut w = self.windows.clone();
         w.sort_by(|a, b| a.total_cmp(b));
-        w.get(((w.len() as f32 - 1.0) * p).round() as usize).copied()
+        w.get(((w.len() as f32 - 1.0) * p).round() as usize)
+            .copied()
     }
 
     /// One line: nothing until a frame was decoded.
@@ -136,7 +137,10 @@ mod tests {
     #[test]
     fn one_channel_only_shows_in_the_side_level() {
         let mut m = Meter::default();
-        let v: Vec<f32> = sine(1.0, 1000).chunks(2).flat_map(|f| [f[0], 0.0]).collect();
+        let v: Vec<f32> = sine(1.0, 1000)
+            .chunks(2)
+            .flat_map(|f| [f[0], 0.0])
+            .collect();
         m.push(&v);
         let r = m.report().unwrap();
         assert!(r.contains("R -120.0"), "{r}");

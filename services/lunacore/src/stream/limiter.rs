@@ -60,7 +60,7 @@ impl Limiter {
 
     /// Applies the gain and the limit to interleaved stereo `pcm`, in place.
     pub fn process(&mut self, pcm: &mut [f32]) {
-        for f in pcm.chunks_exact_mut(2) {
+        for f in pcm.as_chunks_mut::<2>().0 {
             let x = [f[0] * self.gain, f[1] * self.gain];
             let peak = x[0].abs().max(x[1].abs());
             let need = if peak > self.ceiling {

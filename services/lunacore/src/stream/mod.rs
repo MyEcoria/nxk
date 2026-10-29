@@ -2,8 +2,9 @@
 //! (docs/PROTOCOL.md there): SPP packets over DTLS (`spp`), their
 //! reassembly and ordering (`reliability`), the message framing of every
 //! channel (`framing`), the session's setup messages (`setup`), the
-//! input channel's events (`input`), the audio channel (`audio`), its level (`level`) and the
-//! audio playout's timing (`playout`).
+//! input channel's events (`input`), the audio channel (`audio`), its level (`level`), the
+//! audio playout's timing (`playout`) and its gain and limiter
+//! (`limiter`).
 
 pub mod audio;
 pub mod display;
