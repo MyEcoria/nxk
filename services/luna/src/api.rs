@@ -6,16 +6,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use lunacore::auth::Session;
+pub use lunacore::proxy::token_refused;
 use lunacore::{config, cover, proxy};
 use nxhttp::Client;
 use serde_json::Value;
 
 pub type Result<T> = std::result::Result<T, String>;
-
-/// An HTTP status that is not a success.
-pub fn status_of(e: &str) -> Option<u16> {
-    e.rsplit("HTTP ").next()?.parse().ok()
-}
 
 pub struct Api {
     pub serial: String,

@@ -4,7 +4,8 @@
 //! playing them: the cloud session, the stream, the gamepad, the sound and
 //! the picture (decoded by `nxh264`, shown by the GPU). The Amazon domain of the account is
 //! `domain=` in this catalog's `service.txt` (amazon.com by default); `refresh=` (24 to 60)
-//! and `max_mbit=` set the picture rate and bit rate cap the stream announces.
+//! and `max_mbit=` set the picture rate and bit rate cap the stream announces, `gain_db=` (0 to 24)
+//! the sound's makeup gain.
 
 mod account;
 mod api;
@@ -87,8 +88,8 @@ fn main() {
     };
     cat.set_state(State::Loading("Starting".into()));
     let user = std::env::var("NXK_USER").unwrap_or_default();
-    let (c2, d) = (cat.clone(), domain());
-    std::thread::spawn(move || account::run(c2, d, user));
+    let (c2, d, u2) = (cat.clone(), domain(), user.clone());
+    std::thread::spawn(move || account::run(c2, d, u2));
     let mut playing: Option<launch::Launch> = None;
     while let Ok(r) = rx.recv() {
         match r {
@@ -96,7 +97,7 @@ fn main() {
                 if playing.as_ref().is_some_and(|l| l.running()) {
                     cat.set_state(State::Ready("A game is already starting".into()));
                 } else {
-                    playing = Some(launch::Launch::start(cat.clone(), id));
+                    playing = Some(launch::Launch::start(cat.clone(), id, user.clone()));
                 }
             }
             // Asleep the network goes: the stream and its session end too.

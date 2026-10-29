@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use lunacore::stream::level::Meter;
+use lunacore::stream::limiter::{from_db, Limiter};
 use lunacore::stream::playout::{Drop as Skip, Next, Payload, Playout, Resampler, FRAME};
 use nxgfx::audio::Stream;
 
@@ -24,7 +26,10 @@ const RING_TOP: u32 = 2400;
 /// deadline, a frame and 10 ms.
 const FLOOR: f64 = 2400.0;
 const BASE: f64 = (DEADLINE as usize + FRAME + 480) as f64;
-/// A decoded frame this quiet may be dropped to shed a backlog (-40 dBFS).
+/// Peaks are held under this after the gain (dBFS).
+const CEILING_DB: f32 = -1.0;
+/// A decoded frame this quiet, after the gain, may be dropped to shed a
+/// backlog (-40 dBFS).
 const QUIET_RMS: f32 = 0.01;
 /// Frames the audio service may hold between the ring and the speakers
 /// (about 11 ms in 128-frame periods, instead of its default 85 ms).
@@ -116,11 +121,12 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn start() -> Self {
+    /// `gain_db`: the makeup gain, the stream being far under full scale.
+    pub fn start(gain_db: f32) -> Self {
         let (tx, rx) = channel();
         let report = Arc::new(Mutex::new(String::from("luna: audio not started")));
         let r2 = report.clone();
-        let thread = std::thread::spawn(move || run(rx, r2));
+        let thread = std::thread::spawn(move || run(rx, r2, gain_db));
         Self {
             tx: Some(tx),
             report,
@@ -157,6 +163,7 @@ struct Counts {
     packets: u64,
     silent: u64,
     errors: u64,
+    bytes: u64,
     decode_ns: u64,
     decode_max_ns: u64,
 }
@@ -169,6 +176,10 @@ struct State {
     out: Vec<f32>,
     out16: Vec<i16>,
     counts: Counts,
+    meter: Meter,
+    limiter: Limiter,
+    /// The makeup gain, linear.
+    gain: f32,
     started: Instant,
     ratio: f64,
     /// Frames written, and when the first was.
@@ -181,7 +192,7 @@ struct State {
 
 const TRACE_FOR: Duration = Duration::from_secs(4);
 
-fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
+fn run(rx: Receiver<In>, report: Arc<Mutex<String>>, gain_db: f32) {
     let mut sink: Box<dyn Sink> = match Stream::open_ahead(RING_FRAMES, AHEAD) {
         Ok(s) => {
             let (period, depth) = s.dma();
@@ -205,6 +216,9 @@ fn run(rx: Receiver<In>, report: Arc<Mutex<String>>) {
         out: Vec::with_capacity(2 * RING_FRAMES),
         out16: Vec::with_capacity(2 * RING_FRAMES),
         counts: Counts::default(),
+        meter: Meter::default(),
+        limiter: Limiter::new(gain_db, CEILING_DB),
+        gain: from_db(gain_db),
         started: Instant::now(),
         ratio: 1.0,
         written: 0,
@@ -313,6 +327,7 @@ impl State {
                 .resampler
                 .pull((RING_TOP - queued) as usize, self.ratio, &mut self.out);
             if n > 0 {
+                self.limiter.process(&mut self.out);
                 self.out16.clear();
                 self.out16.extend(
                     self.out
@@ -369,12 +384,14 @@ impl State {
             }
         };
         let ns = t.elapsed().as_nanos() as u64;
+        self.counts.bytes += opus.len() as u64;
         self.counts.decode_ns += ns;
         self.counts.decode_max_ns = self.counts.decode_max_ns.max(ns);
         let pcm = &self.pcm[..2 * n];
+        self.meter.push(pcm);
         let skip = match self.playout.drop_next() {
             Skip::Keep => false,
-            Skip::IfQuiet => rms(pcm) < QUIET_RMS,
+            Skip::IfQuiet => rms(pcm) * self.gain < QUIET_RMS,
             Skip::Always => true,
         };
         if skip {
@@ -400,13 +417,16 @@ impl State {
     }
 
     fn report(&self, sink: &dyn Sink) -> String {
+        let level = self.meter.report().map_or(String::new(), |l| {
+            format!("; {}; {}", l, self.limiter.report())
+        });
         let c = &self.counts;
         let j = &self.playout.jitter;
         let p = self.playout.arrivals.percentiles();
         format!(
             "luna: audio to {}: {} packets, {} silent, {} errors, {} lost, {} late, {} waited for, \
-             {} dup, {} dropped, {} resyncs, {} underruns; decode {} us mean {} us max; delay {:.0} ms \
-             (buffered {:.0} ms at {:+.0} ppm); arrival p50 {:.1} p95 {:.1} p99 {:.1} max {:.1} ms",
+             {} dup, {} dropped, {} resyncs, {} underruns; decode {} us mean {} us max, {} B a packet; delay {:.0} ms \
+             (buffered {:.0} ms at {:+.0} ppm); arrival p50 {:.1} p95 {:.1} p99 {:.1} max {:.1} ms{}",
             sink.name(),
             c.packets,
             c.silent,
@@ -420,13 +440,15 @@ impl State {
             sink.underruns(),
             c.decode_ns / 1000 / c.packets.max(1),
             c.decode_max_ns / 1000,
+            c.bytes / c.packets.max(1),
             self.playout.target() / RATE * 1000.0,
             self.playout.buffered() / RATE * 1000.0,
             (self.ratio - 1.0) * 1e6,
             p[0],
             p[1],
             p[2],
-            p[3]
+            p[3],
+            level
         )
     }
 }
