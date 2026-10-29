@@ -4,7 +4,7 @@
 
 use std::arch::global_asm;
 use std::sync::Mutex;
-use x86emu::cpu::{Cpu, Mem, AF, FLAG_MASK};
+use x86emu::cpu::{Cpu, Mem, AF, CF, FLAG_MASK, OF, ZF};
 
 #[repr(C)]
 #[derive(Clone, Default)]
@@ -344,6 +344,290 @@ fn stack_and_branches() {
     }
 }
 
+/// Run each case `ROUNDS` times from random states, comparing the flags in `mask`.
+fn check_all(cases: &[(&[u8], u64)], seed: u64) {
+    let mut rng = Rng(seed);
+    for (code, mask) in cases {
+        for _ in 0..ROUNDS {
+            check(code, *mask, &mut rng);
+        }
+    }
+}
+
+/// Flags defined after a shift by more than one: OF and AF are not.
+const SHIFT_FLAGS: u64 = FLAG_MASK & !(OF | AF);
+
+#[test]
+fn shifts_and_rotates() {
+    let mut cases: Vec<(Vec<u8>, u64)> = Vec::new();
+    for op in [0u8, 1, 2, 3, 4, 5, 7] {
+        // Rotates leave SF/ZF/PF/AF alone (the harness compares them as untouched).
+        let mask = if op < 4 { CF } else { SHIFT_FLAGS };
+        let one = if op < 4 { CF | OF } else { FLAG_MASK & !AF };
+        for prefix in [&[0x48u8][..], &[], &[0x66], &[0x49]] {
+            let modrm = 0xc0 | (op << 3) | 3; // rbx / r11
+            let mut by_cl = prefix.to_vec();
+            by_cl.extend([0xd3, modrm, 0xc3]);
+            cases.push((by_cl, mask));
+            let mut by_1 = prefix.to_vec();
+            by_1.extend([0xd1, modrm, 0xc3]);
+            cases.push((by_1, one));
+            for imm in [1u8, 7, 31, 63, 200] {
+                let mut c = prefix.to_vec();
+                c.extend([0xc1, modrm, imm, 0xc3]);
+                cases.push((c, if imm == 1 { one } else { mask }));
+            }
+        }
+        // Byte forms: bl and ah (no REX).
+        cases.push((vec![0xd2, 0xc0 | (op << 3) | 3, 0xc3], mask));
+        cases.push((vec![0xc0, 0xc0 | (op << 3) | 4, 5, 0xc3], mask));
+    }
+    let refs: Vec<(&[u8], u64)> = cases.iter().map(|(c, m)| (&c[..], *m)).collect();
+    check_all(&refs, 0x5151_e0e0_7a7a_3c3c);
+}
+
+#[test]
+fn mul_div_and_unary() {
+    const MULF: u64 = CF | OF;
+    let cases: &[(&[u8], u64)] = &[
+        (&[0x48, 0xf7, 0xe3, 0xc3], MULF),                   // mul rbx
+        (&[0xf7, 0xe3, 0xc3], MULF),                         // mul ebx
+        (&[0xf6, 0xe3, 0xc3], MULF),                         // mul bl
+        (&[0x66, 0xf7, 0xe3, 0xc3], MULF),                   // mul bx
+        (&[0x48, 0xf7, 0xeb, 0xc3], MULF),                   // imul rbx
+        (&[0xf7, 0xeb, 0xc3], MULF),                         // imul ebx
+        (&[0x48, 0x0f, 0xaf, 0xc3, 0xc3], MULF),             // imul rax, rbx
+        (&[0x0f, 0xaf, 0xcb, 0xc3], MULF),                   // imul ecx, ebx
+        (&[0x66, 0x0f, 0xaf, 0xcb, 0xc3], MULF),             // imul cx, bx
+        (&[0x48, 0x6b, 0xc3, 0xf9, 0xc3], MULF),             // imul rax, rbx, -7
+        (&[0x69, 0xc3, 0x40, 0x42, 0x0f, 0x00, 0xc3], MULF), // imul eax, ebx, 1000000
+        // Dividends and divisors kept in range so the native run cannot fault.
+        (
+            &[0x48, 0x83, 0xcb, 0x01, 0x31, 0xd2, 0x48, 0xf7, 0xf3, 0xc3],
+            0,
+        ), // or rbx,1; xor edx,edx; div rbx
+        (&[0x83, 0xcb, 0x01, 0x31, 0xd2, 0xf7, 0xf3, 0xc3], 0), // div ebx
+        (
+            &[
+                0x48, 0xd1, 0xeb, 0x48, 0x83, 0xcb, 0x01, 0x48, 0x99, 0x48, 0xf7, 0xfb, 0xc3,
+            ],
+            0,
+        ), // idiv rbx
+        (&[0xd1, 0xeb, 0x83, 0xcb, 0x01, 0x99, 0xf7, 0xfb, 0xc3], 0), // cdq; idiv ebx
+        (&[0x0f, 0xb6, 0xc0, 0x80, 0xcb, 0x80, 0xf6, 0xf3, 0xc3], 0), // movzx eax,al; or bl,0x80; div bl
+        (&[0x48, 0xf7, 0xd8, 0xc3], FLAG_MASK),                       // neg rax
+        (&[0xf6, 0xdc, 0xc3], FLAG_MASK),                             // neg ah
+        (&[0x48, 0xf7, 0xd0, 0xc3], FLAG_MASK),                       // not rax
+        (&[0x48, 0xff, 0xc0, 0xc3], FLAG_MASK),                       // inc rax
+        (&[0xff, 0xc9, 0xc3], FLAG_MASK),                             // dec ecx
+        (&[0xfe, 0xc3, 0xc3], FLAG_MASK),                             // inc bl
+        (&[0x66, 0xff, 0x0b, 0xc3], FLAG_MASK),                       // dec word [rbx]
+        (&[0x48, 0x98, 0x48, 0x99, 0xc3], FLAG_MASK),                 // cdqe; cqo
+        (&[0x98, 0x66, 0x99, 0xc3], FLAG_MASK),                       // cwde; cwd
+        (&[0x66, 0x98, 0x99, 0xc3], FLAG_MASK),                       // cbw; cdq
+    ];
+    check_all(cases, 0x0d1f_0d1f_2468_ace0);
+}
+
+#[test]
+fn widths_and_extensions() {
+    let cases: &[(&[u8], u64)] = &[
+        (&[0x88, 0xe3, 0xc3], FLAG_MASK),                   // mov bl, ah
+        (&[0x40, 0x88, 0xe3, 0xc3], FLAG_MASK),             // mov bl, spl
+        (&[0x66, 0x89, 0xd8, 0xc3], FLAG_MASK),             // mov ax, bx
+        (&[0x66, 0x01, 0xd8, 0xc3], FLAG_MASK),             // add ax, bx
+        (&[0x00, 0xe3, 0xc3], FLAG_MASK),                   // add bl, ah
+        (&[0x28, 0xc4, 0xc3], FLAG_MASK),                   // sub ah, al
+        (&[0x80, 0xf3, 0x5a, 0xc3], FLAG_MASK & !AF),       // xor bl, 0x5a
+        (&[0x66, 0x81, 0xc3, 0x34, 0x92, 0xc3], FLAG_MASK), // add bx, 0x9234
+        (&[0x04, 0x80, 0xc3], FLAG_MASK),                   // add al, 0x80
+        (&[0x48, 0x2d, 0x00, 0x00, 0x00, 0x80, 0xc3], FLAG_MASK), // sub rax, imm32
+        (&[0xa8, 0x81, 0xc3], FLAG_MASK & !AF),             // test al, 0x81
+        (&[0xf6, 0xc7, 0x10, 0xc3], FLAG_MASK & !AF),       // test bh, 0x10
+        (&[0x0f, 0xb6, 0xc7, 0xc3], FLAG_MASK),             // movzx eax, bh
+        (&[0x48, 0x0f, 0xb7, 0xc3, 0xc3], FLAG_MASK),       // movzx rax, bx
+        (&[0x48, 0x0f, 0xbe, 0xc3, 0xc3], FLAG_MASK),       // movsx rax, bl
+        (&[0x0f, 0xbf, 0xcb, 0xc3], FLAG_MASK),             // movsx ecx, bx
+        (&[0x48, 0x63, 0xc3, 0xc3], FLAG_MASK),             // movsxd rax, ebx
+        (&[0x48, 0x63, 0x0b, 0xc3], FLAG_MASK),             // movsxd rcx, [rbx]
+        (&[0x0f, 0xb6, 0x0a, 0xc3], FLAG_MASK),             // movzx ecx, byte [rdx]
+        (&[0xc6, 0x03, 0x99, 0xc3], FLAG_MASK),             // mov byte [rbx], 0x99
+        (&[0x66, 0xc7, 0x03, 0x11, 0x22, 0xc3], FLAG_MASK), // mov word [rbx], 0x2211
+        (&[0xb7, 0x42, 0xc3], FLAG_MASK),                   // mov bh, 0x42
+        (&[0x41, 0xb4, 0x42, 0xc3], FLAG_MASK),             // mov r12b, 0x42
+        (&[0x48, 0x87, 0xd8, 0xc3], FLAG_MASK),             // xchg rax, rbx
+        (&[0x87, 0x0b, 0xc3], FLAG_MASK),                   // xchg [rbx], ecx
+        (&[0x93, 0xc3], FLAG_MASK),                         // xchg eax, ebx
+        (&[0x0f, 0xc8, 0x48, 0x0f, 0xcb, 0xc3], FLAG_MASK), // bswap eax; bswap rbx
+    ];
+    check_all(cases, 0x7172_7374_7576_7778);
+}
+
+#[test]
+fn conditions_and_bits() {
+    let mut cases: Vec<(Vec<u8>, u64)> = Vec::new();
+    for cc in 0..16u8 {
+        cases.push((
+            vec![0x48, 0x39, 0xd8, 0x0f, 0x90 | cc, 0xc1, 0xc3],
+            FLAG_MASK,
+        )); // cmp; setcc cl
+        cases.push((
+            vec![0x48, 0x39, 0xd8, 0x48, 0x0f, 0x40 | cc, 0xcb, 0xc3],
+            FLAG_MASK,
+        )); // cmovcc rcx, rbx
+        cases.push((vec![0x39, 0xd8, 0x0f, 0x40 | cc, 0xcb, 0xc3], FLAG_MASK)); // cmovcc ecx, ebx
+    }
+    let fixed: &[(&[u8], u64)] = &[
+        (&[0x48, 0x0f, 0xbc, 0xc3, 0xc3], ZF), // bsf rax, rbx
+        (&[0x0f, 0xbd, 0xc3, 0xc3], ZF),       // bsr eax, ebx
+        (&[0xf3, 0x48, 0x0f, 0xbc, 0xc3, 0xc3], CF | ZF), // tzcnt rax, rbx
+        (&[0xf3, 0x0f, 0xbd, 0xc3, 0xc3], CF | ZF), // lzcnt eax, ebx
+        (&[0xf3, 0x66, 0x0f, 0xbc, 0xc3, 0xc3], CF | ZF), // tzcnt ax, bx
+        (&[0xf3, 0x48, 0x0f, 0xb8, 0xc3, 0xc3], FLAG_MASK), // popcnt rax, rbx
+        (&[0x48, 0x0f, 0xa3, 0xd8, 0xc3], CF), // bt rax, rbx
+        (&[0x48, 0x0f, 0xab, 0xd8, 0xc3], CF), // bts rax, rbx
+        (&[0x0f, 0xba, 0xf0, 0x27, 0xc3], CF), // btr eax, 39
+        (&[0x48, 0x0f, 0xba, 0xf8, 0x3f, 0xc3], CF), // btc rax, 63
+        (&[0x48, 0x83, 0xe0, 0x3f, 0x48, 0x0f, 0xab, 0x03, 0xc3], CF), // and rax,63; bts [rbx], rax
+        (&[0x48, 0x0f, 0xb1, 0x0b, 0xc3], FLAG_MASK), // cmpxchg [rbx], rcx
+        (&[0x48, 0x8b, 0x03, 0x48, 0x0f, 0xb1, 0x0b, 0xc3], FLAG_MASK), // equal case
+        (&[0x0f, 0xb1, 0xcb, 0xc3], FLAG_MASK), // cmpxchg ebx, ecx
+        (&[0x48, 0x0f, 0xc1, 0x03, 0xc3], FLAG_MASK), // xadd [rbx], rax
+        (&[0xf0, 0x0f, 0xc1, 0x03, 0xc3], FLAG_MASK), // lock xadd [rbx], eax
+    ];
+    let mut refs: Vec<(&[u8], u64)> = cases.iter().map(|(c, m)| (&c[..], *m)).collect();
+    refs.extend_from_slice(fixed);
+    check_all(&refs, 0x0c0d_0e0f_1011_1213);
+}
+
+#[test]
+fn calls_strings_and_stack() {
+    let cases: &[(&[u8], u64)] = &[
+        // call +1; ret (inner); ret
+        (
+            &[0xe8, 0x01, 0, 0, 0, 0xc3, 0x48, 0x01, 0xd8, 0xc3],
+            FLAG_MASK,
+        ),
+        // lea rcx,[rip+3]; call rcx; ret; inc eax; ret
+        (
+            &[
+                0x48, 0x8d, 0x0d, 0x03, 0, 0, 0, 0xff, 0xd1, 0xc3, 0xff, 0xc0, 0xc3,
+            ],
+            FLAG_MASK,
+        ),
+        // push rbp; mov rbp,rsp; sub rsp,32; mov [rbp-8],rax; leave; ret
+        (
+            &[
+                0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x45, 0xf8, 0xc9, 0xc3,
+            ],
+            FLAG_MASK,
+        ),
+        (
+            &[0x6a, 0xf0, 0x58, 0x68, 0x00, 0x00, 0x00, 0x80, 0x5b, 0xc3],
+            FLAG_MASK,
+        ), // push -16; pop rax; push imm32; pop rbx
+        (&[0xff, 0x33, 0x8f, 0x02, 0xc3], FLAG_MASK), // push [rbx]; pop [rdx]
+        // mov rdi,rbx; mov rsi,rdx; mov ecx,9; cld; rep movsb
+        (
+            &[
+                0x48, 0x89, 0xdf, 0x48, 0x89, 0xd6, 0xb9, 9, 0, 0, 0, 0xfc, 0xf3, 0xa4, 0xc3,
+            ],
+            FLAG_MASK,
+        ),
+        // mov rdi,rbx; mov ecx,5; cld; rep stosq
+        (
+            &[
+                0x48, 0x89, 0xdf, 0xb9, 5, 0, 0, 0, 0xfc, 0xf3, 0x48, 0xab, 0xc3,
+            ],
+            FLAG_MASK,
+        ),
+        // mov rdi,rbx; mov rsi,rdx; cld; movsd (one element, no rep)
+        (
+            &[0x48, 0x89, 0xdf, 0x48, 0x89, 0xd6, 0xfc, 0xa5, 0xc3],
+            FLAG_MASK,
+        ),
+        // jump table: lea rcx,[rip+6]; and eax,1; jmp [rcx+rax*8] is replaced by a register jump
+        (
+            &[
+                0x48, 0x8d, 0x0d, 0x04, 0, 0, 0, 0xff, 0xe1, 0x90, 0x90, 0xc3,
+            ],
+            FLAG_MASK,
+        ),
+        (
+            &[0x0f, 0x1f, 0x44, 0, 0, 0x66, 0x90, 0xc2, 0x00, 0x00],
+            FLAG_MASK,
+        ), // nops; ret 0
+    ];
+    check_all(cases, 0x9abc_def0_1234_5678);
+}
+
+/// SSE2 integer ops, checked through the GPRs: xmm0 = rbx:rax and xmm2 = rdx:rcx are built
+/// with movq + punpcklqdq, the op runs, and xmm0 comes back in rax (low) and rbx (high).
+#[test]
+fn sse_integer() {
+    const SETUP: [u8; 30] = [
+        0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+        0x66, 0x48, 0x0f, 0x6e, 0xcb, // movq xmm1, rbx
+        0x66, 0x0f, 0x6c, 0xc1, // punpcklqdq xmm0, xmm1
+        0x66, 0x48, 0x0f, 0x6e, 0xd1, // movq xmm2, rcx
+        0x66, 0x48, 0x0f, 0x6e, 0xda, // movq xmm3, rdx
+        0x66, 0x0f, 0x6c, 0xd3, // punpcklqdq xmm2, xmm3
+        0x90, 0x90,
+    ];
+    const OUT: [u8; 16] = [
+        0x66, 0x48, 0x0f, 0x7e, 0xc0, // movq rax, xmm0
+        0x66, 0x0f, 0x73, 0xd8, 0x08, // psrldq xmm0, 8
+        0x66, 0x48, 0x0f, 0x7e, 0xc3, // movq rbx, xmm0
+        0xc3,
+    ];
+    let mut ops: Vec<Vec<u8>> = Vec::new();
+    for b in [
+        0x60u8, 0x61, 0x62, 0x6c, 0x68, 0x69, 0x6a, 0x6d, 0x64, 0x65, 0x66, 0x74, 0x75, 0x76, 0xd4,
+        0xfc, 0xfd, 0xfe, 0xf8, 0xf9, 0xfa, 0xfb, 0xf4, 0xdb, 0xdf, 0xeb, 0xef, 0xd1, 0xd2, 0xd3,
+        0xe1, 0xe2, 0xf1, 0xf2, 0xf3,
+    ] {
+        ops.push(vec![0x66, 0x0f, b, 0xc2]); // op xmm0, xmm2
+    }
+    for b in [0x54u8, 0x55, 0x56, 0x57] {
+        ops.push(vec![0x0f, b, 0xc2]); // andps / andnps / orps / xorps
+    }
+    for imm in [0u8, 1, 3, 7, 8, 15, 16, 31, 33, 63, 64, 200] {
+        for (b, reg) in [
+            (0x71u8, 2u8),
+            (0x71, 4),
+            (0x71, 6),
+            (0x72, 2),
+            (0x72, 4),
+            (0x72, 6),
+            (0x73, 2),
+            (0x73, 6),
+            (0x73, 3),
+            (0x73, 7),
+        ] {
+            ops.push(vec![0x66, 0x0f, b, 0xc0 | (reg << 3), imm]);
+        }
+        ops.push(vec![0x66, 0x0f, 0x70, 0xc2, imm.wrapping_mul(37)]); // pshufd xmm0, xmm2
+    }
+    // Shift counts small enough to matter: xmm2's low quadword = rcx & 31.
+    let small = [0x48u8, 0x83, 0xe1, 0x1f]; // and rcx, 31
+    ops.push(vec![0x66, 0x0f, 0x6f, 0xc2]); // movdqa xmm0, xmm2
+    ops.push(vec![0xf3, 0x0f, 0x7e, 0xc2]); // movq xmm0, xmm2 (zero-extends)
+    ops.push(vec![0x66, 0x0f, 0xd6, 0xd0]); // movq xmm0, xmm2 (store form, register)
+    ops.push(vec![0x66, 0x0f, 0x7e, 0xd0, 0x66, 0x0f, 0x6e, 0xc0]); // movd eax, xmm2; movd xmm0, eax
+    let mut cases: Vec<Vec<u8>> = Vec::new();
+    for op in &ops {
+        for pre in [&[][..], &small[..]] {
+            let mut c = pre.to_vec();
+            c.extend_from_slice(&SETUP);
+            c.extend_from_slice(op);
+            c.extend_from_slice(&OUT);
+            cases.push(c);
+        }
+    }
+    let refs: Vec<(&[u8], u64)> = cases.iter().map(|c| (&c[..], 0)).collect();
+    check_all(&refs, 0x55aa_33cc_0ff0_9669);
+}
+
 /// Regenerates `apps/x86test/src/vectors.rs`: `cargo test -p x86emu --test differential
 /// gen_vectors -- --ignored --nocapture > apps/x86test/src/vectors.rs`.
 #[test]
@@ -353,7 +637,15 @@ fn gen_vectors() {
     let page = unsafe { mmap(std::ptr::null_mut(), 4096, 7, 0x22, -1, 0) };
     let stack = vec![0u64; 512].into_boxed_slice();
     let s = stack.as_ptr() as u64 + 2048;
-    let edges = [0u64, 1, u64::MAX, 1 << 63, (1 << 63) - 1, 0xffff_ffff, 0x8000_0000];
+    let edges = [
+        0u64,
+        1,
+        u64::MAX,
+        1 << 63,
+        (1 << 63) - 1,
+        0xffff_ffff,
+        0x8000_0000,
+    ];
     println!("// Generated by gen_vectors (ps4/x86emu/tests/differential.rs) from a native run.");
     println!("// (op, 64-bit, rax, rbx, flags_in, rax_out, rbx_out, flags_out)");
     println!("pub const ALU: &[(u8, bool, u64, u64, u64, u64, u64, u64)] = &[");
@@ -364,13 +656,26 @@ fn gen_vectors() {
             for &a in &edges {
                 for &b in &edges {
                     for fin in [0u64, 1] {
-                        let mut r = NativeRegs { code: page as u64, flags: 2 | fin, ..Default::default() };
+                        let mut r = NativeRegs {
+                            code: page as u64,
+                            flags: 2 | fin,
+                            ..Default::default()
+                        };
                         r.gpr[0] = a;
                         r.gpr[3] = b;
                         r.gpr[4] = s;
                         unsafe { ps4_native_run(&mut r) };
-                        let mask = if matches!(op, 1 | 4 | 6) { FLAG_MASK & !AF } else { FLAG_MASK };
-                        println!("    ({op}, {w}, {a:#x}, {b:#x}, {fin}, {:#x}, {:#x}, {:#x}),", r.gpr[0], r.gpr[3], r.flags & mask);
+                        let mask = if matches!(op, 1 | 4 | 6) {
+                            FLAG_MASK & !AF
+                        } else {
+                            FLAG_MASK
+                        };
+                        println!(
+                            "    ({op}, {w}, {a:#x}, {b:#x}, {fin}, {:#x}, {:#x}, {:#x}),",
+                            r.gpr[0],
+                            r.gpr[3],
+                            r.flags & mask
+                        );
                     }
                 }
             }

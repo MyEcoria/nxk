@@ -69,10 +69,7 @@ fn counts_a_loop() {
     cpu.run(&mut mem, SENTINEL, 10_000_000).unwrap();
     let dt = t.elapsed().as_secs_f64();
     assert_eq!(cpu.gpr[0], n as u64 * (n as u64 + 1) / 2);
-    eprintln!(
-        "interpreter: {:.1} MIPS",
-        3.0 * n as f64 / dt / 1e6
-    );
+    eprintln!("interpreter: {:.1} MIPS", 3.0 * n as f64 / dt / 1e6);
 }
 
 struct Counting(VecMem, u64);
