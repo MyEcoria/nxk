@@ -1226,6 +1226,10 @@ pub mod proto {
         pub const I2C5: u64 = 5;
         pub const I2C6: u64 = 6;
         pub const SDMMC1: u64 = 10;
+        /// SDMMC2 (the game card reader's ASIC): PLLC4 up and locked, the
+        /// controller clocked from PLLC4_OUT2 (about 200 MHz, hekate's HS100
+        /// source), the legacy timeout clock on.
+        pub const SDMMC2: u64 = 11;
         pub const SDMMC4: u64 = 13;
         /// xHCI host: host plus SuperSpeed logic clocks, XUSBA
         /// and XUSBC partitions.
@@ -1442,6 +1446,40 @@ pub mod proto {
         pub const ST_NO_SENSOR: u64 = 4;
         /// SoC temperature forcing full speed.
         pub const HOT_MC: i64 = 60_000;
+    }
+    /// Game card reader (`gc`), published as "gc": the Lotus3 ASIC behind
+    /// the SDMMC2 controller and the cartridge's detect switch. The ASIC
+    /// stays powered off until a `PROBE`; with no Nintendo firmware
+    /// loaded (that burns OTP fuses, so nxk never does it unasked) the
+    /// bring-up stops at the ASIC's bootrom, which answers the controller's
+    /// tuning and status commands only.
+    pub mod gc {
+        /// Reply: word 0 = `PRESENT_*`, then as `PROBE`'s last result.
+        pub const STATUS: u32 = 1;
+        /// Power the ASIC, release its reset, bring SDMMC2 up, tune it and
+        /// read the card status, then power it down. Reply: word 0 =
+        /// `PRESENT_*`, word 1 = `ST_*` bits reached, word 2 = errno (0:
+        /// all steps done, else the step after the last `ST_*` bit set),
+        /// word 3 = CMD13 R1 status (`NO_STATUS`: not read), word 4 = the
+        /// ASIC rail (MAX77620 LDO3) CFG | CFG2 << 8 | FPS << 16 as found
+        /// before the probe, word 5 = milliseconds the probe took.
+        pub const PROBE: u32 = 2;
+        /// Card-detect switch (GPIO S3, low with a cartridge in).
+        pub const PRESENT_NO: u64 = 0;
+        pub const PRESENT_YES: u64 = 1;
+        /// The detect pad could not be read.
+        pub const PRESENT_UNKNOWN: u64 = 2;
+        /// ASIC rail up at 3.1 V.
+        pub const ST_RAIL: u64 = 1;
+        /// Reset released (GPIO BB3 high) and the SDMMC2 clock ready.
+        pub const ST_RESET: u64 = 2;
+        /// Host controller up: 8-bit bus, 1.8 V, HS100 timing.
+        pub const ST_HOST: u64 = 4;
+        /// Hardware tuning found a sampling tap (CMD21): the ASIC is alive.
+        pub const ST_TUNED: u64 = 8;
+        /// CMD13 answered (its status is word 3).
+        pub const ST_STATUS: u64 = 16;
+        pub const NO_STATUS: u64 = u64::MAX;
     }
     /// CPU clock: PLLX at sys-clk's steps, the CPU rail at NVIDIA's
     /// PLL-source voltage for the chip's speedo (Erista only).
