@@ -905,6 +905,10 @@ fn pcie_link(car: &Mmio, pmc: Option<&Mmio>, label: u32) -> (i64, u64) {
     }
 }
 
+/// PLLC4 was started by this service: only then is it stopped again (a
+/// loader that left it locked keeps it).
+static PLLC4_OURS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// PLLC4 then the legacy timeout clock, as hekate: lock detection on,
 /// PLL and IDDQ off for 10 us, dividers, enable, wait for lock. A PLL
 /// the loader left locked is kept as is.
@@ -916,9 +920,16 @@ fn pllc4_up(car: &Mmio) -> i64 {
         time::sleep_us(10);
         car.w32(PLLC4_BASE, PLLC4_DIV);
         car.modify(PLLC4_BASE, 0, PLL_ENABLE);
-        if !wait_bits(car, PLLC4_BASE, PLL_LOCK, 2_000) {
+        let locked = wait_bits(car, PLLC4_BASE, PLL_LOCK, 2_000);
+        if !locked {
+            println!(
+                "[clk] PLLC4 did not lock: base {:#010x} misc {:#010x}",
+                car.r32(PLLC4_BASE),
+                car.r32(PLLC4_MISC)
+            );
             return EIO;
         }
+        PLLC4_OURS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     if car.r32(Y.enb) & SDMMC_LEGACY_TM_BIT == 0 {
         car.w32(Y.enb_set, SDMMC_LEGACY_TM_BIT);
@@ -927,8 +938,11 @@ fn pllc4_up(car: &Mmio) -> i64 {
     0
 }
 
-/// PLLC4 off again (SDMMC2 is its only user): clock gone first.
+/// PLLC4 off again, if this service started it (SDMMC2 is its only user).
 fn pllc4_down(car: &Mmio) {
+    if !PLLC4_OURS.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     time::sleep_us(100);
     car.modify(PLLC4_BASE, PLL_ENABLE, 0);
     car.modify(PLLC4_BASE, 0, PLLC4_IDDQ);
