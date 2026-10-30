@@ -19,7 +19,7 @@ use libnx::i2c::I2c;
 use libnx::ipc::Msg;
 use libnx::{println, time};
 use nxk_sdcard::gc::{Gc, SDMMC2_OFFSET};
-use nxk_sdcard::{Host, Regs, SDMMC1};
+use nxk_sdcard::{Host, Line, Regs, SDMMC1};
 
 const PINMUX: u64 = 0x7000_3000;
 const GPIO: u64 = 0x6000_D000;
@@ -36,6 +36,14 @@ const PULL_UP: u32 = 2 << 2;
 const PULL_MASK: u32 = 3 << 2;
 const PARKED: u32 = 1 << 5;
 const TRISTATE: u32 = 1 << 4;
+
+/// Pad GPIO_X1_AUD is GPIO BB3, the ASIC's reset (Linux
+/// `pinctrl-tegra210.c`: `GPIO_X1_AUD PBB3`, register 0x18C). `input`
+/// also writes this pad, taking it for the touch interrupt's (that is
+/// TOUCH_INT PX1, pad 0x220), so it is set up again on every probe: GPIO
+/// function, not tristated, not parked, pulled down.
+const PIN_GPIO_X1_AUD: usize = 0x18C;
+const PULL_DOWN: u32 = 1 << 2;
 
 /// GPIO ports, plain registers (the masked ones did not take on an
 /// Erista, hwboot/README.md run 4): S3 detect, BB3 reset.
@@ -216,8 +224,13 @@ impl Reader {
         }
     }
 
-    /// Reset line as an output, low or high.
+    /// Reset pad on its GPIO function, then as an output, low or high.
     fn reset_line(&self, high: bool) {
+        let pad = self.pinmux.r32(PIN_GPIO_X1_AUD);
+        let want = (pad & !(PULL_MASK | PARKED | TRISTATE | 3)) | PULL_DOWN;
+        if pad != want {
+            self.pinmux.w32(PIN_GPIO_X1_AUD, want);
+        }
         let (cnf, out, oe) = (
             port(GPIO_CNF, PORT_BB),
             port(GPIO_OUT, PORT_BB),
@@ -231,6 +244,29 @@ impl Reader {
         );
         self.gpio.modify(oe, 0, RESET);
         let _ = self.gpio.r32(oe);
+    }
+
+    /// What a failed bring-up leaves to look at: the reset pad and line,
+    /// the detect pad, the rail as it reads now, the clock's state and
+    /// SDMMC2's own registers (only once the clock is ready).
+    fn diag<R: Regs, H: Host>(&self, gc: Option<&Gc<R, H>>) {
+        let bit = |reg| self.gpio.r32(port(reg, PORT_BB)) >> 3 & 1;
+        println!(
+            "[gc] reset pad {:#x}, BB3 cnf/oe/out {}/{}/{}; detect pad {:#x}, S3 in {}; LDO3 cfg {:#04x}; clk state {:?}",
+            self.pinmux.r32(PIN_GPIO_X1_AUD),
+            bit(GPIO_CNF),
+            bit(GPIO_OE),
+            bit(GPIO_OUT),
+            self.pinmux.r32(PIN_CAM_I2C_SDA),
+            self.gpio.r32(port(GPIO_IN, PORT_S)) >> 3 & 1,
+            self.pmic(LDO3_CFG).unwrap_or(0xFF),
+            libnx::clk::status(clk::SDMMC2).map(|s| s.0)
+        );
+        if let Some(gc) = gc {
+            let mut line = Line::new();
+            let _ = gc.describe(&mut line);
+            println!("[gc] {}", line.as_str());
+        }
     }
 
     fn pmic(&self, reg: u8) -> Option<u8> {
@@ -285,8 +321,9 @@ impl Reader {
         self.rail(true)?;
         time::sleep_ms(RAIL_SETTLE_MS);
         r.stages |= proto::ST_RAIL;
-        libnx::clk::enable(clk::SDMMC2)?;
-        if !libnx::clk::ready(clk::SDMMC2) {
+        let clocked = libnx::clk::enable(clk::SDMMC2).is_ok() && libnx::clk::ready(clk::SDMMC2);
+        if !clocked {
+            self.diag::<Window, Timing>(None);
             return Err(-err::ENODEV);
         }
         self.reset_line(true);
@@ -294,12 +331,17 @@ impl Reader {
         r.stages |= proto::ST_RESET;
 
         let gc = Gc::new(Window(self.sdmmc), Timing, self.mariko);
-        gc.start(&self.misc, &self.pinmux)?;
+        if let Err(e) = gc.start(&self.misc, &self.pinmux) {
+            self.diag(Some(&gc));
+            return Err(e);
+        }
         r.stages |= proto::ST_HOST;
         time::sleep_ms(1);
         let tuned = gc.tune();
         if tuned.is_ok() {
             r.stages |= proto::ST_TUNED;
+        } else {
+            self.diag(Some(&gc));
         }
         // CMD13 is information: the bootrom may not answer it.
         match gc.status() {

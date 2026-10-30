@@ -7,6 +7,8 @@
 //! Only the commands that cannot change the ASIC are here: tuning and
 //! CMD13. CMD60's operation 0x01 loads firmware, which burns OTP fuses.
 
+use core::fmt::{self, Write};
+
 use crate::*;
 
 /// SDMMC2 inside SDMMC1's register page.
@@ -315,6 +317,22 @@ impl<R: Regs, H: Host> Gc<R, H> {
         r
     }
 
+    /// Controller state for the report of a failed bring-up.
+    pub fn describe(&self, out: &mut dyn Write) -> fmt::Result {
+        write!(
+            out,
+            "SDMMC2 present {:#010x} ctl {:#04x} ctl2 {:#06x} clock {:#06x} int {:#010x} autocal {:#010x} tuning {:#010x} {:#010x}",
+            self.regs.r32(PRESENT_STATE),
+            self.regs.r8(HOST_CONTROL),
+            self.regs.r16(HOST_CONTROL2),
+            self.regs.r16(CLOCK_CONTROL),
+            self.regs.r32(INT_STATUS),
+            self.regs.r32(AUTO_CAL_STATUS),
+            self.regs.r32(VENDOR_TUNING_CNTRL0),
+            self.regs.r32(VENDOR_CLOCK_CNTRL),
+        )
+    }
+
     /// Card clock and bus power off, before the ASIC loses its rail.
     pub fn stop(&self) {
         self.regs.w16(CLOCK_CONTROL, 0);
@@ -328,7 +346,6 @@ mod tests {
     extern crate std;
     use super::*;
     use core::cell::RefCell;
-    use core::fmt;
     use std::vec::Vec;
 
     /// Register file that reads back what was written, with the
