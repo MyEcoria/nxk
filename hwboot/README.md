@@ -1566,9 +1566,10 @@ within 5 s.
     answers it); CMD13 answered `0x804` (state 4, ready for data); 46 ms in
     all, then the ASIC and its clocks off again. Nothing past tuning and
     CMD13 was sent: CMD60 loads signed firmware, which burns OTP fuses, and
-    reading the card needs the console's keys. Not yet checked: the
-    detect switch's polarity with the cartridge out, the Tools page on the
-    panel.
+    reading the card needs the console's keys. The detect switch is low
+    with the cartridge in: taken out, `gc` reads "none", put back "in"
+    (the probe's steps stay as the last one left them). Not yet checked:
+    the Tools page on the panel.
 80. 30/10/2026, same console, rebooted under nxk (gauge 18 %, charging): `x86test` with
     x87 (80-bit soft-float, register stack, control and status words) sent with
     `usbterm.py --put`: 8/8. The `long double` guest (series, conversions, truncation

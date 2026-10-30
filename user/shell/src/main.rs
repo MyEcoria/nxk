@@ -843,7 +843,7 @@ fn gc_cmd(arg: Option<&str>) {
             } else {
                 let step = |bit, name| {
                     println!(
-                        "  {:<24}{}",
+                        "  {:<26}{}",
                         name,
                         if stages & bit != 0 { "ok" } else { "-" }
                     )
