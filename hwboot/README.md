@@ -89,7 +89,8 @@ another board (`boardtype=0x073e`): use the console's own.
 The screen shows nxk's boot logo a second after the injection and the shell
 comes up on the USB-C console (`tools/usbterm.py`). `./inject.sh PAYLOAD`
 sends another payload: `dl/hekate_ctcaer_6.5.4.bin` for recovery or the
-key and firmware extraction below.
+key and firmware extraction below. `dl/nxk-ipl.bin` is built only when
+missing: run `python3 hwboot/mkipl.py` again after changing `nxk-ipl/`.
 
 `inject.sh` uses the vendored `fusee-nano` injector (MIT, see
 `fusee-nano/UPSTREAM`). Nothing runs automatically on plug-in by design:
@@ -1576,8 +1577,8 @@ within 5 s.
     CMD13 was sent: CMD60 loads signed firmware, which burns OTP fuses, and
     reading the card needs the console's keys. The detect switch is low
     with the cartridge in: taken out, `gc` reads "none", put back "in"
-    (the probe's steps stay as the last one left them). Not yet checked:
-    the Tools page on the panel.
+    (the probe's steps stay as the last one left them). The Tools page on
+    the panel works (checked by Pierric).
 80. 30/10/2026, same console, rebooted under nxk (gauge 18 %, charging): `x86test` with
     x87 (80-bit soft-float, register stack, control and status words) sent with
     `usbterm.py --put`: 8/8. The `long double` guest (series, conversions, truncation
