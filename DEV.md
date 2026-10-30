@@ -543,6 +543,9 @@ kernel/     the microkernel
 shader/     nxk-shader: the shader IR games write GPU programs in, its
             validator, a CPU reference machine, and the compiler to
             Maxwell SASS (used by `gpu`; `cargo test` runs it on the PC)
+cartridge/  nxk-cartridge: game card contents read through a byte source: HFS0/PFS0
+            partitions, NCA headers (XTS), section keys and CTR, RomFS, NACP titles.
+            Host-only (`cargo test`); the real-data test reads an NSP named by `NXK_NSP`
 user/       libnx (no_std system library), init, shell, drivers and services
 std/        Rust standard library port, linker script, target
 apps/       ordinary Rust (std) programs: hello-std, stdtest

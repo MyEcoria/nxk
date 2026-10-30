@@ -1,0 +1,9 @@
+[package]
+name = "nxk-cartridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Switch game card contents: HFS0/PFS0 partitions, NCA headers and keys, RomFS and NACP titles"
+
+[dependencies]
+aes = { version = "0.8", default-features = false }

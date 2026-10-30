@@ -40,3 +40,34 @@ bring-up; this file is the status record the rest of this section points to.
 The probe is the whole of the `gc` service: it reports the cartridge's
 presence and the bring-up steps as a hardware diagnostic (`gc probe`, the
 Tools page). The contents of the inserted cartridge are not read.
+
+### Reading the title (in progress, branch `feat/gc-title`)
+
+- **Software layer, done**: `cartridge/` (crate `nxk-cartridge`) reads the
+  title name from a Control NCA through a byte source: HFS0/PFS0 partitions,
+  NCA headers (AES-XTS with the header key, big-endian sector tweak), the
+  key area (key generation `max(old, new) - 1`, application key-area key),
+  section AES-CTR, the IVFC data level, RomFS, `control.nacp`. The keys come
+  from `prod.keys` at runtime; nothing key-shaped is in the tree. The
+  `aes` crate already in `user/Cargo.lock` does the block cipher.
+- **Checked on real data**: an NSP's Control NCA decrypts with the console's
+  own `prod.keys` to "The Legend of Zelda: Tears of the Kingdom" (NXK_NSP
+  for `cargo test --test real`; skipped without it). A cartridge's NCAs
+  are the same files, so this covers the NCA and RomFS path; the XCI's own
+  top level (root HFS0 offset) has no dump to check against and is not
+  written. The CTR counter's upper half was only checked as zero (the real
+  file's value), and the title's key path only with the standard key area
+  (the NSP's rights ID is zero).
+- **Not done, blocked**: reading the card. The ASIC's bootrom takes only
+  `SendFirmware` (CMD60, see DEV.md), and the firmware and its handshake
+  are not in the local sources: `refs/` has only hekate's `sdmmc_storage_init_gc`
+  (no firmware), and the decompiled FS (`firmware/keys/ghidra/FS.c`) names
+  `nn.gc.AsicHandler` and `nn.gc.DeviceDetector` but no firmware blob or
+  command sequence. NCM imports `GetGameCardHandle` and
+  `MountGameCardPartition`. Whether sending the firmware this console already
+  runs burns any OTP fuse is not established by the local sources; the
+  project's record says it does, and the risk is the user's to accept.
+  No `CMD60` is sent by any code here.
+- **Not done, needs a decision**: whether the user accepts a firmware load
+  that may burn fuses in the console's ASIC. Until then no `gc` service
+  path sends `CMD60`, and no console run reads the card.

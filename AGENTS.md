@@ -50,6 +50,8 @@ abi/        nxk-abi: syscall numbers, errors, rights, service protocols
 kernel/     the EL1 microkernel (crate `nxk`)
 shader/     nxk-shader: shader IR, validator, CPU reference, SASS compiler
             (`cd shader && cargo test` on the PC; used by `user/gpu`, `jeux/nxgfx`)
+cartridge/  nxk-cartridge: game card contents (HFS0/PFS0, NCA headers and keys,
+            RomFS, NACP titles); `cargo test` on the PC (`NXK_NSP` for real data)
 user/       workspace: libnx (no_std) + init, shell, drivers, services, tests
 std/        Rust std port: std/library overlay, target JSON, linker script
 apps/       ordinary std programs: hello-std, stdtest
