@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libnx::abi::proto::{input, power, provider};
+use libnx::abi::proto::{gc, input, power, provider};
 
 use crate::art;
 use crate::font::{self, Face};
@@ -16,18 +16,19 @@ use crate::stats::{Data, Seen};
 use crate::status::usb_short;
 use crate::theme::{pal, BLACK, WHITE};
 use crate::ui::{
-    Action, Id, Ui, CONTROLLERS, H, LOGS, NETWORK, SETTINGS, STATUS_Y, SYSTEM, TERMINAL, W,
+    Action, Id, Ui, CONTROLLERS, H, LOGS, NETWORK, SETTINGS, STATUS_Y, SYSTEM, TERMINAL, TOOLS, W,
 };
 use crate::widgets::{button_glyph, fit, icon, Icon, Tone};
 
 /// The round buttons under the game row, in `art::button` / `art::head` order.
-pub const BUTTONS: [&str; 7] = [
+pub const BUTTONS: [&str; 8] = [
     "System",
     "Network",
     "Terminal",
     "Logs",
     "Controllers",
     "System Settings",
+    "Tools",
     "Power",
 ];
 
@@ -68,6 +69,7 @@ impl Ui {
             3 => self.go(LOGS),
             4 => self.go(CONTROLLERS),
             5 => self.go(SETTINGS),
+            6 => self.go(TOOLS),
             _ => self.open_power(),
         }
         None
@@ -137,6 +139,11 @@ impl Ui {
                 if self.cfg.light { "white" } else { "black" },
                 self.cfg.brightness.max(crate::backlight::MIN_PCT)
             ),
+            6 => match d.gc {
+                Seen::Value(r) if r.present == gc::PRESENT_YES => "game card inserted".into(),
+                Seen::Value(r) if r.present == gc::PRESENT_NO => "no game card".into(),
+                _ => "game card reader".into(),
+            },
             _ => match d.supply {
                 Seen::Value(src) => {
                     let how = if src == power::SUPPLY_EXTERNAL {

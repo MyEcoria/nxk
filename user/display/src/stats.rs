@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 
 use libnx::abi::err::ETIMEDOUT;
 use libnx::abi::info::{self, CpuInfo, MemInfo};
-use libnx::abi::proto::{bt, cpufreq, eth, fan, fs, gpu, joycon, net, power, usbcon as usb, wifi};
+use libnx::abi::proto::{
+    bt, cpufreq, eth, fan, fs, gc, gpu, joycon, net, power, usbcon as usb, wifi,
+};
 use libnx::ipc::{self, Msg};
 use libnx::ns::Service;
 use libnx::seqpage::SeqPage;
@@ -35,6 +37,7 @@ static CPUFREQ: Service = Service::optional("cpufreq");
 static GPU: Service = Service::optional("gpu");
 static BT: Service = Service::optional("bt");
 static JOYCON: Service = Service::optional("joycon");
+static GC: Service = Service::optional("gc");
 
 /// A service asked every refresh.
 #[derive(Clone, Copy)]
@@ -194,6 +197,40 @@ impl Fan {
             manual: (m.mr[4] != fan::AUTO).then_some(m.mr[4]),
             temp: (m.mr[2] != fan::NO_TEMP).then_some(m.mr[2] as i64),
         }
+    }
+}
+
+/// The game card reader (`gc::STATUS` / `PROBE` reply).
+#[derive(Clone, Copy)]
+pub struct Reader {
+    /// `gc::PRESENT_*`.
+    pub present: u64,
+    /// `gc::ST_*` bits the last probe reached.
+    pub stages: u64,
+    /// The errno that stopped it (0: none).
+    pub error: i64,
+    pub status: Option<u32>,
+    /// The ASIC rail as found: LDO3 CFG | CFG2 << 8 | FPS << 16.
+    pub rail: u64,
+    /// How long the probe took (0: none yet).
+    pub ms: u64,
+}
+
+impl Reader {
+    pub fn from_reply(m: &Msg) -> Self {
+        Self {
+            present: m.mr[0],
+            stages: m.mr[1],
+            error: m.mr[2] as i64,
+            status: (m.mr[3] != gc::NO_STATUS).then_some(m.mr[3] as u32),
+            rail: m.mr[4],
+            ms: m.mr[5],
+        }
+    }
+
+    /// A probe has run.
+    pub fn probed(&self) -> bool {
+        self.stages != 0 || self.error != 0 || self.ms != 0
     }
 }
 
@@ -391,6 +428,8 @@ pub struct Data {
     pub cpu: Seen<Cpu>,
     /// From the stats page, current even while the service is busy.
     pub gpu: Seen<Gpu>,
+    /// The game card reader: the cartridge switch and the last probe.
+    pub gc: Seen<Reader>,
     gpu_page: Option<GpuPage>,
     pub wifi: Seen<Wifi>,
     /// Card: free and total bytes.
@@ -434,6 +473,7 @@ impl Data {
             fan: Seen::Unknown,
             cpu: Seen::Unknown,
             gpu: Seen::Unknown,
+            gc: Seen::Unknown,
             gpu_page: None,
             wifi: Seen::Unknown,
             disk: Seen::Unknown,
@@ -524,6 +564,7 @@ impl Data {
         self.cpu
             .poll(&CPUFREQ, cpufreq::STATUS, n, force, Cpu::from_reply);
         self.gpu_refresh(n, force);
+        self.gc.poll(&GC, gc::STATUS, n, force, Reader::from_reply);
         self.wifi.poll(&WIFI, wifi::STATUS, n, force, |m| {
             let mut w = Wifi {
                 state: m.mr[0],

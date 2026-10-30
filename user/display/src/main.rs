@@ -46,6 +46,7 @@ mod stats;
 mod status;
 mod term;
 mod theme;
+mod tools;
 mod ui;
 mod users;
 mod userspage;
@@ -64,7 +65,8 @@ use libnx::abi::err::{EINVAL, EIO, ENODEV, EPERM};
 use libnx::abi::proto::gpu as gpuproto;
 use libnx::abi::proto::provider as provproto;
 use libnx::abi::proto::{
-    audio, bt, console as con, cpufreq, display as proto, fan, gpu, input, power, wifi,
+    audio, bt, console as con, cpufreq, display as proto, fan, gc as gcproto, gpu, input, power,
+    wifi,
 };
 use libnx::abi::rights::{DMA, DUP, GRANT, MAP, SEND, WRITE};
 use libnx::abi::shm::{CONTIGUOUS, DMA32, UNCACHED};
@@ -157,6 +159,7 @@ static INPUT: Service = Service::new("input", 0);
 static WIFI: Service = Service::optional("wifi");
 static POWER: Service = Service::optional("power");
 static FAN: Service = Service::optional("fan");
+static GC: Service = Service::optional("gc");
 static CPUFREQ: Service = Service::optional("cpufreq");
 static EMC: Service = Service::optional("emc");
 static GPU: Service = Service::optional("gpu");
@@ -271,6 +274,8 @@ enum Done {
     Audio(Result<Option<&'static str>, i64>),
     /// A Bluetooth call, with the toast it gives when it worked.
     Bt(Result<&'static str, i64>),
+    /// The game card reader's answer to a probe.
+    Gc(Result<stats::Reader, i64>),
 }
 
 /// A game that took the screen: the images it draws on (block-linear,
@@ -885,6 +890,10 @@ fn work(w: &Worker, notif: u32, mut hw: Screens, link: &Mutex<Link>, awake: &Con
                 AUDIO
                     .call(&Msg::from_words(audio::TONE, &[440, 2000, 50]))
                     .map(|_| Some("playing 440 Hz tone (2 s)")),
+            ),
+            Action::GcProbe => Done::Gc(
+                GC.call(&Msg::new(gcproto::PROBE, 0, 0))
+                    .map(|m| stats::Reader::from_reply(&m)),
             ),
             Action::BtPair(on) => Done::Bt(
                 BT.call(&Msg::from_words(
@@ -2917,6 +2926,14 @@ fn main() -> i32 {
                                 ),
                                 Err(e) => ui
                                     .toast(format!("gpu clock: {}", libnx::abi::err::name(e)), now),
+                            }
+                        }
+                        Done::Gc(r) => {
+                            ui.gc_probing = false;
+                            match r {
+                                Ok(g) => data.gc = stats::Seen::Value(g),
+                                Err(e) => ui
+                                    .toast(format!("game card: {}", libnx::abi::err::name(e)), now),
                             }
                         }
                         Done::Bt(Ok(msg)) => ui.toast(msg.into(), now),
