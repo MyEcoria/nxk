@@ -217,6 +217,24 @@ const DRIVERS: &[Driver] = &[
         console: 0,
         prio: 6,
     },
+    // The game card reader's ASIC: SDMMC2 inside SDMMC1's register page
+    // (the window `gc` uses stops at 0x200), APB_MISC (pad control,
+    // chip revision), pinmux (detect pad) and GPIO (detect S3, reset BB3).
+    // Clocks and the rail go through clk and i2c; polled, no interrupt.
+    Driver {
+        name: "gc",
+        mmio: &[
+            (0x700B_0000, 0x1000),
+            (0x7000_0000, 0x1000),
+            (0x7000_3000, 0x1000),
+            (0x6000_D000, 0x1000),
+        ],
+        ro_mmio: &[],
+        irqs: &[],
+        sysctl: false,
+        console: 0,
+        prio: 6,
+    },
     Driver {
         name: "fs",
         mmio: &[],
