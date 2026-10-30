@@ -54,7 +54,7 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 | USB device | ✅ Complete | Serial console and terminal over USB-C; `usb0` network shared by the PC, validated on the Erista |
 | USB host | 🟡 Partial | Keyboard and USB Ethernet adapter work in the emulator; on the Erista the xHCI is left unpowered, and it needs NVIDIA firmware |
 | Storage | 🟡 Partial | SD card (64 GB read and written on the Erista), FAT32, file API; eMMC and ext4 to do |
-| Game card reader | 🟡 Partial | Cartridge detect, ASIC power, reset and SDMMC2 bring-up up to the ASIC's bootrom (`gc probe`, Tools page); reading a cartridge needs Nintendo's signed ASIC firmware and the console's keys, not available to nxk |
+| Game card reader | 🟡 Partial | Cartridge detect, ASIC power, reset and SDMMC2 bring-up up to the ASIC's bootrom (`gc probe`, Tools page); the cartridge's contents are not read |
 | Network | 🟡 Partial | TCP, UDP, DNS, DHCP, sockets, switching between links; IPv6 to do |
 | Wi-Fi | 🟡 Partial | Scans, open and WPA2-Personal joins, traffic on `wlan0`; the chip still resets itself at times (cause unknown), and `wlan` brings it back; WPA (TKIP), WPA3 and mixed WPA/WPA2 refused |
 | Bluetooth | 🟡 Partial | Pro Controller pairs, reconnects and streams on the Erista; Joy-Cons, rumble, motion sensors, one gamepad per player, Bluetooth audio and BLE to do |
