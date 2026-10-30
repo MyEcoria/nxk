@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicI64, Ordering};
 
 use libnx::abi::err;
 use libnx::abi::info::{self, CpuInfo, MemInfo, ProcInfo, SocInfo, ThreadInfo};
-use libnx::abi::proto::{audio, cpufreq, emc, fan, gpu, pm, power};
+use libnx::abi::proto::{audio, cpufreq, emc, fan, gc, gpu, pm, power};
 use libnx::fs::{self, Kind};
 use libnx::ipc::{self, Msg};
 use libnx::seqpage::SeqPage;
@@ -199,6 +199,7 @@ fn command(line: &str) {
         "temp" => temp(),
         "fan" => fan_cmd(argv.get(1).copied()),
         "cpufreq" => cpufreq_cmd(argv.get(1).copied()),
+        "gc" => gc_cmd(argv.get(1).copied()),
         "emc" => emc_cmd(&argv),
         "gpu" => gpu_cmd(&argv),
         "audio" => audio_cmd(&argv),
@@ -805,6 +806,72 @@ fn fan_cmd(arg: Option<&str>) {
         }
         Err(e) => {
             println!("fan: {}", err::name(e));
+            fail(e);
+        }
+    }
+    let _ = sys::handle_close(h);
+}
+
+/// `gc`: the cartridge switch and the last probe; `gc probe` powers the
+/// reader's ASIC for a bring-up test (no firmware is loaded: it stops at
+/// the bootrom) and reports each step.
+fn gc_cmd(arg: Option<&str>) {
+    let label = match arg {
+        None => gc::STATUS,
+        Some("probe") => gc::PROBE,
+        Some(_) => {
+            println!("usage: gc [probe]");
+            fail(-err::EINVAL);
+            return;
+        }
+    };
+    let Some(h) = service("gc") else { return };
+    match ipc::call(h, &Msg::new(label, 0, 0)).and_then(ipc::checked) {
+        Ok(m) => {
+            let (present, stages, e, status, rail, ms) =
+                (m.mr[0], m.mr[1], m.mr[2] as i64, m.mr[3], m.mr[4], m.mr[5]);
+            println!(
+                "cartridge: {}",
+                match present {
+                    gc::PRESENT_YES => "in",
+                    gc::PRESENT_NO => "none",
+                    _ => "unknown",
+                }
+            );
+            if stages == 0 && e == 0 && status == gc::NO_STATUS && ms == 0 {
+                println!("no probe yet (gc probe)");
+            } else {
+                let step = |bit, name| {
+                    println!(
+                        "  {:<26}{}",
+                        name,
+                        if stages & bit != 0 { "ok" } else { "-" }
+                    )
+                };
+                step(gc::ST_RAIL, "ASIC rail (LDO3 3.1 V)");
+                step(gc::ST_RESET, "reset released, clock");
+                step(gc::ST_HOST, "SDMMC2 8-bit 1.8 V HS100");
+                step(gc::ST_TUNED, "tuning (ASIC alive)");
+                step(gc::ST_STATUS, "CMD13");
+                if status != gc::NO_STATUS {
+                    println!("  CMD13 status {:#010x}", status);
+                }
+                println!(
+                    "  LDO3 before: cfg {:#04x} cfg2 {:#04x} fps {:#04x}; {} ms",
+                    rail & 0xFF,
+                    rail >> 8 & 0xFF,
+                    rail >> 16 & 0xFF,
+                    ms
+                );
+                if e != 0 {
+                    println!("  stopped: {}", err::name(e));
+                } else {
+                    println!("  ASIC bootrom reached; firmware and keys needed to read the card");
+                }
+            }
+        }
+        Err(e) => {
+            println!("gc: {}", err::name(e));
             fail(e);
         }
     }

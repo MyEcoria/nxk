@@ -59,6 +59,7 @@ pub const LOGS: usize = 4;
 pub const SETTINGS: usize = 5;
 pub const CONTROLLERS: usize = 6;
 pub const USERS: usize = 7;
+pub const TOOLS: usize = 8;
 
 const TOAST_NS: u64 = 4_000_000_000;
 /// `prov_list` while the list shown is the cache's.
@@ -123,6 +124,8 @@ pub enum Id {
     /// The speed test sheet: open, and start or stop the test.
     SpeedOpen,
     SpeedRun,
+    /// The Tools page: probe the game card reader.
+    GcProbe,
     // Controllers.
     BtPair,
     /// A paired controller, by its index in `bt_pads`.
@@ -194,6 +197,8 @@ pub enum Action {
     SpeedStop,
     Retry,
     Leave,
+    /// Probe the game card reader (`gc::PROBE`).
+    GcProbe,
     ClearLogs,
     /// Start game `n` of the library.
     Launch(usize),
@@ -293,6 +298,8 @@ pub struct Ui {
     /// The Controllers page as last drawn: pairing under way, and the
     /// paired controllers' addresses and names.
     pub(crate) bt_pairing: bool,
+    /// A reader probe is running (the page's button waits).
+    pub(crate) gc_probing: bool,
     pub(crate) bt_pads: Vec<(u64, String)>,
     pub(crate) sheet: Option<Sheet>,
     /// The drawer on the right (`+`, `-` or the status).
@@ -389,6 +396,7 @@ impl Ui {
             unread: 0,
             ssid: String::new(),
             bt_pairing: false,
+            gc_probing: false,
             bt_pads: Vec::new(),
             sheet: None,
             quick: false,
@@ -1258,6 +1266,10 @@ impl Ui {
                 self.busy = true;
                 return Some(Action::Retry);
             }
+            Id::GcProbe => {
+                self.gc_probing = true;
+                return Some(Action::GcProbe);
+            }
             Id::BtPair => return Some(Action::BtPair(!self.bt_pairing)),
             Id::BtForget(i) => {
                 let (addr, name) = self.bt_pads.get(i)?.clone();
@@ -1368,6 +1380,7 @@ impl Ui {
                 SYSTEM => self.system(s, d),
                 CONTROLLERS => self.controllers(s, d),
                 USERS => self.users_page(s),
+                TOOLS => self.tools_page(s, d),
                 TERMINAL => self.terminal(s, d, term, now),
                 _ => self.logs(s, msgs),
             }
@@ -1562,6 +1575,7 @@ impl Ui {
                 TERMINAL => 2,
                 LOGS => 3,
                 CONTROLLERS => 4,
+                TOOLS => 6,
                 _ => 5,
             };
             if let Some(img) = art::get(art::UI, art::head(k)) {

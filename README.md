@@ -14,7 +14,7 @@ and capabilities, and everything else (drivers, files, network, the
 screen) runs as ordinary programs. The screen is a game library with
 users, settings and system pages; games are ordinary Rust programs
 drawing with the GPU's 3D engine through a small SDK; cloud games
-stream from Amazon Luna. It boots on a real Erista through hekate.
+stream from Amazon Luna. It boots on a real Erista by itself, from its own RCM launcher (`nxk-ipl`), with no hekate.
 
 Building, running, testing and the design: [DEV.md](DEV.md).
 
@@ -32,7 +32,7 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 | Games | ✅ Complete | Cube, Lumen and Starlane; Lumen (ray-traced shadows) and Starlane run on the Erista at 60 fps; Cube is a small demo |
 | Audio | 🟡 Partial | 16-bit stereo 48 kHz on the speakers; clean sound while a game runs, headphones, capture and mixing to do |
 | Amazon Luna | 🟡 Partial | Sign-in by code, the account's games, H.264 video and Opus audio, performance overlay; 60 Hz not reached (45 Hz by default) |
-| Boot on Erista | ✅ Complete | Via hekate and `nxk-bl31`: 4 cores, PSCI, DRAM detection, shell over USB-C, SD card |
+| Boot on Erista | ✅ Complete | From `nxk-ipl`, nxk's own RCM payload (no hekate), then `nxk-bl31`: DRAM training, 4 cores, PSCI, shell over USB-C, SD card |
 | Boot on Mariko | ⏳ To do | Emulated (`tegrax1plus`); not yet tested on a Mariko, and no USB-C console there (its OTG port belongs to XUSB) |
 | Memory | ✅ Complete | On demand, W^X, `mprotect`, shared memory, DMA buffers, ASLR, reserved areas |
 | Threads and scheduling | 🟡 Partial | Priorities, affinity, migration, balancing, tickless, futex; deep sleep states to do |
@@ -42,7 +42,7 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 | Security | ✅ Complete | Capabilities, revocation, Spectre v2 mitigation, isolation |
 | Tools | ✅ Complete | Build, SD card image, tests, gdb, L4T comparison, USB-C terminal |
 | Base drivers | ✅ Complete | UART, I2C, PMIC, RTC, temperatures |
-| Screen | ✅ Complete | InnoLux 720x1280 panel taken over from hekate, backlight and sleep; JDI and AUO power-down tables untested |
+| Screen | ✅ Complete | InnoLux 720x1280 panel started by `nxk-ipl`, backlight and sleep; JDI and AUO power-down tables untested |
 | Boot screen | 🟡 Partial | nxk logo and progress bar from the monitor to the library, logs with Vol+ held; checked pixel for pixel in the emulator, not yet seen on the Erista |
 | Touchscreen | ✅ Complete | FTM3BD56, read on its interrupt line, polled as a fallback |
 | Fan | ✅ Complete | Temperature curve as in Nyx, speed read from the tachometer |
@@ -52,8 +52,9 @@ Building, running, testing and the design: [DEV.md](DEV.md).
 | CPU clock | 🟡 Partial | PLLX steps up to about 1224 MHz on the Erista; faster steps need the DFLL, not written yet |
 | DRAM clock | 🟡 Partial | Switches between 204, 408 and 800 MHz validated on the Erista; 1331 and 1600 MHz need periodic training, not ported |
 | USB device | ✅ Complete | Serial console and terminal over USB-C; `usb0` network shared by the PC, validated on the Erista |
-| USB host | 🟡 Partial | Keyboard and USB Ethernet adapter work in the emulator; on the Erista hekate's L4T path leaves the xHCI unpowered, and it needs NVIDIA firmware |
+| USB host | 🟡 Partial | Keyboard and USB Ethernet adapter work in the emulator; on the Erista the xHCI is left unpowered, and it needs NVIDIA firmware |
 | Storage | 🟡 Partial | SD card (64 GB read and written on the Erista), FAT32, file API; eMMC and ext4 to do |
+| Game card reader | 🟡 Partial | Cartridge detect, ASIC power, reset and SDMMC2 bring-up up to the ASIC's bootrom (`gc probe`, Tools page); the cartridge's contents are not read |
 | Network | 🟡 Partial | TCP, UDP, DNS, DHCP, sockets, switching between links; IPv6 to do |
 | Wi-Fi | 🟡 Partial | Scans, open and WPA2-Personal joins, traffic on `wlan0`; the chip still resets itself at times (cause unknown), and `wlan` brings it back; WPA (TKIP), WPA3 and mixed WPA/WPA2 refused |
 | Bluetooth | 🟡 Partial | Pro Controller pairs, reconnects and streams on the Erista; Joy-Cons, rumble, motion sensors, one gamepad per player, Bluetooth audio and BLE to do |

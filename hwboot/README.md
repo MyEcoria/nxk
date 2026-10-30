@@ -1,10 +1,13 @@
 # hwboot — physical Switch (Erista, AutoRCM) bring-up kit
 
-Host-side setup to boot a first-generation Switch into **hekate** over USB
-(fusée-gelée RCM exploit), then nxk through hekate's L4T entry (Stage 2).
-Status: nxk boots to user space on hardware; the shell has not been
-reached there yet: the USB-C console ("Shell over USB-C") is the way in,
-tried in the emulator only (see "Hardware runs").
+Host-side setup to boot a first-generation Switch into **nxk** over USB
+(fusée-gelée RCM exploit): `inject.sh` sends `nxk-ipl.bin`, nxk's own
+launcher, which starts the console and loads nxk from the SD card
+(`BOOT.md`). **hekate is not used to boot nxk any more**; it stays on the
+card for recovery and to extract firmware and keys, and the older "through
+hekate's L4T entry" chain is the fallback (`inject.sh dl/hekate_ctcaer_6.5.4.bin`,
+then More Configs, nxk). The USB-C console ("Shell over USB-C") is the way
+in; "Hardware runs" is the log.
 
 ## What you need
 
@@ -80,8 +83,14 @@ another board (`boardtype=0x073e`): use the console's own.
 
 ```bash
 ./check.sh    # exit 0 + APX line = console in RCM and visible
-./inject.sh   # sends hekate; the Switch screen should show hekate's menu
+./inject.sh   # sends nxk-ipl (built by mkipl.py if missing): nxk boots by itself
 ```
+
+The screen shows nxk's boot logo a second after the injection and the shell
+comes up on the USB-C console (`tools/usbterm.py`). `./inject.sh PAYLOAD`
+sends another payload: `dl/hekate_ctcaer_6.5.4.bin` for recovery or the
+key and firmware extraction below. `dl/nxk-ipl.bin` is built only when
+missing: run `python3 hwboot/mkipl.py` again after changing `nxk-ipl/`.
 
 `inject.sh` uses the vendored `fusee-nano` injector (MIT, see
 `fusee-nano/UPSTREAM`). Nothing runs automatically on plug-in by design:
@@ -93,8 +102,8 @@ console powers on to a black screen (AutoRCM) rather than the Nintendo logo
 
 ## Safety
 
-- RCM + hekate from SD is the standard soft-mod path: it does **not** write
-  the Switch NAND by itself. Don't enable emuMMC creation, NAND backup
+- RCM + a payload from SD (nxk-ipl, or hekate for recovery) is the standard
+  soft-mod path: it does **not** write the Switch NAND by itself. Don't enable emuMMC creation, NAND backup
   restore, or AutoRCM toggles in hekate unless you know what they do.
 - Keep the battery charged; a dead battery in RCM looks like a dead console
   (charge for an hour if in doubt).
@@ -1556,6 +1565,29 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+81. 30/10/2026, same console (gauge 15 %, charging), `dev` at `195ec2f`,
+    `nxk-ipl.bin` injected, SD card from `mksd-hw.sh`, a game cartridge in the
+    slot: **the game card reader's ASIC answers**. `gc probe` (new `gc`
+    service): the detect switch (GPIO S3) reads "in"; LDO3 was off before
+    (cfg 0x2e, cfg2 0xd2, fps 0xc7), the probe raised it to 3.1 V; reset
+    (GPIO BB3) released after 20 ms; SDMMC2 up at 8 bits, 1.8 V, HS100 from
+    PLLC4_OUT2; hardware tuning on CMD21 found a tap (the ASIC's bootrom
+    answers it); CMD13 answered `0x804` (state 4, ready for data); 46 ms in
+    all, then the ASIC and its clocks off again. Nothing past tuning and
+    CMD13 was sent: CMD60 loads signed firmware, which burns OTP fuses. The
+    card's contents are not read. The detect switch is low
+    with the cartridge in: taken out, `gc` reads "none", put back "in"
+    (the probe's steps stay as the last one left them). The Tools page on
+    the panel works (checked by Pierric).
+80. 30/10/2026, same console, rebooted under nxk (gauge 18 %, charging): `x86test` with
+    x87 (80-bit soft-float, register stack, control and status words) sent with
+    `usbterm.py --put`: 8/8. The `long double` guest (series, conversions, truncation
+    through the control word, 24/53/64-bit precision, fprem loops, overflow, NaN) prints
+    the PC's native output bit for bit: 15089 instructions, 3.8 MIPS at 998 MHz, 4.7 at
+    1224 MHz. The other guests: 3.2 to 4.8 MIPS at 998 MHz (floating point 3.2), the ALU
+    loop 7.3 (8.9 at 1224), a little below run 79's 9.0 and 5.1 to 5.5 for the same
+    code: not investigated (the larger binary, the console's temperature or the low
+    battery are candidates). stdtest 19/19.
 79. 29/10/2026, same console and boot as run 76 (gauge 40 %, charging), `x86test`
     with SSE/AVX floating point on the soft-float core, sent with `usbterm.py --put`:
     7/7. The float guest (float and double arithmetic, conversions, specials, FTZ and

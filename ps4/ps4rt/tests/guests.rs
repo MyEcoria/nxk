@@ -12,6 +12,8 @@ const EXPECTED: &str = include_str!("../../guest/bin/expected.txt");
 const FP: &[u8] = include_bytes!("../../guest/bin/fp.so");
 const FP_JAGUAR: &[u8] = include_bytes!("../../guest/bin/fp-jaguar.so");
 const FP_EXPECTED: &str = include_str!("../../guest/bin/fp-expected.txt");
+const X87: &[u8] = include_bytes!("../../guest/bin/x87.so");
+const X87_EXPECTED: &str = include_str!("../../guest/bin/x87-expected.txt");
 
 fn run(main: &[u8]) -> (String, LinkReport) {
     run_with(LIBMINI, main)
@@ -59,6 +61,12 @@ fn float_guest_matches_native() {
     // Float and double arithmetic, conversions, specials, FTZ/DAZ and MXCSR rounding.
     assert_eq!(run_with(LIBMINI, FP).0, FP_EXPECTED);
     assert_eq!(run_with(LIBMINI_JAGUAR, FP_JAGUAR).0, FP_EXPECTED);
+}
+
+#[test]
+fn x87_guest_matches_native() {
+    // long double arithmetic, precision control, truncation through the control word, fprem loops.
+    assert_eq!(run_with(LIBMINI, X87).0, X87_EXPECTED);
 }
 
 #[test]

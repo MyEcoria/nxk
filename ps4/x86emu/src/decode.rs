@@ -3,6 +3,9 @@
 //! emit them for the PS4's Jaguar (8/16/32/64-bit operands, legacy and VEX encodings).
 
 mod simd;
+mod x87;
+
+pub use x87::{FSrc, X87Op};
 
 /// Why decoding stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +385,8 @@ pub enum Op {
     Crc32(u8),
     /// ldmxcsr (`true`) / stmxcsr of a 32-bit memory operand.
     Mxcsr(bool),
+    /// An x87 instruction (D8..DF); a memory operand is in `dst`.
+    X87(X87Op),
 }
 
 /// `rep` / `repne` prefix state.
@@ -653,6 +658,8 @@ fn decode_1byte(c: &mut Ctx, b: u8) -> Result<Inst, DecodeError> {
     let size = c.size();
     let rex = c.rex;
     match b {
+        0x9b => c.done(Op::Nop, size, NONE, NONE, 0), // fwait: no deferred exceptions here
+        0xd8..=0xdf => x87::decode(c, b),
         0x00..=0x3f if b & 7 < 6 => {
             let op = Op::Alu(ALU[(b >> 3) as usize & 7]);
             match b & 7 {
@@ -1111,6 +1118,8 @@ mod tests {
         assert_eq!(decode(&[0x48]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x01]), Err(DecodeError::Truncated));
         assert_eq!(decode(&[0x0f, 0x05]), Err(DecodeError::Unsupported(0x05)));
-        assert_eq!(decode(&[0xd8, 0xc0]), Err(DecodeError::Unsupported(0xd8)));
+        // x87 transcendentals stay undecoded (f2xm1, fyl2x, fsin ...).
+        assert_eq!(decode(&[0xd9, 0xf0]), Err(DecodeError::Unsupported(0xd9)));
+        assert_eq!(decode(&[0xd9, 0xfe]), Err(DecodeError::Unsupported(0xd9)));
     }
 }

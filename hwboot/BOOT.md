@@ -2,8 +2,10 @@
 
 Goal: nxk starts the console itself (hardware init, load, hand-off), with no
 third-party bootloader, and shows a boot screen from the first moment.
-Status: the Erista boots nxk from nxk-ipl (2026-10-29); hekate stays on
-the card as the fallback. See "Steps and status".
+Status: the Erista boots nxk from nxk-ipl (2026-10-29), and that is now
+the only way to start nxk (`inject.sh` sends it by default); hekate stays
+on the card for recovery and for extracting firmware and keys. See "Steps
+and status".
 
 ## What cannot go away
 

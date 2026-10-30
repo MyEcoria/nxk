@@ -8,6 +8,8 @@ needs gcc):
   libmini.so   guest "libc" module (standard ELF dynamic tags)
   main.so      main program, imports by name (standard ELF)
   *-jaguar.so  both again at -O3 for the PS4's CPU (-march=btver2: AVX, BMI1, SSE4.2)
+  x87.so, x87-expected.txt
+               long double guest (x87), and its native output
   fp.so, fp-jaguar.so, fp-expected.txt
                the floating-point guest (fpmain.c), generic and for Jaguar, and its native
                output (no fast-math, no contraction: IEEE fixes every bit)
@@ -169,6 +171,15 @@ def main():
          os.path.join(OUT, "fp.so")])
     run(["gcc", *SO, *JAGUAR, *FP, "-Wl,-e,_start", src("fpmain.c"), "-L" + OUT, "-lmini", "-o",
          os.path.join(OUT, "fp-jaguar.so")])
+    run(["gcc", *SO, *FP, "-Wl,-e,_start", src("x87main.c"), "-L" + OUT, "-lmini", "-o",
+         os.path.join(OUT, "x87.so")])
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = os.path.join(tmp, "x87.native")
+        run(["gcc", *COMMON, *FP, *LIBMINI_EXTRA, "-static", "-no-pie", "-Wl,-e,native_entry",
+             src("x87main.c"), src("libmini.c"), src("native.c"), "-o", exe])
+        r = subprocess.run([exe], stdout=subprocess.PIPE)
+    with open(os.path.join(OUT, "x87-expected.txt"), "wb") as f:
+        f.write(r.stdout + f"exit {r.returncode}\n".encode())
     with tempfile.TemporaryDirectory() as tmp:
         exe = os.path.join(tmp, "fp.native")
         run(["gcc", *COMMON, *FP, *LIBMINI_EXTRA, "-static", "-no-pie", "-Wl,-e,native_entry",

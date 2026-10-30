@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod board;
+pub mod gc;
 
 use core::fmt::{self, Write};
 
@@ -28,6 +29,10 @@ pub trait Regs {
 
     fn modify(&self, off: usize, clear: u32, set: u32) {
         self.w32(off, (self.r32(off) & !clear) | set);
+    }
+
+    fn modify16(&self, off: usize, clear: u16, set: u16) {
+        self.w16(off, (self.r16(off) & !clear) | set);
     }
 }
 

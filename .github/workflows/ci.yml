@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [shader, emc, services/lunacore, services/nxopus, services/nxh264, services/nxdtls]
+        crate: [shader, emc, cartridge, services/lunacore, services/nxopus, services/nxh264, services/nxdtls]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal && rustup default stable

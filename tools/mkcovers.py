@@ -5,7 +5,7 @@
 
 `-o`: the UI's own images, built into display: the player avatar
 (64x64), the home screen's round buttons (System, Network, Terminal,
-Logs, Controllers, System Settings, Power; 76x76, on the dark theme's disc, then on
+Logs, Controllers, System Settings, Tools, Power; 76x76, on the dark theme's disc, then on
 the light one's) and the same glyphs for the page headers (40x40, on
 each theme's background). `--games DIR`: one DIR/NAME.bin per game of
 jeux/ (title and color from its game.txt), installed by tools/mksd.py as
@@ -493,6 +493,25 @@ def ic_power(d, cx, cy, s, col):
     d.line((cx, cy - r * 1.2, cx, cy - r * 0.15), fill=col, width=t)
 
 
+def ic_tools(d, cx, cy, s, col):
+    """A wrench: a slanted shaft ending in a ring with an open jaw."""
+    t = int(s * 0.07)
+    r = s * 0.12
+    jx, jy = cx + s * 0.15, cy - s * 0.15
+    d.line((cx - s * 0.22, cy + s * 0.22, jx - r * 0.55, jy + r * 0.55), fill=col, width=t)
+    d.ellipse((jx - r, jy - r, jx + r, jy + r), outline=col, width=t)
+    # The jaw: a wedge cut out of the ring along the shaft's direction.
+    k = math.sqrt(0.5)
+    ux, uy = k, -k
+    vx, vy = k, k
+    w = r * 0.5
+    d.polygon([
+        (jx, jy),
+        (jx + ux * r * 1.8 + vx * w * 1.7, jy + uy * r * 1.8 + vy * w * 1.7),
+        (jx + ux * r * 1.8 - vx * w * 1.7, jy + uy * r * 1.8 - vy * w * 1.7),
+    ], fill=(0, 0, 0, 0))
+
+
 def ic_controllers(d, cx, cy, s, col):
     """A pair of Joy-Cons side by side, each with its stick."""
     w, h, t, g = s * 0.17, s * 0.44, int(s * 0.045), s * 0.035
@@ -503,10 +522,10 @@ def ic_controllers(d, cx, cy, s, col):
         d.ellipse((x - r, y - r, x + r, y + r), fill=col)
 
 
-# Home order: System, Network, Terminal, Logs, Controllers, System Settings, Power.
-GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_controllers, ic_settings, ic_power]
+# Home order: System, Network, Terminal, Logs, Controllers, System Settings, Tools, Power.
+GLYPHS = [ic_system, ic_network, ic_terminal, ic_logs, ic_controllers, ic_settings, ic_tools, ic_power]
 # Glyph colors; None: the theme's grey.
-COLORS = [(240, 86, 62), (70, 136, 241), (58, 190, 192), (44, 182, 67), (247, 174, 36), None, None]
+COLORS = [(240, 86, 62), (70, 136, 241), (58, 190, 192), (44, 182, 67), (247, 174, 36), None, (158, 116, 240), None]
 THEMES = {
     # (page background, dock surface, grey glyph)
     "dark": ((28, 28, 28), (46, 46, 46), (196, 196, 196)),
