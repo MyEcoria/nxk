@@ -118,6 +118,18 @@ const PLL_ENABLE: u32 = 1 << 30;
 const PLL_LOCK: u32 = 1 << 27;
 /// PLLU USB, HSIC, ICUSB and 48M outputs.
 const PLLU_OUTPUTS: u32 = 0x2E0_0000;
+/// PLLC4 (hekate `_clock_enable_pllc4`): DIVM 4, DIVN 104, DIVP 1 gives
+/// 998 MHz on OUT0 and 199.68 MHz on OUT2, SDMMC2's HS100 source.
+const PLLC4_BASE: usize = 0x5A4;
+const PLLC4_MISC: usize = 0x5A8;
+const PLLC4_IDDQ: u32 = 1 << 18;
+const PLLC4_EN_LCKDET: u32 = 1 << 30;
+const PLLC4_DIV: u32 = (104 << 8) | 4;
+/// SDMMC legacy timeout clock (bank Y bit 1, enable only): shared with
+/// SDMMC1, so only ever set, never cycled.
+const SDMMC_LEGACY_TM_BIT: u32 = 1 << 1;
+/// SDMMC2 clock source 1: PLLC4_OUT2 left-justified, divider ignored.
+const SDMMC2_SRC_PLLC4_OUT2_LJ: u32 = 1 << 29;
 const UTMIP_PLL_CFG0: usize = 0x480;
 const UTMIP_PLL_CFG1: usize = 0x484;
 const UTMIP_PLL_CFG2: usize = 0x488;
@@ -202,6 +214,8 @@ enum Needs {
     Gpu,
     /// AUD partition on and PLLA locked (`audio_up`).
     Audio,
+    /// PLLC4 running and locked, the SDMMC legacy timeout clock on.
+    Pllc4,
 }
 
 /// One device: its clocks in enable order plus PMC partitions that must
@@ -238,6 +252,15 @@ const SDMMC1: [Clock; 1] = [Clock {
     source: 0x150,
     keep: 0,
     src: 15,
+    reset: true,
+}];
+/// SDMMC2 (game card ASIC): PLLC4_OUT2, the controller divides by 2.
+const SDMMC2: [Clock; 1] = [Clock {
+    bank: &L,
+    bit: 9,
+    source: 0x154,
+    keep: 0,
+    src: SDMMC2_SRC_PLLC4_OUT2_LJ,
     reset: true,
 }];
 const SDMMC4: [Clock; 1] = [Clock {
@@ -452,6 +475,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::PWM => Needs::Shared,
         proto::GPU => Needs::Gpu,
         proto::AUDIO => Needs::Audio,
+        proto::SDMMC2 => Needs::Pllc4,
         _ => Needs::Nothing,
     };
     let (clocks, parts): (&'static [Clock], u32) = match dev {
@@ -462,6 +486,7 @@ fn table(dev: u64) -> Option<Device> {
         proto::I2C5 => (&I2C5, 0),
         proto::I2C6 => (&I2C6, 0),
         proto::SDMMC1 => (&SDMMC1, 0),
+        proto::SDMMC2 => (&SDMMC2, 0),
         proto::SDMMC4 => (&SDMMC4, 0),
         proto::XUSB_HOST => (&XUSB_HOST, PART_XUSBA | PART_XUSBC),
         proto::USBD => (&USBD, 0),
@@ -513,6 +538,10 @@ fn status(car: &Mmio, pmc: Option<&Mmio>, d: &Device) -> u64 {
         Needs::Pcie => car.r32(PLLE_MISC) & PLLE_MISC_LOCK != 0,
         Needs::Gpu => pmc.is_some_and(|p| p.r32(PMC_GPU_RG_CNTRL) & 1 == 0),
         Needs::Audio => car.r32(PLLA_BASE) & PLL_LOCK != 0,
+        Needs::Pllc4 => {
+            car.r32(PLLC4_BASE) & (PLL_ENABLE | PLL_LOCK) == PLL_ENABLE | PLL_LOCK
+                && car.r32(Y.enb) & SDMMC_LEGACY_TM_BIT != 0
+        }
     };
     if powered(pmc, d.parts) && extra {
         st |= proto::ST_POWERED;
@@ -876,6 +905,35 @@ fn pcie_link(car: &Mmio, pmc: Option<&Mmio>, label: u32) -> (i64, u64) {
     }
 }
 
+/// PLLC4 then the legacy timeout clock, as hekate: lock detection on,
+/// PLL and IDDQ off for 10 us, dividers, enable, wait for lock. A PLL
+/// the loader left locked is kept as is.
+fn pllc4_up(car: &Mmio) -> i64 {
+    if car.r32(PLLC4_BASE) & (PLL_ENABLE | PLL_LOCK) != PLL_ENABLE | PLL_LOCK {
+        car.w32(PLLC4_MISC, PLLC4_EN_LCKDET);
+        car.modify(PLLC4_BASE, PLL_ENABLE, 0);
+        car.modify(PLLC4_BASE, PLLC4_IDDQ, 0);
+        time::sleep_us(10);
+        car.w32(PLLC4_BASE, PLLC4_DIV);
+        car.modify(PLLC4_BASE, 0, PLL_ENABLE);
+        if !wait_bits(car, PLLC4_BASE, PLL_LOCK, 2_000) {
+            return EIO;
+        }
+    }
+    if car.r32(Y.enb) & SDMMC_LEGACY_TM_BIT == 0 {
+        car.w32(Y.enb_set, SDMMC_LEGACY_TM_BIT);
+        let _ = car.r32(Y.enb);
+    }
+    0
+}
+
+/// PLLC4 off again (SDMMC2 is its only user): clock gone first.
+fn pllc4_down(car: &Mmio) {
+    time::sleep_us(100);
+    car.modify(PLLC4_BASE, PLL_ENABLE, 0);
+    car.modify(PLLC4_BASE, 0, PLLC4_IDDQ);
+}
+
 fn enable(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>, d: &Device) -> i64 {
     if d.needs == Needs::Audio {
         if status(car, pmc, d) == proto::ST_READY {
@@ -961,6 +1019,12 @@ fn enable(car: &Mmio, pmc: Option<&Mmio>, ahub: Option<&Mmio>, d: &Device) -> i6
     }
     if d.needs == Needs::UsbPlls {
         let r = usb_plls(car, pmc);
+        if r != 0 {
+            return r;
+        }
+    }
+    if d.needs == Needs::Pllc4 {
+        let r = pllc4_up(car);
         if r != 0 {
             return r;
         }
@@ -1056,6 +1120,9 @@ fn main() -> i32 {
             }
             (proto::DISABLE, Some(d)) if !matches!(d.needs, Needs::FuseVisible | Needs::Shared) => {
                 disable(&car, &d);
+                if d.needs == Needs::Pllc4 {
+                    pllc4_down(&car);
+                }
                 0
             }
             (proto::STATUS, Some(d)) => {
