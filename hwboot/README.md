@@ -1556,6 +1556,15 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+80. 30/10/2026, same console, rebooted under nxk (gauge 18 %, charging): `x86test` with
+    x87 (80-bit soft-float, register stack, control and status words) sent with
+    `usbterm.py --put`: 8/8. The `long double` guest (series, conversions, truncation
+    through the control word, 24/53/64-bit precision, fprem loops, overflow, NaN) prints
+    the PC's native output bit for bit: 15089 instructions, 3.8 MIPS at 998 MHz, 4.7 at
+    1224 MHz. The other guests: 3.2 to 4.8 MIPS at 998 MHz (floating point 3.2), the ALU
+    loop 7.3 (8.9 at 1224), a little below run 79's 9.0 and 5.1 to 5.5 for the same
+    code: not investigated (the larger binary, the console's temperature or the low
+    battery are candidates). stdtest 19/19.
 79. 29/10/2026, same console and boot as run 76 (gauge 40 %, charging), `x86test`
     with SSE/AVX floating point on the soft-float core, sent with `usbterm.py --put`:
     7/7. The float guest (float and double arithmetic, conversions, specials, FTZ and
