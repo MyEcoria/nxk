@@ -1556,6 +1556,19 @@ within 5 s.
     then died at once on the code-page fault of run 58 (`+0xd5170`, a
     page-aligned address, right after "SPP connected"). Reloading
     `display` leaves the old catalog process running (two orphans).
+81. 30/10/2026, same console (gauge 15 %, charging), `dev` at `195ec2f`,
+    `nxk-ipl.bin` injected, SD card from `mksd-hw.sh`, a game cartridge in the
+    slot: **the game card reader's ASIC answers**. `gc probe` (new `gc`
+    service): the detect switch (GPIO S3) reads "in"; LDO3 was off before
+    (cfg 0x2e, cfg2 0xd2, fps 0xc7), the probe raised it to 3.1 V; reset
+    (GPIO BB3) released after 20 ms; SDMMC2 up at 8 bits, 1.8 V, HS100 from
+    PLLC4_OUT2; hardware tuning on CMD21 found a tap (the ASIC's bootrom
+    answers it); CMD13 answered `0x804` (state 4, ready for data); 46 ms in
+    all, then the ASIC and its clocks off again. Nothing past tuning and
+    CMD13 was sent: CMD60 loads signed firmware, which burns OTP fuses, and
+    reading the card needs the console's keys. Not yet checked: the
+    detect switch's polarity with the cartridge out, the Tools page on the
+    panel.
 80. 30/10/2026, same console, rebooted under nxk (gauge 18 %, charging): `x86test` with
     x87 (80-bit soft-float, register stack, control and status words) sent with
     `usbterm.py --put`: 8/8. The `long double` guest (series, conversions, truncation
