@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Sends an RCM payload to a Switch waiting in RCM (fusee-gelee).
 # Usage: ./inject.sh [payload.bin]
-# Default payload: hekate (boots to its menu on the console screen).
+# Default payload: nxk-ipl, nxk's own launcher (hwboot/dl/nxk-ipl.bin, built by
+# mkipl.py when missing): the console boots nxk with no hekate. hekate is only
+# for recovery and key/firmware extraction: ./inject.sh dl/hekate_ctcaer_6.5.4.bin
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-payload="${1:-$here/dl/hekate_ctcaer_6.5.4.bin}"
+payload="${1:-$here/dl/nxk-ipl.bin}"
+if [ -z "${1:-}" ] && [ ! -s "$payload" ]; then
+    echo "[inject] building nxk-ipl..."
+    python3 "$here/mkipl.py" -o "$payload"
+fi
 [ -s "$payload" ] || { echo "[inject] missing payload: $payload (run ./fetch.sh)" >&2; exit 1; }
 
 if [ ! -x "$here/fusee-nano/fusee-nano" ]; then

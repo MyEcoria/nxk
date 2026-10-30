@@ -1,10 +1,13 @@
 # hwboot — physical Switch (Erista, AutoRCM) bring-up kit
 
-Host-side setup to boot a first-generation Switch into **hekate** over USB
-(fusée-gelée RCM exploit), then nxk through hekate's L4T entry (Stage 2).
-Status: nxk boots to user space on hardware; the shell has not been
-reached there yet: the USB-C console ("Shell over USB-C") is the way in,
-tried in the emulator only (see "Hardware runs").
+Host-side setup to boot a first-generation Switch into **nxk** over USB
+(fusée-gelée RCM exploit): `inject.sh` sends `nxk-ipl.bin`, nxk's own
+launcher, which starts the console and loads nxk from the SD card
+(`BOOT.md`). **hekate is not used to boot nxk any more**; it stays on the
+card for recovery and to extract firmware and keys, and the older "through
+hekate's L4T entry" chain is the fallback (`inject.sh dl/hekate_ctcaer_6.5.4.bin`,
+then More Configs, nxk). The USB-C console ("Shell over USB-C") is the way
+in; "Hardware runs" is the log.
 
 ## What you need
 
@@ -80,8 +83,13 @@ another board (`boardtype=0x073e`): use the console's own.
 
 ```bash
 ./check.sh    # exit 0 + APX line = console in RCM and visible
-./inject.sh   # sends hekate; the Switch screen should show hekate's menu
+./inject.sh   # sends nxk-ipl (built by mkipl.py if missing): nxk boots by itself
 ```
+
+The screen shows nxk's boot logo a second after the injection and the shell
+comes up on the USB-C console (`tools/usbterm.py`). `./inject.sh PAYLOAD`
+sends another payload: `dl/hekate_ctcaer_6.5.4.bin` for recovery or the
+key and firmware extraction below.
 
 `inject.sh` uses the vendored `fusee-nano` injector (MIT, see
 `fusee-nano/UPSTREAM`). Nothing runs automatically on plug-in by design:
@@ -93,8 +101,8 @@ console powers on to a black screen (AutoRCM) rather than the Nintendo logo
 
 ## Safety
 
-- RCM + hekate from SD is the standard soft-mod path: it does **not** write
-  the Switch NAND by itself. Don't enable emuMMC creation, NAND backup
+- RCM + a payload from SD (nxk-ipl, or hekate for recovery) is the standard
+  soft-mod path: it does **not** write the Switch NAND by itself. Don't enable emuMMC creation, NAND backup
   restore, or AutoRCM toggles in hekate unless you know what they do.
 - Keep the battery charged; a dead battery in RCM looks like a dead console
   (charge for an hour if in doubt).

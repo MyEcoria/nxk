@@ -34,7 +34,7 @@ EL1  nxk: memory · threads · scheduler · IPC · capabilities · IRQ · futex
 ```
 
 Everything but the GPU has been verified in the `tegra_qemu` emulator. On
-a **real Switch** (Erista), nxk boots through hekate on its four cores;
+a **real Switch** (Erista), nxk boots by itself (no hekate) from its RCM launcher `nxk-ipl`, on its four cores;
 the `display` service shows the **game library** (cards read from
 `/games`, played with touch or a gamepad, HOME to leave) and the
 dashboard pages (overview, system, network, a mirror of the USB-C
@@ -555,7 +555,7 @@ bench/      comparison against L4T: EL3 monitor, Linux measurement program, scri
 tools/      build, SD card, std toolchain, launch, automated tests,
             usbterm.py (USB-C console terminal on the PC),
             nxdbg.py (screen capture, touch and gamepad over USB-C)
-hwboot/     physical Switch bring-up: RCM injector, hekate entry, nxk-bl31 EL3 monitor
+hwboot/     physical Switch bring-up: RCM injector, nxk-ipl (the launcher, no hekate), nxk-bl31 EL3 monitor
 refs/       hekate, Atmosphere: hardware documentation (never compiled)
 docs/logo/  pixel-art logo (regenerate with tools/mklogo.py)
 ```
@@ -635,7 +635,7 @@ stops threads.
 
 **Boot**: directly from reset (EL3), or in EL2 under a PSCI monitor
 (as on a Switch with its secure firmware); DRAM size detected; device
-tree read when provided. On a Switch, hekate's L4T entry loads
+tree read when provided. On a Switch, `hwboot/nxk-ipl` (injected over RCM, `hwboot/inject.sh`) loads
 `hwboot/nxk-bl31`, an EL3 monitor doing ATF's job, which enters nxk in
 EL2 and starts the other cores through PSCI `CPU_ON`; `CPU_OFF` powers
 cores 1-3 down again (`cores MASK` in the shell, `display` at sleep), the
@@ -675,12 +675,12 @@ program that vanished without closing them (crash) are reclaimed.
 
 ## Limits
 
-- **On a real Switch** (Erista, hekate L4T entry) nxk reaches the
+- **On a real Switch** (Erista, from `nxk-ipl`) nxk reaches the
   shell over the USB-C console (`usbcon`, `tools/usbterm.py`): UART-A
   pads are internal. Last hardware run: single core (before PSCI in
   nxk-bl31) and no SD card (see `hwboot/README.md`, "Hardware runs").
   A USB keyboard does not help: its keys go to `input`, not to the
-  shell, and hekate's L4T path leaves the xHCI unpowered. Seen there:
+  shell, and the xHCI is left unpowered. Seen there:
   4 cores, SD card and filesystem, `ktest` 29/29, `stdtest` 17/17
   (`hwboot/README.md`, "Hardware runs").
 - Kernel messages (`[nxk]` fault reports) reach the USB console through
